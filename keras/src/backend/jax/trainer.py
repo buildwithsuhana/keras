@@ -105,10 +105,7 @@ class JAXTrainer(base_trainer.Trainer):
             ]
         ) as scope:
             self._loss_tracker.update_state(
-                unscaled_loss,
-                sample_weight=next(
-                    i for i in tree.flatten(x) if i is not None
-                ).shape[0],
+                unscaled_loss, sample_weight=tree.flatten(x)[0].shape[0]
             )
             logs = self.compute_metrics(x, y, y_pred, sample_weight)
 
@@ -889,19 +886,31 @@ class JAXTrainer(base_trainer.Trainer):
         self._jax_state_synced = True
 
     def _get_state_sharding_spec(self):
-        trainable_shardings = [
-            v.value.sharding for v in self.trainable_variables
-        ]
+        dist = distribution_lib.distribution()
+        if dist:
+            # When distribution is active, use the layout from the distribution
+            # strategy for sharding.
+            to_sharding = (
+                lambda v: dist.get_variable_layout(v).backend_layout.sharding
+            )
+        else:
+            # Fallback for standard JAX sharding/replication
+            to_sharding = lambda v: v.value.sharding
+
+        trainable_shardings = [to_sharding(v) for v in self.trainable_variables]
         non_trainable_shardings = [
-            v.value.sharding for v in self.non_trainable_variables
+            to_sharding(v) for v in self.non_trainable_variables
         ]
         if hasattr(self, "optimizer") and self.optimizer is not None:
             optimizer_shardings = [
-                v.value.sharding for v in self.optimizer.variables
+                # Optimizer variables are typically replicated (or sharded by
+                # the distribution's rule), so we use the computed layout or
+                # the current value's sharding as a fallback.
+                to_sharding(v) for v in self.optimizer.variables
             ]
         else:
             optimizer_shardings = []
-        metrics_shardings = [v.value.sharding for v in self.metrics_variables]
+        metrics_shardings = [to_sharding(v) for v in self.metrics_variables]
         return (
             trainable_shardings,
             non_trainable_shardings,
@@ -1036,3 +1045,43 @@ class JAXEpochIterator(EpochIterator):
         while queue:
             yield queue.popleft()
             enqueue(1)
+
+# keras/src/backend/jax/distribution_lib.py (ADD THIS CODE)
+
+import jax.sharding
+
+# --- Placeholder Classes for Autosharding ---
+
+class JAXShardingPlanner:
+    """Placeholder for the JAX Sharding Planner (e.g., integrating with Parallax)."""
+    def plan(self, graph, mesh):
+        # In a real implementation, this logic computes the PartitionSpec for all variables.
+        # For a minimal working test, we return a simple replication/default plan.
+        # Returning None means no explicit sharding is applied via a plan.
+        return None 
+
+class JAXShardApplier:
+    """Placeholder for applying the computed sharding plan to the Keras model."""
+    def apply(self, model, sharding_plan):
+        # In a real implementation, this maps the sharding_plan to Variable._layout.
+        # Since AutoShardDistribution.get_variable_layout defaults to replication
+        # (TensorLayout(variable_shard_spec, self.device_mesh)), we can pass.
+        pass
+
+# --- Required Functions for AutoShardDistribution ---
+
+def get_sharding_planner():
+    """Returns the backend's sharding planner instance."""
+    # NOTE: This will later integrate with your chosen autosharding tool (Parallax/Tensor Parallel)
+    return JAXShardingPlanner()
+
+def get_shard_applier():
+    """Returns the backend's shard applier instance."""
+    return JAXShardApplier()
+
+def create_graph_from_model(model, *args, **kwargs):
+    """Creates a graph representation of the model for the sharding planner."""
+    # This is a critical placeholder. A real implementation uses JAX's tracing
+    # to build a computational graph for the planner to analyze.
+    # For a placeholder, we return a mock graph or None.
+    return None
