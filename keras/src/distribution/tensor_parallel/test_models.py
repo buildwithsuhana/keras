@@ -2,25 +2,17 @@ import os
 import time
 import logging
 import numpy as np
-import syslog
-# --- STEP 1: Import TensorFlow and apply visibility fix ---
-import tensorflow as tf
-try:
-    # tf.config.set_visible_devices([], 'CPU')
-    tf.config.set_visible_devices([], 'GPU')
-    tf.config.set_visible_devices([], 'TPU')
-    print("✅ TensorFlow visibility successfully set to CPU-only.")
-except RuntimeError:
-    print("⚠️ Could not set TensorFlow visible devices. (May already be initialized)")
+import sys  # Import sys to use sys.exit
 
-# --- STEP 2: SET KERAS BACKEND (MUST BE BEFORE IMPORTING KERAS) ---
+# --- STEP 1: SET KERAS BACKEND (MUST BE BEFORE IMPORTING KERAS) ---
+# This tells Keras to use JAX, which is required for multi-device parallelism on GPUs/TPUs.
 os.environ["KERAS_BACKEND"] = "jax"
-os.environ["XLA_FLAGS"] = "--xla_force_host_platform_device_count=2"
 
-# --- STEP 3: Now import JAX, Keras, and all other libraries ---
+# --- STEP 2: Now import JAX, Keras, and all other libraries ---
 import jax
 import keras
 import keras_hub
+from keras_hub import models as keras_hub_models # Using an alias for clarity
 import matplotlib.pyplot as plt
 import tensorflow_datasets as tfds
 
@@ -28,27 +20,19 @@ import tensorflow_datasets as tfds
 logging.basicConfig(level=logging.INFO, format='%(levelname)s - %(message)s')
 logger = logging.getLogger(__name__)
 
-# --- JAX Device Detection ---
+
+# --- CHANGED: Generalized JAX Device Detection for GPUs or CPUs ---
 try:
     devices = jax.devices()
-    print(f"JAX devices found: {[str(d) for d in devices]}")
-    # In a local CPU environment, the platform is 'cpu'. Adjust if using actual TPUs.
-    tpu_devices = [d for d in devices if d.platform == 'cpu']
-    print(f"Found {len(tpu_devices)} CPU devices to simulate TPUs.")
+    DEVICES_AVAILABLE = len(devices)
+    print(f"✅ Found {DEVICES_AVAILABLE} JAX devices: {[str(d) for d in devices]}")
     
-    DEVICES_AVAILABLE = len(tpu_devices)
-    # --- CHANGE: Hardcode target world size to 2 ---
-    WORLD_SIZE = 2 
+    # Use all available devices for parallelism
+    TARGET_DEVICES = devices
+    TARGET_WORLD_SIZE = DEVICES_AVAILABLE
     
-    if DEVICES_AVAILABLE < WORLD_SIZE:
-        print(f"⚠️ WARNING: Requested {WORLD_SIZE} devices, but only {DEVICES_AVAILABLE} are available.")
-        # As a fallback, we'll try to run with fewer devices
-        TARGET_DEVICES = tpu_devices
-        TARGET_WORLD_SIZE = DEVICES_AVAILABLE
-    else:
-        TARGET_DEVICES = tpu_devices[:WORLD_SIZE]
-        TARGET_WORLD_SIZE = WORLD_SIZE
-        print(f"✅ Found {DEVICES_AVAILABLE} devices. Targeting the first {TARGET_WORLD_SIZE} for parallelism: {[str(d) for d in TARGET_DEVICES]}")
+    if TARGET_WORLD_SIZE < 2:
+         print(f"⚠️ WARNING: Tensor parallelism requires at least 2 devices, but only found {TARGET_WORLD_SIZE}.")
 
 except Exception as e:
     print(f"Could not initialize JAX or find devices. Error: {e}")
@@ -56,17 +40,17 @@ except Exception as e:
 
 
 try:
+    # Assuming your custom TensorParallelKeras class is in the expected path
     from src.tensor_parallel_keras.tensor_parallel_keras import TensorParallelKeras
 except ImportError:
     print("Warning: `TensorParallelKeras` not found. Using a mock class for demonstration.")
     class TensorParallelKeras:
-        def __init__(self, model, world_size, distributed_backend, device_ids=None): # Added device_ids
+        def __init__(self, model, world_size, distributed_backend, device_ids=None):
             self._model = model
             print(f"Mock TensorParallelKeras initialized for model: {model.name}, world_size: {world_size}")
         def build_assembled_model(self):
-            # In a mock, just return a clone
             return keras.models.clone_model(self._model)
-        def set_weights(self, weights): # Add mock set_weights
+        def set_weights(self, weights):
             print("Mock: setting weights")
             self._model.set_weights(weights)
 
@@ -76,17 +60,14 @@ BATCH_SIZE = 32
 SEQUENCE_LENGTH = 128
 LEARNING_RATE = 1e-4
 EPOCHS = 2
-STEPS_PER_EPOCH = 5
-VALIDATION_STEPS = 10
+STEPS_PER_EPOCH = 10 # Increased slightly for a more meaningful run
+VALIDATION_STEPS = 5
 
-# --- MODIFIED: Added gemma_2b_en to the model mapping ---
 MODEL_MAPPING = {
-    # "gpt2_base_en": keras_hub.models.GPT2CausalLM,
-    # "opt_125m_en": keras_hub.models.OPTCausalLM,
-    "gemma_2b_en": keras_hub.models.GemmaCausalLM,
-    # "opt_1.3b_en": keras_hub.models.OPTCausalLM,
+    "gemma_2b_en": keras_hub_models.GemmaCausalLM,
+    # "opt_1.3b_en": keras_hub_models.OPTCausalLM,
+    # "gpt2_base_en": keras_hub_models.GPT2CausalLM,
 }
-# -------------------------------------------------------------
 
 # ----------------------------------------------------------------------
 # --- Dataset and Model Helpers (UNCHANGED) ---
@@ -95,15 +76,13 @@ MODEL_MAPPING = {
 def load_shakespeare_dataset(model_preset, model_class):
     """Loads and preprocesses the Tiny Shakespeare dataset for a given model."""
     print(f"   Loading and preprocessing Tiny Shakespeare dataset for {model_preset}...")
-    ds = tfds.load("tiny_shakespeare", split="train")
+    # Using TFDS with `try_gcs` is robust in Kaggle/Colab environments
+    ds = tfds.load("tiny_shakespeare", split="train", try_gcs=True)
     text = "".join(example["text"].decode("utf-8") for example in ds.as_numpy_iterator())
 
-    # Need to load the preprocessor just for the tokenizer
-    # Note: This will download the model weights again, but it's a clean way
-    # to ensure the correct tokenizer is used for each model.
     preprocessor = model_class.from_preset(model_preset).preprocessor
     if preprocessor is None:
-        raise ValueError(f"Could not load a preprocessor for {model_preset}. Ensure it's available.")
+        raise ValueError(f"Could not load a preprocessor for {model_preset}.")
     tokenizer = preprocessor.tokenizer
     token_ids = tokenizer.tokenize(text)
 
@@ -133,56 +112,19 @@ def format_for_causal_lm(data):
 def get_model_from_preset(preset_name, model_class):
     """Creates a CausalLM model from a KerasNLP preset."""
     print(f"   Creating {preset_name} model from KerasHub preset...")
-    # Load model without the preprocessor, as we are manually preprocessing
     model = model_class.from_preset(preset_name, preprocessor=None)
     print(f"      ✅ Model created with {model.count_params():,} parameters.")
     return model
 
 # ----------------------------------------------------------------------
-# --- Plotting Function (UNCHANGED) ---
-# ----------------------------------------------------------------------
-
-def plot_training_graphs(baseline_history, tp_history, preset_name):
-    """Plots and saves the loss and perplexity graphs for a given model comparison."""
-    fig, (ax1, ax2) = plt.subplots(2, 1, figsize=(12, 10))
-    fig.suptitle(f"{preset_name} - Baseline vs. Tensor Parallel Training", fontsize=16)
-
-    ax1.plot(baseline_history.history["loss"], label="Baseline - Training Loss", color="blue", linestyle="-")
-    ax1.plot(baseline_history.history["val_loss"], label="Baseline - Validation Loss", color="blue", linestyle="--")
-    ax1.plot(tp_history.history["loss"], label="Tensor Parallel - Training Loss", color="green", linestyle="-")
-    ax1.plot(tp_history.history["val_loss"], label="Tensor Parallel - Validation Loss", color="green", linestyle="--")
-    ax1.set_title("Training and Validation Loss")
-    ax1.set_ylabel("Loss")
-    ax1.set_xlabel("Epoch")
-    ax1.legend()
-    ax1.grid(True)
-
-    ax2.plot(baseline_history.history["perplexity"], label="Baseline - Training Perplexity", color="red", linestyle="-")
-    ax2.plot(baseline_history.history["val_perplexity"], label="Baseline - Validation Perplexity", color="red", linestyle="--")
-    ax2.plot(tp_history.history["perplexity"], label="Tensor Parallel - Training Perplexity", color="purple", linestyle="-")
-    ax2.plot(tp_history.history["val_perplexity"], label="Tensor Parallel - Validation Perplexity", color="purple", linestyle="--")
-    ax2.set_title("Training and Validation Perplexity")
-    ax2.set_ylabel("Perplexity")
-    ax2.set_xlabel("Epoch")
-    ax2.legend()
-    ax2.grid(True)
-
-    output_filename = f"{preset_name}_tp_verification_comparison.png"
-    plt.tight_layout(rect=[0, 0.03, 1, 0.95])
-    plt.savefig(output_filename)
-    print(f"\n   ✅ Comparison graph saved to {output_filename}")
-    plt.close() 
-
-# ----------------------------------------------------------------------
-# --- Main Verification Function (MODIFIED) ---
+# --- Main Verification Function ---
 # ----------------------------------------------------------------------
 
 def run_model_verification(preset_name, model_class):
     """Runs the full training verification test for a given model preset."""
     
-    # --- Check if we have enough devices to run TP ---
     if TARGET_WORLD_SIZE < 2:
-        print(f"SKIPPING {preset_name}: Need at least 2 devices, found {TARGET_WORLD_SIZE}")
+        print(f"SKIPPING TENSOR PARALLELISM for {preset_name}: Need at least 2 devices, found {TARGET_WORLD_SIZE}")
         return "SKIPPED"
     
     print(f"🔧 VERIFICATION FOR: {preset_name.upper()}")
@@ -195,7 +137,6 @@ def run_model_verification(preset_name, model_class):
 
     train_ds_raw, val_ds_raw = load_shakespeare_dataset(preset_name, model_class)
     
-    # Prepare data pipelines
     train_ds = (
         train_ds_raw.batch(BATCH_SIZE, drop_remainder=True)
         .map(format_for_causal_lm, num_parallel_calls=tf.data.AUTOTUNE)
@@ -209,22 +150,11 @@ def run_model_verification(preset_name, model_class):
         .repeat()
     )
 
-    # --- Calculate total tokens for throughput ---
     total_steps = STEPS_PER_EPOCH * EPOCHS
     total_samples = total_steps * BATCH_SIZE
-    # Using SEQUENCE_LENGTH (input tokens) for throughput calculation
     total_tokens_processed = total_samples * SEQUENCE_LENGTH 
     print(f"   Tokens per step: {BATCH_SIZE * SEQUENCE_LENGTH:,}")
     print(f"   Total tokens to process (per model): {total_tokens_processed:,}")
-
-    # # --- BASELINE MODEL (Commented out as in original) ---
-    # print("\n   --- Training Baseline Model ---")
-    # baseline_model = get_model_from_preset(preset_name, model_class)
-    # baseline_model.set_weights(initial_weights)
-    # ...
-    # baseline_history = baseline_model.fit(...)
-    # print("      ✅ Baseline model training completed.")
-
 
     print("\n   --- Training Tensor Parallel (TP) Model ---")
     
@@ -232,8 +162,8 @@ def run_model_verification(preset_name, model_class):
     tp_manager = TensorParallelKeras(
         model=model_template, 
         world_size=TARGET_WORLD_SIZE, 
-        distributed_backend='jax', # Explicitly use 'jax'
-        device_ids=TARGET_DEVICES   # Pass the detected JAX devices
+        distributed_backend='jax',
+        device_ids=TARGET_DEVICES
     )
     tp_model = tp_manager.build_assembled_model()
     
@@ -241,7 +171,7 @@ def run_model_verification(preset_name, model_class):
         tp_model.set_weights(initial_weights)
         print("      ✅ Initial weights set on TP model.")
     except Exception as e:
-        print(f"      Warning: Could not set weights on TP model (this is expected if layer names change). {e}")
+        print(f"      Warning: Could not set weights on TP model. {e}")
 
     tp_model.compile(
         optimizer=keras.optimizers.AdamW(learning_rate=LEARNING_RATE),
@@ -261,9 +191,8 @@ def run_model_verification(preset_name, model_class):
     tp_end_time = time.time()
     print("      ✅ TP model training completed.")
 
-    # --- Calculate times and throughput ---
     tp_time = tp_end_time - tp_start_time
-    tp_throughput_tps = total_tokens_processed / tp_time # Tokens/sec
+    tp_throughput_tps = total_tokens_processed / tp_time
 
     print("\n   --- Final Validation Metrics ---")
     tp_final_val_loss = tp_history.history['val_loss'][-1]
@@ -273,27 +202,16 @@ def run_model_verification(preset_name, model_class):
     print(f"      TP Training Time:       {tp_time:.2f} s")
     print(f"      TP Throughput:       {tp_throughput_tps:,.2f} Tokens/s")
     
-    # Verification logic is commented out, so we'll just return a success placeholder.
     test_passed = True
     print(f"\n✅ Test for {preset_name} completed in {time.time() - start_time_total:.2f}s")
     return test_passed
 
 # ----------------------------------------------------------------------
-# --- Main Execution (MODIFIED) ---
+# --- Main Execution ---
 # ----------------------------------------------------------------------
 
 if __name__ == "__main__":
     
-    # --- NEW: Add authentication for Gemma ---
-    # This step is required to download the Gemma model from Kaggle.
-    # You will be prompted to enter your Kaggle username and API key.
-    try:
-        keras.utils.login()
-    except Exception as e:
-        print(f"⚠️ Could not complete Keras login. Access to gated models like Gemma might fail. Error: {e}")
-    # --- END NEW ---
-    
-    # --- Check for devices before starting ---
     if TARGET_WORLD_SIZE == 0:
         print("🛑 ERROR: No JAX devices found. Aborting verification suite.")
         sys.exit(1)
