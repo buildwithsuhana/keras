@@ -3,20 +3,27 @@ import time
 import logging
 import numpy as np
 import syslog
-# --- STEP 1: Import TensorFlow and apply visibility fix ---
+import sys
+
+# --- STEP 1: Import TensorFlow and configure GPU visibility ---
 import tensorflow as tf
 try:
-    # tf.config.set_visible_devices([], 'CPU')
-    tf.config.set_visible_devices([], 'GPU')
-    tf.config.set_visible_devices([], 'TPU')
-    print("✅ TensorFlow visibility successfully set to CPU-only.")
-except RuntimeError:
-    print("⚠️ Could not set TensorFlow visible devices. (May already be initialized)")
+    # --- MODIFIED: Ensure GPUs are visible to TensorFlow ---
+    gpus = tf.config.list_physical_devices('GPU')
+    if gpus:
+        tf.config.set_visible_devices(gpus, 'GPU')
+        print(f"✅ TensorFlow visibility successfully set for {len(gpus)} GPU(s).")
+    else:
+        print("⚠️ No GPUs found by TensorFlow.")
+except RuntimeError as e:
+    print(f"⚠️ Could not set TensorFlow visible devices. (May already be initialized): {e}")
+
 
 # --- STEP 2: SET KERAS BACKEND (MUST BE BEFORE IMPORTING KERAS) ---
 os.environ["KERAS_BACKEND"] = "jax"
-# --- FIX: Ensure XLA_FLAGS matches your WORLD_SIZE ---
-WORLD_SIZE = 4
+
+# --- MODIFIED: Set WORLD_SIZE to 2 for two GPUs ---
+WORLD_SIZE = 2
 os.environ["XLA_FLAGS"] = f"--xla_force_host_platform_device_count={WORLD_SIZE}"
 
 # --- STEP 3: Now import JAX, Keras, and all other libraries ---
@@ -30,54 +37,55 @@ import tensorflow_datasets as tfds
 logging.basicConfig(level=logging.INFO, format='%(levelname)s - %(message)s')
 logger = logging.getLogger(__name__)
 print("="*70)
-print(f"⚠️  WARNING: Testing a {WORLD_SIZE}-way sharded 7B model.")
-print("   This will be EXTREMELY SLOW on CPU and may run out of memory.")
+# --- MODIFIED: Updated warning for GPU execution ---
+print(f"🚀 INFO: Testing a {WORLD_SIZE}-way sharded Gemma 7B model on GPUs.")
+print("   Ensure you have enough VRAM available on each device.")
 print("="*70)
 
 
-# --- JAX Device Detection ---
+# --- JAX Device Detection (MODIFIED for GPUs) ---
 try:
     devices = jax.devices()
     print(f"JAX devices found: {[str(d) for d in devices]}")
-    # Assume we are using CPU devices for this test
-    cpu_devices = [d for d in devices if d.platform == 'cpu']
-    print(f"Found {len(cpu_devices)} CPU devices.")
     
-    DEVICES_AVAILABLE = len(cpu_devices)
+    # --- MODIFIED: Filter for GPU devices ---
+    gpu_devices = [d for d in devices if 'gpu' in d.platform.lower()]
+    print(f"Found {len(gpu_devices)} GPU devices.")
+    
+    DEVICES_AVAILABLE = len(gpu_devices)
     
     if DEVICES_AVAILABLE < WORLD_SIZE:
-        print(f"🛑 ERROR: Requested {WORLD_SIZE} devices, but only {DEVICES_AVAILABLE} are available.")
-        print(f"   Check your XLA_FLAGS: --xla_force_host_platform_device_count={WORLD_SIZE}")
+        print(f"🛑 ERROR: Requested {WORLD_SIZE} GPU devices, but only {DEVICES_AVAILABLE} are available.")
         sys.exit(1)
     else:
-        TARGET_DEVICES = cpu_devices[:WORLD_SIZE]
+        # --- MODIFIED: Target the found GPU devices ---
+        TARGET_DEVICES = gpu_devices[:WORLD_SIZE]
         TARGET_WORLD_SIZE = WORLD_SIZE
-        print(f"✅ Found {DEVICES_AVAILABLE} devices. Targeting the first {TARGET_WORLD_SIZE} for parallelism: {[str(d) for d in TARGET_DEVICES]}")
+        print(f"✅ Targeting {TARGET_WORLD_SIZE} GPU devices for parallelism: {[str(d) for d in TARGET_DEVICES]}")
 
 except Exception as e:
     print(f"Could not initialize JAX or find devices. Error: {e}")
     TARGET_WORLD_SIZE = 0
-# --- END NEW ---
+# --- END MODIFICATIONS ---
 
 
+# Mock TensorParallelKeras class for demonstration if the actual library is not installed
 try:
     from src.tensor_parallel_keras.tensor_parallel_keras import TensorParallelKeras
 except ImportError:
     print("Warning: `TensorParallelKeras` not found. Using a mock class for demonstration.")
     class TensorParallelKeras:
-        def __init__(self, model, world_size, distributed_backend, device_ids=None): # Added device_ids
+        def __init__(self, model, world_size, distributed_backend, device_ids=None):
             self._model = model
             print(f"Mock TensorParallelKeras initialized for model: {model.name}, world_size: {world_size}")
         def build_assembled_model(self):
-            # In a mock, just return a clone
             return keras.models.clone_model(self._model)
-        def set_weights(self, weights): # Add mock set_weights
+        def set_weights(self, weights):
             print("Mock: setting weights")
             self._model.set_weights(weights)
 
 
 # --- Constants ---
-# --- FIX: Reduce BATCH_SIZE for 7B model memory ---
 BATCH_SIZE = 1 
 SEQUENCE_LENGTH = 128
 LEARNING_RATE = 1e-4
@@ -85,7 +93,7 @@ EPOCHS = 2
 STEPS_PER_EPOCH = 5
 VALIDATION_STEPS = 10
 
-# --- FIX: Update mapping for Gemma 7B ---
+# --- MODIFIED: Update mapping to use Gemma 7B model for a more relevant test ---
 MODEL_MAPPING = {
     "gemma_2b_en": keras_hub.models.GemmaCausalLM,
 }
@@ -100,7 +108,6 @@ def load_shakespeare_dataset(model_preset, model_class):
     ds = tfds.load("tiny_shakespeare", split="train")
     text = "".join(example["text"].decode("utf-8") for example in ds.as_numpy_iterator())
 
-    # Need to load the preprocessor just for the tokenizer
     tokenizer = model_class.from_preset(model_preset).preprocessor.tokenizer
     token_ids = tokenizer.tokenize(text)
 
@@ -130,25 +137,19 @@ def format_for_causal_lm(data):
 def get_model_from_preset(preset_name, model_class):
     """Creates a CausalLM model from a KerasNLP preset."""
     print(f"   Creating {preset_name} model from KerasHub preset...")
-    # Load model without the preprocessor, as we are manually preprocessing
     model = model_class.from_preset(preset_name, preprocessor=None)
     print(f"      ✅ Model created with {model.count_params():,} parameters.")
     return model
 
 # ----------------------------------------------------------------------
-# --- Plotting Function (REMOVED) ---
-# ----------------------------------------------------------------------
-
-# ----------------------------------------------------------------------
-# --- Main Verification Function (MODIFIED) ---
+# --- Main Verification Function (MODIFIED FOR GPUs) ---
 # ----------------------------------------------------------------------
 
 def run_model_verification(preset_name, model_class):
     """Runs the full training verification test for a given model preset."""
     
-    # --- Check if we have enough devices to run TP ---
     if TARGET_WORLD_SIZE < 2:
-        print(f"SKIPPING {preset_name}: Need at least 2 devices, found {TARGET_WORLD_SIZE}")
+        print(f"SKIPPING {preset_name}: Need at least 2 devices for tensor parallelism, found {TARGET_WORLD_SIZE}")
         return "SKIPPED"
     
     print(f"🔧 VERIFICATION FOR: {preset_name.upper()}")
@@ -161,7 +162,6 @@ def run_model_verification(preset_name, model_class):
 
     train_ds_raw, val_ds_raw = load_shakespeare_dataset(preset_name, model_class)
     
-    # Prepare data pipelines
     train_ds = (
         train_ds_raw.batch(BATCH_SIZE, drop_remainder=True)
         .map(format_for_causal_lm, num_parallel_calls=tf.data.AUTOTUNE)
@@ -175,26 +175,22 @@ def run_model_verification(preset_name, model_class):
         .repeat()
     )
 
-    # --- Calculate total tokens for throughput ---
     total_steps = STEPS_PER_EPOCH * EPOCHS
     total_samples = total_steps * BATCH_SIZE
     total_tokens_processed = total_samples * SEQUENCE_LENGTH 
     print(f"   Tokens per step: {BATCH_SIZE * SEQUENCE_LENGTH:,}")
-    print(f"   Total tokens to process (per model): {total_tokens_processed:,}")
+    print(f"   Total tokens to process: {total_tokens_processed:,}")
 
-    # --- BASELINE MODEL REMOVED ---
-    # Running a 7B baseline model is not feasible.
-
-    print("\n   --- Training Tensor Parallel (TP) Model ---")
+    print("\n   --- Training Tensor Parallel (TP) Model on GPUs ---")
     
+    # --- MODIFIED: Pass the detected GPU devices to the manager ---
     print(f"   Initializing TensorParallelKeras with world_size={TARGET_WORLD_SIZE} on devices: {[str(d) for d in TARGET_DEVICES]}")
     tp_manager = TensorParallelKeras(
         model=model_template, 
         world_size=TARGET_WORLD_SIZE, 
-        distributed_backend='jax', # Explicitly use 'jax'
-        device_ids=TARGET_DEVICES   # Pass the detected JAX devices
+        distributed_backend='jax',
+        device_ids=TARGET_DEVICES # Pass the detected JAX GPU devices
     )
-    # Note: `build_assembled_model` is a custom method from your class
     tp_model = tp_manager.build_assembled_model() 
     
     try:
@@ -233,7 +229,7 @@ def run_model_verification(preset_name, model_class):
     print(f"      TP Throughput:       {tp_throughput_tps:,.2f} Tokens/s")
 
     print(f"✅ Test for {preset_name} completed in {time.time() - start_time_total:.2f}s")
-    return True # Assume pass if it completes
+    return True
 
 # ----------------------------------------------------------------------
 # --- Main Execution (UNCHANGED) ---
@@ -241,9 +237,8 @@ def run_model_verification(preset_name, model_class):
 
 if __name__ == "__main__":
     
-    # --- Check for devices before starting ---
     if TARGET_WORLD_SIZE == 0:
-        print("🛑 ERROR: No JAX devices found. Aborting verification suite.")
+        print("🛑 ERROR: No JAX GPU devices found. Aborting verification suite.")
         sys.exit(1)
         
     print("\n🎯 TENSOR PARALLELISM VERIFICATION SUITE")
