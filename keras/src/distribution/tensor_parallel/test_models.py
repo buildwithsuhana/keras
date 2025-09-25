@@ -97,12 +97,12 @@ def load_shakespeare_dataset(model_preset, model_class):
     # This prevents a conflict where the TF-based tokenizer tries to access
     # the TPU that JAX has already claimed.
     print("      Running preprocessor loading on CPU to avoid device conflict...")
-    with tf.device("/CPU:0"):
-        preprocessor = model_class.from_preset(model_preset).preprocessor
+    # with tf.device("/CPU:0"):
+    #     preprocessor = model_class.from_preset(model_preset).preprocessor
 
-    if preprocessor is None:
-        raise ValueError(f"Could not load a preprocessor for {model_preset}.")
-    tokenizer = preprocessor.tokenizer
+    # if preprocessor is None:
+        # raise ValueError(f"Could not load a preprocessor for {model_preset}.")
+    tokenizer = model_class.from_preset(model_preset).preprocessor.tokenizer
     token_ids = tokenizer.tokenize(text)
 
     num_tokens = (len(token_ids) // (SEQUENCE_LENGTH + 1)) * (SEQUENCE_LENGTH + 1)
