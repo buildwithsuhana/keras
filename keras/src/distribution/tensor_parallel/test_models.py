@@ -94,17 +94,21 @@ def load_shakespeare_dataset(model_preset, model_class):
     print(f"      ✅ Dataset loaded! It contains {len(text):,} characters.")
 
     # 3. *** FIX: Force preprocessor loading to run on CPU ***
-    # This prevents a conflict where the TF-based tokenizer tries to access
-    # the TPU that JAX has already claimed.
-    print("      Running preprocessor loading on CPU to avoid device conflict...")
-    # with tf.device("/CPU:0"):
-    #     preprocessor = model_class.from_preset(model_preset).preprocessor
+    # This prevents the TF-based tokenizer from trying to access the
+    # same accelerator (TPU/GPU) that JAX has already claimed.
+    print("      Forcing preprocessor/tokenizer loading onto CPU to avoid device conflict...")
+    with tf.device("/CPU:0"):
+        # Load the preprocessor on the CPU
+        preprocessor = model_class.from_preset(model_preset, preprocessor="default").preprocessor
 
-    # if preprocessor is None:
-        # raise ValueError(f"Could not load a preprocessor for {model_preset}.")
-    tokenizer = model_class.from_preset(model_preset).preprocessor.tokenizer
+    if preprocessor is None:
+        raise ValueError(f"Could not load a preprocessor for {model_preset}.")
+
+    # Now that the tokenizer is loaded (on the CPU), we can use it.
+    tokenizer = preprocessor.tokenizer
     token_ids = tokenizer.tokenize(text)
 
+    # --- The rest of the function remains the same ---
     num_tokens = (len(token_ids) // (SEQUENCE_LENGTH + 1)) * (SEQUENCE_LENGTH + 1)
     sequences = np.array(token_ids[:num_tokens]).reshape(-1, SEQUENCE_LENGTH + 1)
     
