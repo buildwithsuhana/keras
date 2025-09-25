@@ -6,7 +6,7 @@ import sys  # Import sys to use sys.exit
 
 # --- STEP 1: SET KERAS BACKEND (MUST BE BEFORE IMPORTING KERAS) ---
 # This tells Keras to use JAX, which is required for multi-device parallelism on GPUs/TPUs.
-os.environ["KERAS_BACKEND"] = "jax"
+# os.environ["KERAS_BACKEND"] = "jax"
 
 # --- STEP 2: Now import JAX, Keras, and all other libraries ---
 import jax
