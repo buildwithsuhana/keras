@@ -80,7 +80,7 @@ def load_shakespeare_dataset(model_preset, model_class):
     """Loads and preprocesses the Tiny Shakespeare dataset for a given model."""
     print(f"   Loading and preprocessing Tiny Shakespeare dataset for {model_preset}...")
     # Using TFDS with `try_gcs` is robust in Kaggle/Colab environments
-    ds = tfds.load("tiny_shakespeare", split="train", try_gcs=True)
+    ds = tfds.load("tiny_shakespeare", split="train")
     text = "".join(example["text"].decode("utf-8") for example in ds.as_numpy_iterator())
 
     preprocessor = model_class.from_preset(model_preset).preprocessor
