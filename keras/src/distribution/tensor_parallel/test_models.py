@@ -154,23 +154,44 @@ def run_model_verification(preset_name, model_class):
     initial_weights = model_template.get_weights()
     print("      ✅ Initial weights saved from template model.")
 
+    # NOTE: The 'load_shakespeare_dataset' function with the tf.device fix should be kept.
     train_ds_raw, val_ds_raw = load_shakespeare_dataset(preset_name, model_class)
     
+    # --- START OF MODIFIED SECTION ---
+
+    # 1. Build the TF data pipeline, but DO NOT use .repeat()
+    # We will only iterate through it once to convert to NumPy.
+    print("   Building initial tf.data pipeline...")
     train_ds = (
-        train_ds_raw.batch(BATCH_SIZE, drop_remainder=True)
+        train_ds_raw.take(STEPS_PER_EPOCH * BATCH_SIZE) # Take just enough data for the run
+        .batch(BATCH_SIZE, drop_remainder=True)
         .map(format_for_causal_lm, num_parallel_calls=tf.data.AUTOTUNE)
         .prefetch(tf.data.AUTOTUNE)
-        .repeat()
     )
     val_ds = (
-        val_ds_raw.batch(BATCH_SIZE, drop_remainder=True)
+        val_ds_raw.take(VALIDATION_STEPS * BATCH_SIZE) # Take just enough data for the run
+        .batch(BATCH_SIZE, drop_remainder=True)
         .map(format_for_causal_lm, num_parallel_calls=tf.data.AUTOTUNE)
         .prefetch(tf.data.AUTOTUNE)
-        .repeat()
     )
 
+    # 2. Convert the entire dataset to NumPy arrays. This is the crucial step.
+    # It forces all TF processing to happen now, on the CPU, before training begins.
+    print("   Converting tf.data.Dataset to NumPy arrays to decouple from JAX training...")
+    train_data_np = tfds.as_numpy(train_ds)
+    val_data_np = tfds.as_numpy(val_ds)
+
+    # Unpack the NumPy iterators into explicit x, y arrays
+    x_train = np.concatenate([x for x, y in train_data_np], axis=0)
+    y_train = np.concatenate([y for x, y in train_data_np], axis=0)
+    x_val = np.concatenate([x for x, y in val_data_np], axis=0)
+    y_val = np.concatenate([y for x, y in val_data_np], axis=0)
+    print(f"      ✅ Data converted. Train shapes: {x_train['token_ids'].shape}, {y_train.shape}")
+    
+    # --- END OF MODIFIED SECTION ---
+
     total_steps = STEPS_PER_EPOCH * EPOCHS
-    total_samples = total_steps * BATCH_SIZE
+    total_samples = x_train['token_ids'].shape[0] * EPOCHS
     total_tokens_processed = total_samples * SEQUENCE_LENGTH 
     print(f"   Tokens per step: {BATCH_SIZE * SEQUENCE_LENGTH:,}")
     print(f"   Total tokens to process (per model): {total_tokens_processed:,}")
@@ -199,10 +220,13 @@ def run_model_verification(preset_name, model_class):
     )
     
     tp_start_time = time.time()
+    
+    # 3. Fit the model using the NumPy arrays
     tp_history = tp_model.fit(
-        train_ds,
-        validation_data=val_ds,
+        x_train, y_train,
+        validation_data=(x_val, y_val),
         epochs=EPOCHS,
+        batch_size=BATCH_SIZE, # Specify batch size here
         steps_per_epoch=STEPS_PER_EPOCH,
         validation_steps=VALIDATION_STEPS,
         verbose=1
