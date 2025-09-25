@@ -20,7 +20,10 @@ import tensorflow_datasets as tfds
 logging.basicConfig(level=logging.INFO, format='%(levelname)s - %(message)s')
 logger = logging.getLogger(__name__)
 
+import tensorflow as tf
 
+# This line tells TensorFlow: "Don't touch the TPUs. Leave them for JAX."
+tf.config.set_visible_devices([], 'TPU')
 # --- CHANGED: Generalized JAX Device Detection for GPUs or CPUs ---
 try:
     devices = jax.devices()
