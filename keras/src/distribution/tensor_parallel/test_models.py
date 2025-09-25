@@ -2,32 +2,35 @@ import os
 import time
 import logging
 import numpy as np
-import sys
-import tensorflow as tf
+import sys  # Import sys to use sys.exit
 
 # --- STEP 1: SET KERAS BACKEND (MUST BE BEFORE IMPORTING KERAS) ---
+# This tells Keras to use JAX, which is required for multi-device parallelism on GPUs/TPUs.
 os.environ["KERAS_BACKEND"] = "jax"
 
 # --- STEP 2: Now import JAX, Keras, and all other libraries ---
 import jax
 import keras
 import keras_hub
-from keras_hub import models as keras_hub_models
+from keras_hub import models as keras_hub_models # Using an alias for clarity
 import matplotlib.pyplot as plt
+import tensorflow_datasets as tfds
 
 # --- Configuration and Initialization ---
 logging.basicConfig(level=logging.INFO, format='%(levelname)s - %(message)s')
 logger = logging.getLogger(__name__)
 
+import tensorflow as tf
+
 # This line tells TensorFlow: "Don't touch the TPUs. Leave them for JAX."
 tf.config.set_visible_devices([], 'TPU')
-
-# --- Generalized JAX Device Detection for GPUs or CPUs ---
+# --- CHANGED: Generalized JAX Device Detection for GPUs or CPUs ---
 try:
     devices = jax.devices()
     DEVICES_AVAILABLE = len(devices)
     print(f"✅ Found {DEVICES_AVAILABLE} JAX devices: {[str(d) for d in devices]}")
     
+    # Use all available devices for parallelism
     TARGET_DEVICES = devices
     TARGET_WORLD_SIZE = DEVICES_AVAILABLE
     
@@ -60,18 +63,19 @@ BATCH_SIZE = 32
 SEQUENCE_LENGTH = 128
 LEARNING_RATE = 1e-4
 EPOCHS = 2
-STEPS_PER_EPOCH = 10
+STEPS_PER_EPOCH = 10 # Increased slightly for a more meaningful run
 VALIDATION_STEPS = 5
 
 MODEL_MAPPING = {
+    # "gemma_2b_en": keras_hub_models.GemmaCausalLM,
     "opt_1.3b_en": keras_hub_models.OPTCausalLM,
+    # "gpt2_base_en": keras_hub_models.GPT2CausalLM,
 }
 
 # ----------------------------------------------------------------------
-# --- Dataset and Model Helpers ---
+# --- Dataset and Model Helpers (UNCHANGED) ---
 # ----------------------------------------------------------------------
 
-# =================== MODIFIED FUNCTION ===================
 def load_shakespeare_dataset(model_preset, model_class):
     """
     Loads and preprocesses the Tiny Shakespeare dataset by manually downloading
@@ -109,7 +113,6 @@ def load_shakespeare_dataset(model_preset, model_class):
 
     print(f"      ✅ Preprocessing complete with {num_train_samples} training and {num_sequences - num_train_samples} validation sequences.")
     return train_ds, val_ds
-# =========================================================
 
 def format_for_causal_lm(data):
     """Formats data for KerasNLP's CausalLM, creating features and labels."""
