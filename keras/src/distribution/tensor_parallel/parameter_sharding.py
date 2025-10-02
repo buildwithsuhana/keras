@@ -259,8 +259,7 @@ class ParameterShardingStrategy:
                         if isinstance(item, layers.Layer):
                             search_layer_recursive(item, full_name)
 
-        for layer in model.layers:
-            search_layer_recursive(layer, prefix="")
+        search_layer_recursive(model, prefix="")
 
         return matching_params
 
@@ -308,6 +307,52 @@ def _define_parameter_sharded_model():
                 self.build(original_model.inputs[0].shape)
 
             print("🚀 ParameterShardedModel created successfully")
+        @property
+        def device(self):
+            # The model is distributed, so it doesn't have a single device.
+            # Returning None is a safe default.
+            return None
+        def train_step(self, data):
+            """
+            Custom train_step for the parameter-sharded model.
+
+            This override includes a gradient synchronization (all-reduce) step,
+            which is essential for the backward pass in tensor parallelism.
+            """
+            x, y = data
+
+            with self.backend.GradientTape() as tape:
+                # The forward pass is handled by the model's `call` method,
+                # which already contains the forward-pass communication logic.
+                y_pred = self(x, training=True)
+                loss = self.compute_loss(y=y, y_pred=y_pred)
+
+            trainable_vars = self.trainable_variables
+            gradients = tape.gradient(loss, trainable_vars)
+
+            # --------------------------------------------------------------
+            # ## CRITICAL STEP: Use the communicator for gradient sync ##
+            # This is the backward-pass equivalent of the logic in your
+            # `call` method. You must sum the gradients across all devices.
+            # --------------------------------------------------------------
+            
+            # Use the existing communicator to perform the all-reduce sum.
+            # NOTE: Verify the exact method name in your TensorParallelCommunicator class.
+            # It might be `all_reduce`, `reduce`, or something similar.
+            synced_gradients = self.communicator.all_reduce(
+                gradients, op="sum", axis_name="model"
+            )
+
+            # Update weights with the synchronized gradients
+            self.optimizer.apply(
+                synced_gradients,
+                trainable_vars,
+            )
+
+            # Update metrics
+            self.compiled_metrics.update_state(y, y_pred)
+
+            return {m.name: m.result() for m in self.metrics}
 
         def _build_and_cache_weights(self):
             """

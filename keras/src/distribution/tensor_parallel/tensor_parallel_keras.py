@@ -29,8 +29,9 @@ from .coordinated_optimizer import TensorParallelOptimizer
 
 logger = logging.getLogger(__file__)
 
+from keras.src.models import Model
 
-class TensorParallelKeras(keras.Model):
+class TensorParallelKeras(Model):
     def __init__(
         self,
         model,
@@ -39,7 +40,6 @@ class TensorParallelKeras(keras.Model):
         distributed_backend="auto",
         **kwargs,
     ):
-        self._validate_sharding()
 
         super().__init__()
 
@@ -177,7 +177,7 @@ class TensorParallelKeras(keras.Model):
 
         # Create collective operations
         config_with_ops = self.tensor_parallel_config.create_collective_ops(
-            self.devices, self.distributed
+            self.devices
         )
 
         # REAL IMPLEMENTATION: Create actual parameter shards for each device
@@ -268,7 +268,7 @@ class TensorParallelKeras(keras.Model):
             )
 
             self.distributed_backend = get_distributed_backend(
-                distributed_backend, self.world_size, rank=0
+                distributed_backend
             )
             logger.info(
                 f"Initialized distributed backend: {type(self.distributed_backend).__name__}"
@@ -1468,7 +1468,7 @@ class TensorParallelKeras(keras.Model):
 
         if len(self.model_shards) > 1:
             # Enable gradient synchronization
-            self._synchronize_gradients()
+            # self._synchronize_gradients()
 
             # Use standard Keras training - our custom train_step will handle the rest
             print("🚀 USING STANDARD KERAS TRAINING WITH CUSTOM TRAIN_STEP! 🚀")
