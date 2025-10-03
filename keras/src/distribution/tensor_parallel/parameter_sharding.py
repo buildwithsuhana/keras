@@ -307,11 +307,13 @@ def _define_parameter_sharded_model():
                 self.build(original_model.inputs[0].shape)
 
             print("🚀 ParameterShardedModel created successfully")
+
         @property
         def device(self):
             # The model is distributed, so it doesn't have a single device.
             # Returning None is a safe default.
             return None
+
         def train_step(self, data):
             """
             Custom train_step for the parameter-sharded model.
@@ -335,7 +337,7 @@ def _define_parameter_sharded_model():
             # This is the backward-pass equivalent of the logic in your
             # `call` method. You must sum the gradients across all devices.
             # --------------------------------------------------------------
-            
+
             # Use the existing communicator to perform the all-reduce sum.
             # NOTE: Verify the exact method name in your TensorParallelCommunicator class.
             # It might be `all_reduce`, `reduce`, or something similar.

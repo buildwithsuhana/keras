@@ -31,6 +31,7 @@ logger = logging.getLogger(__file__)
 
 from keras.src.models import Model
 
+
 class TensorParallelKeras(Model):
     def __init__(
         self,
@@ -40,7 +41,6 @@ class TensorParallelKeras(Model):
         distributed_backend="auto",
         **kwargs,
     ):
-
         super().__init__()
 
         if world_size is None:

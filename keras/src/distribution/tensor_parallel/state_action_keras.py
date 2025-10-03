@@ -7,7 +7,6 @@ import keras
 class StateActionKeras:
     """
     Abstract base class for actions that transform tensors for distribution.
-
     An action defines how a tensor should be processed for a specific worker
     (rank) and how to reverse that action to reconstruct the original tensor.
     """
@@ -15,11 +14,9 @@ class StateActionKeras:
     def __call__(self, tensor: Any, rank: int) -> Any:
         """
         Apply the state action to a tensor for a given worker rank.
-
         Args:
             tensor: The input tensor to transform.
             rank: The rank of the worker process.
-
         Returns:
             The transformed tensor shard for the specified rank.
         """
@@ -28,10 +25,8 @@ class StateActionKeras:
     def undo(self, tensors: Sequence[Any]) -> Any:
         """
         Reverse the action to reconstruct the original tensor from its parts.
-
         Args:
             tensors: A sequence of tensor shards from all worker processes.
-
         Returns:
             The reconstructed, original tensor.
         """
@@ -44,17 +39,15 @@ class _ConcatenateMixin:
     def undo(self, tensors: Sequence[Any]) -> Any:
         """Concatenate a sequence of tensors along the specified dimension."""
         if self.dim == -1:
-            # Resolve dim=-1 to the last dimension of the input tensors
             dim = keras.ops.ndim(tensors[0]) - 1
         else:
             dim = self.dim
         return keras.ops.concatenate(tensors, axis=dim)
 
 
-class SplitKeras(StateActionKeras, _ConcatenateMixin):
+class SplitKeras(_ConcatenateMixin, StateActionKeras):
     """
     Splits a tensor into shards along a specified dimension for each worker.
-
     Args:
         world_size: The total number of workers/shards.
         dim: The dimension along which to split the tensor. If -1, the last
@@ -91,57 +84,50 @@ class SplitKeras(StateActionKeras, _ConcatenateMixin):
         slices = [slice(None)] * keras.ops.ndim(tensor)
         slices[dim] = slice(start_idx, end_idx)
         return tensor[tuple(slices)]
-
-
-class GatherKeras(StateActionKeras, _ConcatenateMixin):
-    """
-    Represents a gather operation, where tensors are collected from all ranks.
-
-    The actual collective communication is handled by a different layer; this
-    class primarily serves as a placeholder to trigger that communication and
-    define how to undo it.
-
-    Args:
-        world_size: The total number of workers.
-        dim: The dimension along which tensors will be concatenated in the
-             `undo` operation.
-    """
-
-    def __init__(self, world_size: int, dim: int):
-        self.world_size = world_size
-        self.dim = dim
-
-    def __call__(self, tensor: Any, rank: int) -> Any:
+    
+    class GatherKeras(_ConcatenateMixin, StateActionKeras):
         """
-        Returns the tensor as-is.
-
-        The actual gathering is performed by the communication backend.
+        Represents a gather operation, where tensors are collected from all ranks.
+        The actual collective communication is handled by a different layer; this
+        class primarily serves as a placeholder to trigger that communication and
+        define how to undo it.
+        Args:
+            world_size: The total number of workers.
+            dim: The dimension along which tensors will be concatenated in the
+                `undo` operation.
         """
-        return tensor
+
+        def __init__(self, world_size: int, dim: int):
+            self.world_size = world_size
+            self.dim = dim
+
+        def __call__(self, tensor: Any, rank: int) -> Any:
+            """
+            Returns the tensor as-is.
+            The actual gathering is performed by the communication backend.
+            """
+            return tensor
 
 
-class SumKeras(StateActionKeras):
-    """
-    Represents a sum operation, where tensors are summed across all ranks.
-
-    The actual collective communication (AllReduce) is handled by a different
-    layer. This class triggers that operation and defines the `undo` logic.
-
-    Args:
-        world_size: The total number of workers.
-    """
-
-    def __init__(self, world_size: int):
-        self.world_size = world_size
-
-    def __call__(self, tensor: Any, rank: int) -> Any:
+    class SumKeras(StateActionKeras):
         """
-        Returns the tensor as-is.
-
-        The actual summing is performed by the communication backend.
+        Represents a sum operation, where tensors are summed across all ranks.
+        The actual collective communication (AllReduce) is handled by a different
+        layer. This class triggers that operation and defines the `undo` logic.
+        Args:
+            world_size: The total number of workers.
         """
-        return tensor
 
-    def undo(self, tensors: Sequence[Any]) -> Any:
-        """Sums the collected tensors from all workers."""
-        return sum(tensors)
+        def __init__(self, world_size: int):
+            self.world_size = world_size
+
+        def __call__(self, tensor: Any, rank: int) -> Any:
+            """
+            Returns the tensor as-is.
+            The actual summing is performed by the communication backend.
+            """
+            return tensor
+
+        def undo(self, tensors: Sequence[Any]) -> Any:
+            """Sums the collected tensors from all workers."""
+            return sum(tensors)

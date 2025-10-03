@@ -21,9 +21,6 @@ from keras.src.backend.common import global_state
 # from keras.src.distribution.tensor_parallel.tensor_parallel_keras import (
 #     TensorParallelKeras,
 # )
-from keras.src.distribution.tensor_parallel.autoconfig import (
-    get_default_config_keras,
-)
 
 DEFAULT_BATCH_DIM_NAME = "batch"
 GLOBAL_ATTRIBUTE_NAME = "distribution"
@@ -562,6 +559,7 @@ class DataParallel(Distribution):
 
 # Place this in keras/src/distribution/distribution_lib.py
 
+
 @keras_export("keras.distribution.AutoTPDistribution")
 class AutoTPDistribution(Distribution):
     """Distribution for automatic tensor parallelism.
@@ -623,6 +621,7 @@ class AutoTPDistribution(Distribution):
         from keras.src.distribution.tensor_parallel.tensor_parallel_keras import (
             TensorParallelKeras,
         )
+
         """
         Applies automatic tensor parallelism to a Keras model.
 
@@ -641,7 +640,7 @@ class AutoTPDistribution(Distribution):
         print(f"INFO: Sharding model `{model.name}` for Tensor Parallelism...")
         world_size = np.prod(self.device_mesh.shape)
         device_ids = np.ravel(self.device_mesh.devices).tolist()
-        
+
         # The `TensorParallelKeras` class contains all the sharding logic.
         # This distribution strategy is a clean, high-level entry point to it.
         sharded_model = TensorParallelKeras(
@@ -665,14 +664,19 @@ class AutoTPDistribution(Distribution):
         return TensorLayout([None] * len(variable.shape), self.device_mesh)
 
     def get_tensor_layout(self, path):
-        return None # Not needed as communication is handled by the model's call()
+        return (
+            None  # Not needed as communication is handled by the model's call()
+        )
 
     def distribute_dataset(self, dataset):
         if distribution_lib.num_processes() <= 1 or not self.auto_shard_dataset:
             return dataset
         from keras.src.utils.module_utils import tensorflow as tf
+
         if not tf.available or not isinstance(dataset, tf.data.Dataset):
-            raise ValueError("Only `tf.data.Dataset` is supported for auto-sharding.")
+            raise ValueError(
+                "Only `tf.data.Dataset` is supported for auto-sharding."
+            )
         return dataset.with_options(tf.data.Options())
 
 
