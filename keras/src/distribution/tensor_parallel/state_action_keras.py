@@ -84,7 +84,7 @@ class SplitKeras(_ConcatenateMixin, StateActionKeras):
         slices = [slice(None)] * keras.ops.ndim(tensor)
         slices[dim] = slice(start_idx, end_idx)
         return tensor[tuple(slices)]
-    
+
     class GatherKeras(_ConcatenateMixin, StateActionKeras):
         """
         Represents a gather operation, where tensors are collected from all ranks.
@@ -107,7 +107,6 @@ class SplitKeras(_ConcatenateMixin, StateActionKeras):
             The actual gathering is performed by the communication backend.
             """
             return tensor
-
 
     class SumKeras(StateActionKeras):
         """

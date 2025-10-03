@@ -110,7 +110,9 @@ class TestAutoConfigKeras(testing.TestCase):
                 self.world_size, 1, "column"
             )
         }
-        expected_output_rules = {r"^embed_model.token_embedding$": {0: "no_comm"}}
+        expected_output_rules = {
+            r"^embed_model.token_embedding$": {0: "no_comm"}
+        }
 
         self._assert_rules_equal(config.state_rules, expected_state_rules)
         self._assert_rules_equal(config.output_rules, expected_output_rules)
@@ -139,7 +141,9 @@ class TestAutoConfigKeras(testing.TestCase):
             r"^outer_model.inner_block.inner_dense.bias$": SplitKeras(
                 self.world_size, 0, "column"
             ),
-            r"^outer_model.outer_dense.kernel$": SplitKeras(self.world_size, 0, "row"),
+            r"^outer_model.outer_dense.kernel$": SplitKeras(
+                self.world_size, 0, "row"
+            ),
         }
         expected_output_rules = {
             r"^outer_model.inner_block.inner_dense$": {0: "no_comm"},
