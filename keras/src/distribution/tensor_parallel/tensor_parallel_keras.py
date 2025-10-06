@@ -5,17 +5,23 @@ Port of the PyTorch tensor_parallel library
 
 import logging
 import re
-from typing import Collection
-from typing import Optional
-from typing import Sequence
-from typing import Union
-import keras_nlp
+from typing import Collection, Optional, Sequence, Union
+
+try:
+    import keras_nlp
+    KERAS_NLP_AVAILABLE = True
+    logger = logging.getLogger(__name__)
+    logger.info("✅ KerasNLP found. Sharding will be applied to KerasNLP layers where applicable.")
+except ImportError:
+    keras_nlp = None
+    KERAS_NLP_AVAILABLE = False
+    logger = logging.getLogger(__name__)
+    logger.warning(" KerasNLP not found. Sharding will only apply to stock Keras layers.")
+
 import numpy as np
 import tensorflow as tf
-
 import keras
 from keras import ops
-
 from keras.src.distribution.tensor_parallel.autoconfig import (
     get_default_config_keras,
 )
@@ -977,35 +983,6 @@ class TensorParallelKeras(Model):
         else:
             super().compile(optimizer, loss, metrics, **kwargs)
 
-    def train_step(self, state, data):
-        """
-        Implements the logic for a single training step, with a signature
-        compatible with the JAX backend.
-
-        The JAX backend calls this method with `state` (weights and optimizer
-        state) and `data`. This method accepts both and then implements the
-        full training step logic manually.
-        """
-        import tensorflow as tf
-        x, y, sample_weight = keras.utils.unpack_x_y_sample_weight(data)
-
-        with tf.GradientTape() as tape:
-            y_pred = self(x, training=True)
-            loss = self.compute_loss(
-                x=x, y=y, y_pred=y_pred, sample_weight=sample_weight
-            )
-        trainable_vars = self.trainable_variables
-        gradients = tape.gradient(loss, trainable_vars)
-        self.optimizer.apply_gradients(zip(gradients, trainable_vars))
-
-        for metric in self.metrics:
-            if metric.name == "loss":
-                metric.update_state(loss)
-            else:
-                metric.update_state(y, y_pred, sample_weight=sample_weight)
-
-        return {m.name: m.result() for m in self.metrics}
-
     def _apply_backward_communication(self, gradients, layer_type="unknown"):
         """
         Apply backward pass communication following the conjugate rule.
@@ -1225,11 +1202,11 @@ class TensorParallelKeras(Model):
             return "unknown"
 
     def fit(self, x=None, y=None, **kwargs):
-        """Use standard Keras training with our corrected train_step method."""
+        """Use standard Keras training which correctly handles the train_step."""
         print("🚀 FIT METHOD CALLED ON TENSOR PARALLEL MODEL! 🚀")
 
         if len(self.model_shards) > 1:
-            print("🚀 USING STANDARD KERAS TRAINING WITH CUSTOM TRAIN_STEP! 🚀")
+            print("🚀 USING STANDARD KERAS TRAINING! 🚀")
             return super().fit(x, y, **kwargs)
         else:
             print("🚀 USING STANDARD FIT FOR SINGLE SHARD! 🚀")
@@ -1347,10 +1324,9 @@ class TensorParallelKeras(Model):
         return_dict=False,
     ):
         """
-        Train on a single batch of data ensuring numerical equivalence for testing.
-        This will be replaced with actual tensor parallelism once we verify correctness.
+        Train on a single batch of data. This will use the default logic.
         """
-        logger.debug("Routing train_on_batch to custom train_step")
+        logger.debug("Routing train_on_batch to parent implementation.")
 
         try:
             return super().train_on_batch(
