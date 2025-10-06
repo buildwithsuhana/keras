@@ -9,7 +9,7 @@ from typing import Collection
 from typing import Optional
 from typing import Sequence
 from typing import Union
-
+import keras_nlp
 import numpy as np
 import tensorflow as tf
 
@@ -175,6 +175,23 @@ class TensorParallelKeras(Model):
                 "Using automatic config with auto sharding strategy: sharding individual Dense/Conv/Embedding layers"
             )
 
+            # --- ADD THIS SECTION ---
+            # WORKAROUND: The custom ReversibleEmbedding layer is not compatible
+            # with the sharding logic. We will exclude it from being sharded
+            # by removing the rule that targets it. It will be replicated instead.
+            # key_to_delete = None
+            # for key, rule in self.tensor_parallel_config.state_rules.items():
+            #     if "embedding" in key.lower():
+            #         key_to_delete = key
+            #         break
+            
+            # if key_to_delete:
+            #     del self.tensor_parallel_config.state_rules[key_to_delete]
+            #     logger.warning(
+            #         f"Removed sharding rule for key '{key_to_delete}' to prevent "
+            #         "issues with custom embedding layer. It will be replicated."
+            #     )
+
         # Create collective operations
         config_with_ops = self.tensor_parallel_config.create_collective_ops(
             self.devices
@@ -210,14 +227,51 @@ class TensorParallelKeras(Model):
                 logger.warning(f"⚠️  JAX backend initialization failed: {e}")
 
         for rank, device_id in enumerate(self.devices):
-            # Create separate shard for each rank with actual parameter splitting
+            # Create a separate shard for each rank
             shard, modified_parameters_names = make_parameter_sharded_model(
-                model, config_with_ops, rank=rank, world_size=self.world_size
+                model,
+                config_with_ops,
+                rank=rank,
+                world_size=self.world_size,
+                device_id=device_id,
             )
-            self.model_shards.append(shard)  # Different instance for each rank
+            self.model_shards.append(shard)
             self.modified_parameters_names.update(modified_parameters_names)
 
             logger.info(f"   ✅ Created shard {rank} for device {device_id}")
+
+            # --- THIS IS THE CORRECTED WORKAROUND ---
+            # It should be INSIDE the main loop, with NO nested loop.
+            # try:
+            #     logger.warning(
+            #         f"Applying workaround to fix corrupted ReversibleEmbedding layer in shard {rank}..."
+            #     )
+            #     parent_embedding_layer = shard.get_layer("opt_causal_lm").get_layer(
+            #         "opt_backbone_1"
+            #     ).get_layer("embeddings")
+            #     broken_embedding_layer = parent_embedding_layer.token_embedding
+
+            #     def fixed_call(self_layer, inputs, **kwargs):
+            #         if kwargs.get("reverse", False):
+            #             return keras.ops.matmul(
+            #                 inputs, keras.ops.transpose(self_layer.embeddings)
+            #             )
+            #         else:
+            #             return keras.ops.take(self_layer.embeddings, inputs, axis=0)
+
+            #     import types
+            #     broken_embedding_layer.call = types.MethodType(
+            #         fixed_call, broken_embedding_layer
+            #     )
+            #     logger.warning(
+            #         f"✅ Monkey-patched the .call() method of the embedding layer in shard {rank}."
+            #     )
+
+            # except Exception as e:
+            #     logger.error(
+            #         "❌ Failed to apply embedding layer workaround for shard "
+            #         f"{rank}: {e}"
+            #     )
 
         # Validate REAL sharding
         params_per_shard = []
@@ -262,24 +316,35 @@ class TensorParallelKeras(Model):
         self.distributed_backend_name = distributed_backend
 
         # Initialize distributed backend for real communication
-        try:
-            from keras.src.backend.distributed.backend_resolver import (
-                get_distributed_backend,
-            )
+        # REPLACE with this NEW BLOCK
 
-            self.distributed_backend = get_distributed_backend(
-                distributed_backend
-            )
+        # Initialize distributed backend for real communication
+        try:
+            # Import the global backend object
+            from keras.src.distribution import distributed_backend
+
+            # Store a reference to it
+            self.distributed_backend = distributed_backend
             logger.info(
-                f"Initialized distributed backend: {type(self.distributed_backend).__name__}"
+                f"Accessed Keras global distributed backend for '{keras.backend.backend()}'."
             )
+        except ImportError as e:
+            logger.warning(
+                f"Failed to import the global distributed backend: {e}. "
+                "Collective ops will not be available."
+            )
+            self.distributed_backend = None
         except Exception as e:
-            logger.warning(f"Failed to initialize distributed backend: {e}")
+            logger.warning(f"An unexpected error occurred while accessing the distributed backend: {e}")
             self.distributed_backend = None
 
         # Set model as built
         super().__init__(**kwargs)  # <-- Init parent class
         self.built = True
+        if self.distributed:
+            self.assembled_model = self.build_assembled_model()
+        else:
+            self.assembled_model = self.original_model
 
     def _auto_detect_parallelism(self):
         """Auto-detect world_size and device_ids efficiently."""
@@ -560,86 +625,16 @@ class TensorParallelKeras(Model):
             self.devices,
             0,  # Use first device index
         )
-
-    # --- FIX 3: Replaced broken 'call' method ---
     def call(self, inputs, training=None, **kwargs):
         """
-        Forward pass implementing actual tensor parallelism.
-        This method runs all shards and combines their outputs.
+        Forward pass for the tensor-parallel model.
+
+        This method now delegates the forward pass to the `assembled_model`,
+        which was constructed during initialization. This robustly handles
+        the aggregation of outputs from all shards using the Keras
+        functional API.
         """
-        if not self.distributed:
-            # Single device, just run the original model
-            return self.original_model(inputs, training=training, **kwargs)
-
-        # 1. Get partial outputs from all shards
-        # We assume data is replicated and passed to all shards
-        partial_outputs = []
-        for shard in self.model_shards:
-            from keras import device
-
-            # Place computation on the shard's device
-            with device(shard.device):
-                output = shard(inputs, training=training, **kwargs)
-                partial_outputs.append(output)
-
-        if not partial_outputs:
-            logger.warning("No shard outputs found, returning None.")
-            return None
-
-        # 2. Combine the partial outputs
-        final_layer = self.original_model.layers[-1]
-        sharding_type = "unknown"
-
-        # Find the sharding type of the final layer
-        final_kernel_name = f"{final_layer.name}.kernel"
-        if hasattr(self.original_model, "name") and self.original_model.name:
-            final_kernel_name = (
-                f"{self.original_model.name}.{final_kernel_name}"
-            )
-
-        if (
-            hasattr(self, "tensor_parallel_config")
-            and self.tensor_parallel_config
-        ):
-            for (
-                pattern,
-                action,
-            ) in self.tensor_parallel_config.state_rules.items():
-                if re.search(pattern, final_kernel_name):
-                    if hasattr(action, "sharding_type"):
-                        sharding_type = action.sharding_type
-                    break
-
-        logger.debug(
-            f"Combining shard outputs with sharding type: {sharding_type}"
-        )
-
-        if sharding_type == "column":
-            # Column-parallel: Concatenate along the feature axis
-            final_output = keras.ops.concatenate(partial_outputs, axis=-1)
-            # Trim if necessary (if sharding wasn't perfect)
-            original_output_dim = self.original_model.output_shape[-1]
-            if final_output.shape[-1] > original_output_dim:
-                final_output = final_output[..., :original_output_dim]
-        elif sharding_type == "row":
-            # Row-parallel: Sum the outputs
-            final_output = keras.ops.sum(
-                keras.ops.stack(partial_outputs), axis=0
-            )
-            # Correct for replicated bias
-            if final_layer.use_bias:
-                bias = final_layer.bias
-                bias_shape = [1] * (len(final_output.shape) - 1) + [-1]
-                reshaped_bias = keras.ops.reshape(bias, bias_shape)
-                final_output -= reshaped_bias * (self.world_size - 1)
-        else:
-            # Default: no sharding on output, just return first shard's output
-            # (This is often used when the final layer is replicated)
-            final_output = partial_outputs[0]
-
-        return final_output
-
-    # --- END FIX 3 ---
+        return self.assembled_model(inputs, training=training, **kwargs)
 
     def _tensor_parallel_forward(self, inputs, training, **kwargs):
         """
@@ -1178,46 +1173,44 @@ class TensorParallelKeras(Model):
             # Single shard or no optimizer - use standard compilation
             super().compile(optimizer, loss, metrics, **kwargs)
 
-    def train_step(self, data, state=None, **kwargs):
+    def train_step(self, state, data):
         """
-        Ensure backward mathematical identity by using tensor parallel model's own training.
-        Compatible with backends that pass an additional `state`.
+        Implements the logic for a single training step, with a signature
+        compatible with the JAX backend.
+
+        The JAX backend calls this method with `state` (weights and optimizer
+        state) and `data`. This method accepts both and then implements the
+        full training step logic manually.
         """
-        # This custom train_step is now CRITICAL because 'call' is implemented
+        import tensorflow as tf
+        # 1. Unpack the data.
+        x, y, sample_weight = keras.utils.unpack_x_y_sample_weight(data)
 
-        # Unpack data (Keras 3 behavior)
-        if isinstance(data, tuple):
-            x, y, sample_weight = keras.utils.unpack_x_y_sample_weight(data)
-        else:
-            x, y, sample_weight = keras.utils.unpack_x_y_sample_weight((data,))
-
+        # 2. Run the forward pass and compute the loss.
+        # The `self.optimizer` is the CoordinatedOptimizer, which will
+        # manage distributed gradients.
         with tf.GradientTape() as tape:
-            # Call the 'call' method which performs the parallel forward pass
-            y_pred = self(x, training=True, **kwargs)
-
-            # Compute loss
+            # self() calls our corrected `call` method, which uses the assembled_model
+            y_pred = self(x, training=True)
             loss = self.compute_loss(
                 x=x, y=y, y_pred=y_pred, sample_weight=sample_weight
             )
 
-        # Get trainable variables
+        # 3. Compute and apply gradients.
+        # The optimizer, being a TensorParallelOptimizer, will handle the
+        # all-reduce operation required to sync gradients across shards.
         trainable_vars = self.trainable_variables
-
-        # Compute gradients
         gradients = tape.gradient(loss, trainable_vars)
+        self.optimizer.apply_gradients(zip(gradients, trainable_vars))
 
-        # Update weights using the optimizer
-        # The coordinated_optimizer will handle gradient communication/sharding
-        self.optimizer.apply(gradients, trainable_vars)
-
-        # Update metrics
+        # 4. Update metrics (includes the metric that tracks the loss).
         for metric in self.metrics:
             if metric.name == "loss":
                 metric.update_state(loss)
             else:
-                metric.update_state(y, y_pred, sample_weight)
+                metric.update_state(y, y_pred, sample_weight=sample_weight)
 
-        # Return metrics as a dict
+        # 5. Return a dict mapping metric names to their current value.
         return {m.name: m.result() for m in self.metrics}
 
     def _apply_backward_communication(self, gradients, layer_type="unknown"):

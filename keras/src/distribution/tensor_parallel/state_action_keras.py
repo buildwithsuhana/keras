@@ -85,48 +85,50 @@ class SplitKeras(_ConcatenateMixin, StateActionKeras):
         slices[dim] = slice(start_idx, end_idx)
         return tensor[tuple(slices)]
 
-    class GatherKeras(_ConcatenateMixin, StateActionKeras):
+
+class GatherKeras(_ConcatenateMixin, StateActionKeras):
+    """
+    Represents a gather operation, where tensors are collected from all ranks.
+    The actual collective communication is handled by a different layer; this
+    class primarily serves as a placeholder to trigger that communication and
+    define how to undo it.
+    Args:
+        world_size: The total number of workers.
+        dim: The dimension along which tensors will be concatenated in the
+             `undo` operation.
+    """
+
+    def __init__(self, world_size: int, dim: int):
+        self.world_size = world_size
+        self.dim = dim
+
+    def __call__(self, tensor: Any, rank: int) -> Any:
         """
-        Represents a gather operation, where tensors are collected from all ranks.
-        The actual collective communication is handled by a different layer; this
-        class primarily serves as a placeholder to trigger that communication and
-        define how to undo it.
-        Args:
-            world_size: The total number of workers.
-            dim: The dimension along which tensors will be concatenated in the
-                `undo` operation.
+        Returns the tensor as-is.
+        The actual gathering is performed by the communication backend.
         """
+        return tensor
 
-        def __init__(self, world_size: int, dim: int):
-            self.world_size = world_size
-            self.dim = dim
 
-        def __call__(self, tensor: Any, rank: int) -> Any:
-            """
-            Returns the tensor as-is.
-            The actual gathering is performed by the communication backend.
-            """
-            return tensor
+class SumKeras(StateActionKeras):
+    """
+    Represents a sum operation, where tensors are summed across all ranks.
+    The actual collective communication (AllReduce) is handled by a different
+    layer. This class triggers that operation and defines the `undo` logic.
+    Args:
+        world_size: The total number of workers.
+    """
 
-    class SumKeras(StateActionKeras):
+    def __init__(self, world_size: int):
+        self.world_size = world_size
+
+    def __call__(self, tensor: Any, rank: int) -> Any:
         """
-        Represents a sum operation, where tensors are summed across all ranks.
-        The actual collective communication (AllReduce) is handled by a different
-        layer. This class triggers that operation and defines the `undo` logic.
-        Args:
-            world_size: The total number of workers.
+        Returns the tensor as-is.
+        The actual summing is performed by the communication backend.
         """
+        return tensor
 
-        def __init__(self, world_size: int):
-            self.world_size = world_size
-
-        def __call__(self, tensor: Any, rank: int) -> Any:
-            """
-            Returns the tensor as-is.
-            The actual summing is performed by the communication backend.
-            """
-            return tensor
-
-        def undo(self, tensors: Sequence[Any]) -> Any:
-            """Sums the collected tensors from all workers."""
-            return sum(tensors)
+    def undo(self, tensors: Sequence[Any]) -> Any:
+        """Sums the collected tensors from all workers."""
+        return sum(tensors)

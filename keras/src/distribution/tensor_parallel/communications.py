@@ -17,6 +17,13 @@ class CollectiveOpKeras:
     """
 
     def __init__(self, world_size: int, rank: int = 0):
+        """Initializes the collective operation.
+        Args:
+            world_size (int): The total number of participating processes or
+                devices in the communication group.
+            rank (int, optional): The rank of the current process. Defaults
+                to 0.
+        """
         self.world_size = world_size
         self.rank = rank
 
@@ -40,6 +47,13 @@ class AllReduceKeras(CollectiveOpKeras):
     """
 
     def __init__(self, world_size: int, op: str = "sum", rank: int = 0):
+        """Initializes the AllReduce operation.
+        Args:
+            world_size (int): The total number of participating processes.
+            op (str, optional): The reduction operation. Supported values are
+                "sum" and "mean". Defaults to "sum".
+            rank (int, optional): The rank of current process. Defaults to 0.
+        """
         super().__init__(world_size, rank)
         self.op = op
         self.all_reduce_fn = distributed_backend.get_communication_ops().get(
@@ -78,6 +92,13 @@ class AllGatherKeras(CollectiveOpKeras):
     """
 
     def __init__(self, world_size: int, dim: int = -1, rank: int = 0):
+        """Initializes the AllGather operation.
+        Args:
+            world_size (int): The total number of participating processes.
+            dim (int, optional): The dimension along which to concatenate the
+                gathered tensors. Defaults to -1.
+            rank (int, optional): The rank of current process. Defaults to 0.
+        """
         super().__init__(world_size, rank)
         self.dim = dim
         self.all_gather_fn = distributed_backend.get_communication_ops().get(
@@ -117,6 +138,13 @@ class BroadcastKeras(CollectiveOpKeras):
     """
 
     def __init__(self, world_size: int, src_rank: int = 0, rank: int = 0):
+        """Initializes the Broadcast operation.
+        Args:
+            world_size (int): The total number of participating processes.
+            src_rank (int, optional): The rank of the source process that is
+                broadcasting the tensor. Defaults to 0.
+            rank (int, optional): The rank of current process. Defaults to 0.
+        """
         super().__init__(world_size, rank)
         self.src_rank = src_rank
         self.broadcast_fn = distributed_backend.get_communication_ops().get(
@@ -153,6 +181,11 @@ class TensorParallelCommunicator:
     """
 
     def __init__(self, world_size: int, rank: int = 0):
+        """Initializes the communicator.
+        Args:
+            world_size (int): The total number of devices in the group.
+            rank (int, optional): The rank of the current device. Defaults to 0.
+        """
         self.world_size = world_size
         self.rank = rank
         self.allreduce = AllReduceKeras(world_size, rank=rank)
@@ -160,77 +193,88 @@ class TensorParallelCommunicator:
         self.broadcast = BroadcastKeras(world_size, rank=rank)
 
     def forward_column_parallel(
-        self, local_tensor: Any, dim: int = -1, axis_name: str = "i"
-    ) -> Any:
-        """Communication for the forward pass of a column-parallel layer.
-        In a column-parallel layer, the input is broadcast to all devices, and
-        the output shards are gathered. This function handles the gathering.
+        self, partial_outputs: List, dim: int = -1, axis_name: str = "batch"
+    ):
+        """Gathers output shards in a column-parallel forward pass.
+        In a column-parallel layer, the output activations are sharded across
+        devices. This function collects all shards using an AllGather operation
+        to form the full output tensor.
         Args:
-            local_tensor (Any): The local output shard from the column-parallel
-                layer.
-            dim (int, optional): The dimension to concatenate the shards along.
-                Defaults to -1.
-            axis_name (str, optional): The communication axis name.
-                Defaults to "i".
+            partial_outputs (List): A list of output shards, with one tensor
+                from each device in the communication group.
+            dim (int, optional): The dimension along which to concatenate the
+                gathered tensors. Defaults to -1.
+            axis_name (str, optional): The name of the communication axis used
+                by the backend. Defaults to "batch".
         Returns:
-            Any: The full, gathered output tensor.
+            Any: The full, gathered output tensor, which is identical on all
+            devices.
         """
         self.allgather.dim = dim
-        return self.allgather(local_tensor, axis_name=axis_name)
+        return self.allgather(partial_outputs[self.rank], axis_name=axis_name)
 
     def backward_column_parallel(
-        self, local_gradient: Any, op: str = "sum", axis_name: str = "i"
-    ) -> Any:
-        """Communication for the backward pass of a column-parallel layer.
-        In the backward pass, the gradients with respect to the weights are
-        reduced across devices.
+        self,
+        partial_gradients: List,
+        op: str = "sum",
+        axis_name: str = "batch",
+    ) -> List:
+        """Reduces weight gradients in a column-parallel backward pass.
+        This is the conjugate operation to `forward_column_parallel`. It uses an
+        AllReduce operation to sum the gradients computed on each device for
+        the weight matrix.
         Args:
-            local_gradient (Any): The local gradient computed on the device.
-            op (str, optional): The reduction operation ("sum" or "mean").
+            partial_gradients (List): A list of local weight gradients, with
+                one tensor from each device.
+            op (str, optional): The reduction operation, either "sum" or "mean".
                 Defaults to "sum".
-            axis_name (str, optional): The communication axis name.
-                Defaults to "i".
+            axis_name (str, optional): The name of the communication axis.
+                Defaults to "batch".
         Returns:
-            Any: The reduced gradient.
+            Any: The reduced gradient tensor, identical on all devices.
         """
         self.allreduce.op = op
-        return self.allreduce(local_gradient, axis_name=axis_name)
+        return self.allreduce(partial_gradients[self.rank], axis_name=axis_name)
 
     def forward_row_parallel(
-        self, local_output: Any, op: str = "sum", axis_name: str = "i"
-    ) -> Any:
-        """Communication for the forward pass of a row-parallel layer.
-        In a row-parallel layer, the local outputs from each device are
-        summed together (AllReduce) to produce the final output.
+        self, partial_outputs: List, op: str = "sum", axis_name: str = "batch"
+    ) -> List:
+        """Reduces output shards in a row-parallel forward pass.
+        In a row-parallel layer, each device computes a partial output. This
+        function uses an AllReduce operation to sum these partial outputs into
+        the final, correct output tensor.
         Args:
-            local_output (Any): The local output from the row-parallel layer.
-            op (str, optional): The reduction operation ("sum" or "mean").
+            partial_outputs (List): A list of partial outputs, one from each
+                device.
+            op (str, optional): The reduction operation, either "sum" or "mean".
                 Defaults to "sum".
-            axis_name (str, optional): The communication axis name.
-                Defaults to "i".
+            axis_name (str, optional): The name of the communication axis.
+                Defaults to "batch".
         Returns:
             Any: The final, reduced output tensor.
         """
         self.allreduce.op = op
-        return self.allreduce(local_output, axis_name=axis_name)
+        return self.allreduce(partial_outputs[self.rank], axis_name=axis_name)
 
     def backward_row_parallel(
-        self, local_gradient: Any, dim: int = -1, axis_name: str = "i"
-    ) -> Any:
-        """Communication for the backward pass of a row-parallel layer.
-        In the backward pass, the gradients with respect to the input are
-        gathered from all devices.
+        self, partial_gradients: List, dim: int = -1, axis_name: str = "batch"
+    ):
+        """Gathers input gradients in a row-parallel backward pass.
+        This is the conjugate operation to `forward_row_parallel`. It uses an
+        AllGather operation to collect the sharded input gradients from all
+        devices to reconstruct the full gradient tensor.
         Args:
-            local_gradient (Any): The local gradient computed on the device.
-            dim (int, optional): The dimension to concatenate the gradients
-                along. Defaults to -1.
-            axis_name (str, optional): The communication axis name.
-                Defaults to "i".
+            partial_gradients (List): A list of local input gradients, one
+                from each device.
+            dim (int, optional): The dimension along which to concatenate the
+                gradients. Defaults to -1.
+            axis_name (str, optional): The name of the communication axis.
+                Defaults to "batch".
         Returns:
             Any: The full, gathered gradient tensor.
         """
         self.allgather.dim = dim
-        return self.allgather(local_gradient, axis_name=axis_name)
+        return self.allgather(partial_gradients[self.rank], axis_name=axis_name)
 
     def handle_mlp_handshake(
         self, up_projection_outputs: List, down_projection_inputs: List

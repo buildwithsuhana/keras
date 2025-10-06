@@ -531,6 +531,17 @@ class TensorParallelOptimizer(optimizers.Optimizer):
             }
         )
         return config
+    
+    def update_step(self, gradient, variable, *args, **kwargs):
+        if hasattr(self.base_optimizer, 'update_step'):
+            try:
+                return self.base_optimizer.update_step(gradient, variable, *args, **kwargs)
+            except TypeError:
+                return self.base_optimizer.update_step(gradient, variable)
+        try:
+            return super().update_step(gradient, variable, *args, **kwargs)
+        except TypeError:
+            return super().update_step(gradient, variable)
 
     @classmethod
     def from_config(cls, config: dict[str, Any]) -> "TensorParallelOptimizer":

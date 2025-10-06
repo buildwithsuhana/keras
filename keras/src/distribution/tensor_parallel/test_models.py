@@ -74,7 +74,7 @@ except Exception as e:
 # This import now directly attempts to load the real implementation.
 # If it fails, the script will raise an ImportError and stop, which is
 # the desired behavior for a non-mock test.
-from keras.src.distribution.tensor_parallel.tensorparallelkeras import (
+from keras.src.distribution.tensor_parallel.tensor_parallel_keras import (
     TensorParallelKeras,
 )
 
