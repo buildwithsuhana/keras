@@ -22,7 +22,7 @@ os.environ["KERAS_BACKEND"] = "jax"
 os.environ["XLA_FLAGS"] = "--xla_force_host_platform_device_count=2"
 
 import jax
-import keras_nlp
+import keras_hub
 import matplotlib.pyplot as plt
 import tensorflow as tf
 import tensorflow_datasets as tfds
@@ -74,13 +74,13 @@ from keras.src.distribution.tensor_parallel.tensor_parallel_keras import (
 BATCH_SIZE = 16
 SEQUENCE_LENGTH = 128
 LEARNING_RATE = 1e-4
-EPOCHS = 10
+EPOCHS = 2
 STEPS_PER_EPOCH = 10
 VALIDATION_STEPS = 5
 LOSS_TOLERANCE = 1e-1 # Set a tolerance for comparing floating point numbers
 
 MODEL_MAPPING = {
-    "opt_1.3b_en": keras_nlp.models.OPTCausalLM,
+    "opt_125m_en": keras_hub.models.OPTCausalLM,
 }
 
 # ----------------------------------------------------------------------
@@ -98,7 +98,7 @@ def load_shakespeare_dataset(model_preset):
         example["text"].decode("utf-8") for example in ds.as_numpy_iterator()
     )
 
-    tokenizer = keras_nlp.models.OPTCausalLM.from_preset(
+    tokenizer = keras_hub.models.OPTCausalLM.from_preset(
         model_preset
     ).preprocessor.tokenizer
     token_ids = tokenizer.tokenize(text)
@@ -248,7 +248,7 @@ def run_model_verification(preset_name, model_class):
         optimizer=keras.optimizers.AdamW(learning_rate=LEARNING_RATE),
         loss=keras.losses.SparseCategoricalCrossentropy(from_logits=True),
         metrics=[
-            keras_nlp.metrics.Perplexity(from_logits=True, name="perplexity")
+            keras_hub.metrics.Perplexity(from_logits=True, name="perplexity")
         ],
     )
 
@@ -280,7 +280,7 @@ def run_model_verification(preset_name, model_class):
         optimizer=keras.optimizers.AdamW(learning_rate=LEARNING_RATE),
         loss=keras.losses.SparseCategoricalCrossentropy(from_logits=True),
         metrics=[
-            keras_nlp.metrics.Perplexity(from_logits=True, name="perplexity")
+            keras_hub.metrics.Perplexity(from_logits=True, name="perplexity")
         ],
     )
 

@@ -8,28 +8,6 @@ from keras.src.distribution.tensor_parallel.state_action_keras import SplitKeras
 # --- 1. Define logger at the top ---
 logger = logging.getLogger(__name__)
 
-# --- 2. Correctly import KerasNLP layers ---
-try:
-    from keras_nlp import layers as knlp_layers
-    from keras_nlp import models as knlp_models
-    
-    KERASNLP_BACKBONES = (knlp_models.GemmaBackbone, knlp_models.GPT2Backbone, knlp_models.OPTBackbone)
-    
-    # A tuple of all MHA types we want to check
-    KERASNLP_MHA_TUPLE = (knlp_layers.CachedMultiHeadAttention)
-    
-    # --- FIX: We also need to explicitly check for PositionEmbedding ---
-    KERASNLP_EMBEDDINGS = (knlp_layers.PositionEmbedding, )
-
-    logger.info("Successfully imported KerasNLP layers for sharding.")
-
-except ImportError:
-    KERASNLP_BACKBONES = ()
-    KERASNLP_MHA_TUPLE = () # Empty tuple
-    KERASNLP_EMBEDDINGS = () # Empty tuple # <-- FIX
-    logger.warning("KerasNLP not found. Sharding will only apply to stock Keras layers.")
-# --- END IMPORTS ---
-
 
 def analyze_dense_layer_directly(layer, module, prefix: str) -> str:
     """
@@ -41,7 +19,6 @@ def analyze_dense_layer_directly(layer, module, prefix: str) -> str:
         return 'generic_dense'
 
     try:
-        # Kernel shape is always (input_dim, output_dim)
         kernel_shape = layer.kernel.shape
         if len(kernel_shape) != 2:
             return 'generic_dense'
@@ -50,7 +27,6 @@ def analyze_dense_layer_directly(layer, module, prefix: str) -> str:
         output_dim = kernel_shape[1]
         
     except Exception:
-        # Layer might not be built, fallback to units
         if hasattr(layer, 'units'):
             output_dim = layer.units
         else:
@@ -82,7 +58,17 @@ def get_default_config_keras(module, device_ids: Sequence[str]) -> ConfigKeras:
     """
     Generates a smart, recursive sharding configuration for a Keras model.
     """
+    """
+    Generates a smart, recursive sharding configuration for a Keras model.
+    """
+    from keras_hub import layers as knlp_layers
+    from keras_hub import models as knlp_models
+
+    logger.info("Successfully imported KerasNLP layers for sharding.")
+
+
     from keras import layers, Model
+    world_size = len(device_ids)
     world_size = len(device_ids)
     state_rules = {}
     output_rules = {}
@@ -154,7 +140,7 @@ def get_default_config_keras(module, device_ids: Sequence[str]) -> ConfigKeras:
             return 
 
         # --- FIX 2: Correct Embedding Logic ---
-        elif isinstance(current_layer, (layers.Embedding,) + KERASNLP_EMBEDDINGS):
+        elif isinstance(current_layer, (layers.Embedding,)):
             # Check if this is a *container* (like TokenAndPositionEmbedding)
             if hasattr(current_layer, 'token_embedding') or hasattr(current_layer, 'position_embedding'):
                 # If it's a container, DON'T shard it.
