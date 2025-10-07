@@ -9,11 +9,12 @@ from keras.src.distribution.tensor_parallel.communications import BroadcastKeras
 from keras.src.distribution.tensor_parallel.communications import (
     TensorParallelCommunicator,
 )
+from keras.src import backend
 
 
 @pytest.mark.skipif(
-    keras.backend.backend() != "jax",
-    reason="This test suite requires a real JAX distributed backend.",
+    backend.backend() not in ("torch", "jax"),
+    reason="This test is for JAX/PyTorch backends."
 )
 class TestCollectiveOps(testing.TestCase):
     """

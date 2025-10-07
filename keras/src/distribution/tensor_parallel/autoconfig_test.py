@@ -18,8 +18,9 @@ from keras.src.distribution.tensor_parallel.state_action_keras import SplitKeras
 
 
 @pytest.mark.skipif(
-    backend.backend() != "jax",
-    reason="Tensor Parallelism autoconfig tests are only for the JAX backend."
+    backend.backend() not in ("torch", "jax") or
+    distributed_backend.get_device_info()["device_count"] <= 1,
+    reason="This test is for JAX/PyTorch backends and requires > 1 device."
 )
 class TestAutoConfigKeras(testing.TestCase):
     def setUp(self):

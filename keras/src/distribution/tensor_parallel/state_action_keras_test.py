@@ -7,11 +7,12 @@ from keras.src.distribution.tensor_parallel.state_action_keras import (
 )
 from keras.src.distribution.tensor_parallel.state_action_keras import SplitKeras
 from keras.src.distribution.tensor_parallel.state_action_keras import SumKeras
+from keras.src import backend
 
 
 @pytest.mark.skipif(
-    keras.backend.backend() != "jax",
-    reason="This test suite requires a real JAX distributed backend.",
+    backend.backend() not in ("torch", "jax"),
+    reason="This test is for JAX/PyTorch backends."
 )
 class TestStateActions(testing.TestCase):
     """Test suite for tensor distribution state actions."""

@@ -14,10 +14,11 @@ from keras.src.distribution.tensor_parallel.parameter_sharding import (
     make_parameter_sharded_model,
     ShardedWeight,
 )
+from keras.src import backend
 
 @pytest.mark.skipif(
-    keras.backend.backend() != "jax",
-    reason="This test is JAX-specific.",
+    backend.backend() not in ("torch", "jax"),
+    reason="This test is for JAX/PyTorch backends."
 )
 def _create_simple_mlp():
     """Creates a simple, unsharded Keras MLP model for testing."""

@@ -7,11 +7,11 @@ from keras.src.distribution.tensor_parallel.communications import AllReduceKeras
 from keras.src.distribution.tensor_parallel.communications import BroadcastKeras
 from keras.src.distribution.tensor_parallel.config import ConfigKeras
 from keras.src.distribution.tensor_parallel.config import _create_ops_from_rules
-
+from keras.src import backend
 
 @pytest.mark.skipif(
-    keras.backend.backend() != "jax",
-    reason="This test suite requires a real JAX distributed backend.",
+    backend.backend() not in ("torch", "jax"),
+    reason="This test is for JAX/PyTorch backends."
 )
 class TestConfig(testing.TestCase):
     """Test suite for the tensor parallel configuration."""
