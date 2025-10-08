@@ -53,6 +53,10 @@ class ShardedWeight:
     def variable(self):
         """Provides direct access to the underlying tf.Variable."""
         return self._variable
+    
+    @property
+    def value(self):
+        return self._variable.value
 
     def numpy(self):
         """Returns the value of the variable as a NumPy array."""
