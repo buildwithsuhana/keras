@@ -10,58 +10,6 @@ import jax.numpy as jnp
 
 import keras
 
-
-def compute_gradients(
-    _loss: jnp.ndarray, trainable_vars: List[jnp.ndarray]
-) -> List[jnp.ndarray]:
-    """Computes gradients of the loss with respect to trainable variables.
-    Note: This is a placeholder implementation that returns zeros. A real
-    implementation would use `jax.grad`.
-    Args:
-        _loss (jnp.ndarray): The loss value for which to compute gradients.
-        trainable_vars (List[jnp.ndarray]): A list of variables to compute
-            gradients with respect to.
-    Returns:
-        List[jnp.ndarray]: A list of gradients corresponding to the
-        trainable variables.
-    """
-    return [jnp.zeros_like(var) for var in trainable_vars]
-
-
-def apply_gradients(
-    gradients: List[jnp.ndarray],
-    trainable_vars: List[jnp.ndarray],
-    learning_rate: float = 0.001,
-) -> List[jnp.ndarray]:
-    """Applies gradients and returns the updated variables."""
-    updated_vars = []
-    for grad, var in zip(gradients, trainable_vars):
-        if grad is not None:
-            new_var = var - (learning_rate * grad)
-            updated_vars.append(new_var)
-        else:
-            updated_vars.append(var)
-    return updated_vars
-
-
-def create_optimizer(optimizer_class: str, **kwargs) -> Dict[str, Any]:
-    """Creates a configuration dictionary for an optimizer.
-    This function returns a dictionary containing the optimizer's configuration,
-    removing the need for a specific optimizer library like Optax.
-    Args:
-        optimizer_class (str): The name of the optimizer to create (e.g.,
-            `"adam"`, `"sgd"`).
-        **kwargs: Keyword arguments to be passed to the optimizer's
-            constructor (e.g., `learning_rate`).
-    Returns:
-        Dict[str, Any]: A dictionary representing the optimizer configuration.
-    """
-    config = kwargs.copy()
-    config["name"] = optimizer_class.lower()
-    config.setdefault("learning_rate", 0.001)
-    return config
-
-
 def get_device_info() -> Dict[str, Any]:
     """Retrieves information about the available JAX devices.
     Returns:

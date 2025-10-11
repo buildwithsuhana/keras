@@ -1,7 +1,7 @@
 from typing import Sequence, Dict, Any, Set
 
-from keras.src.distribution.tensor_parallel.config import ConfigKeras
-from keras.src.distribution.tensor_parallel.state_action_keras import SplitKeras
+from keras.src.distribution.tensor_parallel.tensor_layout import LayoutMap
+from keras.src.distribution.tensor_parallel.tensor_layout import Split
 
 
 def analyze_dense_layer_directly(layer, module, prefix: str) -> str:
@@ -116,32 +116,32 @@ def _find_and_shard_layers(
         mlp_type = analyze_dense_layer_directly(current_layer, module, full_name)
 
         if mlp_type == 'up_projection':
-            state_rules[f"^{full_name}.kernel$"] = SplitKeras(world_size, 1, "column")
+            state_rules[f"^{full_name}.kernel$"] = Split(world_size, 1, "column")
             if current_layer.use_bias:
-                state_rules[f"^{full_name}.bias$"] = SplitKeras(world_size, 0, "column")
+                state_rules[f"^{full_name}.bias$"] = Split(world_size, 0, "column")
             output_rules[f"^{full_name}$"] = {0: "gather"}
 
         elif mlp_type == 'down_projection':
-            state_rules[f"^{full_name}.kernel$"] = SplitKeras(world_size, 0, "row")
+            state_rules[f"^{full_name}.kernel$"] = Split(world_size, 0, "row")
             output_rules[f"^{full_name}$"] = {0: "allreduce"}
 
         else:
-            state_rules[f"^{full_name}.kernel$"] = SplitKeras(world_size, 1, "column")
+            state_rules[f"^{full_name}.kernel$"] = Split(world_size, 1, "column")
             if current_layer.use_bias:
-                state_rules[f"^{full_name}.bias$"] = SplitKeras(world_size, 0, "column")
+                state_rules[f"^{full_name}.bias$"] = Split(world_size, 0, "column")
             output_rules[f"^{full_name}$"] = {0: "gather -1"}
         return
 
     elif isinstance(current_layer, layers.EinsumDense):
         if "attention_output" in full_name:
-            state_rules[f"^{full_name}.kernel$"] = SplitKeras(world_size, 0, "row")
+            state_rules[f"^{full_name}.kernel$"] = Split(world_size, 0, "row")
             if hasattr(current_layer, 'bias') and current_layer.bias is not None:
                 pass
             output_rules[f"^{full_name}$"] = {0: "allreduce"}
         else:
-            state_rules[f"^{full_name}.kernel$"] = SplitKeras(world_size, 1, "column")
+            state_rules[f"^{full_name}.kernel$"] = Split(world_size, 1, "column")
             if hasattr(current_layer, 'bias') and current_layer.bias is not None:
-                state_rules[f"^{full_name}.bias$"] = SplitKeras(world_size, 0, "column")
+                state_rules[f"^{full_name}.bias$"] = Split(world_size, 0, "column")
             output_rules[f"^{full_name}$"] = {0: "gather -1"}
         return
 
@@ -156,7 +156,7 @@ def _find_and_shard_layers(
                 weight_name = 'position_embeddings'
 
             if weight_name:
-                state_rules[f"^{full_name}\\..*{weight_name}$"] = SplitKeras(world_size, 1, "column")
+                state_rules[f"^{full_name}\\..*{weight_name}$"] = Split(world_size, 1, "column")
                 output_rules[f"^{full_name}$"] = {0: "no_comm"}
             return
 
@@ -189,7 +189,7 @@ def _find_and_shard_layers(
                             state_rules, output_rules, processed_layers
                         )
 
-def get_default_config_keras(module, device_ids: Sequence[str]) -> ConfigKeras:
+def get_default_config_keras(module, device_ids: Sequence[str]) -> LayoutMap:
     """Generates a default tensor parallelism sharding configuration for a model.
 
     This function serves as the entry point for automatically creating a sharding
@@ -230,7 +230,7 @@ def get_default_config_keras(module, device_ids: Sequence[str]) -> ConfigKeras:
         processed_layers=processed_layers
     )
 
-    return ConfigKeras(
+    return LayoutMap(
         state_rules=state_rules,
         output_rules=output_rules
     )
