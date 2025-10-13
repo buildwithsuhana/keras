@@ -191,7 +191,7 @@ class TensorParallelKeras(Model):
             )
 
         self.distributed_backend_name = distributed_backend
-        from keras.src.distribution import distributed_backend
+        from keras.src.backend import distributed_backend
 
         self.distributed_backend = distributed_backend
         logger.info(
@@ -473,34 +473,6 @@ class TensorParallelKeras(Model):
         """
         return self.assembled_model(inputs, training=training, **kwargs)
 
-    def _apply_forward_communication(self, inputs, training=None, **kwargs):
-        """
-        Apply forward pass communication following the conjugate rule.
-        """
-        if (
-            not hasattr(self, "tensor_parallel_config")
-            or self.tensor_parallel_config is None
-        ):
-            return self.shard_outputs[0]
-
-        output_rules = self.tensor_parallel_config.output_rules
-
-        if not output_rules:
-            return self.shard_outputs[0]
-
-        from keras.src.distribution.tensor_parallel.communications import (
-            TensorParallelCommunicator,
-        )
-
-        communicator = TensorParallelCommunicator(self.world_size, rank=0)
-
-        if hasattr(self, "_is_mlp_model") and self._is_mlp_model:
-            return self._handle_mlp_forward_communication(communicator)
-        else:
-            return self._handle_single_layer_forward_communication(
-                communicator, output_rules
-            )
-
     def _handle_mlp_forward_communication(self, communicator):
         """
         Handle MLP forward communication with handshake optimization.
@@ -593,88 +565,6 @@ class TensorParallelKeras(Model):
 
         else:
             super().compile(optimizer, loss, metrics, **kwargs)
-
-    def _apply_backward_communication(self, gradients, layer_type="unknown"):
-        """
-        Apply backward pass communication following the conjugate rule.
-        """
-        if len(self.model_shards) <= 1:
-            return gradients
-
-        from keras.src.distribution.tensor_parallel.communications import (
-            TensorParallelCommunicator,
-        )
-
-        communicator = TensorParallelCommunicator(self.world_size, rank=0)
-
-        if (
-            "column" in layer_type.lower()
-            or "up_projection" in layer_type.lower()
-        ):
-            logger.info(
-                "   - Backward column-parallel: AllReducing gradients"
-            )
-            return communicator.backward_column_parallel(
-                gradients, op="sum"
-            )
-        elif (
-            "row" in layer_type.lower()
-            or "down_projection" in layer_type.lower()
-        ):
-            logger.info(
-                "   - Backward row-parallel: AllGathering gradients"
-            )
-            gathered = communicator.backward_row_parallel(gradients, dim=-1)
-            return [gathered] * self.world_size
-        else:
-            logger.debug(
-                f"Unknown layer type '{layer_type}', skipping backward communication"
-            )
-            return gradients
-
-    def _slice_upstream_gradients_for_backward(
-        self, full_gradients, sharding_type="unknown"
-    ):
-        """
-        Slice upstream gradients to match each device's shard.
-        """
-        if len(self.model_shards) <= 1:
-            return [full_gradients]
-
-        from keras.src.distribution.tensor_parallel.communications import (
-            TensorParallelCommunicator,
-        )
-
-        communicator = TensorParallelCommunicator(self.world_size, rank=0)
-
-        sliced_gradients = []
-
-        for rank in range(self.world_size):
-            if sharding_type == "column_parallel":
-                sliced_grad = communicator.slice_upstream_gradient_for_column_parallel(
-                    full_gradients, rank, self.world_size, dim=-1
-                )
-                logger.debug(
-                    f"   - Rank {rank}: Sliced upstream gradient for column-parallel"
-                )
-            elif sharding_type == "row_parallel":
-                sliced_grad = (
-                    communicator.slice_upstream_gradient_for_row_parallel(
-                        full_gradients, rank, self.world_size, dim=0
-                    )
-                )
-                logger.debug(
-                    f"   - Rank {rank}: Sliced upstream gradient for row-parallel"
-                )
-            else:
-                logger.warning(
-                    f"Unknown sharding type '{sharding_type}', using full gradient"
-                )
-                sliced_grad = full_gradients
-
-            sliced_gradients.append(sliced_grad)
-
-        return sliced_gradients
 
     def _compute_shard_gradients_with_sliced_upstream(
         self, shard, sliced_upstream_grad, inputs, training=True

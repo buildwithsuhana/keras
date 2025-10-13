@@ -3,8 +3,6 @@ import keras.src.distribution.tensor_parallel.tensor_layout
 import keras.src.distribution.tensor_parallel.coordinated_optimizer
 import keras.src.distribution.tensor_parallel.sharding_keras
 from keras.src.distribution.distribution_lib import AutoTPDistribution
-
-# import keras.src.distribution.tensor_parallel.tensor_parallel_keras
 from keras.src.distribution.distribution_lib import DataParallel
 from keras.src.distribution.distribution_lib import DeviceMesh
 from keras.src.distribution.distribution_lib import Distribution

@@ -6,7 +6,7 @@ import numpy as np
 import keras
 from keras.src import ops
 from keras.src import optimizers
-from keras.src.distribution import distributed_backend
+from keras.src.backend import distributed_backend
 
 
 class CoordinatedOptimizer:
