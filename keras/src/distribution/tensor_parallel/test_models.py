@@ -21,7 +21,7 @@ except Exception:
 
 # --- Backend and Device Configuration ---
 os.environ["KERAS_BACKEND"] = "jax"
-os.environ["XLA_FLAGS"] = "--xla_force_host_platform_device_count=2"
+os.environ["XLA_FLAGS"] = "--xla_force_host_platform_device_count=12"
 
 import jax
 import keras_hub
@@ -46,7 +46,7 @@ try:
         host_devices = devices
 
     DEVICES_AVAILABLE = len(host_devices)
-    WORLD_SIZE = 2
+    WORLD_SIZE = 12
 
     if DEVICES_AVAILABLE < WORLD_SIZE:
         logger.warning(
