@@ -154,23 +154,62 @@ class CoordinatedOptimizer:
             ValueError: If the number of gradient sets does not match the
                 world size.
         """
-        if len(gradients_and_vars) != self.world_size:
-            error_msg = (
-                f"Expected {self.world_size} gradient sets, "
-                f"got {len(gradients_and_vars)}"
-            )
-            raise ValueError(error_msg)
+        # In coordinated_optimizer.py -> TensorParallelOptimizer
 
-        synchronized_gradients = self._synchronize_gradients(gradients_and_vars)
+        """
+        Applies gradients to the model variables.
 
-        if self.shard_optimizer_states and self.sharded_states:
-            self._apply_gradients_with_sharded_states(
-                synchronized_gradients, shard_models
-            )
-        else:
-            self._apply_gradients_with_replicated_states(
-                synchronized_gradients, shard_models
-            )
+        This version is corrected to handle the flat list of gradients produced
+        by the 'assembled_model' during `model.fit()`. It uses the
+        `_shard_var_map` to reconstruct the per-shard gradient lists required
+        by the CoordinatedOptimizer for synchronization and sharded state updates.
+        """
+        if not hasattr(self, "_shard_var_map") or not hasattr(self, "_shard_models"):
+            # Fallback for non-sharded or uninitialized cases
+            self.base_optimizer.apply_gradients(grads_and_vars, **kwargs)
+            return
+
+        # Initialize a list of lists to hold gradients for each shard
+        reconstructed_sharded_grads = [[] for _ in range(self.world_size)]
+        
+        # Create a dictionary for quick lookup of gradients by variable path
+        grad_map = {
+            (getattr(var, "path", None) or var.name): grad
+            for grad, var in grads_and_vars if grad is not None
+        }
+
+        # Iterate through the assembled model's variables to ensure correct order
+        # for each shard.
+        assembled_vars = (getattr(self, "variables", None) or 
+                        self.base_optimizer.variables)
+
+        for var in assembled_vars:
+            var_key = getattr(var, "path", None) or var.name
+            
+            if var_key not in self._shard_var_map:
+                continue
+                
+            # Get the corresponding variables from each shard
+            shard_vars = self._shard_var_map[var_key]
+            
+            # Get the gradient computed for the assembled variable
+            grad = grad_map.get(var_key)
+
+            if grad is None:
+                # Handle cases with no gradient (e.g., non-trainable layers)
+                for i in range(self.world_size):
+                    reconstructed_sharded_grads[i].append((None, shard_vars[i]))
+                continue
+
+            # Distribute the gradient to each corresponding shard variable
+            for i, shard_var in enumerate(shard_vars):
+                if shard_var is not None:
+                    reconstructed_sharded_grads[i].append((grad, shard_var))
+
+        # Now, call the coordinated optimizer with the correctly structured gradients
+        self.coordinated_optimizer.apply_gradients(
+            reconstructed_sharded_grads, self._shard_models
+        )
 
     def _apply_gradients_with_replicated_states(
         self, synchronized_gradients: list[list[tuple]], shard_models: list

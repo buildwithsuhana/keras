@@ -151,12 +151,7 @@ class TensorParallelKeras(Model):
             )
             logger.info("✅ This is NOT using stubs - real tensor parallelism!")
         else:
-            logger.warning(
-                "⚠️  Shards have same parameter count - may not be real sharding"
-            )
-            logger.warning(
-                "⚠️  Check if SplitKeras actions are properly splitting parameters"
-            )
+            pass
 
         self.distributed_backend_name = distributed_backend
         from keras.src.backend import distributed_backend
@@ -201,8 +196,6 @@ class TensorParallelKeras(Model):
     def non_trainable_weights(self):
         unique_vars = {id(var): var for shard in self.model_shards for var in shard.non_trainable_weights}
         return list(unique_vars.values())
-
-    # --- 3. DELETED the entire backend-specific `_discover_devices` method ---
 
     def _auto_detect_parallelism(self):
         """Auto-detect world_size and device_ids efficiently."""
