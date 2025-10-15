@@ -1,56 +1,62 @@
+
 import os
 os.environ["XLA_FLAGS"] = "--xla_force_host_platform_device_count=2"
 import re
+
 import numpy as np
-import keras
 import pytest
+
+import keras
 from keras import distribution
-
-
-from keras.src.testing import TestCase
-from keras.src.distribution.tensor_parallel.config import ConfigKeras
-from keras.src.distribution.tensor_parallel.state_action_keras import SplitKeras
+from keras.src import backend
+from keras.src.distribution.tensor_parallel.tensor_layout import LayoutMap
 from keras.src.distribution.tensor_parallel.parameter_sharding import (
-    make_parameter_sharded_model,
     ShardedWeight,
 )
-from keras.src import backend
-
-@pytest.mark.skipif(
-    backend.backend() not in ("torch", "jax"),
-    reason="This test is for JAX/PyTorch backends."
+from keras.src.distribution.tensor_parallel.parameter_sharding import (
+    make_parameter_sharded_model,
 )
+from keras.src.distribution.tensor_parallel.tensor_layout import Split
+from keras.src.testing import TestCase
+
+
+
 def _create_simple_mlp():
-    """Creates a simple, unsharded Keras MLP model for testing."""
     inputs = keras.Input(shape=(16,), name="input")
     x = keras.layers.Dense(32, use_bias=True, name="up_proj")(inputs)
     x = keras.layers.Activation("relu")(x)
     outputs = keras.layers.Dense(8, use_bias=False, name="down_proj")(x)
     return keras.Model(inputs=inputs, outputs=outputs, name="simple_mlp")
 
-
+@pytest.mark.skipif(
+    backend.backend() != "jax",
+    reason="This test is for the JAX backend only.",
+)
 class ParameterShardingTest(TestCase):
     def setUp(self):
         super().setUp()
         import logging
+
         logging.getLogger().setLevel(logging.ERROR)
 
         self.world_size = 2
         all_devices = distribution.list_devices()
-        self.devices = all_devices[:self.world_size]
+        self.devices = all_devices[: self.world_size]
         if len(self.devices) < self.world_size:
-             self.skipTest(f"Not enough devices to run TP test. Found {len(self.devices)}, need {self.world_size}")
-
+            self.skipTest(
+                f"""Not enough devices to run TP test. 
+                Found {len(self.devices)}, need {self.world_size}"""
+            )
 
         self.original_model = _create_simple_mlp()
         self.original_model.build(input_shape=(None, 16))
 
-        self.tp_config = ConfigKeras(
+        self.tp_config = LayoutMap(
             state_rules={
-                re.escape("simple_mlp.up_proj.kernel"): SplitKeras(
+                re.escape("simple_mlp.up_proj.kernel"): Split(
                     self.world_size, dim=1
                 ),
-                re.escape("simple_mlp.down_proj.kernel"): SplitKeras(
+                re.escape("simple_mlp.down_proj.kernel"): Split(
                     self.world_size, dim=0
                 ),
             },
@@ -88,9 +94,7 @@ class ParameterShardingTest(TestCase):
                 world_size=self.world_size,
                 device_id=self.devices[rank],
             )
-        original_weights_dict = {
-            w.path: w for w in self.original_model.weights
-        }
+        original_weights_dict = {w.path: w for w in self.original_model.weights}
         sharded_weights_dict = {
             w.name if isinstance(w, ShardedWeight) else w.path: w
             for w in sharded_model.weights
@@ -108,9 +112,7 @@ class ParameterShardingTest(TestCase):
             shard_down_kernel.shape[0],
             orig_down_kernel.shape[0] // self.world_size,
         )
-        self.assertEqual(
-            shard_down_kernel.shape[1], orig_down_kernel.shape[1]
-        )
+        self.assertEqual(shard_down_kernel.shape[1], orig_down_kernel.shape[1])
 
     def test_forward_pass_correctness(self):
         expected_output = self.original_model(self.input_data)
@@ -133,7 +135,7 @@ class ParameterShardingTest(TestCase):
             keras.ops.sum(keras.ops.stack(sharded_outputs), axis=0)
             / self.world_size
         )
-        
+
         self.assertAllClose(
             expected_output, reconstructed_output, atol=1e-5, rtol=1e-5
         )

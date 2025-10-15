@@ -1,10 +1,8 @@
-from typing import Sequence, Dict, Any, Set
-
 from keras.src.distribution.tensor_parallel.tensor_layout import LayoutMap
 from keras.src.distribution.tensor_parallel.tensor_layout import Split
 
 
-def analyze_dense_layer_directly(layer, module, prefix: str) -> str:
+def analyze_dense_layer_directly(layer, module, prefix):
     """Analyzes a Keras Dense layer to classify its sharding strategy.
 
     This function inspects the input and output dimensions of a Dense layer
@@ -65,13 +63,13 @@ def analyze_dense_layer_directly(layer, module, prefix: str) -> str:
 
 
 def _find_and_shard_layers(
-    current_layer: "layers.Layer",
-    prefix: str,
-    module: "layers.Layer",
-    world_size: int,
-    state_rules: Dict[str, Any],
-    output_rules: Dict[str, Any],
-    processed_layers: Set[int],
+    current_layer,
+    prefix,
+    module,
+    world_size,
+    state_rules,
+    output_rules,
+    processed_layers,
 ):
     """Recursively traverses the model graph to apply sharding rules.
 
@@ -189,7 +187,7 @@ def _find_and_shard_layers(
                             state_rules, output_rules, processed_layers
                         )
 
-def get_default_config_keras(module, device_ids: Sequence[str]) -> LayoutMap:
+def get_default_config_keras(module, device_ids):
     """Generates a default tensor parallelism sharding configuration for a model.
 
     This function serves as the entry point for automatically creating a sharding

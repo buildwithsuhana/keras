@@ -17,9 +17,9 @@ from keras.src.distribution.tensor_parallel.autoconfig import (
 from keras.src.distribution.tensor_parallel.parameter_sharding import (
     make_parameter_sharded_model,
 )
-from keras.src.distribution.tensor_parallel.sharding_keras import ShardedKeras
-
 from keras.src.distribution.tensor_parallel.coordinated_optimizer import TensorParallelOptimizer
+
+from keras.src.distribution import list_devices
 
 logger = logging.getLogger(__file__)
 
@@ -35,10 +35,8 @@ class TensorParallelKeras(Model):
         distributed_backend="auto",
         **kwargs,
     ):
-        # Call super().__init__ ONCE and at the VERY BEGINNING.
         super().__init__(**kwargs)
 
-        # Set instance attributes immediately after.
         self._original_model = model
 
         if world_size is None:
@@ -57,44 +55,25 @@ class TensorParallelKeras(Model):
         self.distributed = True
 
         self.sharded_models = [self._original_model]
-        original_params = 0
-        for p in model.weights:
-            if hasattr(p, "shape") and hasattr(p.shape, "num_elements"):
-                original_params += p.shape.num_elements()
-            elif hasattr(p, "shape") and hasattr(p.shape, "__iter__"):
-                original_params += np.prod(p.shape)
-            else:
-                original_params += np.prod(p.shape)
-
+        
+        accel_devices = list_devices()
         device_ids = list(self.check_device_ids(device_ids))
-
-        accel_devices = self._discover_devices()
 
         if accel_devices:
             backend_name = keras.backend.backend()
-            print(
-                f"🔍 Discovered {len(accel_devices)} devices for backend '{backend_name}'"
-            )
+            print(f"🔍 Discovered {len(accel_devices)} devices for backend '{backend_name}'")
             print(f"🔍 Devices: {[str(d) for d in accel_devices]}")
 
             if len(accel_devices) >= world_size:
-                print(
-                    f"✅ Using REAL tensor parallelism on {world_size} discovered devices."
-                )
+                print(f"✅ Using REAL tensor parallelism on {world_size} discovered devices.")
                 device_ids = accel_devices[:world_size]
             else:
-                print(
-                    f"⚠️  Discovered {len(accel_devices)} devices but world_size={world_size} was requested."
-                )
-                print(
-                    f"⚠️  Reducing world_size to {len(accel_devices)} for real implementation."
-                )
+                print(f"⚠️  Discovered {len(accel_devices)} devices but world_size={world_size} was requested.")
+                print(f"⚠️  Reducing world_size to {len(accel_devices)} for real implementation.")
                 world_size = len(accel_devices)
                 device_ids = accel_devices[:world_size]
         else:
-            print(
-                f"⚠️  Could not discover accelerator devices. Falling back to configuration."
-            )
+            print(f"⚠️  Could not discover accelerator devices. Falling back to configuration.")
 
         if not device_ids:
             device_ids = self._auto_configure_devices(
@@ -106,7 +85,6 @@ class TensorParallelKeras(Model):
 
         self.devices = device_ids
         self.world_size = world_size
-        self.sharding_manager = None
         
         if self.world_size <= 1:
             self.model_shards = [model]
@@ -163,17 +141,7 @@ class TensorParallelKeras(Model):
 
         params_per_shard = []
         for i, shard in enumerate(self.model_shards):
-            total_params = 0
-            for p in shard.weights:
-                if hasattr(p, "num_elements"):
-                    total_params += p.num_elements()
-                elif hasattr(p, "numel"):
-                    total_params += p.numel()
-                elif hasattr(p.shape, "num_elements"):
-                    total_params += p.shape.num_elements()
-                else:
-                    total_params += np.prod(p.shape)
-
+            total_params = sum(np.prod(p.shape) for p in shard.weights)
             params_per_shard.append(int(total_params))
             logger.info(f"   📊 Shard {i} parameters: {int(total_params):,}")
 
@@ -206,104 +174,43 @@ class TensorParallelKeras(Model):
 
     @property
     def variables(self):
-        unique_vars = {}
-        for shard in self.model_shards:
-            for var in shard.variables:
-                if id(var) not in unique_vars:
-                    unique_vars[id(var)] = var
+        unique_vars = {id(var): var for shard in self.model_shards for var in shard.variables}
         return list(unique_vars.values())
 
     @property
     def trainable_variables(self):
-        unique_vars = {}
-        for shard in self.model_shards:
-            for var in shard.trainable_variables:
-                if id(var) not in unique_vars:
-                    unique_vars[id(var)] = var
+        unique_vars = {id(var): var for shard in self.model_shards for var in shard.trainable_variables}
         return list(unique_vars.values())
 
     @property
     def non_trainable_variables(self):
-        unique_vars = {}
-        for shard in self.model_shards:
-            for var in shard.non_trainable_variables:
-                if id(var) not in unique_vars:
-                    unique_vars[id(var)] = var
+        unique_vars = {id(var): var for shard in self.model_shards for var in shard.non_trainable_variables}
         return list(unique_vars.values())
 
     @property
     def weights(self):
-        unique_vars = {}
-        for shard in self.model_shards:
-            for var in shard.weights:
-                if id(var) not in unique_vars:
-                    unique_vars[id(var)] = var
+        unique_vars = {id(var): var for shard in self.model_shards for var in shard.weights}
         return list(unique_vars.values())
 
     @property
     def trainable_weights(self):
-        unique_vars = {}
-        for shard in self.model_shards:
-            for var in shard.trainable_weights:
-                if id(var) not in unique_vars:
-                    unique_vars[id(var)] = var
+        unique_vars = {id(var): var for shard in self.model_shards for var in shard.trainable_weights}
         return list(unique_vars.values())
 
     @property
     def non_trainable_weights(self):
-        unique_vars = {}
-        for shard in self.model_shards:
-            for var in shard.non_trainable_weights:
-                if id(var) not in unique_vars:
-                    unique_vars[id(var)] = var
+        unique_vars = {id(var): var for shard in self.model_shards for var in shard.non_trainable_weights}
         return list(unique_vars.values())
 
-    def _discover_devices(self):
-        """Discovers available accelerator devices for the current backend."""
-        backend = keras.backend.backend()
-        devices = []
-
-        if backend == "jax":
-            import jax
-            all_devices = jax.devices()
-            for platform in ("tpu", "gpu", "cpu"):
-                platform_devices = [
-                    d for d in all_devices if d.platform == platform
-                ]
-                if platform_devices:
-                    devices = platform_devices
-                    break
-        elif backend == "tensorflow":
-            import tensorflow as tf
-            gpus = tf.config.list_logical_devices("GPU")
-            if gpus:
-                devices = [d.name for d in gpus]
-            else:
-                cpus = tf.config.list_logical_devices("CPU")
-                devices = [d.name for d in cpus]
-        elif backend == "torch":
-            import torch
-            if torch.cuda.is_available():
-                devices = [
-                    f"cuda:{i}" for i in range(torch.cuda.device_count())
-                ]
-            elif torch.backends.mps.is_available():
-                devices = ["mps"]
-            else:
-                devices = ["cpu"]
-                
-        return devices
+    # --- 3. DELETED the entire backend-specific `_discover_devices` method ---
 
     def _auto_detect_parallelism(self):
         """Auto-detect world_size and device_ids efficiently."""
         from keras.src.distribution import get_best_devices
-        from keras.src.distribution import list_devices
 
         available_devices = list_devices()
         world_size = len(available_devices)
-        print(
-            f"🔍 Auto-detected world_size: {world_size} from {len(available_devices)} available devices"
-        )
+        print(f"🔍 Auto-detected world_size: {world_size} from {len(available_devices)} available devices")
 
         device_ids = get_best_devices(world_size)
         print(f"🔍 Auto-detected device_ids: {device_ids}")
@@ -315,30 +222,12 @@ class TensorParallelKeras(Model):
         current_size = len(device_ids)
         if current_size >= target_world_size:
             return device_ids[:target_world_size]
-
-        num_to_add = target_world_size - current_size
-
-        if not device_ids:
-            return [f"cpu:{i}" for i in range(target_world_size)]
-
-        base_device = device_ids[0]
-        if isinstance(base_device, str) and ":" in base_device:
-            device_type, index_str = base_device.rsplit(":", 1)
-            if index_str.isdigit():
-                additional_devices = [
-                    f"{device_type}:{current_size + i}" for i in range(num_to_add)
-                ]
-                return device_ids + additional_devices
-
-        additional_devices = [f"cpu:{current_size + i}" for i in range(num_to_add)]
-        return device_ids + additional_devices
+        
+        return list(device_ids) + [f"cpu:{i}" for i in range(current_size, target_world_size)]
 
     def _auto_configure_devices(self, world_size, distributed_backend):
         """Auto-configure devices - simplified version."""
-        from keras.src.distribution import list_devices
-
         available_devices = list_devices()
-
         if available_devices:
             devices = available_devices[:world_size]
             logger.info(f"Auto-configured devices: {devices}")
@@ -353,24 +242,12 @@ class TensorParallelKeras(Model):
         """Validate and normalize device IDs for Keras."""
         if device_ids is None:
             device_ids = self._get_all_device_indices()
-
-        device_ids = list(device_ids)
-
-        canonical_ids = []
-        for device_id in device_ids:
-            if isinstance(device_id, str):
-                canonical_ids.append(self.canonicalize_device(device_id))
-            else:
-                canonical_ids.append(device_id)
-
-        return tuple(canonical_ids)
+        
+        return tuple(self.canonicalize_device(d) for d in device_ids)
 
     def _get_all_device_indices(self) -> Sequence[str]:
         """Get all available device indices using distribution library."""
-        from keras.src.distribution import list_devices
-
-        devices = list_devices()
-        return devices
+        return list_devices()
 
     def build_assembled_model(self):
         """
@@ -452,89 +329,11 @@ class TensorParallelKeras(Model):
         else:
             return "cpu"
 
-    def apply_sharding(
-        self, replicated_param_names: Optional[Collection[str]] = None
-    ):
-        """Apply sharding to the model parameters."""
-        if replicated_param_names is None:
-            replicated_param_names = self.modified_parameters_names
-
-        self.sharding_manager = ShardedKeras(
-            self.model_shards,
-            replicated_param_names,
-            self.tensor_parallel_config,
-            self.devices,
-            0,
-        )
-
     def call(self, inputs, training=None, **kwargs):
         """
         Forward pass for the tensor-parallel model.
         """
         return self.assembled_model(inputs, training=training, **kwargs)
-
-    def _handle_mlp_forward_communication(self, communicator):
-        """
-        Handle MLP forward communication with handshake optimization.
-        """
-        up_outputs = []
-        down_outputs = []
-
-        for i in range(self.world_size):
-            if i in self.shard_outputs:
-                up_outputs.append(self.shard_outputs[i])
-                down_outputs.append(self.shard_outputs[i])
-
-        final_up, final_down = communicator.handle_mlp_handshake(
-            up_outputs, down_outputs
-        )
-
-        return final_down[0] if isinstance(final_down, list) else final_down
-
-    def _handle_single_layer_forward_communication(
-        self, communicator, output_rules
-    ):
-        """
-        Handle single layer forward communication.
-        """
-        first_output = self.shard_outputs[0]
-        if hasattr(first_output, "shape") and len(first_output.shape) >= 2:
-            if (
-                hasattr(self, "_is_multi_layer_model")
-                and self._is_multi_layer_model
-            ):
-                logger.info(
-                    "   - Multi-layer model detected: Each shard produces full output"
-                )
-                logger.info(
-                    f"   - Returning shard output directly: {getattr(first_output, 'shape', 'unknown')}"
-                )
-                return first_output
-
-            logger.info(
-                "   - Detected single-layer model: Using column-parallel AllGather for mathematical identity"
-            )
-
-            partial_outputs = []
-            for i in range(self.world_size):
-                if i in self.shard_outputs:
-                    partial_outputs.append(self.shard_outputs[i])
-                    logger.info(
-                        f"   - Shard {i} output shape: {getattr(self.shard_outputs[i], 'shape', 'unknown')}"
-                    )
-
-            logger.info(
-                f"   - Number of partial outputs: {len(partial_outputs)}"
-            )
-            logger.info(
-                f"   - Expected final shape: {getattr(first_output, 'shape', 'unknown')}"
-            )
-            logger.info(
-                "   - Using first shard output for mathematical identity"
-            )
-            return first_output
-
-        return self.shard_outputs[0]
 
     def compile(self, optimizer=None, loss=None, metrics=None, **kwargs):
         """
@@ -552,6 +351,37 @@ class TensorParallelKeras(Model):
             logger.info(
                 f"Created coordinated optimizer for {self.world_size} shards"
             )
+            # Register shard models and a variable mapping on the coordinated
+            # optimizer so it can convert a flat grads-and-vars list produced
+            # by the assembled model into a per-shard grads-and-vars list
+            # expected by the CoordinatedOptimizer.
+            try:
+                self.coordinated_optimizer._shard_models = self.model_shards
+
+                var_map = {}
+                assembled = getattr(self, "assembled_model", None)
+                assembled_vars = assembled.variables if assembled is not None else []
+
+                for a_var in assembled_vars:
+                    key = getattr(a_var, "path", None) or a_var.name
+                    suffix = key.split("/")[-1]
+                    per_shard = []
+                    for shard in self.model_shards:
+                        match = next(
+                            (v for v in shard.variables if v.name.endswith(suffix)),
+                            None,
+                        )
+                        per_shard.append(match)
+                    var_map[key] = per_shard
+
+                self.coordinated_optimizer._shard_var_map = var_map
+                # Also register on the inner CoordinatedOptimizer instance
+                inner = getattr(self.coordinated_optimizer, "coordinated_optimizer", None)
+                if inner is not None:
+                    inner._shard_models = self.model_shards
+                    inner._shard_var_map = var_map
+            except Exception:
+                logger.exception("Failed to register shard mapping on coordinated optimizer")
 
             super().compile(
                 optimizer=self.coordinated_optimizer,
@@ -565,34 +395,6 @@ class TensorParallelKeras(Model):
 
         else:
             super().compile(optimizer, loss, metrics, **kwargs)
-
-    def _compute_shard_gradients_with_sliced_upstream(
-        self, shard, sliced_upstream_grad, inputs, training=True
-    ):
-        """
-        Compute gradients for a specific shard using the properly sliced upstream gradient.
-        """
-        with tf.GradientTape() as tape:
-            shard_output = shard(inputs, training=training)
-            loss = self._compute_shard_loss(
-                shard_output, sliced_upstream_grad
-            )
-
-        gradients = tape.gradient(loss, shard.trainable_variables)
-        return gradients
-
-    def _compute_shard_loss(self, shard_output, sliced_upstream_grad):
-        """
-        Compute a loss that will produce the correct gradients for this shard.
-        """
-        if hasattr(sliced_upstream_grad, "shape") and hasattr(
-            shard_output, "shape"
-        ):
-            target = sliced_upstream_grad
-            loss = tf.reduce_mean(tf.square(shard_output - target))
-            return loss
-        else:
-            return tf.reduce_mean(tf.square(shard_output))
 
     def fit(self, x=None, y=None, **kwargs):
         """Use standard Keras training which correctly handles the train_step."""

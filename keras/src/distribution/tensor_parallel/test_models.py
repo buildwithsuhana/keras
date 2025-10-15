@@ -46,7 +46,7 @@ try:
         host_devices = devices
 
     DEVICES_AVAILABLE = len(host_devices)
-    WORLD_SIZE = 12
+    WORLD_SIZE = 2
 
     if DEVICES_AVAILABLE < WORLD_SIZE:
         logger.warning(

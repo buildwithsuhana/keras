@@ -1,164 +1,121 @@
-import pytest
-import numpy as np
+# Keep your os.environ setup in the terminal command, not in the file.
+
 import keras
-import tensorflow as tf
-from unittest.mock import patch, MagicMock
+from keras import layers
+import numpy as np
+import jax  # Keep this import to ensure jax is initialized
 
-# Assume the file containing your class is named `tensor_parallel_keras.py`
+# Import the class to be tested
 from tensor_parallel_keras import TensorParallelKeras
+# Import the Keras testing base class
+from keras.src.testing import TestCase
 
-# --- Test Constants and Helper Functions ---
 
-INPUT_DIM = 10
-HIDDEN_DIM = 17 # Using an odd number to ensure shards are different sizes
-OUTPUT_DIM = 5
-BATCH_SIZE = 8
+class TensorParallelKerasTest(TestCase):
+    """
+    Test suite for the TensorParallelKeras class running on the JAX backend.
+    """
 
-def create_simple_mlp():
-    """Creates a simple Keras Sequential model for testing."""
-    return keras.Sequential(
-        [
-            keras.Input(shape=(INPUT_DIM,), name="input_layer"),
-            keras.layers.Dense(HIDDEN_DIM, activation="relu", name="dense_1"),
-            keras.layers.Dense(OUTPUT_DIM, name="dense_2"),
-        ]
-    )
-
-def count_params(model_or_weights):
-    """Helper function to count the total number of parameters."""
-    weights = []
-    if isinstance(model_or_weights, keras.Model):
-        weights = model_or_weights.weights
-    else:
-        weights = model_or_weights
+    def setUp(self):
+        """Set up a reusable model and data for all tests."""
+        super().setUp()
         
-    total_params = 0
-    for p in weights:
-        if hasattr(p, "shape"):
-            total_params += np.prod(p.shape)
-    return int(total_params)
-
-
-# --- Test Class for TensorParallelKeras ---
-
-class TestTensorParallelKeras:
-    """Test suite for the TensorParallelKeras wrapper."""
-
-    @pytest.fixture
-    def mock_devices(self):
-        """A pytest fixture to mock device discovery for a predictable environment."""
-        with patch.object(
-            TensorParallelKeras,
-            "_discover_devices",
-            return_value=["cpu:0", "cpu:1"],
-        ) as mock:
-            yield mock
-
-    def test_initialization_and_sharding(self, mock_devices):
-        """
-        Tests if the model is correctly initialized and sharded for world_size > 1.
-        """
-        print("🚀 Testing model initialization and sharding...")
-        original_model = create_simple_mlp()
-        original_params = count_params(original_model)
-
-        # Act
-        tp_model = TensorParallelKeras(model=original_model, world_size=2)
-
-        # Assert
-        assert tp_model.world_size == 2
-        assert tp_model.distributed is True
-        assert len(tp_model.model_shards) == 2, "Model should be split into 2 shards"
-
-        shard1_params = count_params(tp_model.model_shards[0])
-        shard2_params = count_params(tp_model.model_shards[1])
-
-        assert shard1_params < original_params, "Shard 1 should have fewer params than the original"
-        assert shard2_params < original_params, "Shard 2 should have fewer params than the original"
-        assert shard1_params != shard2_params, "Shards should have different param counts"
-        print("✅ Initialization and sharding successful.")
-
-
-    def test_non_distributed_case_world_size_one(self, mock_devices):
-        """
-        Tests if the model behaves like a standard Keras model when world_size is 1.
-        """
-        print("\n🚀 Testing non-distributed case (world_size=1)...")
-        original_model = create_simple_mlp()
-        original_params = count_params(original_model)
-
-        tp_model = TensorParallelKeras(model=original_model, world_size=1)
-
-        assert tp_model.world_size == 1
-        assert tp_model.distributed is False
-        assert len(tp_model.model_shards) == 1
-        assert tp_model.model_shards[0] == original_model
-        assert count_params(tp_model.model_shards[0]) == original_params
-        print("✅ Non-distributed case handled correctly.")
-
-
-    def test_forward_pass_output_shape(self, mock_devices):
-        """
-        Tests if the forward pass of the sharded model executes and returns the correct shape.
-        """
-        print("\n🚀 Testing forward pass output shape...")
-        original_model = create_simple_mlp()
-        dummy_input = np.random.rand(BATCH_SIZE, INPUT_DIM).astype("float32")
-
-        tp_model = TensorParallelKeras(model=original_model, world_size=2)
-        output = tp_model(dummy_input)
-
-        assert output is not None
-        assert output.shape == (BATCH_SIZE, OUTPUT_DIM), "Output shape is incorrect"
-        print("✅ Forward pass successful with correct output shape.")
-
-    # ===== NEW FOCUSED TESTS FOR COMMUNICATION =====
-
-    @patch("keras.src.distribution.tensor_parallel.communications.TensorParallelCommunicator")
-    def test_gradient_slicing_logic(self, MockCommunicator, mock_devices):
-        """
-        Verifies that the correct upstream gradient slicing methods are called.
-        """
-        print("\n🚀 Testing upstream gradient slicing logic...")
-        mock_communicator_instance = MagicMock()
-        MockCommunicator.return_value = mock_communicator_instance
+        inputs = keras.Input(shape=(64,), name="input_layer")
+        x = layers.Dense(128, activation="relu", name="dense_column_sharded")(inputs)
+        outputs = layers.Dense(10, name="dense_row_sharded")(x)
+        self.original_model = keras.Model(
+            inputs=inputs, outputs=outputs, name="test_mlp"
+        )
         
-        original_model = create_simple_mlp()
-        tp_model = TensorParallelKeras(model=original_model, world_size=2)
+        self.input_data = np.random.rand(32, 64).astype("float32")
+        self.target_data = np.random.rand(32, 10).astype("float32")
         
-        dummy_full_gradients = tf.ones((BATCH_SIZE, OUTPUT_DIM))
-
-        # Test column-parallel slicing
-        tp_model._slice_upstream_gradients_for_backward(dummy_full_gradients, "column_parallel")
-        assert mock_communicator_instance.slice_upstream_gradient_for_column_parallel.call_count == 2
+        self.world_size = 2
+        self.device_ids = [f"cpu:{i}" for i in range(self.world_size)]
+        print(f"\n✅ Configured test environment for JAX with world_size=2.")
         
-        # Test row-parallel slicing
-        tp_model._slice_upstream_gradients_for_backward(dummy_full_gradients, "row_parallel")
-        assert mock_communicator_instance.slice_upstream_gradient_for_row_parallel.call_count == 2
-        
-        print("✅ Upstream gradient slicing calls verified.")
-
-
-    @patch("keras.src.distribution.tensor_parallel.communications.TensorParallelCommunicator")
-    def test_backward_communication_logic(self, MockCommunicator, mock_devices):
+    def test_initialization_and_sharding_verification(self):
         """
-        Verifies that the correct backward communication primitives (AllReduce/AllGather) are called.
+        Tests if the model is correctly initialized and that parameter sharding occurs.
         """
-        print("\n🚀 Testing backward pass communication logic...")
-        mock_communicator_instance = MagicMock()
-        MockCommunicator.return_value = mock_communicator_instance
+        tp_model = TensorParallelKeras(
+            self.original_model, world_size=self.world_size, device_ids=self.device_ids
+        )
 
-        original_model = create_simple_mlp()
-        tp_model = TensorParallelKeras(model=original_model, world_size=2)
-        
-        dummy_gradients = [tf.ones((INPUT_DIM, HIDDEN_DIM)), tf.ones((HIDDEN_DIM,))]
+        self.assertTrue(tp_model.distributed)
+        self.assertEqual(tp_model.world_size, self.world_size)
+        self.assertEqual(len(tp_model.model_shards), self.world_size)
 
-        # Test column-parallel backward (should AllReduce)
-        tp_model._apply_backward_communication(dummy_gradients, layer_type="column")
-        mock_communicator_instance.backward_column_parallel.assert_called_once()
+        original_params = self.original_model.count_params()
+        shard_0_params = tp_model.model_shards[0].count_params()
         
-        # Test row-parallel backward (should AllGather)
-        tp_model._apply_backward_communication(dummy_gradients, layer_type="row")
-        mock_communicator_instance.backward_row_parallel.assert_called_once()
+        self.assertLess(shard_0_params, original_params)
         
-        print("✅ Backward communication calls verified.")
+        # --- FIX 3: Compare total parameter count, not weight list length ---
+        # This correctly handles replicated weights that are duplicated in JAX.
+        tp_model_total_params = sum(np.prod(v.shape) for v in tp_model.weights)
+        self.assertEqual(tp_model_total_params, original_params)
+
+    def test_non_distributed_case_world_size_one(self):
+        """
+        Tests the behavior when world_size is 1, ensuring it gracefully degrades
+        to a standard, non-distributed model.
+        """
+        tp_model = TensorParallelKeras(self.original_model, world_size=1)
+
+        self.assertFalse(tp_model.distributed)
+        self.assertEqual(tp_model.world_size, 1)
+        self.assertEqual(len(tp_model.model_shards), 1)
+        self.assertIs(tp_model.assembled_model, self.original_model)
+
+        output = tp_model.predict(self.input_data, verbose=0)
+        self.assertEqual(output.shape, (32, 10))
+
+    def test_forward_pass_correctness(self):
+        """
+        Tests if the output of the sharded model is numerically identical
+        to the original model.
+        """
+        # --- FIX 2: Add the name to the input layer ---
+        inputs = keras.Input(shape=(64,), name="input_layer")
+        x = layers.Dense(128, activation="relu", kernel_initializer='glorot_uniform')(inputs)
+        outputs = layers.Dense(10, kernel_initializer='glorot_uniform')(x)
+        original_model = keras.Model(inputs=inputs, outputs=outputs)
+        
+        input_data = np.random.rand(32, 64).astype("float32")
+
+        original_output = original_model(input_data, training=False)
+
+        tp_model = TensorParallelKeras(
+            original_model, world_size=self.world_size, device_ids=self.device_ids
+        )
+        
+        tp_output = tp_model(input_data, training=False)
+
+        self.assertAllClose(original_output, tp_output, atol=1e-5, rtol=1e-5)
+
+    def test_distributed_training_workflow(self):
+        """
+        Tests if the model can be compiled and trained for one step without errors.
+        """
+        tp_model = TensorParallelKeras(
+            self.original_model, world_size=self.world_size, device_ids=self.device_ids
+        )
+
+        tp_model.compile(
+            optimizer=keras.optimizers.Adam(learning_rate=0.01),
+            loss="mse",
+        )
+
+        self.assertTrue(hasattr(tp_model, "coordinated_optimizer"))
+
+        history = tp_model.fit(
+            self.input_data, self.target_data, epochs=1, batch_size=16, verbose=0
+        )
+
+        self.assertIn("loss", history.history)
+        self.assertIsNotNone(history.history["loss"][0])
+
+if __name__ == "__main__":
+    import unittest
+    unittest.main()

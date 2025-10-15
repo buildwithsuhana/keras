@@ -252,15 +252,15 @@ class ParameterShardingStrategy:
 
         return matching_params
 
-    def get_sharded_weight(self, param_name: str) -> Optional[np.ndarray]:
-        """Get sharded weight for a parameter."""
-        if param_name in self.sharded_weights:
-            return self.sharded_weights[param_name].numpy()
-        return None
+    # def get_sharded_weight(self, param_name: str) -> Optional[np.ndarray]:
+    #     """Get sharded weight for a parameter."""
+    #     if param_name in self.sharded_weights:
+    #         return self.sharded_weights[param_name].numpy()
+    #     return None
 
-    def get_weight_info(self, param_name: str) -> Optional[Dict]:
-        """Get information about a sharded weight."""
-        return self.weight_mapping.get(param_name)
+    # def get_weight_info(self, param_name: str) -> Optional[Dict]:
+        # """Get information about a sharded weight."""
+        # return self.weight_mapping.get(param_name)
 
 
 def _define_parameter_sharded_model():
@@ -351,69 +351,55 @@ def _define_parameter_sharded_model():
             return self._weights_list
 
         def call(self, inputs, training=None, mask=None):
-            """
-            This is the forward pass. It walks the model and applies communication.
-            """
             from keras.src import layers
-
             tensor_cache = {}
-            current_tensor = inputs
+
+            if isinstance(inputs, dict):
+                # Handle multiple named inputs
+                for inp_tensor in self.original_model.inputs:
+                    tensor_cache[id(inp_tensor)] = inputs[inp_tensor.name]
+            else:
+                tensor_cache[id(self.original_model.inputs[0])] = inputs
 
             for layer in self.original_model.layers:
-                # (Layer traversal and input handling logic is unchanged)
                 if isinstance(layer, layers.InputLayer):
                     continue
-
-                if isinstance(layer, layers.Add):
-                    try:
-                        if "feedforward_output" in layer.name:
-                            residual_source_name = layer.name.replace(
-                                "feedforward_output", "self_attention_output"
-                            )
-                        elif "self_attention_output" in layer.name:
-                            residual_source_name = layer.name.replace(
-                                "self_attention_output", "input_layer_norm"
-                            )
-                        else:
-                            residual_source_name = None
-
-                        if (
-                            residual_source_name
-                            and residual_source_name in tensor_cache
-                        ):
-                            layer_inputs = [
-                                current_tensor,
-                                tensor_cache[residual_source_name],
-                            ]
-                        else:
-                            layer_inputs = [current_tensor, current_tensor]
-                    except Exception:
-                        layer_inputs = [current_tensor, current_tensor]
-                else:
-                    layer_inputs = current_tensor
-
-                if (
-                    "attention_output" in layer.name
-                    or "feedforward_output" in layer.name
-                ):
-                    tensor_cache[layer.name] = current_tensor
+                
+                layer_inputs = []
+                for node in layer._inbound_nodes:
+                    for symbolic_input_tensor in node.input_tensors:
+                        layer_inputs.append(tensor_cache[id(symbolic_input_tensor)])
+                
+                if len(layer_inputs) == 1:
+                    layer_inputs = layer_inputs[0]
 
                 current_tensor = layer(layer_inputs, training=training)
 
+                tensor_cache[id(layer.output)] = current_tensor
+                
                 layer_path = layer.path
-
                 output_rule = None
                 for pattern, rule in self.config.output_rules.items():
                     if re.search(pattern, layer_path):
                         output_rule = rule.get(0)
                         break
-
                 if output_rule:
                     current_tensor = self._apply_communication(
                         current_tensor, layer.name, output_rule
                     )
+                    # IMPORTANT: Update the cache with the modified tensor
+                    tensor_cache[id(layer.output)] = current_tensor
 
-            return current_tensor
+            # --- CHANGE 2: RETURN THE FINAL MODEL OUTPUT ---
+            # At the end of the loop, you must look up the original model's
+            # final output tensor(s) in the cache and return the result.
+            final_outputs = []
+            for symbolic_output in self.original_model.outputs:
+                final_outputs.append(tensor_cache[id(symbolic_output)])
+
+            if len(final_outputs) == 1:
+                return final_outputs[0]
+            return final_outputs
 
         def _apply_communication(self, sharded_output, layer_name, rule_str: str):
             """MODIFIED: Applies communication directly using the distributed backend."""
@@ -475,63 +461,63 @@ def make_parameter_sharded_model(
     return sharded_model, modified_parameters
 
 
-def apply_parameter_sharding_to_existing_model(
-    model: "Model", config: LayoutMap, rank: int, world_size: int
-) -> "Model":
-    """
-    Apply parameter sharding to an existing model without creating a new one.
-    """
-    print(f"🔧 Applying parameter sharding to existing model: {model.name}")
+# def apply_parameter_sharding_to_existing_model(
+#     model: "Model", config: LayoutMap, rank: int, world_size: int
+# ) -> "Model":
+#     """
+#     Apply parameter sharding to an existing model without creating a new one.
+#     """
+#     print(f"🔧 Applying parameter sharding to existing model: {model.name}")
 
-    sharding_strategy = ParameterShardingStrategy(world_size, rank)
-    for pattern, action in config.state_rules.items():
-        if isinstance(action, LayoutAction):
-            matching_params = sharding_strategy._find_matching_parameters(
-                model, pattern
-            )
+#     sharding_strategy = ParameterShardingStrategy(world_size, rank)
+#     for pattern, action in config.state_rules.items():
+#         if isinstance(action, LayoutAction):
+#             matching_params = sharding_strategy._find_matching_parameters(
+#                 model, pattern
+#             )
 
-            for param_name, param in matching_params:
-                try:
-                    param_id = id(param.experimental_ref())
-                except AttributeError:
-                    param_id = id(param)
+#             for param_name, param in matching_params:
+#                 try:
+#                     param_id = id(param.experimental_ref())
+#                 except AttributeError:
+#                     param_id = id(param)
 
-                if param_id in sharding_strategy.sharded_weights_by_id:
-                    sharding_strategy.sharded_weights[param_name] = (
-                        sharding_strategy.sharded_weights_by_id[param_id]
-                    )
-                    existing_param_name = next(
-                        k
-                        for k, v in sharding_strategy.sharded_weights.items()
-                        if v
-                        is sharding_strategy.sharded_weights_by_id[param_id]
-                    )
-                    sharding_strategy.weight_mapping[param_name] = (
-                        sharding_strategy.weight_mapping[existing_param_name]
-                    )
-                    print(
-                        f"   🔗 Tied {param_name} to existing shard from {existing_param_name}"
-                    )
-                    continue
+#                 if param_id in sharding_strategy.sharded_weights_by_id:
+#                     sharding_strategy.sharded_weights[param_name] = (
+#                         sharding_strategy.sharded_weights_by_id[param_id]
+#                     )
+#                     existing_param_name = next(
+#                         k
+#                         for k, v in sharding_strategy.sharded_weights.items()
+#                         if v
+#                         is sharding_strategy.sharded_weights_by_id[param_id]
+#                     )
+#                     sharding_strategy.weight_mapping[param_name] = (
+#                         sharding_strategy.weight_mapping[existing_param_name]
+#                     )
+#                     print(
+#                         f"   🔗 Tied {param_name} to existing shard from {existing_param_name}"
+#                     )
+#                     continue
 
-                sharded_param = action(param, rank)
+#                 sharded_param = action(param, rank)
 
-                sharding_strategy.sharded_weights[param_name] = sharded_param
-                sharding_strategy.sharded_weights_by_id[param_id] = (
-                    sharded_param
-                )
+#                 sharding_strategy.sharded_weights[param_name] = sharded_param
+#                 sharding_strategy.sharded_weights_by_id[param_id] = (
+#                     sharded_param
+#                 )
 
-                sharding_strategy.weight_mapping[param_name] = {
-                    "original_shape": param.shape,
-                    "sharded_shape": sharded_param.shape,
-                    "action": action,
-                }
+#                 sharding_strategy.weight_mapping[param_name] = {
+#                     "original_shape": param.shape,
+#                     "sharded_shape": sharded_param.shape,
+#                     "action": action,
+#                 }
 
-                print(
-                    f"   ✅ Sharded {param_name}: {param.shape} -> {sharded_param.shape}"
-                )
+#                 print(
+#                     f"   ✅ Sharded {param_name}: {param.shape} -> {sharded_param.shape}"
+#                 )
 
-    model._tensor_parallel_sharding = sharding_strategy
+#     model._tensor_parallel_sharding = sharding_strategy
 
-    print("🎯 Parameter sharding applied to existing model")
-    return model
+#     print("🎯 Parameter sharding applied to existing model")
+#     return model

@@ -111,6 +111,8 @@ def get_communication_ops() -> Dict[str, Callable]:
         """Checks if the default process group is initialized."""
         return dist.is_available() and dist.is_initialized()
 
+    # In /Users/suhanaaa/keras/keras/src/backend/torch/distributed_backend.py
+
     def all_reduce(
         x: torch.Tensor,
         op: Literal["sum", "mean"] = "sum",
@@ -118,15 +120,8 @@ def get_communication_ops() -> Dict[str, Callable]:
     ) -> torch.Tensor:
         """Reduces a tensor across all devices."""
         if not _is_distributed():
-            world_size = torch.cuda.device_count() if torch.cuda.is_available() else 1
-            if world_size <= 1:
-                return x
-            if op == "sum":
-                return x * float(world_size)
-            elif op == "mean":
-                return x
-            else:
-                raise ValueError(f"Unsupported all_reduce op: {op}")
+            # FIX: If not distributed, all_reduce is a no-op.
+            return x
 
         reduce_op = {"sum": dist.ReduceOp.SUM, "mean": dist.ReduceOp.AVG}.get(op)
         if reduce_op is None:
@@ -143,10 +138,8 @@ def get_communication_ops() -> Dict[str, Callable]:
     ) -> torch.Tensor:
         """Gathers tensors from all devices and concatenates them."""
         if not _is_distributed():
-            world_size = torch.cuda.device_count() if torch.cuda.is_available() else 1
-            if world_size <= 1:
-                return x
-            return torch.cat([x] * world_size, dim=axis)
+            # FIX: If not distributed, the tensor is already complete.
+            return x
 
         world_size = dist.get_world_size()
         tensor_list = [torch.empty_like(x) for _ in range(world_size)]

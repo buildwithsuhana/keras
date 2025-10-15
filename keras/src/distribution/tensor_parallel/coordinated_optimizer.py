@@ -136,13 +136,6 @@ class CoordinatedOptimizer:
         else:
             return [np.copy(state_array) for _ in range(self.world_size)]
 
-    def get_config(self) -> dict[str, Any]:
-        return {
-            "base_optimizer": self.base_optimizer.get_config(),
-            "world_size": self.world_size,
-            "shard_optimizer_states": self.shard_optimizer_states,
-        }
-
     def apply_gradients(
         self, gradients_and_vars: list[list[tuple]], shard_models: list
     ):
@@ -255,7 +248,8 @@ class CoordinatedOptimizer:
         for var in optimizer.variables:
             if var is optimizer.iterations:
                 if "iterations" in local_states:
-                    ops.assign(var, local_states["iterations"])
+                    # Corrected line
+                    var.assign(local_states["iterations"])
                 continue
 
             param = self._state_variable_to_parameter.get(var.path, None)
@@ -269,7 +263,8 @@ class CoordinatedOptimizer:
             ):
                 local_param_state = local_states[slot_name][param.path]
                 if var.shape == local_param_state.shape:
-                    ops.assign(var, local_param_state)
+                    # Corrected line
+                    var.assign(local_param_state)
 
     def _update_global_sharded_states(self, optimizer, shard_idx: int):
         """Updates the main sharded_states dictionary after a gradient step."""
@@ -399,14 +394,6 @@ class CoordinatedOptimizer:
         self._variables = variables
         self._initialize_sharded_states()
 
-    def disable_optimizer_state_sharding(self):
-        """Disables sharding and clears any sharded states.
-
-        This reverts the optimizer to using a single, replicated state.
-        """
-        if self.shard_optimizer_states:
-            self.shard_optimizer_states = False
-            self.sharded_states = {}
 
 
 class TensorParallelOptimizer(optimizers.Optimizer):
@@ -573,8 +560,16 @@ class TensorParallelOptimizer(optimizers.Optimizer):
 
         self.base_optimizer.build(variables)
         if variables:
+            iterations = self.base_optimizer.iterations
+            original_iterations_val = None
+            if iterations is not None:
+                original_iterations_val = ops.convert_to_numpy(iterations.value)
+
             zero_grads = [ops.zeros_like(v) for v in variables]
             self.base_optimizer.apply_gradients(zip(zero_grads, variables))
+
+            if iterations is not None and original_iterations_val is not None:
+                iterations.assign(original_iterations_val)
 
         self.coordinated_optimizer.enable_optimizer_state_sharding(variables)
         super().build(variables)
@@ -604,9 +599,6 @@ class TensorParallelOptimizer(optimizers.Optimizer):
     @property
     def iterations(self):
         """
-        Returns the training iteration count, compensating for the initial
-        dummy step in the build method.
+        Returns the training iteration count directly from the base optimizer.
         """
-        if self.base_optimizer.iterations is None:
-            return None
-        return self.base_optimizer.iterations - 1
+        return self.base_optimizer.iterations
