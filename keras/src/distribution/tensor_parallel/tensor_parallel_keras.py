@@ -32,9 +32,8 @@ class TensorParallelKeras(Model):
     def __init__(
         self,
         model,
-        device_count=None,  # <-- RENAMED: world_size -> device_count
+        device_count=None,
         device_ids=None,
-        # --- REFACTOR: Removed 'distributed_backend' from signature ---
         **kwargs,
     ):
         super().__init__(**kwargs)
@@ -42,18 +41,14 @@ class TensorParallelKeras(Model):
         self._original_model = model
 
         if device_count is None:
-            # <-- RENAMED: world_size -> device_count (return value)
             device_count, device_ids = self._auto_detect_parallelism()
         elif device_ids is None:
-            # --- REFACTOR: Removed 'distributed_backend' from call ---
-            # <-- RENAMED: world_size -> device_count (argument)
             device_ids = self._auto_configure_devices(device_count)
 
-        self.device_count = device_count  # <-- RENAMED: self.world_size -> self.device_count
+        self.device_count = device_count
         self.device_ids = device_ids
         self.sharding_strategy = "auto"
-        # --- REFACTOR: Removed 'self.distributed_backend' assignment ---
-
+        
         self.tensor_parallel_config = None
         self.distributed = True
 
@@ -70,20 +65,18 @@ class TensorParallelKeras(Model):
             print(f"🔍 Devices: {[str(d) for d in accel_devices]}")
 
             if len(accel_devices) >= device_count:
-                # <-- RENAMED: world_size -> device_count (print statement)
                 print(
                     f"✅ Using REAL tensor parallelism on {device_count} discovered devices."
                 )
                 device_ids = accel_devices[:device_count]
             else:
-                # <-- RENAMED: world_size -> device_count (print statement)
                 print(
                     f"⚠️  Discovered {len(accel_devices)} devices but device_count={device_count} was requested."
                 )
                 print(
                     f"⚠️  Reducing device_count to {len(accel_devices)} for real implementation."
                 )
-                device_count = len(accel_devices)  # <-- RENAMED: world_size -> device_count
+                device_count = len(accel_devices)
                 device_ids = accel_devices[:device_count]
         else:
             print(
@@ -91,19 +84,15 @@ class TensorParallelKeras(Model):
             )
 
         if not device_ids:
-            # --- REFACTOR: Removed 'distributed_backend' from call ---
-            # <-- RENAMED: world_size -> device_count (argument)
             device_ids = self._auto_configure_devices(device_count)
 
-        # <-- RENAMED: world_size -> device_count
         if len(device_ids) != device_count:
-            # <-- RENAMED: world_size -> device_count (argument)
             device_ids = self._adjust_device_list(device_ids, device_count)
 
         self.devices = device_ids
-        self.device_count = device_count  # <-- RENAMED: self.world_size -> self.device_count
+        self.device_count = device_count
 
-        if self.device_count <= 1:  # <-- RENAMED: self.world_size -> self.device_count
+        if self.device_count <= 1:
             self.model_shards = [model]
             self.distributed = False
             if len(self.devices) == 1:
@@ -145,13 +134,14 @@ class TensorParallelKeras(Model):
             print(f"[{device_id}] ➡️  Starting sharding process for Rank {rank}")
             shard, modified_parameters_names = make_parameter_sharded_model(
                 model,
-                self.tensor_parallel_config,  # Pass config directly
+                self.tensor_parallel_config,
                 rank=rank,
-                device_count=self.device_count,  # <-- RENAMED: world_size -> device_count
+                device_count=self.device_count,
                 device_id=device_id,
             )
             self.model_shards.append(shard)
             self.modified_parameters_names.update(modified_parameters_names)
+            
 
             logger.info(f"   ✅ Created shard {rank} for device {device_id}")
 
@@ -169,14 +159,9 @@ class TensorParallelKeras(Model):
         else:
             pass
 
-        # --- REFACTOR: Removed 'self.distributed_backend_name' assignment ---
-        # --- REFACTOR: Removed incorrect import ---
-        # from keras.src.backend import distributed_backend # <--- This was removed
-        # self.distributed_backend = distributed_backend # <--- This was removed
         logger.info(
             f"Using '{keras.backend.backend()}' backend logic for distribution."
         )
-        # --- END REFACTOR ---
 
         self.built = True
         if self.distributed:
@@ -243,9 +228,7 @@ class TensorParallelKeras(Model):
         from keras.src.distribution import get_best_devices
 
         available_devices = list_devices()
-        # <-- RENAMED: world_size -> device_count
         device_count = len(available_devices)
-        # <-- RENAMED: world_size -> device_count (print statement)
         print(
             f"🔍 Auto-detected device_count: {device_count} from {len(available_devices)} available devices"
         )
@@ -253,26 +236,23 @@ class TensorParallelKeras(Model):
         device_ids = get_best_devices(device_count)
         print(f"🔍 Auto-detected device_ids: {device_ids}")
 
-        return device_count, device_ids  # <-- RENAMED: world_size -> device_count
+        return device_count, device_ids
 
-    def _adjust_device_list(self, device_ids, target_device_count):  # <-- RENAMED: target_world_size -> target_device_count
+    def _adjust_device_list(self, device_ids, target_device_count):
         """Adjust device list to match target device_count intelligently."""
         current_size = len(device_ids)
-        if current_size >= target_device_count:  # <-- RENAMED: target_world_size -> target_device_count
-            return device_ids[:target_device_count]  # <-- RENAMED: target_world_size -> target_device_count
+        if current_size >= target_device_count:
+            return device_ids[:target_device_count]
 
         return list(device_ids) + [
-            f"cpu:{i}" for i in range(current_size, target_device_count)  # <-- RENAMED: target_world_size -> target_device_count
+            f"cpu:{i}" for i in range(current_size, target_device_count)
         ]
 
-    def _auto_configure_devices(self, device_count):  # <-- RENAMED: world_size -> device_count
-        """Auto-configure devices - simplified version.
-        
-        # --- REFACTOR: Removed 'distributed_backend' from signature ---
-        """
+    def _auto_configure_devices(self, device_count):
+        """Auto-configure devices - simplified version."""
         available_devices = list_devices()
         if available_devices:
-            devices = available_devices[:device_count]  # <-- RENAMED: world_size -> device_count
+            devices = available_devices[:device_count]
             logger.info(f"Auto-configured devices: {devices}")
             return devices
         else:
@@ -341,7 +321,6 @@ class TensorParallelKeras(Model):
             if final_layer.use_bias:
                 bias = final_layer.bias
                 final_output = keras.layers.Lambda(
-                    # <-- RENAMED: self.world_size -> self.device_count
                     lambda x: x - bias * (self.device_count - 1)
                 )(summed_output)
             else:
@@ -384,21 +363,15 @@ class TensorParallelKeras(Model):
         Compile the tensor parallel model.
         """
         if len(self.model_shards) > 1 and optimizer is not None:
-            # --- REFACTOR: Removed 'backend_name' logic and passing ---
             self.coordinated_optimizer = TensorParallelOptimizer(
                 optimizer,
-                self.device_count,  # <-- RENAMED: self.world_size -> self.device_count
-                # distributed_backend=backend_name, # Removed
+                self.device_count,
                 tensor_parallel_config=self.tensor_parallel_config,
             )
-            # <-- RENAMED: self.world_size -> self.device_count (print statement)
             logger.info(
                 f"Created coordinated optimizer for {self.device_count} shards"
             )
-            # Register shard models and a variable mapping on the coordinated
-            # optimizer so it can convert a flat grads-and-vars list produced
-            # by the assembled model into a per-shard grads-and-vars list
-            # expected by the CoordinatedOptimizer.
+            
             try:
                 self.coordinated_optimizer._shard_models = self.model_shards
 
@@ -425,7 +398,7 @@ class TensorParallelKeras(Model):
                     var_map[key] = per_shard
 
                 self.coordinated_optimizer._shard_var_map = var_map
-                # Also register on the inner CoordinatedOptimizer instance
+                
                 inner = getattr(
                     self.coordinated_optimizer, "coordinated_optimizer", None
                 )
