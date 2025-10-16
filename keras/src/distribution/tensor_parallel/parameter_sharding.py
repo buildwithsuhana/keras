@@ -4,9 +4,9 @@ from typing import Any, Dict, List, Optional, Set, Tuple
 
 import numpy as np
 
-from keras.src.backend import distributed_backend
+from keras.src.backend.jax.distribution_lib import all_gather, all_reduce
 from keras.src.distribution.tensor_parallel.tensor_layout import LayoutMap
-from keras.src.distribution.tensor_parallel.tensor_layout import LayoutAction
+from keras.src.distribution.tensor_parallel.tensor_layout import Split
 
 logger = logging.getLogger(__name__)
 
@@ -102,7 +102,7 @@ class ParameterShardingStrategy:
         modified_parameters = set()
 
         for pattern, action in config.state_rules.items():
-            if isinstance(action, LayoutAction):
+            if isinstance(action, Split):
                 matching_params = self._find_matching_parameters(model, pattern)
 
                 for param_name, param in matching_params:
@@ -403,15 +403,17 @@ def _define_parameter_sharded_model():
 
         def _apply_communication(self, sharded_output, layer_name, rule_str: str):
             """MODIFIED: Applies communication directly using the distributed backend."""
+            # --- REFACTOR CHANGE: Call functions directly ---
             # Get the backend's collective communication functions
-            comm_ops = distributed_backend.get_communication_ops()
+            # comm_ops = distributed_backend.get_communication_ops() # This line is removed
 
             if "sum" in rule_str or "allreduce" in rule_str:
                 # This is a Row-Parallel forward pass. Sum partial results.
                 logger.debug(
                     f"Applying Row-Parallel Forward (AllReduce) to {layer_name}"
                 )
-                return comm_ops["all_reduce"](
+                # Call all_reduce directly
+                return all_reduce(
                     sharded_output, op="sum", axis_name="model"
                 )
 
@@ -423,7 +425,8 @@ def _define_parameter_sharded_model():
                 logger.debug(
                     f"Applying Column-Parallel Forward (AllGather dim={dim}) to {layer_name}"
                 )
-                return comm_ops["all_gather"](
+                # Call all_gather directly
+                return all_gather(
                     sharded_output, axis=dim, axis_name="model"
                 )
 
@@ -471,7 +474,8 @@ def make_parameter_sharded_model(
 
 #     sharding_strategy = ParameterShardingStrategy(world_size, rank)
 #     for pattern, action in config.state_rules.items():
-#         if isinstance(action, LayoutAction):
+#         # --- REFACTOR CHANGE: Check for Split, not LayoutAction ---
+#         if isinstance(action, Split):
 #             matching_params = sharding_strategy._find_matching_parameters(
 #                 model, pattern
 #             )

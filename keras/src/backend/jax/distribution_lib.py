@@ -11,6 +11,7 @@ from typing import List
 from typing import Optional
 
 import jax
+import jax.lax as lax  # <-- Added import
 import numpy as np
 
 from keras.src.backend.common import global_state
@@ -37,6 +38,18 @@ def list_devices(device_type=None):
     device_type = device_type.lower() if device_type else None
     jax_devices = jax.devices(backend=device_type)
     return [f"{device.platform}:{device.id}" for device in jax_devices]
+
+
+def get_device_count():  # <-- ADDED
+    """Returns the number of local JAX devices.
+
+    This function is based on the reviewer's suggestion to replace
+    `is_multi_device_capable` with a function that returns the actual count.
+
+    Returns:
+        int: The total count of local JAX devices.
+    """
+    return jax.local_device_count()
 
 
 def get_device_info(device_id: str) -> Dict[str, any]:
@@ -355,6 +368,64 @@ def num_processes():
 def process_id():
     """Return the current process ID for the distribution setting."""
     return jax.process_index()
+
+
+# --- ADDED COLLECTIVE OPS ---
+
+
+def all_reduce(x, op="sum", axis_name="model"):  # <-- ADDED
+    """Reduces a tensor across a device mesh axis using a collective.
+
+    This function assumes it is called within a `pjit` context that has a
+    device mesh with the specified `axis_name`. It performs a collective
+    reduction operation (like sum or mean) across all devices mapped to
+    that axis.
+
+    Args:
+        x (jax.Array): The input JAX array (tensor) on the local device.
+        op (str, optional): The reduction operation to perform. Supported
+            values are 'sum' and 'mean'. Defaults to 'sum'.
+        axis_name (str, optional): The name of the mapped axis in the device
+            mesh over which to communicate. Defaults to 'model'.
+
+    Returns:
+        jax.Array: The reduced JAX array, which is identical across all
+        devices participating in the reduction.
+    """
+    if op == "sum":
+        return lax.psum(x, axis_name=axis_name)
+    elif op == "mean":
+        return lax.pmean(x, axis_name=axis_name)
+    else:
+        raise ValueError(
+            f"Unsupported reduction operation: {op}. "
+            "Supported options are 'sum' and 'mean'."
+        )
+
+
+def all_gather(x, axis, axis_name="model"):  # <-- ADDED
+    """Gathers and concatenates tensors from all devices across a mesh axis.
+
+    This function assumes it is called within a `pjit` context. It takes
+    the local shard `x` from each device along the `axis_name` of the mesh
+    and concatenates them along the specified tensor `axis` to form a
+    single, larger tensor that is then replicated on all participating devices.
+
+    Args:
+        x (jax.Array): The input JAX array (tensor) shard on the local device.
+        axis (int): The tensor axis along which to concatenate the gathered
+            shards.
+        axis_name (str, optional): The name of the mesh axis to gather
+            from. Defaults to 'model'.
+
+    Returns:
+        jax.Array: The full, gathered JAX array, which is identical across
+        all devices participating in the gather.
+    """
+    return lax.all_gather(x, axis_name=axis_name, axis=axis, tiled=True)
+
+
+# --- END ADDED COLLECTIVE OPS ---
 
 
 def _to_backend_device(device_name):

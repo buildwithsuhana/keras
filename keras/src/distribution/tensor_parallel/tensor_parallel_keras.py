@@ -17,7 +17,9 @@ from keras.src.distribution.tensor_parallel.autoconfig import (
 from keras.src.distribution.tensor_parallel.parameter_sharding import (
     make_parameter_sharded_model,
 )
-from keras.src.distribution.tensor_parallel.coordinated_optimizer import TensorParallelOptimizer
+from keras.src.distribution.tensor_parallel.coordinated_optimizer import (
+    TensorParallelOptimizer,
+)
 
 from keras.src.distribution import list_devices
 
@@ -32,7 +34,7 @@ class TensorParallelKeras(Model):
         model,
         world_size=None,
         device_ids=None,
-        distributed_backend="auto",
+        # --- REFACTOR: Removed 'distributed_backend' from signature ---
         **kwargs,
     ):
         super().__init__(**kwargs)
@@ -42,55 +44,64 @@ class TensorParallelKeras(Model):
         if world_size is None:
             world_size, device_ids = self._auto_detect_parallelism()
         elif device_ids is None:
-            device_ids = self._auto_configure_devices(
-                world_size, distributed_backend
-            )
+            # --- REFACTOR: Removed 'distributed_backend' from call ---
+            device_ids = self._auto_configure_devices(world_size)
 
         self.world_size = world_size
         self.device_ids = device_ids
         self.sharding_strategy = "auto"
-        self.distributed_backend = distributed_backend
+        # --- REFACTOR: Removed 'self.distributed_backend' assignment ---
 
         self.tensor_parallel_config = None
         self.distributed = True
 
         self.sharded_models = [self._original_model]
-        
+
         accel_devices = list_devices()
         device_ids = list(self.check_device_ids(device_ids))
 
         if accel_devices:
             backend_name = keras.backend.backend()
-            print(f"🔍 Discovered {len(accel_devices)} devices for backend '{backend_name}'")
+            print(
+                f"🔍 Discovered {len(accel_devices)} devices for backend '{backend_name}'"
+            )
             print(f"🔍 Devices: {[str(d) for d in accel_devices]}")
 
             if len(accel_devices) >= world_size:
-                print(f"✅ Using REAL tensor parallelism on {world_size} discovered devices.")
+                print(
+                    f"✅ Using REAL tensor parallelism on {world_size} discovered devices."
+                )
                 device_ids = accel_devices[:world_size]
             else:
-                print(f"⚠️  Discovered {len(accel_devices)} devices but world_size={world_size} was requested.")
-                print(f"⚠️  Reducing world_size to {len(accel_devices)} for real implementation.")
+                print(
+                    f"⚠️  Discovered {len(accel_devices)} devices but world_size={world_size} was requested."
+                )
+                print(
+                    f"⚠️  Reducing world_size to {len(accel_devices)} for real implementation."
+                )
                 world_size = len(accel_devices)
                 device_ids = accel_devices[:world_size]
         else:
-            print(f"⚠️  Could not discover accelerator devices. Falling back to configuration.")
+            print(
+                f"⚠️  Could not discover accelerator devices. Falling back to configuration."
+            )
 
         if not device_ids:
-            device_ids = self._auto_configure_devices(
-                world_size, distributed_backend
-            )
+            # --- REFACTOR: Removed 'distributed_backend' from call ---
+            device_ids = self._auto_configure_devices(world_size)
 
         if len(device_ids) != world_size:
             device_ids = self._adjust_device_list(device_ids, world_size)
 
         self.devices = device_ids
         self.world_size = world_size
-        
+
         if self.world_size <= 1:
             self.model_shards = [model]
             self.distributed = False
             if len(self.devices) == 1:
                 from keras import device
+
                 with device(self.devices[0]):
                     self.model_shards[0] = model
             self.built = True
@@ -105,9 +116,6 @@ class TensorParallelKeras(Model):
             logger.info(
                 "Using automatic config with auto sharding strategy: sharding individual Dense/Conv/Embedding layers"
             )
-        config_with_ops = self.tensor_parallel_config.create_collective_ops(
-            self.devices
-        )
 
         print(
             f"🔧 Creating REAL parameter shards for {model.name} across {len(self.devices)} devices"
@@ -129,7 +137,7 @@ class TensorParallelKeras(Model):
         for rank, device_id in enumerate(self.devices):
             shard, modified_parameters_names = make_parameter_sharded_model(
                 model,
-                config_with_ops,
+                self.tensor_parallel_config,  # Pass config directly
                 rank=rank,
                 world_size=self.world_size,
                 device_id=device_id,
@@ -153,13 +161,14 @@ class TensorParallelKeras(Model):
         else:
             pass
 
-        self.distributed_backend_name = distributed_backend
-        from keras.src.backend import distributed_backend
-
-        self.distributed_backend = distributed_backend
+        # --- REFACTOR: Removed 'self.distributed_backend_name' assignment ---
+        # --- REFACTOR: Removed incorrect import ---
+        # from keras.src.backend import distributed_backend # <--- This was removed
+        # self.distributed_backend = distributed_backend # <--- This was removed
         logger.info(
-            f"Accessed Keras global distributed backend for '{keras.backend.backend()}'."
+            f"Using '{keras.backend.backend()}' backend logic for distribution."
         )
+        # --- END REFACTOR ---
 
         self.built = True
         if self.distributed:
@@ -169,32 +178,56 @@ class TensorParallelKeras(Model):
 
     @property
     def variables(self):
-        unique_vars = {id(var): var for shard in self.model_shards for var in shard.variables}
+        unique_vars = {
+            id(var): var
+            for shard in self.model_shards
+            for var in shard.variables
+        }
         return list(unique_vars.values())
 
     @property
     def trainable_variables(self):
-        unique_vars = {id(var): var for shard in self.model_shards for var in shard.trainable_variables}
+        unique_vars = {
+            id(var): var
+            for shard in self.model_shards
+            for var in shard.trainable_variables
+        }
         return list(unique_vars.values())
 
     @property
     def non_trainable_variables(self):
-        unique_vars = {id(var): var for shard in self.model_shards for var in shard.non_trainable_variables}
+        unique_vars = {
+            id(var): var
+            for shard in self.model_shards
+            for var in shard.non_trainable_variables
+        }
         return list(unique_vars.values())
 
     @property
     def weights(self):
-        unique_vars = {id(var): var for shard in self.model_shards for var in shard.weights}
+        unique_vars = {
+            id(var): var
+            for shard in self.model_shards
+            for var in shard.weights
+        }
         return list(unique_vars.values())
 
     @property
     def trainable_weights(self):
-        unique_vars = {id(var): var for shard in self.model_shards for var in shard.trainable_weights}
+        unique_vars = {
+            id(var): var
+            for shard in self.model_shards
+            for var in shard.trainable_weights
+        }
         return list(unique_vars.values())
 
     @property
     def non_trainable_weights(self):
-        unique_vars = {id(var): var for shard in self.model_shards for var in shard.non_trainable_weights}
+        unique_vars = {
+            id(var): var
+            for shard in self.model_shards
+            for var in shard.non_trainable_weights
+        }
         return list(unique_vars.values())
 
     def _auto_detect_parallelism(self):
@@ -203,7 +236,9 @@ class TensorParallelKeras(Model):
 
         available_devices = list_devices()
         world_size = len(available_devices)
-        print(f"🔍 Auto-detected world_size: {world_size} from {len(available_devices)} available devices")
+        print(
+            f"🔍 Auto-detected world_size: {world_size} from {len(available_devices)} available devices"
+        )
 
         device_ids = get_best_devices(world_size)
         print(f"🔍 Auto-detected device_ids: {device_ids}")
@@ -215,11 +250,16 @@ class TensorParallelKeras(Model):
         current_size = len(device_ids)
         if current_size >= target_world_size:
             return device_ids[:target_world_size]
-        
-        return list(device_ids) + [f"cpu:{i}" for i in range(current_size, target_world_size)]
 
-    def _auto_configure_devices(self, world_size, distributed_backend):
-        """Auto-configure devices - simplified version."""
+        return list(device_ids) + [
+            f"cpu:{i}" for i in range(current_size, target_world_size)
+        ]
+
+    def _auto_configure_devices(self, world_size):
+        """Auto-configure devices - simplified version.
+        
+        # --- REFACTOR: Removed 'distributed_backend' from signature ---
+        """
         available_devices = list_devices()
         if available_devices:
             devices = available_devices[:world_size]
@@ -235,7 +275,7 @@ class TensorParallelKeras(Model):
         """Validate and normalize device IDs for Keras."""
         if device_ids is None:
             device_ids = self._get_all_device_indices()
-        
+
         return tuple(self.canonicalize_device(d) for d in device_ids)
 
     def _get_all_device_indices(self) -> Sequence[str]:
@@ -333,12 +373,11 @@ class TensorParallelKeras(Model):
         Compile the tensor parallel model.
         """
         if len(self.model_shards) > 1 and optimizer is not None:
-            backend_name = getattr(self, "distributed_backend_name", "auto")
-
+            # --- REFACTOR: Removed 'backend_name' logic and passing ---
             self.coordinated_optimizer = TensorParallelOptimizer(
                 optimizer,
                 self.world_size,
-                distributed_backend=backend_name,
+                # distributed_backend=backend_name, # Removed
                 tensor_parallel_config=self.tensor_parallel_config,
             )
             logger.info(
@@ -353,7 +392,9 @@ class TensorParallelKeras(Model):
 
                 var_map = {}
                 assembled = getattr(self, "assembled_model", None)
-                assembled_vars = assembled.variables if assembled is not None else []
+                assembled_vars = (
+                    assembled.variables if assembled is not None else []
+                )
 
                 for a_var in assembled_vars:
                     key = getattr(a_var, "path", None) or a_var.name
@@ -361,7 +402,11 @@ class TensorParallelKeras(Model):
                     per_shard = []
                     for shard in self.model_shards:
                         match = next(
-                            (v for v in shard.variables if v.name.endswith(suffix)),
+                            (
+                                v
+                                for v in shard.variables
+                                if v.name.endswith(suffix)
+                            ),
                             None,
                         )
                         per_shard.append(match)
@@ -369,12 +414,16 @@ class TensorParallelKeras(Model):
 
                 self.coordinated_optimizer._shard_var_map = var_map
                 # Also register on the inner CoordinatedOptimizer instance
-                inner = getattr(self.coordinated_optimizer, "coordinated_optimizer", None)
+                inner = getattr(
+                    self.coordinated_optimizer, "coordinated_optimizer", None
+                )
                 if inner is not None:
                     inner._shard_models = self.model_shards
                     inner._shard_var_map = var_map
             except Exception:
-                logger.exception("Failed to register shard mapping on coordinated optimizer")
+                logger.exception(
+                    "Failed to register shard mapping on coordinated optimizer"
+                )
 
             super().compile(
                 optimizer=self.coordinated_optimizer,
