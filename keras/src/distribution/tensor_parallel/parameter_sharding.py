@@ -4,9 +4,12 @@ from typing import Any, Dict, List, Optional, Set, Tuple
 
 import numpy as np
 
+# Assuming these imports work for the JAX backend
 from keras.src.backend.jax.distribution_lib import all_gather, all_reduce
+# Assuming these custom classes are correct and available
 from keras.src.distribution.tensor_parallel.tensor_layout import LayoutMap
 from keras.src.distribution.tensor_parallel.tensor_layout import Split
+from keras.src import ops
 
 logger = logging.getLogger(__name__)
 
@@ -16,10 +19,17 @@ class ShardedWeight:
     A wrapper for a sharded Keras Variable, providing a consistent interface.
     """
 
-    def __init__(self, tensor_shard, name, trainable=True):
-        import keras
+    def __init__(self, tensor_shard, name, trainable=True, device_id=None):
+        from keras import Variable, device
 
-        self._variable = keras.Variable(
+        # 🌟 FIX: Use the device_id passed to the constructor
+        current_dev_name = device_id if device_id else "UNKNOWN_DEVICE"
+        print(
+            f"   [DEV: {current_dev_name}] 🧬 Creating Sharded Variable "
+            f"'{name}' with shape {tensor_shard.shape}"
+        )
+
+        self._variable = Variable(
             initializer=tensor_shard, trainable=trainable, name=name
         )
         self.regularizer = None
@@ -59,9 +69,7 @@ class ShardedWeight:
 
     def num_elements(self):
         """Returns the total number of elements in the tensor."""
-        import keras
-
-        return keras.ops.size(self._variable)
+        return ops.size(self._variable)
 
     def __repr__(self):
         return (
@@ -77,8 +85,8 @@ class ParameterShardingStrategy:
     communication during forward/backward passes.
     """
 
-    def __init__(self, world_size: int, rank: int):
-        self.world_size = world_size
+    def __init__(self, device_count: int, rank: int):
+        self.device_count = device_count
         self.rank = rank
         self.sharded_weights = {}
         self.original_weights = {}
@@ -252,16 +260,6 @@ class ParameterShardingStrategy:
 
         return matching_params
 
-    # def get_sharded_weight(self, param_name: str) -> Optional[np.ndarray]:
-    #     """Get sharded weight for a parameter."""
-    #     if param_name in self.sharded_weights:
-    #         return self.sharded_weights[param_name].numpy()
-    #     return None
-
-    # def get_weight_info(self, param_name: str) -> Optional[Dict]:
-        # """Get information about a sharded weight."""
-        # return self.weight_mapping.get(param_name)
-
 
 def _define_parameter_sharded_model():
     """
@@ -301,14 +299,11 @@ def _define_parameter_sharded_model():
         def device(self):
             return self._device
 
-        # --- MODIFIED: The custom train_step is removed. ---
-        # The TensorParallelOptimizer is now responsible for handling the
-        # gradient synchronization during the backward pass, which is the
-        # correct place for this logic in the Keras ecosystem.
-
         def _build_and_cache_weights(self):
             """
             Builds the list of trainable/non-trainable weights ONCE and caches it.
+            
+            **FIXED:** Correctly passes `self._device` to the `ShardedWeight` constructor.
             """
             print("   - Building and caching the definitive weights list...")
             logger.debug("--- WEIGHT CACHE BUILDER ---")
@@ -322,7 +317,15 @@ def _define_parameter_sharded_model():
                 param_name,
                 sharded_tensor,
             ) in self.sharding_strategy.sharded_weights.items():
-                weights_list.append(ShardedWeight(sharded_tensor, param_name))
+                # --- START OF FIX ---
+                weights_list.append(
+                    ShardedWeight(
+                        sharded_tensor, 
+                        param_name, 
+                        device_id=self._device  # <-- CORRECT DEVICE PASSING
+                    )
+                )
+                # --- END OF FIX ---
 
             logger.debug(f"Added {len(weights_list)} sharded weights.")
 
@@ -366,6 +369,7 @@ def _define_parameter_sharded_model():
                     continue
                 
                 layer_inputs = []
+                # Use _inbound_nodes to determine the inputs to the current layer
                 for node in layer._inbound_nodes:
                     for symbolic_input_tensor in node.input_tensors:
                         layer_inputs.append(tensor_cache[id(symbolic_input_tensor)])
@@ -375,24 +379,29 @@ def _define_parameter_sharded_model():
 
                 current_tensor = layer(layer_inputs, training=training)
 
+                # Update cache with the layer's output *before* communication
+                # (This ensures subsequent layers get the *uncommunicated* tensor
+                # if the output rule doesn't apply to this rank/layer type)
                 tensor_cache[id(layer.output)] = current_tensor
                 
+                # Check for output rule to apply collective communication
                 layer_path = layer.path
                 output_rule = None
                 for pattern, rule in self.config.output_rules.items():
+                    # Simplified check: assuming rule.get(0) provides the string action
                     if re.search(pattern, layer_path):
                         output_rule = rule.get(0)
                         break
+                
                 if output_rule:
                     current_tensor = self._apply_communication(
                         current_tensor, layer.name, output_rule
                     )
-                    # IMPORTANT: Update the cache with the modified tensor
+                    # IMPORTANT: Update the cache with the modified (communicated) tensor
+                    # for the next layer to use
                     tensor_cache[id(layer.output)] = current_tensor
 
-            # --- CHANGE 2: RETURN THE FINAL MODEL OUTPUT ---
-            # At the end of the loop, you must look up the original model's
-            # final output tensor(s) in the cache and return the result.
+            # Return the final model output(s)
             final_outputs = []
             for symbolic_output in self.original_model.outputs:
                 final_outputs.append(tensor_cache[id(symbolic_output)])
@@ -402,10 +411,7 @@ def _define_parameter_sharded_model():
             return final_outputs
 
         def _apply_communication(self, sharded_output, layer_name, rule_str: str):
-            """MODIFIED: Applies communication directly using the distributed backend."""
-            # --- REFACTOR CHANGE: Call functions directly ---
-            # Get the backend's collective communication functions
-            # comm_ops = distributed_backend.get_communication_ops() # This line is removed
+            """Applies communication directly using the distributed backend."""
 
             if "sum" in rule_str or "allreduce" in rule_str:
                 # This is a Row-Parallel forward pass. Sum partial results.
@@ -419,6 +425,7 @@ def _define_parameter_sharded_model():
 
             elif "gather" in rule_str:
                 try:
+                    # Extract dimension from the rule string, e.g., "gather dim -1"
                     dim = int(rule_str.split(" ")[-1])
                 except (ValueError, IndexError):
                     dim = -1
@@ -440,6 +447,8 @@ def _define_parameter_sharded_model():
         @classmethod
         def from_config(cls, config, custom_objects=None):
             """Create model from config."""
+            # NOTE: This implementation is incomplete for distributed serialization
+            # but is preserved from the original code.
             return cls(**config)
 
     return ParameterShardedModel
@@ -449,79 +458,16 @@ def make_parameter_sharded_model(
     module: "Model",
     config: LayoutMap,
     rank: int,
-    world_size: int,
+    device_count: int,
     device_id: Any,
 ) -> Tuple["Model", Set[str]]:
     """
     Create a parameter-sharded version of a Keras model.
     """
-    sharding_strategy = ParameterShardingStrategy(world_size, rank)
+    sharding_strategy = ParameterShardingStrategy(device_count, rank)
 
     sharded_model, modified_parameters = sharding_strategy.shard_model_parameters(
         module, config, device_id
     )
 
     return sharded_model, modified_parameters
-
-
-# def apply_parameter_sharding_to_existing_model(
-#     model: "Model", config: LayoutMap, rank: int, world_size: int
-# ) -> "Model":
-#     """
-#     Apply parameter sharding to an existing model without creating a new one.
-#     """
-#     print(f"🔧 Applying parameter sharding to existing model: {model.name}")
-
-#     sharding_strategy = ParameterShardingStrategy(world_size, rank)
-#     for pattern, action in config.state_rules.items():
-#         # --- REFACTOR CHANGE: Check for Split, not LayoutAction ---
-#         if isinstance(action, Split):
-#             matching_params = sharding_strategy._find_matching_parameters(
-#                 model, pattern
-#             )
-
-#             for param_name, param in matching_params:
-#                 try:
-#                     param_id = id(param.experimental_ref())
-#                 except AttributeError:
-#                     param_id = id(param)
-
-#                 if param_id in sharding_strategy.sharded_weights_by_id:
-#                     sharding_strategy.sharded_weights[param_name] = (
-#                         sharding_strategy.sharded_weights_by_id[param_id]
-#                     )
-#                     existing_param_name = next(
-#                         k
-#                         for k, v in sharding_strategy.sharded_weights.items()
-#                         if v
-#                         is sharding_strategy.sharded_weights_by_id[param_id]
-#                     )
-#                     sharding_strategy.weight_mapping[param_name] = (
-#                         sharding_strategy.weight_mapping[existing_param_name]
-#                     )
-#                     print(
-#                         f"   🔗 Tied {param_name} to existing shard from {existing_param_name}"
-#                     )
-#                     continue
-
-#                 sharded_param = action(param, rank)
-
-#                 sharding_strategy.sharded_weights[param_name] = sharded_param
-#                 sharding_strategy.sharded_weights_by_id[param_id] = (
-#                     sharded_param
-#                 )
-
-#                 sharding_strategy.weight_mapping[param_name] = {
-#                     "original_shape": param.shape,
-#                     "sharded_shape": sharded_param.shape,
-#                     "action": action,
-#                 }
-
-#                 print(
-#                     f"   ✅ Sharded {param_name}: {param.shape} -> {sharded_param.shape}"
-#                 )
-
-#     model._tensor_parallel_sharding = sharding_strategy
-
-#     print("🎯 Parameter sharding applied to existing model")
-#     return model

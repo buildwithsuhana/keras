@@ -3,7 +3,6 @@ from typing import Any
 
 import numpy as np
 
-import keras
 from keras.src import ops
 from keras.src import optimizers
 
@@ -20,10 +19,10 @@ class CoordinatedOptimizer:
     Args:
         base_optimizer: The Keras optimizer instance
             (e.g., `keras.optimizers.Adam`) whose state will be managed.
-        world_size: The total number of devices/processes in the distributed
+        device_count: The total number of devices/processes in the distributed
             setup.
         shard_optimizer_states: If `True`, the optimizer's state variables
-            (e.g., momentum, velocity) will be partitioned across `world_size`
+            (e.g., momentum, velocity) will be partitioned across `device_count`
             devices. Defaults to `True`.
         tensor_parallel_config: An optional configuration object that defines
             rules for tensor parallelism, such as which gradients to
@@ -33,13 +32,13 @@ class CoordinatedOptimizer:
     def __init__(
         self,
         base_optimizer: optimizers.Optimizer,
-        world_size: int,
+        device_count: int,
         # --- REFACTOR: Removed unused 'rank' argument ---
         shard_optimizer_states: bool = True,
         tensor_parallel_config=None,
     ):
         self.base_optimizer = base_optimizer
-        self.world_size = world_size
+        self.device_count = device_count
         self.shard_optimizer_states = shard_optimizer_states
         self.tensor_parallel_config = tensor_parallel_config
         self.sharded_states = {}
@@ -131,11 +130,11 @@ class CoordinatedOptimizer:
         state_array = ops.convert_to_numpy(state_variable)
         if (
             state_array.ndim > dim
-            and state_array.shape[dim] >= self.world_size
+            and state_array.shape[dim] >= self.device_count
         ):
-            return np.array_split(state_array, self.world_size, axis=dim)
+            return np.array_split(state_array, self.device_count, axis=dim)
         else:
-            return [np.copy(state_array) for _ in range(self.world_size)]
+            return [np.copy(state_array) for _ in range(self.device_count)]
 
     def apply_gradients(
         self, gradients_and_vars: list[list[tuple]], shard_models: list
@@ -155,9 +154,9 @@ class CoordinatedOptimizer:
             ValueError: If the number of gradient sets does not match the
                 world size.
         """
-        if len(gradients_and_vars) != self.world_size:
+        if len(gradients_and_vars) != self.device_count:
             raise ValueError(
-                f"Expected {self.world_size} sets of gradients, "
+                f"Expected {self.device_count} sets of gradients, "
                 f"but received {len(gradients_and_vars)}."
             )
 
@@ -215,7 +214,7 @@ class CoordinatedOptimizer:
         self, synchronized_gradients: list[list[tuple]], shard_models: list
     ):
         """Applies gradients to each shard using its local optimizer state."""
-        for shard_idx in range(self.world_size):
+        for shard_idx in range(self.device_count):
             local_states = self._get_local_optimizer_states(shard_idx)
             # This assumes the base optimizer is attached to each shard model
             shard_optimizer = shard_models[shard_idx].optimizer.base_optimizer
@@ -340,7 +339,7 @@ class CoordinatedOptimizer:
                 if grads_to_reduce:
                     # _allreduce_gradients will return a list of identical grads
                     synced_grad = self._allreduce_gradients(grads_to_reduce)[0]
-                    for shard_idx in range(self.world_size):
+                    for shard_idx in range(self.device_count):
                         # Update the gradient for each shard
                         if gradients_and_vars[shard_idx][i][0] is not None:
                             gradients_and_vars[shard_idx][i] = (
@@ -377,10 +376,10 @@ class CoordinatedOptimizer:
                 numpy_grad, op="mean", axis_name="model"
             )
             synced_tensor = ops.convert_to_tensor(synced_numpy)
-            return [synced_tensor for _ in range(self.world_size)]
+            return [synced_tensor for _ in range(self.device_count)]
         # --- END REFACTOR ---
 
-        stacked_grads = keras.ops.stack(
+        stacked_grads = ops.stack(
             [ops.convert_to_tensor(g) for g in gradients], axis=0
         )
         mean_grad = ops.mean(stacked_grads, axis=0)
@@ -413,7 +412,7 @@ class TensorParallelOptimizer(optimizers.Optimizer):
     Args:
         base_optimizer: A Keras optimizer instance or a string identifier
             (e.g., 'adam', 'sgd').
-        world_size: The total number of devices/processes in the distributed
+        device_count: The total number of devices/processes in the distributed
             setup.
         tensor_parallel_config: An optional configuration object that defines
             rules for tensor parallelism. Defaults to `None`.
@@ -423,7 +422,7 @@ class TensorParallelOptimizer(optimizers.Optimizer):
     def __init__(
         self,
         base_optimizer: optimizers.Optimizer,
-        world_size: int,
+        device_count: int,
         # --- REFACTOR: Removed 'distributed_backend' ---
         tensor_parallel_config=None,
     ):
@@ -444,11 +443,11 @@ class TensorParallelOptimizer(optimizers.Optimizer):
         )
 
         self.base_optimizer = base_optimizer_instance
-        self.world_size = world_size
+        self.device_count = device_count
         # --- REFACTOR: Removed 'self.distributed_backend' ---
         self.coordinated_optimizer = CoordinatedOptimizer(
             self.base_optimizer,
-            world_size,
+            device_count,
             # distributed_backend is no longer passed
             tensor_parallel_config=tensor_parallel_config,
         )
@@ -499,7 +498,7 @@ class TensorParallelOptimizer(optimizers.Optimizer):
                 "base_optimizer": saving.serialize_keras_object(
                     self.base_optimizer
                 ),
-                "world_size": self.world_size,
+                "device_count": self.device_count,
                 # --- REFACTOR: Removed 'distributed_backend' from config ---
             }
         )
@@ -531,7 +530,7 @@ class TensorParallelOptimizer(optimizers.Optimizer):
 
         # --- REFACTOR: Removed 'distributed_backend' from config loading ---
         init_kwargs = {
-            "world_size": config.get("world_size"),
+            "device_count": config.get("device_count"),
             "tensor_parallel_config": config.get("tensor_parallel_config"),
         }
 

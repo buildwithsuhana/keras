@@ -226,7 +226,7 @@ def run_model_verification(preset_name, model_class):
 
     tp_model = TensorParallelKeras(
         model=tp_model_template,
-        world_size=TARGET_WORLD_SIZE,
+        device_count=TARGET_WORLD_SIZE,
         device_ids=TARGET_DEVICES,
     )
 

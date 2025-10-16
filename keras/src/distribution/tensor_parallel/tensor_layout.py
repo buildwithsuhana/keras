@@ -10,18 +10,18 @@ class Split:
     number of workers by distributing the remainder elements one by one to the
     first few workers.
     """
-    def __init__(self, world_size, dim, sharding_type="auto"):
+    def __init__(self, device_count, dim, sharding_type="auto"):
         """Initializes the Split action.
 
         Args:
-            world_size: The total number of workers/shards.
+            device_count: The total number of workers/shards.
             dim: The dimension along which to split the tensor. If -1, the
                 last dimension is used.
             sharding_type: If `dim` is -1, this can be 'row' (dim=0) or
                 'column' (dim=1) to infer the split axis for 2D tensors.
                 Defaults to "auto".
         """
-        self.world_size = world_size
+        self.device_count = device_count
         self.dim = dim
         self.sharding_type = sharding_type
 
@@ -50,8 +50,8 @@ class Split:
             dim = self.dim
 
         total_size = tensor.shape[dim]
-        split_size = total_size // self.world_size
-        remainder = total_size % self.world_size
+        split_size = total_size // self.device_count
+        remainder = total_size % self.device_count
 
         start_idx = rank * split_size + min(rank, remainder)
         end_idx = start_idx + split_size + (1 if rank < remainder else 0)

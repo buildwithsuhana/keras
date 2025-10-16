@@ -1,31 +1,27 @@
 from keras.src.distribution.tensor_parallel.tensor_layout import LayoutMap
 from keras.src.distribution.tensor_parallel.tensor_layout import Split
+from keras.src import layers
 
-
-def analyze_dense_layer_directly(layer, module, prefix):
+def analyze_dense_layer(layer, module, prefix):
     """Analyzes a Keras Dense layer to classify its sharding strategy.
 
     This function inspects the input and output dimensions of a Dense layer
     to determine if it functions as an expansion layer ("up-projection"), a
-    contraction layer ("down-projection"), or neither ("generic_dense"). This
+    contraction layer ("down-projection"), or neither ("dense"). This
     classification is a heuristic commonly used to apply tensor parallelism
     in Transformer-based models, such as in an MLP block where an up-projection
     is followed by a down-projection.
 
     Args:
         layer: The Keras `layers.Dense` instance to analyze.
-        module: The parent module containing the layer (currently unused).
-        prefix (str): The name prefix for the layer in the model hierarchy
-            (currently unused).
 
     Returns:
         str: A string classifying the layer as 'up_projection',
-        'down_projection', or 'generic_dense'.
+        'down_projection', or 'dense'.
     """
-    from keras.src import layers
 
     if not isinstance(layer, layers.Dense):
-        return 'generic_dense'
+        return 'dense'
 
     input_dim = None
     output_dim = None
@@ -40,15 +36,15 @@ def analyze_dense_layer_directly(layer, module, prefix):
         if hasattr(layer, 'units'):
             output_dim = layer.units
         else:
-            return 'generic_dense'
+            return 'dense'
 
         if hasattr(layer, 'input_shape') and layer.input_shape and len(layer.input_shape) > 1:
             input_dim = layer.input_shape[-1]
         else:
-            return 'generic_dense'
+            return 'dense'
 
     if not input_dim or not output_dim:
-        return 'generic_dense'
+        return 'dense'
 
     expansion_threshold = 1.5
     is_expansion = output_dim > input_dim * expansion_threshold
@@ -59,14 +55,14 @@ def analyze_dense_layer_directly(layer, module, prefix):
     elif is_contraction:
         return 'down_projection'
     else:
-        return 'generic_dense'
+        return 'dense'
 
 
 def _find_and_shard_layers(
     current_layer,
     prefix,
     module,
-    world_size,
+    device_count,
     state_rules,
     output_rules,
     processed_layers,
@@ -91,7 +87,7 @@ def _find_and_shard_layers(
         current_layer: The Keras layer currently being processed.
         prefix (str): The hierarchical name prefix for the `current_layer`.
         module: The top-level Keras model or layer being configured.
-        world_size (int): The total number of devices for sharding.
+        device_count (int): The total number of devices for sharding.
         state_rules (Dict[str, Any]): A dictionary to be populated with rules for
             sharding layer weights (state). Keys are regex patterns matching
             weight names, values are `SplitKeras` actions.
@@ -101,7 +97,6 @@ def _find_and_shard_layers(
         processed_layers (Set[int]): A set of `id()`s of layers that have
             already been processed to prevent cycles and redundant work.
     """
-    from keras.src import layers
 
     if id(current_layer) in processed_layers:
         return
@@ -111,35 +106,35 @@ def _find_and_shard_layers(
     full_name = f"{prefix}.{name}" if prefix else name
 
     if isinstance(current_layer, layers.Dense):
-        mlp_type = analyze_dense_layer_directly(current_layer, module, full_name)
+        mlp_type = analyze_dense_layer(current_layer, module, full_name)
 
         if mlp_type == 'up_projection':
-            state_rules[f"^{full_name}.kernel$"] = Split(world_size, 1, "column")
+            state_rules[f"^{full_name}.kernel$"] = Split(device_count, 1, "column")
             if current_layer.use_bias:
-                state_rules[f"^{full_name}.bias$"] = Split(world_size, 0, "column")
+                state_rules[f"^{full_name}.bias$"] = Split(device_count, 0, "column")
             output_rules[f"^{full_name}$"] = {0: "gather"}
 
         elif mlp_type == 'down_projection':
-            state_rules[f"^{full_name}.kernel$"] = Split(world_size, 0, "row")
+            state_rules[f"^{full_name}.kernel$"] = Split(device_count, 0, "row")
             output_rules[f"^{full_name}$"] = {0: "allreduce"}
 
         else:
-            state_rules[f"^{full_name}.kernel$"] = Split(world_size, 1, "column")
+            state_rules[f"^{full_name}.kernel$"] = Split(device_count, 1, "column")
             if current_layer.use_bias:
-                state_rules[f"^{full_name}.bias$"] = Split(world_size, 0, "column")
+                state_rules[f"^{full_name}.bias$"] = Split(device_count, 0, "column")
             output_rules[f"^{full_name}$"] = {0: "gather -1"}
         return
 
     elif isinstance(current_layer, layers.EinsumDense):
         if "attention_output" in full_name:
-            state_rules[f"^{full_name}.kernel$"] = Split(world_size, 0, "row")
+            state_rules[f"^{full_name}.kernel$"] = Split(device_count, 0, "row")
             if hasattr(current_layer, 'bias') and current_layer.bias is not None:
                 pass
             output_rules[f"^{full_name}$"] = {0: "allreduce"}
         else:
-            state_rules[f"^{full_name}.kernel$"] = Split(world_size, 1, "column")
+            state_rules[f"^{full_name}.kernel$"] = Split(device_count, 1, "column")
             if hasattr(current_layer, 'bias') and current_layer.bias is not None:
-                state_rules[f"^{full_name}.bias$"] = Split(world_size, 0, "column")
+                state_rules[f"^{full_name}.bias$"] = Split(device_count, 0, "column")
             output_rules[f"^{full_name}$"] = {0: "gather -1"}
         return
 
@@ -154,7 +149,7 @@ def _find_and_shard_layers(
                 weight_name = 'position_embeddings'
 
             if weight_name:
-                state_rules[f"^{full_name}\\..*{weight_name}$"] = Split(world_size, 1, "column")
+                state_rules[f"^{full_name}\\..*{weight_name}$"] = Split(device_count, 1, "column")
                 output_rules[f"^{full_name}$"] = {0: "no_comm"}
             return
 
@@ -164,7 +159,7 @@ def _find_and_shard_layers(
     if hasattr(current_layer, 'layers') and current_layer.layers:
         for sub_layer in current_layer.layers:
             _find_and_shard_layers(
-                sub_layer, full_name, module, world_size,
+                sub_layer, full_name, module, device_count,
                 state_rules, output_rules, processed_layers
             )
 
@@ -176,14 +171,14 @@ def _find_and_shard_layers(
 
             if isinstance(attr, layers.Layer) and attr is not current_layer:
                 _find_and_shard_layers(
-                    attr, full_name, module, world_size,
+                    attr, full_name, module, device_count,
                     state_rules, output_rules, processed_layers
                 )
             elif isinstance(attr, (list, tuple)):
                 for item in attr:
                     if isinstance(item, layers.Layer):
                         _find_and_shard_layers(
-                            item, full_name, module, world_size,
+                            item, full_name, module, device_count,
                             state_rules, output_rules, processed_layers
                         )
 
@@ -213,7 +208,7 @@ def get_default_config_keras(module, device_ids):
         rules for model weights (`state_rules`) and layer outputs
         (`output_rules`).
     """
-    world_size = len(device_ids)
+    device_count = len(device_ids)
     state_rules = {}
     output_rules = {}
     processed_layers = set()
@@ -222,7 +217,7 @@ def get_default_config_keras(module, device_ids):
         current_layer=module,
         prefix="",
         module=module,
-        world_size=world_size,
+        device_count=device_count,
         state_rules=state_rules,
         output_rules=output_rules,
         processed_layers=processed_layers
