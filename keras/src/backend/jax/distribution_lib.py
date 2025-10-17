@@ -52,29 +52,29 @@ def get_device_count():  # <-- ADDED
     return jax.local_device_count()
 
 
-def get_device_info(device_id: str) -> Dict[str, any]:
-    """
-    Get detailed information about a specific device.
+# def get_device_info(device_id: str) -> Dict[str, any]:
+#     """
+#     Get detailed information about a specific device.
 
-    Args:
-        device_id: Device identifier (e.g., 'gpu:0', 'tpu:0', 'cpu:0')
+#     Args:
+#         device_id: Device identifier (e.g., 'gpu:0', 'tpu:0', 'cpu:0')
 
-    Returns:
-        Dictionary containing device information
-    """
-    device_info = {
-        "id": device_id,
-        "type": None,
-        "index": None,
-        "memory": None,
-        "capabilities": None,
-    }
+#     Returns:
+#         Dictionary containing device information
+#     """
+#     device_info = {
+#         "id": device_id,
+#         "type": None,
+#         "index": None,
+#         "memory": None,
+#         "capabilities": None,
+#     }
 
-    device_type, device_index = device_id.split(":")
-    device_info["type"] = device_type.upper()
-    device_info["index"] = int(device_index)
+#     device_type, device_index = device_id.split(":")
+#     device_info["type"] = device_type.upper()
+#     device_info["index"] = int(device_index)
 
-    return device_info
+#     return device_info
 
 
 def get_best_devices(count: int = 1) -> List[str]:
@@ -101,102 +101,102 @@ def get_best_devices(count: int = 1) -> List[str]:
     return all_devices[:count]
 
 
-def get_device_backend(device_type: str) -> str:
-    """
-    Get the recommended backend for a device type.
+# def get_device_backend(device_type: str) -> str:
+#     """
+#     Get the recommended backend for a device type.
 
-    Args:
-        device_type: Device type ('tpu', 'gpu', 'cpu')
+#     Args:
+#         device_type: Device type ('tpu', 'gpu', 'cpu')
 
-    Returns:
-        Recommended backend name
-    """
-    backend_mapping = {"tpu": "jax", "gpu": "jax", "cpu": "jax"}
+#     Returns:
+#         Recommended backend name
+#     """
+#     backend_mapping = {"tpu": "jax", "gpu": "jax", "cpu": "jax"}
 
-    return backend_mapping.get(device_type.lower(), "jax")
-
-
-def validate_device_placement(device_id: str) -> bool:
-    """
-    Validate if a device can be used for tensor operations.
-
-    Args:
-        device_id: Device identifier
-
-    Returns:
-        True if device is valid and available
-    """
-    all_devices = list_devices()
-    return device_id in all_devices
+#     return backend_mapping.get(device_type.lower(), "jax")
 
 
-def get_device_memory_info(device_id: str) -> Optional[Dict[str, any]]:
-    """
-    Get memory information for a device (if available).
+# def validate_device_placement(device_id: str) -> bool:
+#     """
+#     Validate if a device can be used for tensor operations.
 
-    Args:
-        device_id: Device identifier
+#     Args:
+#         device_id: Device identifier
 
-    Returns:
-        Memory information dictionary or None if not available
-    """
-    if device_id.startswith("gpu:"):
-        return {
-            "type": "GPU",
-            "index": int(device_id.split(":")[1]),
-            "memory": "Available",
-        }
-    elif device_id.startswith("tpu:"):
-        return {
-            "type": "TPU",
-            "index": int(device_id.split(":")[1]),
-            "memory": "TPU Memory",
-        }
-    elif device_id.startswith("cpu:"):
-        return {
-            "type": "CPU",
-            "index": int(device_id.split(":")[1]),
-            "memory": "System RAM",
-        }
-
-    return None
+#     Returns:
+#         True if device is valid and available
+#     """
+#     all_devices = list_devices()
+#     return device_id in all_devices
 
 
-def auto_configure_tensor_parallel(
-    world_size: int = None, backend: str = None
-) -> Dict[str, any]:
-    """
-    Automatically configure tensor parallelism with the best available devices.
+# def get_device_memory_info(device_id: str) -> Optional[Dict[str, any]]:
+#     """
+#     Get memory information for a device (if available).
 
-    Args:
-        world_size: Number of devices to use (if None, uses all available)
-        backend: Backend to use (if None, will be set to 'jax')
+#     Args:
+#         device_id: Device identifier
 
-    Returns:
-        Configuration dictionary with devices, backend, and other settings
-    """
-    all_devices = list_devices()
+#     Returns:
+#         Memory information dictionary or None if not available
+#     """
+#     if device_id.startswith("gpu:"):
+#         return {
+#             "type": "GPU",
+#             "index": int(device_id.split(":")[1]),
+#             "memory": "Available",
+#         }
+#     elif device_id.startswith("tpu:"):
+#         return {
+#             "type": "TPU",
+#             "index": int(device_id.split(":")[1]),
+#             "memory": "TPU Memory",
+#         }
+#     elif device_id.startswith("cpu:"):
+#         return {
+#             "type": "CPU",
+#             "index": int(device_id.split(":")[1]),
+#             "memory": "System RAM",
+#         }
 
-    if not all_devices:
-        raise RuntimeError("No devices available for tensor parallelism")
+#     return None
 
-    if world_size is None:
-        world_size = len(all_devices)
-    else:
-        world_size = min(world_size, len(all_devices))
 
-    selected_devices = all_devices[:world_size]
+# def auto_configure_tensor_parallel(
+#     world_size: int = None, backend: str = None
+# ) -> Dict[str, any]:
+#     """
+#     Automatically configure tensor parallelism with the best available devices.
 
-    recommended_backend = "jax"
+#     Args:
+#         world_size: Number of devices to use (if None, uses all available)
+#         backend: Backend to use (if None, will be set to 'jax')
 
-    config = {
-        "devices": selected_devices,
-        "world_size": world_size,
-        "backend": recommended_backend,
-    }
+#     Returns:
+#         Configuration dictionary with devices, backend, and other settings
+#     """
+#     all_devices = list_devices()
 
-    logger.info(f"Auto-configured tensor parallelism: {config}")
-    return config
+#     if not all_devices:
+#         raise RuntimeError("No devices available for tensor parallelism")
+
+#     if world_size is None:
+#         world_size = len(all_devices)
+#     else:
+#         world_size = min(world_size, len(all_devices))
+
+#     selected_devices = all_devices[:world_size]
+
+#     recommended_backend = "jax"
+
+#     config = {
+#         "devices": selected_devices,
+#         "world_size": world_size,
+#         "backend": recommended_backend,
+#     }
+
+#     logger.info(f"Auto-configured tensor parallelism: {config}")
+#     return config
 
 
 def distribute_variable(value, layout):
