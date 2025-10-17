@@ -586,7 +586,7 @@ class AutoTPDistributionTest(testing.TestCase):
             keras.src.distribution.tensor_parallel.tensor_parallel_keras.TensorParallelKeras,
         )
         # Verify the world size was correctly passed to the internal model
-        self.assertEqual(distribution.model.world_size, 2)
+        self.assertEqual(distribution.model.device_count, 2)
 
     @mock.patch.object(
         distribution_lib,
@@ -603,7 +603,7 @@ class AutoTPDistributionTest(testing.TestCase):
         self.assertEqual(device_mesh.shape, (1, 2))
         self.assertEqual(device_mesh.axis_names, ("data", "model"))
         self.assertEqual(distribution.batch_dim_name, "data")
-        self.assertEqual(distribution.model.world_size, 2)
+        self.assertEqual(distribution.model.device_count, 2)
 
     def test_init_raises_error_on_missing_data_axis(self):
         """Ensures an error is raised if the DeviceMesh lacks a 'data' axis."""

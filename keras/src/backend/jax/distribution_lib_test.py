@@ -437,6 +437,88 @@ class JaxDistributionLibTest(testing.TestCase):
         for shard in result.addressable_shards:
             self.assertEqual(shard.data.shape, (3, 4))
 
+    # Insert these three methods into your existing 'JaxDistributionLibTest' class:
+
+    def test_all_reduce_sum(self):
+        # We use pmap over all available CPU devices to simulate multiple workers.
+        num_devices = jax.local_device_count("cpu")
+        local_value = 10.0
+        
+        # Create an array of local values, one for each device
+        local_inputs = jax.numpy.array([local_value] * num_devices)
+
+        # The pmap function runs the collective op on each device,
+        # using the 'all' axis name for the reduction.
+        @functools.partial(jax.pmap, axis_name="all", devices=jax.devices("cpu"))
+        def reduce_sum_fn(x):
+            return backend_dlib.all_reduce(x, op="sum", axis_name="all")
+
+        # The result is an array where each element is the global sum.
+        result = reduce_sum_fn(local_inputs)
+        
+        # Expected result: local_value * num_devices
+        expected_sum = local_value * num_devices
+        
+        # All resulting elements must equal the expected sum
+        self.assertTrue(np.allclose(result, expected_sum))
+        self.assertEqual(result.shape, (num_devices,))
+    
+    def test_all_reduce_mean(self):
+        # We use pmap over all available CPU devices to simulate multiple workers.
+        num_devices = jax.local_device_count("cpu")
+        local_value = 10.0
+        
+        local_inputs = jax.numpy.array([local_value] * num_devices)
+
+        # The pmap function runs the collective op on each device,
+        # using the 'all' axis name for the reduction.
+        @functools.partial(jax.pmap, axis_name="all", devices=jax.devices("cpu"))
+        def reduce_mean_fn(x):
+            return backend_dlib.all_reduce(x, op="mean", axis_name="all")
+
+        # The result is an array where each element is the global mean.
+        result = reduce_mean_fn(local_inputs)
+        
+        # Expected result: local_value (10.0) since all inputs are 10.0
+        expected_mean = local_value
+        
+        # All resulting elements must equal the expected mean
+        self.assertTrue(np.allclose(result, expected_mean))
+        self.assertEqual(result.shape, (num_devices,))
+
+    def test_all_gather(self):
+        # We use pmap over all available CPU devices to simulate multiple workers.
+        num_devices = jax.local_device_count("cpu")
+        
+        # Each device has a local array of shape (5,).
+        local_data = np.arange(5)
+        
+        # Create a sharded array where each device has a unique local_data
+        local_inputs = jax.numpy.stack(
+            [local_data + (i * 5) for i in range(num_devices)]
+        )
+
+        @functools.partial(jax.pmap, axis_name="all", devices=jax.devices("cpu"))
+        def gather_fn(x):
+            # Gather along the 'all' mesh axis and concatenate along the 0-th tensor axis.
+            return backend_dlib.all_gather(x, axis=0, axis_name="all")
+
+        # The input to pmap is the 'local_inputs' array. 
+        result_array_on_devices = gather_fn(local_inputs)
+        
+        # Expected shape: (num_devices, num_devices * 5)
+        expected_shape = (num_devices, num_devices * 5)
+        self.assertEqual(result_array_on_devices.shape, expected_shape)
+
+        # Expected value: a single array containing all the original data, concatenated.
+        expected_gathered_data = np.arange(num_devices * 5)
+        
+        # The gathered array on *every* device should be identical to the expected full array.
+        for i in range(num_devices):
+            self.assertTrue(
+                np.allclose(result_array_on_devices[i], expected_gathered_data)
+            )
+
 
 class ShardingCaptureLayer(layers.Layer):
     def __init__(self, **kwargs):

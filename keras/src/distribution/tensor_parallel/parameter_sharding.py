@@ -5,7 +5,7 @@ from typing import Any, Dict, List, Optional, Set, Tuple
 import numpy as np
 
 # Assuming these imports work for the JAX backend
-from keras.src.backend.jax.distribution_lib import all_gather, all_reduce
+from keras.src.backend import distribution_lib
 # Assuming these custom classes are correct and available
 from keras.src.distribution.tensor_parallel.tensor_layout import LayoutMap
 from keras.src.distribution.tensor_parallel.tensor_layout import Split
@@ -419,7 +419,7 @@ def _define_parameter_sharded_model():
                     f"Applying Row-Parallel Forward (AllReduce) to {layer_name}"
                 )
                 # Call all_reduce directly
-                return all_reduce(
+                return distribution_lib.all_reduce(
                     sharded_output, op="sum", axis_name="model"
                 )
 
@@ -433,7 +433,7 @@ def _define_parameter_sharded_model():
                     f"Applying Column-Parallel Forward (AllGather dim={dim}) to {layer_name}"
                 )
                 # Call all_gather directly
-                return all_gather(
+                return distribution_lib.all_gather(
                     sharded_output, axis=dim, axis_name="model"
                 )
 

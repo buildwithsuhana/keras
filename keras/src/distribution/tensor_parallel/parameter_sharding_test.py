@@ -1,5 +1,5 @@
-
 import os
+# The environment variable should be set before jax is imported via keras backend
 os.environ["XLA_FLAGS"] = "--xla_force_host_platform_device_count=2"
 import re
 
@@ -20,13 +20,13 @@ from keras.src.distribution.tensor_parallel.tensor_layout import Split
 from keras.src.testing import TestCase
 
 
-
 def _create_simple_mlp():
     inputs = keras.Input(shape=(16,), name="input")
     x = keras.layers.Dense(32, use_bias=True, name="up_proj")(inputs)
     x = keras.layers.Activation("relu")(x)
     outputs = keras.layers.Dense(8, use_bias=False, name="down_proj")(x)
     return keras.Model(inputs=inputs, outputs=outputs, name="simple_mlp")
+
 
 @pytest.mark.skipif(
     backend.backend() != "jax",
@@ -39,13 +39,14 @@ class ParameterShardingTest(TestCase):
 
         logging.getLogger().setLevel(logging.ERROR)
 
-        self.world_size = 2
+        # RENAMED: world_size -> device_count
+        self.device_count = 2
         all_devices = distribution.list_devices()
-        self.devices = all_devices[: self.world_size]
-        if len(self.devices) < self.world_size:
+        self.devices = all_devices[: self.device_count]
+        if len(self.devices) < self.device_count:
             self.skipTest(
                 f"""Not enough devices to run TP test. 
-                Found {len(self.devices)}, need {self.world_size}"""
+                Found {len(self.devices)}, need {self.device_count}"""
             )
 
         self.original_model = _create_simple_mlp()
@@ -54,10 +55,10 @@ class ParameterShardingTest(TestCase):
         self.tp_config = LayoutMap(
             state_rules={
                 re.escape("simple_mlp.up_proj.kernel"): Split(
-                    self.world_size, dim=1
+                    self.device_count, dim=1  # RENAMED: world_size -> device_count
                 ),
                 re.escape("simple_mlp.down_proj.kernel"): Split(
-                    self.world_size, dim=0
+                    self.device_count, dim=0  # RENAMED: world_size -> device_count
                 ),
             },
             output_rules={},
@@ -67,13 +68,15 @@ class ParameterShardingTest(TestCase):
 
     def test_model_sharding_creation_and_weight_counts(self):
         sharded_models = []
-        for rank in range(self.world_size):
+        # RENAMED: world_size -> device_count
+        for rank in range(self.device_count):
             with keras.device(self.devices[rank]):
                 sharded_model, modified_params = make_parameter_sharded_model(
                     self.original_model,
                     self.tp_config,
                     rank=rank,
-                    world_size=self.world_size,
+                    # RENAMED: world_size -> device_count
+                    device_count=self.device_count,
                     device_id=self.devices[rank],
                 )
                 self.assertIsInstance(sharded_model, keras.Model)
@@ -91,7 +94,8 @@ class ParameterShardingTest(TestCase):
                 self.original_model,
                 self.tp_config,
                 rank=rank,
-                world_size=self.world_size,
+                # RENAMED: world_size -> device_count
+                device_count=self.device_count,
                 device_id=self.devices[rank],
             )
         original_weights_dict = {w.path: w for w in self.original_model.weights}
@@ -104,13 +108,15 @@ class ParameterShardingTest(TestCase):
         self.assertEqual(shard_up_kernel.shape[0], orig_up_kernel.shape[0])
         self.assertEqual(
             shard_up_kernel.shape[1],
-            orig_up_kernel.shape[1] // self.world_size,
+            # RENAMED: world_size -> device_count
+            orig_up_kernel.shape[1] // self.device_count,
         )
         orig_down_kernel = original_weights_dict["down_proj/kernel"]
         shard_down_kernel = sharded_weights_dict["simple_mlp.down_proj.kernel"]
         self.assertEqual(
             shard_down_kernel.shape[0],
-            orig_down_kernel.shape[0] // self.world_size,
+            # RENAMED: world_size -> device_count
+            orig_down_kernel.shape[0] // self.device_count,
         )
         self.assertEqual(shard_down_kernel.shape[1], orig_down_kernel.shape[1])
 
@@ -118,7 +124,8 @@ class ParameterShardingTest(TestCase):
         expected_output = self.original_model(self.input_data)
         sharded_outputs = []
         original_weights = self.original_model.get_weights()
-        for rank in range(self.world_size):
+        # RENAMED: world_size -> device_count
+        for rank in range(self.device_count):
             with keras.device(self.devices[rank]):
                 cloned_original = keras.models.clone_model(self.original_model)
                 cloned_original.set_weights(original_weights)
@@ -126,14 +133,16 @@ class ParameterShardingTest(TestCase):
                     cloned_original,
                     self.tp_config,
                     rank=rank,
-                    world_size=self.world_size,
+                    # RENAMED: world_size -> device_count
+                    device_count=self.device_count,
                     device_id=self.devices[rank],
                 )
                 output = sharded_model(self.input_data)
                 sharded_outputs.append(output)
         reconstructed_output = (
             keras.ops.sum(keras.ops.stack(sharded_outputs), axis=0)
-            / self.world_size
+            # RENAMED: world_size -> device_count
+            / self.device_count
         )
 
         self.assertAllClose(

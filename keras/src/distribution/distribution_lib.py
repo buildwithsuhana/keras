@@ -56,6 +56,14 @@ def get_best_devices(count):
     """
     return distribution_lib.get_best_devices(count)
 
+def all_reduce(x, op="sum", axis_name="model"):
+    # FIX: Pass the arguments received by the wrapper directly to the backend function.
+    return distribution_lib.all_reduce(x, op, axis_name)
+
+def all_gather(x, axis, axis_name="model"):
+    # FIX: Pass all arguments to the backend function
+    return distribution_lib.all_gather(x, axis, axis_name)
+
 
 @keras_export("keras.distribution.initialize")
 def initialize(job_addresses=None, num_processes=None, process_id=None):

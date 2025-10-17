@@ -374,28 +374,15 @@ def process_id():
 
 
 def all_reduce(x, op="sum", axis_name="model"):  # <-- ADDED
-    """Reduces a tensor across a device mesh axis using a collective.
-
-    This function assumes it is called within a `pjit` context that has a
-    device mesh with the specified `axis_name`. It performs a collective
-    reduction operation (like sum or mean) across all devices mapped to
-    that axis.
-
-    Args:
-        x (jax.Array): The input JAX array (tensor) on the local device.
-        op (str, optional): The reduction operation to perform. Supported
-            values are 'sum' and 'mean'. Defaults to 'sum'.
-        axis_name (str, optional): The name of the mapped axis in the device
-            mesh over which to communicate. Defaults to 'model'.
-
-    Returns:
-        jax.Array: The reduced JAX array, which is identical across all
-        devices participating in the reduction.
-    """
+    """Reduces a tensor across a device mesh axis using a collective."""
     if op == "sum":
         return lax.psum(x, axis_name=axis_name)
     elif op == "mean":
-        return lax.pmean(x, axis_name=axis_name)
+        # FIX: Manual mean calculation using psum(x) / psum(1) for reliability
+        sum_val = lax.psum(x, axis_name=axis_name)
+        # Calculates the size of the axis reliably within the traced context
+        axis_size = lax.psum(1, axis_name=axis_name) 
+        return sum_val / axis_size
     else:
         raise ValueError(
             f"Unsupported reduction operation: {op}. "

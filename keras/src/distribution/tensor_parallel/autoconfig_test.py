@@ -2,36 +2,37 @@ import keras
 from keras.src import layers
 from keras.src import testing
 
-from autoconfig import analyze_dense_layer_directly, get_default_config_keras
+from autoconfig import analyze_dense_layer, get_default_config_keras
 
 class AutoConfigTest(testing.TestCase):
     def test_analyze_dense_layer_directly(self):
         """Tests the heuristic for classifying Dense layers."""
+        
         up_proj_layer = layers.Dense(64, name="up")
         up_proj_layer.build(input_shape=(None, 16))
         self.assertEqual(
-            analyze_dense_layer_directly(up_proj_layer, None, ""), "up_projection"
+            analyze_dense_layer(up_proj_layer), "up_projection"
         )
         down_proj_layer = layers.Dense(16, name="down")
         down_proj_layer.build(input_shape=(None, 64))
         self.assertEqual(
-            analyze_dense_layer_directly(down_proj_layer, None, ""),
+            analyze_dense_layer(down_proj_layer),
             "down_projection",
         )
         generic_layer = layers.Dense(32, name="generic")
         generic_layer.build(input_shape=(None, 28))
         self.assertEqual(
-            analyze_dense_layer_directly(generic_layer, None, ""), "generic_dense"
+            analyze_dense_layer(generic_layer), "dense"
         )
         non_dense_layer = layers.LayerNormalization()
         self.assertEqual(
-            analyze_dense_layer_directly(non_dense_layer, None, ""), "generic_dense"
+            analyze_dense_layer(non_dense_layer), "dense"
         )
 
     def test_simple_mlp_model(self):
         """Tests rule generation for a standard MLP block (like in a Transformer)."""
-        world_size = 2
-        devices = [f"gpu:{i}" for i in range(world_size)]
+        device_count = 2
+        devices = [f"gpu:{i}" for i in range(device_count)]
 
         model = keras.Sequential(
             [
@@ -47,28 +48,28 @@ class AutoConfigTest(testing.TestCase):
         output_rules = layout_map.output_rules
 
         # Assertions for State (Weight) Sharding Rules
-        up_kernel_rule = state_rules["^mlp_block.mlp_up.kernel$"]
-        self.assertEqual(up_kernel_rule.world_size, world_size)
+        up_kernel_key = "mlp_block.mlp_up.kernel"
+        up_kernel_rule = state_rules[up_kernel_key]
+        self.assertEqual(up_kernel_rule.device_count, device_count) # FIX: Use .device_count
         self.assertEqual(up_kernel_rule.dim, 1)
 
-        down_kernel_rule = state_rules["^mlp_block.mlp_down.kernel$"]
-        self.assertEqual(down_kernel_rule.world_size, world_size)
+        down_kernel_key = "mlp_block.mlp_down.kernel"
+        down_kernel_rule = state_rules[down_kernel_key]
+        self.assertEqual(down_kernel_rule.device_count, device_count) # FIX: Use .device_count
         self.assertEqual(down_kernel_rule.dim, 0)
 
         # Assertions for Output Communication Rules
-        # --- FIX: Removed trailing space. The source code generates "{0: 'gather'}" ---
-        self.assertEqual(output_rules["^mlp_block.mlp_up$"], {0: "gather"})
-        self.assertEqual(output_rules["^mlp_block.mlp_down$"], {0: "allreduce"})
+        self.assertEqual(output_rules["mlp_block.mlp_up"], {0: "gather"})
+        self.assertEqual(output_rules["mlp_block.mlp_down"], {0: "allreduce"})
 
     def test_model_with_embedding_and_einsumdense(self):
         """Tests rule generation for Embedding and EinsumDense layers."""
-        world_size = 4
-        devices = [f"gpu:{i}" for i in range(world_size)]
+        device_count = 4
+        devices = [f"gpu:{i}" for i in range(device_count)]
 
         class SimpleTransformer(layers.Layer):
             def __init__(self, **kwargs):
                 super().__init__(**kwargs)
-                # --- FIX: Add explicit `name` arguments to ensure layer names are predictable ---
                 self.embedding = layers.Embedding(
                     input_dim=1000, output_dim=64, name="embedding"
                 )
@@ -97,28 +98,26 @@ class AutoConfigTest(testing.TestCase):
         layout_map = get_default_config_keras(model, devices)
         state_rules = layout_map.state_rules
 
-        # --- Assertions ---
-        # --- FIX: The regex key must match what the provided autoconfig.py generates ---
-        expected_key = "^transformer.embedding\\..*embeddings$"
+        expected_key = "transformer.embedding.embeddings"
         self.assertIn(expected_key, state_rules)
         emb_rule = state_rules[expected_key]
-        self.assertEqual(emb_rule.world_size, world_size)
+        self.assertEqual(emb_rule.device_count, device_count) # FIX: Use .device_count
         self.assertEqual(emb_rule.dim, 1)
 
-        # These assertions are now correct because the layers are explicitly named
-        qkv_rule = state_rules["^transformer.qkv_proj.kernel$"]
-        self.assertEqual(qkv_rule.world_size, world_size)
+        qkv_key = "transformer.qkv_proj.kernel"
+        qkv_rule = state_rules[qkv_key]
+        self.assertEqual(qkv_rule.device_count, device_count) # FIX: Use .device_count
         self.assertEqual(qkv_rule.dim, 1)
 
-        attn_out_rule = state_rules["^transformer.attention_output.kernel$"]
-        self.assertEqual(attn_out_rule.world_size, world_size)
+        attn_out_key = "transformer.attention_output.kernel"
+        attn_out_rule = state_rules[attn_out_key]
+        self.assertEqual(attn_out_rule.device_count, device_count) # FIX: Use .device_count
         self.assertEqual(attn_out_rule.dim, 0)
 
     def test_nested_model(self):
         """Tests that the recursive traversal finds layers in nested models."""
-        # This test is correct and requires no changes.
-        world_size = 2
-        devices = [f"gpu:{i}" for i in range(world_size)]
+        device_count = 2
+        devices = [f"gpu:{i}" for i in range(device_count)]
         inner_model = keras.Sequential(
             [layers.Dense(64, name="inner_dense")], name="inner_block"
         )
@@ -132,8 +131,9 @@ class AutoConfigTest(testing.TestCase):
         )
         layout_map = get_default_config_keras(outer_model, devices)
         state_rules = layout_map.state_rules
-        expected_key = "^outer_block.inner_block.inner_dense.kernel$"
+        
+        expected_key = "outer_block.inner_block.inner_dense.kernel"
         self.assertIn(expected_key, state_rules)
         inner_rule = state_rules[expected_key]
-        self.assertEqual(inner_rule.world_size, world_size)
+        self.assertEqual(inner_rule.device_count, device_count) # FIX: Use .device_count
         self.assertEqual(inner_rule.dim, 1)
