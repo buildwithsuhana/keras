@@ -38,21 +38,35 @@ def list_devices(device_type=None):
     """
     return distribution_lib.list_devices(device_type)
 
-def get_device_count():
 
+@keras_export("keras.distribution.get_device_count")
+def get_device_count():
+    """
+    Returns the total number of devices (e.g., GPUs, TPUs) available for the
+    current distribution strategy.
+
+    Returns:
+        int: The total number of devices configured in the current distribution
+             strategy.
+    """
     return distribution_lib.get_device_count()
 
+
+@keras_export("keras.distribution.get_best_devices")
 def get_best_devices(count):
+    """
+    Returns a list of the 'best' available devices for computation, up to the
+    specified count.
 
+    Args:
+        count (int): The maximum number of devices to return. If the total
+                     available devices is less than `count`, all available
+                     devices are returned.
+
+    Returns:
+        list: A list of device names (e.g., '/GPU:0', '/TPU:0').
+    """
     return distribution_lib.get_best_devices(count)
-
-def all_reduce(x, op="sum", axis_name="model"):
-    # FIX: Pass the arguments received by the wrapper directly to the backend function.
-    return distribution_lib.all_reduce(x, op, axis_name)
-
-def all_gather(x, axis, axis_name="model"):
-    # FIX: Pass all arguments to the backend function
-    return distribution_lib.all_gather(x, axis, axis_name)
 
 
 @keras_export("keras.distribution.initialize")
@@ -548,6 +562,7 @@ class DataParallel(Distribution):
             num_replicas=self._num_process,
         )
         return distributed_dataset.prefetch(tf.data.AUTOTUNE)
+
 
 @keras_export("keras.distribution.ModelParallel")
 class ModelParallel(Distribution):

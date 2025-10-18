@@ -7,6 +7,7 @@ from keras.src import ops
 from keras.src import optimizers
 
 from keras.src.backend import distribution_lib
+from keras.src.backend import core
 
 
 class CoordinatedOptimizer:
@@ -307,10 +308,9 @@ class CoordinatedOptimizer:
         """
         if not gradients:
             return []
-
         if distribution_lib.get_device_count() > 1:
             local_grad = gradients[0]
-            synced_tensor = distribution_lib.all_reduce(
+            synced_tensor = core.all_reduce(
                 local_grad, op="mean", axis_name="model"
             )
 

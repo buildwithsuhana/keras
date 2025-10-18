@@ -1,5 +1,7 @@
-import keras
 import collections
+
+from keras.src import ops
+
 
 class Split:
     """Splits a tensor into shards along a specified dimension.
@@ -10,6 +12,7 @@ class Split:
     number of workers by distributing the remainder elements one by one to the
     first few workers.
     """
+
     def __init__(self, device_count, dim, sharding_type="auto"):
         """Initializes the Split action.
 
@@ -45,7 +48,7 @@ class Split:
             A tensor shard corresponding to the given rank.
         """
         if self.dim == -1:
-            dim = keras.ops.ndim(tensor) - 1
+            dim = ops.ndim(tensor) - 1
         else:
             dim = self.dim
 
@@ -56,7 +59,7 @@ class Split:
         start_idx = rank * split_size + min(rank, remainder)
         end_idx = start_idx + split_size + (1 if rank < remainder else 0)
 
-        slices = [slice(None)] * keras.ops.ndim(tensor)
+        slices = [slice(None)] * ops.ndim(tensor)
         slices[dim] = slice(start_idx, end_idx)
         return tensor[tuple(slices)]
 

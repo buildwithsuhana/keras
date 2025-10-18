@@ -10,6 +10,7 @@ from keras.src.backend import distribution_lib
 from keras.src.distribution.tensor_parallel.tensor_layout import LayoutMap
 from keras.src.distribution.tensor_parallel.tensor_layout import Split
 from keras.src import ops
+from keras.src.backend import core
 
 logger = logging.getLogger(__name__)
 
@@ -419,7 +420,7 @@ def _define_parameter_sharded_model():
                     f"Applying Row-Parallel Forward (AllReduce) to {layer_name}"
                 )
                 # Call all_reduce directly
-                return distribution_lib.all_reduce(
+                return core.all_reduce(
                     sharded_output, op="sum", axis_name="model"
                 )
 
