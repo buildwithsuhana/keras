@@ -224,19 +224,8 @@ class TensorParallelKeras(Model):
         return list(unique_vars.values())
 
     def _auto_detect_parallelism(self):
-        """Auto-detect device_count and device_ids efficiently."""
-        from keras.src.distribution import get_best_devices
-
         available_devices = list_devices()
-        device_count = len(available_devices)
-        print(
-            f"🔍 Auto-detected device_count: {device_count} from {len(available_devices)} available devices"
-        )
-
-        device_ids = get_best_devices(device_count)
-        print(f"🔍 Auto-detected device_ids: {device_ids}")
-
-        return device_count, device_ids
+        return len(available_devices), available_devices
 
     def _adjust_device_list(self, device_ids, target_device_count):
         """Adjust device list to match target device_count intelligently."""
