@@ -1,6 +1,15 @@
-from keras.src.distribution.tensor_parallel.tensor_layout import LayoutMap
-# from keras.src.distribution.tensor_parallel.tensor_layout import Split
+import collections
 from keras.src import layers
+from keras.src import ops
+
+from keras.src.distribution.tensor_parallel.tensor_layout import (
+    split_tensor_for_parallelism,
+    LayoutMap
+)
+
+# Alias the imported function to keep the configuration logic readable
+_split_fn_internal = split_tensor_for_parallelism 
+
 
 def analyze_dense_layer(layer):
     """Analyzes a Keras Dense layer to classify its sharding strategy.
@@ -9,8 +18,7 @@ def analyze_dense_layer(layer):
     to determine if it functions as an expansion layer ("up-projection"), a
     contraction layer ("down-projection"), or neither ("dense"). This
     classification is a heuristic commonly used to apply tensor parallelism
-    in Transformer-based models, such as in an MLP block where an up-projection
-    is followed by a down-projection.
+    in Transformer-based models.
 
     Args:
         layer: The Keras `layers.Dense` instance to analyze.
@@ -58,6 +66,14 @@ def analyze_dense_layer(layer):
         return 'dense'
 
 
+def _split_rule(device_count, dim):
+    """
+    Returns a sharding rule (lambda) that calls split_tensor_for_parallelism.
+    The lambda must accept (x, index) as expected by the LayoutMap rule.
+    """
+    return lambda x, index: _split_fn_internal(x, index, device_count, dim=dim)
+
+
 def _recursive_layer_traversal(
     current_layer,
     prefix,
@@ -82,34 +98,44 @@ def _recursive_layer_traversal(
     # --- Sharding Logic ---
     if isinstance(current_layer, layers.Dense):
         mlp_type = analyze_dense_layer(current_layer)
-
+        
         if mlp_type == 'up_projection':
-            state_rules[f"{full_name}.kernel"] = Split(device_count, 1, "column")
+            state_rules[f"{full_name}.kernel"] = _split_rule(device_count, dim=1)
             if current_layer.use_bias:
-                state_rules[f"{full_name}.bias"] = Split(device_count, 0, "column")
+                state_rules[f"{full_name}.bias"] = _split_rule(device_count, dim=0)
             output_rules[f"{full_name}"] = {0: "gather"}
 
         elif mlp_type == 'down_projection':
-            state_rules[f"{full_name}.kernel"] = Split(device_count, 0, "row")
+            state_rules[f"{full_name}.kernel"] = _split_rule(device_count, dim=0)
             output_rules[f"{full_name}"] = {0: "allreduce"}
 
         else:
-            state_rules[f"{full_name}.kernel"] = Split(device_count, 1, "column")
+            # Default to Column-wise split
+            state_rules[f"{full_name}.kernel"] = _split_rule(device_count, dim=1)
             if current_layer.use_bias:
-                state_rules[f"{full_name}.bias"] = Split(device_count, 0, "column")
-            output_rules[f"{full_name}"] = {0: "gather -1"}
+                state_rules[f"{full_name}.bias"] = _split_rule(device_count, dim=0)
+            # Output rule specifies using the last dimension for gather 
+            output_rules[f"{full_name}"] = {0: "gather -1"} 
 
     elif isinstance(current_layer, layers.EinsumDense):
+        
+        # Replacing Split(device_count, dim, "type") with _split_rule(device_count, dim)
+        
         if "attention_output" in full_name:
-            state_rules[f"{full_name}.kernel"] = Split(device_count, 0, "row")
+            # Row-wise split (input features) -> dim=0 for kernel
+            state_rules[f"{full_name}.kernel"] = _split_rule(device_count, dim=0)
             output_rules[f"{full_name}"] = {0: "allreduce"}
         else:
-            state_rules[f"{full_name}.kernel"] = Split(device_count, 1, "column")
+            # Column-wise split (output features) -> dim=1 for kernel
+            state_rules[f"{full_name}.kernel"] = _split_rule(device_count, dim=1)
             if hasattr(current_layer, 'bias') and current_layer.bias is not None:
-                state_rules[f"{full_name}.bias"] = Split(device_count, 0, "column")
+                state_rules[f"{full_name}.bias"] = _split_rule(device_count, dim=0)
             output_rules[f"{full_name}"] = {0: "gather -1"}
 
     elif isinstance(current_layer, (layers.Embedding,)):
+        
+        # Replacing Split(device_count, dim, "type") with _split_rule(device_count, dim)
+        
         weight_name = None 
 
         if hasattr(current_layer, 'embeddings'):
@@ -118,13 +144,14 @@ def _recursive_layer_traversal(
             weight_name = 'position_embeddings'
 
         if weight_name:
-            state_rules[f"{full_name}.{weight_name}"] = Split(device_count, 1, "column")
+            # Vocabulary split -> dim=1
+            state_rules[f"{full_name}.{weight_name}"] = _split_rule(device_count, dim=1)
             output_rules[f"{full_name}"] = {0: "no_comm"}
 
     elif isinstance(current_layer, (layers.LayerNormalization, layers.BatchNormalization, layers.GroupNormalization)):
         pass
 
-    # --- Recursive Traversal Logic (Restored) ---
+    # --- Recursive Traversal Logic (Unchanged) ---
     if hasattr(current_layer, 'layers') and current_layer.layers:
         for sub_layer in current_layer.layers:
             _recursive_layer_traversal(
