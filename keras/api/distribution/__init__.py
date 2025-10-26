@@ -19,3 +19,6 @@ from keras.src.distribution.distribution_lib import list_devices as list_devices
 from keras.src.distribution.distribution_lib import (
     set_distribution as set_distribution,
 )
+from keras.src.distribution.distribution_lib import (
+    get_device_count as get_device_count,
+)

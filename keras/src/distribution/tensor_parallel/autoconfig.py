@@ -1,5 +1,5 @@
 from keras.src.distribution.tensor_parallel.tensor_layout import LayoutMap
-from keras.src.distribution.tensor_parallel.tensor_layout import Split
+# from keras.src.distribution.tensor_parallel.tensor_layout import Split
 from keras.src import layers
 
 def analyze_dense_layer(layer):

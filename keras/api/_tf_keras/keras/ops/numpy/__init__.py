@@ -19,6 +19,8 @@ from keras.src.ops.numpy import arccosh as arccosh
 from keras.src.ops.numpy import arcsin as arcsin
 from keras.src.ops.numpy import arcsinh as arcsinh
 from keras.src.ops.numpy import arctan as arctan
+from keras.src.ops.numpy import array_split as array_split
+
 from keras.src.ops.numpy import arctan2 as arctan2
 from keras.src.ops.numpy import arctanh as arctanh
 from keras.src.ops.numpy import argmax as argmax

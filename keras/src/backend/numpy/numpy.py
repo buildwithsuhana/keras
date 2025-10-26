@@ -1096,6 +1096,9 @@ def split(x, indices_or_sections, axis=0):
     axis = standardize_axis_for_numpy(axis)
     return np.split(x, indices_or_sections, axis=axis)
 
+def array_split(x, indices_or_sections, axis=0):
+    axis = standardize_axis_for_numpy(axis)
+    return np.array_split(x, indices_or_sections, axis=axis)
 
 def stack(x, axis=0):
     axis = standardize_axis_for_numpy(axis)

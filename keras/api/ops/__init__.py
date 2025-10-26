@@ -27,6 +27,8 @@ from keras.src.ops.core import slice as slice
 from keras.src.ops.core import slice_update as slice_update
 from keras.src.ops.core import stop_gradient as stop_gradient
 from keras.src.ops.core import switch as switch
+from keras.src.ops.numpy import array_split as array_split
+
 from keras.src.ops.core import unstack as unstack
 from keras.src.ops.core import vectorized_map as vectorized_map
 from keras.src.ops.core import while_loop as while_loop

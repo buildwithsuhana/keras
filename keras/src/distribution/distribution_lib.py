@@ -40,16 +40,18 @@ def list_devices(device_type=None):
 
 
 @keras_export("keras.distribution.get_device_count")
-def get_device_count():
-    """
-    Returns the total number of devices (e.g., GPUs, TPUs) available for the
-    current distribution strategy.
+def get_device_count(device_type=None):
+    """Returns the total number of available devices.
+
+    Args:
+        device_type: Optional device type to count (e.g., "cpu",
+             "gpu", "tpu"). If `None`, it counts all available
+             devices.
 
     Returns:
-        int: The total number of devices configured in the current distribution
-             strategy.
+        int: The total number of available devices.
     """
-    return distribution_lib.get_device_count()
+    return distribution_lib.get_device_count(device_type=device_type)
 
 
 @keras_export("keras.distribution.initialize")
@@ -909,120 +911,3 @@ def set_distribution(value):
         value: a `Distribution` instance.
     """
     global_state.set_global_attribute(GLOBAL_ATTRIBUTE_NAME, value)
-
-@keras_export("keras.distribution.AutoTPDistribution")
-class AutoTPDistribution(Distribution):
-    """A distribution strategy for automated tensor and data parallelism."""
-    def __init__(self, model, device_mesh=None, auto_shard_dataset=True):
-        if device_mesh is None:
-            all_devices = list_devices()
-            if not all_devices:
-                raise RuntimeError("No computational devices found.")
-            device_mesh = DeviceMesh(
-                shape=(1, len(all_devices)),
-                axis_names=("data", "model"),
-                devices=all_devices,
-            )
-
-        if "data" not in device_mesh.axis_names:
-            raise ValueError(
-                "DeviceMesh for AutoTPDistribution must have a 'data' axis."
-            )
-        batch_dim_name = "data"
-
-        super().__init__(device_mesh, batch_dim_name, auto_shard_dataset)
-
-        self._original_model = model
-        self._num_process = distribution_lib.num_processes()
-        self._process_id = distribution_lib.process_id()
-        self._is_multi_process = self._num_process > 1
-        from keras.src.distribution.tensor_parallel.tensor_parallel_keras import (
-    TensorParallelKeras,
-)
-        self.model = TensorParallelKeras(
-            model=self._original_model,
-            device_count=np.prod(self.device_mesh.shape),
-            device_ids=self.device_mesh.devices.flatten().tolist(),
-        )
-
-    def get_data_layout(self, data_shape):
-        data_shard_spec = [None] * len(data_shape)
-        data_shard_spec[0] = self.batch_dim_name
-        return TensorLayout(data_shard_spec, self.device_mesh)
-
-    def get_variable_layout(self, variable):
-        warnings.warn(
-            "Variable layout is determined automatically within "
-            "AutoTPDistribution. This method will return a replicated layout."
-        )
-        return TensorLayout([None] * len(variable.shape), self.device_mesh)
-
-    def get_tensor_layout(self, path):
-        return None
-
-    def distribute_dataset(self, dataset):
-        """Distributes the dataset across processes based on the device mesh."""
-        if not self._is_multi_process or not self.auto_shard_dataset:
-            return dataset
-
-        from keras.src.utils.module_utils import tensorflow as tf
-
-        if not tf.available or not isinstance(dataset, tf.data.Dataset):
-            raise ValueError(
-                "Only `tf.data.Dataset` is supported for auto-sharding, "
-                f"got {type(dataset)}"
-            )
-
-        from tensorflow.python.data.experimental.ops import (
-            distribute as tf_data_distribute,
-        )
-
-        global_batch_size = tf_data_distribute.compute_batch_size(dataset)
-        if global_batch_size.numpy() < 0:
-            raise ValueError(
-                "The batch size of the input dataset is unknown. "
-                "Please configure the batch size for the input dataset, "
-                "e.g., via `dataset.batch(batch_size)`"
-            )
-
-        mesh_batch_dim_index = self.device_mesh.axis_names.index(
-            self.batch_dim_name
-        )
-        num_model_replicas = self.device_mesh.shape[mesh_batch_dim_index]
-
-        if num_model_replicas == 1:
-            return dataset.prefetch(tf.data.AUTOTUNE)
-
-        num_model_replicas_per_process = num_model_replicas / self._num_process
-        if num_model_replicas_per_process >= 1:
-            if global_batch_size % self._num_process != 0:
-                raise ValueError(
-                    "Global batch size must be divisible by the number of "
-                    f"processes. `global_batch_size`={global_batch_size} and "
-                    f"`num_process`={self._num_process}"
-                )
-            per_process_batch_size = global_batch_size // self._num_process
-            distributed_dataset = dataset.rebatch(per_process_batch_size)
-            distributed_dataset = distributed_dataset.shard(
-                num_shards=self._num_process,
-                index=self._process_id,
-            )
-            return distributed_dataset.prefetch(tf.data.AUTOTUNE)
-        else:
-            if global_batch_size % num_model_replicas != 0:
-                raise ValueError(
-                    "Global batch size must be divisible by the number of "
-                    f"replicas. `global_batch_size`={global_batch_size} and "
-                    f"`num_model_replicas`={num_model_replicas}"
-                )
-            per_replica_batch_size = global_batch_size // num_model_replicas
-            distributed_dataset = dataset.rebatch(per_replica_batch_size)
-            
-            processes_per_replica = self._num_process // num_model_replicas
-            data_shard_id = self._process_id // processes_per_replica
-            
-            distributed_dataset = distributed_dataset.shard(
-                num_shards=num_model_replicas,
-                index=data_shard_id,
-            )
-            return distributed_dataset.prefetch(tf.data.AUTOTUNE)
