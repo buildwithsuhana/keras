@@ -318,12 +318,26 @@ class CoordinatedOptimizer:
             return gradients_and_vars
 
         rules = self.tensor_parallel_config.state_rules.items()
+        
+        # --- START MODIFICATION ---
+        # OLD LOGIC:
+        # column_parallel_patterns = {
+        #     pattern
+        #     for pattern, action in rules
+        #     if hasattr(action, "sharding_type")
+        #     and action.sharding_type == "column"
+        # }
+        
+        # NEW LOGIC:
+        # We check for dim == 1, which corresponds to Column Parallelism
+        # (sharding along the output features dimension).
         column_parallel_patterns = {
             pattern
             for pattern, action in rules
-            if hasattr(action, "sharding_type")
-            and action.sharding_type == "column"
+            if hasattr(action, "dim") and action.dim == 1
         }
+        # --- END MODIFICATION ---
+
 
         if not column_parallel_patterns:
             return gradients_and_vars

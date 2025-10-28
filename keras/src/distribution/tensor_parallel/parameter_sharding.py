@@ -1,3 +1,7 @@
+"""
+This file implements the logic for sharding the model's parameters.
+"""
+
 import logging
 import re
 from typing import Any, Dict, List, Optional, Set, Tuple
@@ -6,8 +10,8 @@ import numpy as np
 
 # Assuming these imports work for the JAX backend
 from keras.src.backend import distribution_lib
-# 🌟 FIX: Removed import for the now-deleted 'Split' class
-from keras.src.distribution.tensor_parallel.tensor_layout import LayoutMap 
+# --- MODIFIED: Import SplitRule ---
+from keras.src.distribution.tensor_parallel.tensor_layout import LayoutMap, SplitRule
 # NOTE: The refactored split function is inside the tensor_layout module,
 #       but we will access it via the 'action' callable passed in the config.
 
@@ -35,9 +39,14 @@ class ShardedWeight:
 
         with device(current_dev_name):
             self._variable = Variable(
-                initializer=tensor_shard, trainable=trainable, name=name
+                # --- MODIFIED: Use convert_to_numpy for cleaner device transfer ---
+                # This ensures the initializer is a simple array,
+                # preventing potential graph issues during init.
+                initializer=ops.convert_to_numpy(tensor_shard),
+                trainable=trainable, 
+                name=name
             )
-        self.regularizer = None
+        self.regularizer = None # Note: This discards original regularizers
 
     @property
     def name(self):
@@ -70,7 +79,7 @@ class ShardedWeight:
 
     def numpy(self):
         """Returns the value of the variable as a NumPy array."""
-        return self._variable.numpy()
+        return self.variable.numpy()
 
     def num_elements(self):
         """Returns the total number of elements in the tensor."""
@@ -114,9 +123,9 @@ class ParameterShardingStrategy:
         self._store_original_weights(model)
         modified_parameters = set()
 
-        # 🌟 FIX: Check if the action is a callable function/lambda (from autoconfig.py)
+        # --- MODIFIED: Check if the action is a SplitRule instance ---
         for pattern, action in config.state_rules.items():
-            if callable(action): 
+            if isinstance(action, SplitRule): # Check for SplitRule
                 matching_params = self._find_matching_parameters(model, pattern)
 
                 for param_name, param in matching_params:
@@ -136,7 +145,8 @@ class ParameterShardingStrategy:
                             if shard is self.sharded_weights_by_id[param_id]:
                                 existing_param_name = name
                                 break
-
+                        
+                        # --- MODIFIED: Store the sharding dim ---
                         self.weight_mapping[param_name] = self.weight_mapping[
                             existing_param_name
                         ]
@@ -146,17 +156,18 @@ class ParameterShardingStrategy:
                         )
                         continue
 
-                    # The 'action' here is a lambda: lambda x, index: split_tensor_for_parallelism(x, index, device_count, dim=dim)
-                    # We pass the original tensor 'param' and the current device 'rank'
+                    # The 'action' is our SplitRule object, which is callable
                     sharded_tensor = action(param, self.rank)
 
                     self.sharded_weights[param_name] = sharded_tensor
                     self.sharded_weights_by_id[param_id] = sharded_tensor
 
+                    # --- MODIFIED: Store the sharding dim from the action ---
                     self.weight_mapping[param_name] = {
                         "original_shape": param.shape,
                         "sharded_shape": sharded_tensor.shape,
                         "action": action,
+                        "dim": action.dim,  # <-- CRITICAL FOR CHECKPOINTING
                     }
 
                     modified_parameters.add(param_name)
@@ -192,6 +203,7 @@ class ParameterShardingStrategy:
                     param_name = f"{full_name}.{cleaned_name}"
                     # Only store if it's not a symbolic tensor/placeholder, which .numpy() helps confirm
                     if hasattr(weight, 'numpy'):
+                         # --- MODIFIED: Store weights as numpy ---
                          self.original_weights[param_name] = weight.numpy()
 
             if hasattr(current_layer, "layers") and current_layer.layers:
@@ -300,14 +312,26 @@ def _define_parameter_sharded_model():
             self.sharding_strategy = sharding_strategy
             self.config = config
             self._device = device_id
+            
+            # --- MODIFIED: Cache for ShardedWeight objects ---
+            self._sharded_weight_cache: Dict[str, ShardedWeight] = {}
 
             self._build_and_cache_weights()
 
             # The original model must be built before accessing its inputs
             if not self.original_model.built:
-                 self.original_model.build(self.original_model.inputs[0].shape)
+                 try:
+                     # Try to build with a single input
+                     input_shape = self.original_model.inputs[0].shape
+                     self.original_model.build(input_shape)
+                     self.build(input_shape)
+                 except (AttributeError, IndexError, TypeError, ValueError):
+                     logger.warning(
+                         f"Could not auto-build original_model {self.original_model.name}. "
+                         "Assuming it was built manually."
+                     )
                  
-            if self.original_model.inputs:
+            if self.original_model.inputs and not self.built:
                 self.build(self.original_model.inputs[0].shape)
 
             print("🚀 ParameterShardedModel created successfully")
@@ -332,13 +356,14 @@ def _define_parameter_sharded_model():
                 param_name,
                 sharded_tensor,
             ) in self.sharding_strategy.sharded_weights.items():
-                weights_list.append(
-                    ShardedWeight(
-                        sharded_tensor, 
-                        param_name, 
-                        device_id=self._device  
-                    )
+                # --- MODIFIED: Create and cache ShardedWeight objects ---
+                sharded_weight_obj = ShardedWeight(
+                    sharded_tensor, 
+                    param_name, 
+                    device_id=self._device  
                 )
+                weights_list.append(sharded_weight_obj)
+                self._sharded_weight_cache[param_name] = sharded_weight_obj
 
             logger.debug(f"Added {len(weights_list)} sharded weights.")
 
@@ -367,66 +392,143 @@ def _define_parameter_sharded_model():
             return self._weights_list
 
         def call(self, inputs, training=None, mask=None):
+            # --- DEBUGGER ---
+            print("\n[DEBUGGER] --- TRACE: ParameterShardedModel.call EXECUTED ---")
+            
             # from keras.src import layers # Already imported globally
+            
             tensor_cache = {}
+            print(f"[DEBUG] New call to ParameterShardedModel.call. Inputs: {inputs}")
 
             # Populate cache with initial inputs
             if isinstance(inputs, dict):
-                # Handle multiple named inputs
-                for inp_tensor in self.original_model.inputs:
-                    tensor_cache[id(inp_tensor)] = inputs[inp_tensor.name]
+                model_input_names = [inp.name.split(":")[0] for inp in self.original_model.inputs]
+                for name in model_input_names:
+                    if name in inputs:
+                        symbolic_inp = next(inp for inp in self.original_model.inputs if inp.name.split(":")[0] == name)
+                        tensor_cache[symbolic_inp.name] = inputs[name]
+            elif isinstance(inputs, (list, tuple)):
+                for i, inp_tensor in enumerate(self.original_model.inputs):
+                     tensor_cache[inp_tensor.name] = inputs[i]
             else:
-                tensor_cache[id(self.original_model.inputs[0])] = inputs
+                tensor_cache[self.original_model.inputs[0].name] = inputs
+
+            print(f"[DEBUG] Initial tensor_cache keys: {list(tensor_cache.keys())}")
 
             # Iterate through the original model's layers
             for layer in self.original_model.layers:
                 if isinstance(layer, layers.InputLayer):
                     continue
                 
-                layer_inputs = []
-                # Use _inbound_nodes to determine the inputs to the current layer
-                for node in layer._inbound_nodes:
-                    for symbolic_input_tensor in node.input_tensors:
-                        layer_inputs.append(tensor_cache[id(symbolic_input_tensor)])
+                # ==========================================================
+                # --- START: 🌟 CRITICAL FIX 🌟 ---
+                # Rebuild inputs in the *exact* structure the layer expects
+                # (dict, list, or single tensor)
+                # ==========================================================
                 
-                if len(layer_inputs) == 1:
-                    layer_inputs = layer_inputs[0]
+                if not layer._inbound_nodes:
+                    layer_call_inputs = []
+                else:
+                    node = layer._inbound_nodes[0] 
+                    
+                    # Check how the layer was *originally* called (in the functional model)
+                    original_call_inputs = node.call_args[0] if node.call_args else None
+                    
+                    if isinstance(original_call_inputs, dict):
+                        # --- This layer expects a DICTIONARY ---
+                        print(f"[DEBUG] Layer {layer.name} expects a DICT. Rebuilding dict...")
+                        layer_call_inputs = {}
+                        for key, symbolic_tensor in original_call_inputs.items():
+                            if symbolic_tensor.name not in tensor_cache:
+                                error_msg = (
+                                    f"FATAL CACHE MISS (dict): Cannot find "
+                                    f"'{symbolic_tensor.name}' for layer '{layer.name}'"
+                                )
+                                print(error_msg)
+                                raise KeyError(error_msg)
+                            layer_call_inputs[key] = tensor_cache[symbolic_tensor.name]
+
+                    else:
+                        # --- This layer expects a LIST or a single TENSOR ---
+                        print(f"[DEBUG] Layer {layer.name} expects a LIST/TENSOR. Rebuilding...")
+                        symbolic_inputs = node.input_tensors
+                        if not isinstance(symbolic_inputs, (list, tuple)):
+                            symbolic_inputs = [symbolic_inputs]
+                        
+                        layer_call_inputs = []
+                        for symbolic_tensor in symbolic_inputs:
+                            if symbolic_tensor.name not in tensor_cache:
+                                error_msg = (
+                                    f"FATAL CACHE MISS (list): Cannot find "
+                                    f"'{symbolic_tensor.name}' for layer '{layer.name}'"
+                                )
+                                print(error_msg)
+                                raise KeyError(error_msg)
+                            layer_call_inputs.append(tensor_cache[symbolic_tensor.name])
+                        
+                        if len(layer_call_inputs) == 1:
+                            layer_call_inputs = layer_call_inputs[0]
+
+                # ==========================================================
+                # --- END: CRITICAL FIX ---
+                # ==========================================================
 
                 # Run the layer's forward pass
-                current_tensor = layer(layer_inputs, training=training)
+                # print(f"[DEBUG] Calling layer: {layer.name} with inputs: {layer_call_inputs}")
+                current_tensor = layer(layer_call_inputs, training=training)
 
-                # Update cache with the layer's output (symbolic tensor ID maps to concrete output)
-                tensor_cache[id(layer.output)] = current_tensor
+                # Update cache with the layer's output
+                layer_outputs = current_tensor
+                if not isinstance(layer_outputs, (list, tuple)):
+                    symbolic_outputs = [layer.output]
+                    layer_outputs = [layer_outputs]
+                else:
+                    symbolic_outputs = layer.output
+                
+                for symbolic_out, concrete_out in zip(symbolic_outputs, layer_outputs):
+                    tensor_cache[symbolic_out.name] = concrete_out
                 
                 # Check for output rule to apply collective communication
-                # NOTE: Keras layers have a `.path` property, but sometimes the full path 
-                # (e.g., 'model_name/layer_name') is required. We assume layer.path is the key here.
                 layer_path = layer.path
                 output_rule = None
                 
-                # Find the matching output rule pattern
                 for pattern, rule in self.config.output_rules.items():
                     if re.search(pattern, layer_path):
-                        # Assuming rule is a dict: {0: "gather -1"}
                         output_rule = rule.get(0)
                         break
                 
                 if output_rule:
-                    current_tensor = self._apply_communication(
-                        current_tensor, layer.name, output_rule
+                    first_output_tensor = layer_outputs[0]
+                    modified_tensor = self._apply_communication(
+                        first_output_tensor, layer.name, output_rule
                     )
-                    # IMPORTANT: Update the cache with the modified (communicated) tensor
-                    tensor_cache[id(layer.output)] = current_tensor
+                    tensor_cache[symbolic_outputs[0].name] = modified_tensor
 
             # Return the final model output(s)
             final_outputs = []
+            
+            print("\n[DEBUG] --- Final Output Lookup ---")
+            print(f"[DEBUG] Available keys in tensor_cache: {list(tensor_cache.keys())}")
+            print(f"[DEBUG] Original model outputs to find: {[out.name for out in self.original_model.outputs]}")
+
             for symbolic_output in self.original_model.outputs:
-                final_outputs.append(tensor_cache[id(symbolic_output)])
+                if symbolic_output.name not in tensor_cache:
+                    error_msg = (
+                        f"[DEBUG] FATAL: Final output tensor {symbolic_output.name} not in tensor_cache!"
+                    )
+                    print(error_msg)
+                    raise KeyError(error_msg)
+                final_outputs.append(tensor_cache[symbolic_output.name])
+
+            # --- DEBUGGER ---
+            print(f"[DEBUGGER] --- TRACE: ParameterShardedModel.call RETURNING ---")
+            print(f"[DEBUGGER] Final outputs list: {final_outputs}")
+            print(f"[DEBUGGER] Number of final outputs: {len(final_outputs)}")
 
             if len(final_outputs) == 1:
                 return final_outputs[0]
             return final_outputs
-
+        
         def _apply_communication(self, sharded_output, layer_name, rule_str: str):
             """Applies communication directly using the distributed backend."""
 

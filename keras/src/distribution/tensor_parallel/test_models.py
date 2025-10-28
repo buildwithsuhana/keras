@@ -80,7 +80,7 @@ STEPS_PER_EPOCH = 10
 VALIDATION_STEPS = 5
 
 MODEL_MAPPING = {
-    "opt_1.3b_en": keras_hub.models.OPTCausalLM,
+    "opt_125m_en": keras_hub.models.OPTCausalLM,
 }
 
 # ----------------------------------------------------------------------
@@ -190,10 +190,14 @@ def plot_training_graphs(tp_history, preset_name):
 # --- Main Verification Function (MODIFIED) ---
 # ----------------------------------------------------------------------
 
+# ----------------------------------------------------------------------
+# --- Main Verification Function (MODIFIED) ---
+# ----------------------------------------------------------------------
+
 def run_model_verification(preset_name, model_class):
     """
-    Runs a training execution test for a given model preset using
-    tensor parallelism.
+    Runs a training and checkpointing verification test for a given model
+    preset using tensor parallelism.
     """
     if TARGET_WORLD_SIZE < 2:
         logger.warning(
@@ -220,22 +224,43 @@ def run_model_verification(preset_name, model_class):
         .repeat()
     )
 
+    # Define a common optimizer and loss
+    optimizer_fn = lambda: keras.optimizers.AdamW(learning_rate=LEARNING_RATE)
+    loss_fn = keras.losses.SparseCategoricalCrossentropy(from_logits=True)
+    metrics_fn = [
+        keras_hub.metrics.Perplexity(from_logits=True, name="perplexity")
+    ]
+
     # --- 1. Tensor Parallel Model Training ---
     logger.info("\n--- Training Tensor Parallel (TP) Model ---")
-    tp_model_template = get_model_from_preset(preset_name, model_class)
 
+    # ---
+    # --- MODIFICATION START ---
+    #
+    # OLD CODE:
+    # tp_model_template = get_model_from_preset(preset_name, model_class)
+    # tp_model = TensorParallelKeras(
+    #     model=tp_model_template,
+    #     device_count=TARGET_WORLD_SIZE,
+    #     device_ids=TARGET_DEVICES,
+    # )
+    #
+    # NEW CODE (to fix OOM and align with new API):
+    # We now pass the model-building function and its args.
+    
     tp_model = TensorParallelKeras(
-        model=tp_model_template,
+        model_fn=get_model_from_preset,
+        model_args=(preset_name, model_class),
         device_count=TARGET_WORLD_SIZE,
         device_ids=TARGET_DEVICES,
     )
+    # --- MODIFICATION END ---
+    # ---
 
     tp_model.compile(
-        optimizer=keras.optimizers.AdamW(learning_rate=LEARNING_RATE),
-        loss=keras.losses.SparseCategoricalCrossentropy(from_logits=True),
-        metrics=[
-            keras_hub.metrics.Perplexity(from_logits=True, name="perplexity")
-        ],
+        optimizer=optimizer_fn(),
+        loss=loss_fn,
+        metrics=metrics_fn,
     )
 
     tp_history = tp_model.fit(
@@ -247,15 +272,68 @@ def run_model_verification(preset_name, model_class):
         verbose=1,
     )
     tp_final_val_loss = tp_history.history["val_loss"][-1]
+    tp_final_val_perplexity = tp_history.history["val_perplexity"][-1]
     logger.info("TP model training completed successfully.")
 
-    # --- 2. Verification ---
+    # --- 2. Checkpointing Verification (NEW) ---
+    logger.info("\n--- Verifying Checkpointing (Save/Load) ---")
+    checkpoint_path = f"./{preset_name}_tp_checkpoint.npz"
+
+    # Save
+    logger.info(f"Saving checkpoint to {checkpoint_path}...")
+    tp_model.save_checkpoint(checkpoint_path)
+    logger.info("Save complete.")
+
+    # Create a new model instance to load into
+    logger.info("Creating a new TP model instance for loading...")
+    tp_model_for_loading = TensorParallelKeras(
+        model_fn=get_model_from_preset,
+        model_args=(preset_name, model_class),
+        device_count=TARGET_WORLD_SIZE,
+        device_ids=TARGET_DEVICES,
+    )
+
+    # Compile the new model *before* loading to create optimizer states
+    tp_model_for_loading.compile(
+        optimizer=optimizer_fn(),
+        loss=loss_fn,
+        metrics=metrics_fn,
+    )
+
+    # Load
+    logger.info(f"Loading checkpoint from {checkpoint_path}...")
+    tp_model_for_loading.load_checkpoint(checkpoint_path)
+    logger.info("Load complete.")
+
+    # Verify by evaluating
+    logger.info("Evaluating loaded model...")
+    loaded_metrics = tp_model_for_loading.evaluate(
+        val_ds, steps=VALIDATION_STEPS, verbose=0
+    )
+    # The metrics list corresponds to [loss, perplexity]
+    loaded_val_loss = loaded_metrics[0]
+    loaded_val_perplexity = loaded_metrics[1]
+
+    # --- 3. Verification ---
     logger.info("\n--- ⚖️ Verification Results ---")
-    logger.info(f"TP Final Validation Loss: {tp_final_val_loss:.6f}")
+    logger.info(f"Original TP Final Loss: {tp_final_val_loss:.6f}")
+    logger.info(f"Loaded TP Model Loss:   {loaded_val_loss:.6f}")
+    
+    logger.info(f"Original TP Final Perplexity: {tp_final_val_perplexity:.6f}")
+    logger.info(f"Loaded TP Model Perplexity:   {loaded_val_perplexity:.6f}")
 
     plot_training_graphs(tp_history, preset_name)
 
-    logger.info("✅ SUCCESS: TP model training finished without errors.")
+    # Check if loaded loss is very close to the original final loss
+    if not np.isclose(tp_final_val_loss, loaded_val_loss, rtol=1e-5):
+        logger.error(
+            "❌ FAILURE: Loaded model's validation loss does not match "
+            "original model's final validation loss."
+        )
+        logger.error(f"   Original: {tp_final_val_loss} vs Loaded: {loaded_val_loss}")
+        return False
+
+    logger.info("✅ SUCCESS: TP model training and checkpoint loading finished.")
     return True
 
 

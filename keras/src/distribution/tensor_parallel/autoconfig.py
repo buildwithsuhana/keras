@@ -1,14 +1,19 @@
+"""
+This file defines the automatic sharding configuration logic.
+"""
+
 import collections
 from keras.src import layers
 from keras.src import ops
 
 from keras.src.distribution.tensor_parallel.tensor_layout import (
     split_tensor_for_parallelism,
-    LayoutMap
+    LayoutMap,
+    SplitRule  # --- MODIFIED: Import SplitRule ---
 )
 
 # Alias the imported function to keep the configuration logic readable
-_split_fn_internal = split_tensor_for_parallelism 
+_split_fn_internal = split_tensor_for_parallelism
 
 
 def analyze_dense_layer(layer):
@@ -68,10 +73,9 @@ def analyze_dense_layer(layer):
 
 def _split_rule(device_count, dim):
     """
-    Returns a sharding rule (lambda) that calls split_tensor_for_parallelism.
-    The lambda must accept (x, index) as expected by the LayoutMap rule.
+    # --- MODIFIED: Returns a SplitRule object instead of a lambda. ---
     """
-    return lambda x, index: _split_fn_internal(x, index, device_count, dim=dim)
+    return SplitRule(dim=dim, device_count=device_count)
 
 
 def _recursive_layer_traversal(
@@ -95,7 +99,7 @@ def _recursive_layer_traversal(
     name = current_layer.name
     full_name = f"{prefix}.{name}" if prefix else name
     
-    # --- Sharding Logic ---
+    # --- Sharding Logic (Unchanged, but now assigns SplitRule objects) ---
     if isinstance(current_layer, layers.Dense):
         mlp_type = analyze_dense_layer(current_layer)
         
