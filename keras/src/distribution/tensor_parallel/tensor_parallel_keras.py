@@ -377,12 +377,17 @@ class TensorParallelKeras(Model):
             print(f"Saved weights for shard {i} to {shard_weights_path}")
 
         # 3. Save each optimizer shard's state
-        if self.optimizer and hasattr(self.optimizer, 'save_sharded_state'):
-            for i in range(self.device_count):
-                optimizer_path = os.path.join(checkpoint_path, f"optimizer_shard_{i}.npz")
-                # We pass the rank 'i'
-                self.optimizer.save_sharded_state(optimizer_path, i)
-                print(f"Saved optimizer state for shard {i} to {optimizer_path}")
+        if hasattr(self, 'optimizer') and self.optimizer is not None:
+            if hasattr(self.optimizer, 'save_sharded_state'):
+                for i in range(self.device_count):
+                    optimizer_path = os.path.join(checkpoint_path, f"optimizer_shard_{i}.npz")
+                    self.optimizer.save_sharded_state(optimizer_path, i)
+                    print(f"Saved optimizer state for shard {i} to {optimizer_path}")
+            else:
+                print("Warning: Model optimizer does not support sharded state saving.")
+        else:
+            # This is normal for the conversion script
+            print("No optimizer found (model not compiled). Skipping optimizer state save.")
         
         print(f"Distributed checkpoint saved to {checkpoint_path}")
 
