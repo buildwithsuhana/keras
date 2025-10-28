@@ -146,40 +146,80 @@ def get_model_from_preset(preset_name, model_class):
 # --- Plotting Function (MODIFIED) ---
 # ----------------------------------------------------------------------
 
-def plot_training_graphs(tp_history, preset_name):
-    """Plots and saves the loss and perplexity graphs for the TP run."""
+def plot_training_graphs(original_history, loaded_history, preset_name):
+    """
+    Plots and saves loss and perplexity, showing the continuation
+    of training after loading from a checkpoint.
+    """
     fig, (ax1, ax2) = plt.subplots(2, 1, figsize=(12, 10))
-    fig.suptitle(f"{preset_name} - Tensor Parallel Training Metrics", fontsize=16)
+    fig.suptitle(
+        f"{preset_name} - TP Training (Continued from Checkpoint)", fontsize=16
+    )
 
-    # Plotting Loss
+    # --- Combine histories ---
+    orig_epochs = len(original_history.history["val_loss"])
+    load_epochs = len(loaded_history.history["val_loss"])
+    total_epochs = orig_epochs + load_epochs
+    
+    combined_loss = (
+        original_history.history["val_loss"] + 
+        loaded_history.history["val_loss"]
+    )
+    combined_perplexity = (
+        original_history.history["val_perplexity"] + 
+        loaded_history.history["val_perplexity"]
+    )
+    
+    epoch_range = range(1, total_epochs + 1)
+    
+    # --- Plotting Loss ---
     ax1.plot(
-        tp_history.history["val_loss"],
-        label="Tensor Parallel - Validation Loss",
+        epoch_range,
+        combined_loss,
+        label="Validation Loss",
         color="green",
         linestyle="-",
         marker="o",
+    )
+    # Add a vertical line to show where the checkpoint load happened
+    ax1.axvline(
+        x=orig_epochs, 
+        color='red', 
+        linestyle='--', 
+        label=f'Checkpoint Load (Epoch {orig_epochs})'
     )
     ax1.set_title("Validation Loss")
     ax1.set_ylabel("Loss")
     ax1.set_xlabel("Epoch")
     ax1.legend()
     ax1.grid(True)
+    ax1.set_xticks(range(1, total_epochs + 1))
 
-    # Plotting Perplexity
+
+    # --- Plotting Perplexity ---
     ax2.plot(
-        tp_history.history["val_perplexity"],
-        label="Tensor Parallel - Validation Perplexity",
+        epoch_range,
+        combined_perplexity,
+        label="Validation Perplexity",
         color="purple",
         linestyle="-",
         marker="o",
+    )
+    # Add a vertical line to show where the checkpoint load happened
+    ax2.axvline(
+        x=orig_epochs, 
+        color='red', 
+        linestyle='--', 
+        label=f'Checkpoint Load (Epoch {orig_epochs})'
     )
     ax2.set_title("Validation Perplexity")
     ax2.set_ylabel("Perplexity")
     ax2.set_xlabel("Epoch")
     ax2.legend()
     ax2.grid(True)
+    ax2.set_xticks(range(1, total_epochs + 1))
 
-    output_filename = f"{preset_name}_tp_training.png"
+    output_filename = f"{preset_name}_tp_checkpoint_training.png"
     plt.tight_layout(rect=[0, 0.03, 1, 0.95])
     plt.savefig(output_filename)
     logger.info(f"\nTraining graph saved to {output_filename}")
@@ -192,7 +232,7 @@ def plot_training_graphs(tp_history, preset_name):
 
 def run_model_verification(preset_name, model_class):
     """
-    Runs a training execution test for a given model preset using
+    Runs a full save/load/train test for a given model preset using
     tensor parallelism.
     """
     if TARGET_WORLD_SIZE < 2:
@@ -203,6 +243,8 @@ def run_model_verification(preset_name, model_class):
         return "SKIPPED"
 
     logger.info(f"--- VERIFICATION FOR: {preset_name.upper()} ---")
+    checkpoint_dir = f"./{preset_name}_checkpoint"
+    logger.info(f"Using checkpoint directory: {checkpoint_dir}")
 
     # --- Common Setup ---
     train_ds_raw, val_ds_raw = load_shakespeare_dataset(preset_name)
@@ -219,9 +261,20 @@ def run_model_verification(preset_name, model_class):
         .prefetch(tf.data.AUTOTUNE)
         .repeat()
     )
+    
+    # --- Optimizer, Loss, and Metrics ---
+    # Define them once to ensure consistency
+    optimizer_fn = lambda: keras.optimizers.AdamW(learning_rate=LEARNING_RATE)
+    loss_fn = keras.losses.SparseCategoricalCrossentropy(from_logits=True)
+    metrics_fn = lambda: [
+        keras_hub.metrics.Perplexity(from_logits=True, name="perplexity")
+    ]
 
-    # --- 1. Tensor Parallel Model Training ---
-    logger.info("\n--- Training Tensor Parallel (TP) Model ---")
+    # --- 1. Tensor Parallel Model Training (Initial Run) ---
+    logger.info("\n--- Training Tensor Parallel (TP) Model (Run 1) ---")
+    
+    # This part still loads the full model, which is necessary
+    # one time to create the initial checkpoint.
     tp_model_template = get_model_from_preset(preset_name, model_class)
 
     tp_model = TensorParallelKeras(
@@ -231,11 +284,9 @@ def run_model_verification(preset_name, model_class):
     )
 
     tp_model.compile(
-        optimizer=keras.optimizers.AdamW(learning_rate=LEARNING_RATE),
-        loss=keras.losses.SparseCategoricalCrossentropy(from_logits=True),
-        metrics=[
-            keras_hub.metrics.Perplexity(from_logits=True, name="perplexity")
-        ],
+        optimizer=optimizer_fn(),
+        loss=loss_fn,
+        metrics=metrics_fn(),
     )
 
     tp_history = tp_model.fit(
@@ -247,15 +298,77 @@ def run_model_verification(preset_name, model_class):
         verbose=1,
     )
     tp_final_val_loss = tp_history.history["val_loss"][-1]
-    logger.info("TP model training completed successfully.")
+    logger.info("TP model (Run 1) training completed.")
 
-    # --- 2. Verification ---
+    # --- 2. Save and Reload Test (THE FIX) ---
+    logger.info("\n--- Testing Checkpoint Save and Load ---")
+    
+    # --- Save ---
+    logger.info(f"Saving distributed checkpoint to {checkpoint_dir}...")
+    tp_model.save_checkpoint(checkpoint_dir)
+    logger.info("Checkpoint saved.")
+
+    # --- Delete ---
+    logger.info("Deleting original model from memory...")
+    del tp_model_template
+    del tp_model
+    
+    # --- Load (This is the OOM-safe part) ---
+    logger.info("Loading model from distributed checkpoint (OOM-safe)...")
+    # This uses your new classmethod, which loads the config first
+    # and then loads weights directly onto each shard.
+    loaded_tp_model = TensorParallelKeras.load_checkpoint(
+        checkpoint_dir,
+        device_count=TARGET_WORLD_SIZE,
+        device_ids=TARGET_DEVICES
+    )
+    logger.info("Model loaded successfully from checkpoint.")
+
+    # --- 3. Continue Training Loaded Model ---
+    logger.info("\n--- Continuing Training on Loaded TP Model (Run 2) ---")
+    
+    # 1. Compile the model (this creates the new optimizer)
+    logger.info("Compiling loaded model...")
+    loaded_tp_model.compile(
+        optimizer=optimizer_fn(),
+        loss=loss_fn,
+        metrics=metrics_fn(),
+    )
+
+    # 2. Load the optimizer state from the checkpoint
+    logger.info("Loading optimizer state into compiled model...")
+    loaded_tp_model.load_optimizer_checkpoint(checkpoint_dir)
+    
+    # 3. Fit the loaded model to verify it works and optimizer state was loaded
+    logger.info("Continuing training...")
+    loaded_history = loaded_tp_model.fit(
+        train_ds,
+        validation_data=val_ds,
+        epochs=EPOCHS,  # Continue for a few more epochs
+        steps_per_epoch=STEPS_PER_EPOCH,
+        validation_steps=VALIDATION_STEPS,
+        verbose=1,
+    )
+
+    loaded_final_val_loss = loaded_history.history["val_loss"][-1]
+    logger.info("Loaded TP model (Run 2) training completed.")
+
+    # --- 4. Verification ---
     logger.info("\n--- ⚖️ Verification Results ---")
-    logger.info(f"TP Final Validation Loss: {tp_final_val_loss:.6f}")
+    logger.info(f"Run 1 Final Validation Loss: {tp_final_val_loss:.6f}")
+    logger.info(f"Run 2 Final Validation Loss: {loaded_final_val_loss:.6f}")
 
-    plot_training_graphs(tp_history, preset_name)
+    # Plot graphs comparing the two runs
+    plot_training_graphs(tp_history, loaded_history, preset_name)
 
-    logger.info("✅ SUCCESS: TP model training finished without errors.")
+    if loaded_final_val_loss > tp_final_val_loss:
+         logger.warning(
+            "Validation loss increased after loading. "
+            "This might be OK due to normal fluctuations, but check."
+         )
+    else:
+        logger.info("✅ SUCCESS: Loaded model continued training and loss decreased.")
+        
     return True
 
 

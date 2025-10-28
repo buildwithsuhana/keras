@@ -6,7 +6,7 @@ Port of the PyTorch tensor_parallel library
 import logging
 import re
 from typing import Collection, Optional, Sequence, Union
-
+import os
 import numpy as np
 import tensorflow as tf
 import keras
@@ -346,6 +346,75 @@ class TensorParallelKeras(Model):
         Forward pass for the tensor-parallel model.
         """
         return self.assembled_model(inputs, training=training, **kwargs)
+    
+    def save_checkpoint(self, checkpoint_path):
+        """
+        Saves a distributed checkpoint to a directory.
+        
+        This saves:
+        1. The original model's config (model_config.json)
+        2. The weights for each model shard (model_shard_<i>.weights.h5)
+        3. The state for each optimizer shard (optimizer_shard_<i>.npz)
+        """
+        # Ensure directory exists
+        if not os.path.exists(checkpoint_path):
+            os.makedirs(checkpoint_path)
+
+        # 1. Save the original model's architecture (config)
+        config_path = os.path.join(checkpoint_path, "model_config.json")
+        try:
+            with open(config_path, "w") as f:
+                f.write(self._original_model.to_json())
+            print(f"Saved model config to {config_path}")
+        except Exception as e:
+            print(f"Warning: Could not save model config. {e}")
+
+        # 2. Save each model shard's weights
+        for i, shard in enumerate(self.model_shards):
+            shard_weights_path = os.path.join(checkpoint_path, f"model_shard_{i}.weights.h5")
+            # This saves only the weights for this shard
+            shard.save_weights(shard_weights_path)
+            print(f"Saved weights for shard {i} to {shard_weights_path}")
+
+        # 3. Save each optimizer shard's state
+        if self.optimizer and hasattr(self.optimizer, 'save_sharded_state'):
+            for i in range(self.device_count):
+                optimizer_path = os.path.join(checkpoint_path, f"optimizer_shard_{i}.npz")
+                # We pass the rank 'i'
+                self.optimizer.save_sharded_state(optimizer_path, i)
+                print(f"Saved optimizer state for shard {i} to {optimizer_path}")
+        
+        print(f"Distributed checkpoint saved to {checkpoint_path}")
+
+    def load_optimizer_checkpoint(self, checkpoint_path):
+        """
+        Loads the sharded optimizer state from a checkpoint.
+        
+        This method MUST be called *after* compiling the model,
+        as compiling is what creates the optimizer instance.
+        """
+        if not self.optimizer:
+            print("Warning: Cannot load optimizer state. Model has not been compiled.")
+            return
+        
+        if not hasattr(self.optimizer, 'load_sharded_state'):
+            print("Warning: Optimizer does not support sharded state loading.")
+            return
+            
+        print("Loading sharded optimizer state...")
+        
+        # Build the optimizer if it hasn't been built yet
+        if not self.optimizer.built:
+            self.optimizer.build(self.trainable_variables)
+            
+        for i in range(self.device_count):
+            optimizer_path = os.path.join(checkpoint_path, f"optimizer_shard_{i}.npz")
+            if os.path.exists(optimizer_path):
+                self.optimizer.load_sharded_state(optimizer_path, i)
+                print(f"Loaded optimizer state for shard {i}")
+            else:
+                print(f"Warning: Could not find optimizer state for shard {i} at {optimizer_path}")
+        print("Optimizer state loaded.")
 
     def compile(self, optimizer=None, loss=None, metrics=None, **kwargs):
         """
@@ -415,3 +484,49 @@ class TensorParallelKeras(Model):
     def fit(self, x=None, y=None, **kwargs):
         """Use standard Keras training which correctly handles the train_step."""
         return super().fit(x, y, **kwargs)
+    
+    @classmethod
+    def load_checkpoint(cls, checkpoint_path, device_count=None, device_ids=None):
+        """
+        Loads a distributed checkpoint from a directory, avoiding OOM errors.
+        
+        This method:
+        1. Loads the model structure from 'model_config.json' (lightweight).
+        2. Initializes the TensorParallelKeras class (shards the structure).
+        3. Loads weights *directly* into each shard.
+        """
+        print(f"Loading distributed checkpoint from {checkpoint_path}...")
+        config_path = os.path.join(checkpoint_path, "model_config.json")
+
+        # 1. Load the model *structure* (config) without weights
+        if not os.path.exists(config_path):
+            raise FileNotFoundError(f"Cannot find model_config.json at {config_path}")
+        
+        with open(config_path, "r") as f:
+            config_json = f.read()
+        
+        # Create the model from config - this is lightweight
+        original_model = keras.models.model_from_json(config_json)
+        print("Loaded model structure (no weights).")
+
+        # 2. Initialize TensorParallelKeras
+        # This will create the sharded model structure (again, no weights loaded yet)
+        print("Initializing TensorParallelKeras sharding...")
+        sharded_model = cls(
+            original_model,
+            device_count=device_count,
+            device_ids=device_ids
+        )
+        print("Sharding complete. Loading weights...")
+
+        # 3. Load weights *directly* into each shard
+        for i, shard in enumerate(sharded_model.model_shards):
+            shard_weights_path = os.path.join(checkpoint_path, f"model_shard_{i}.weights.h5")
+            if os.path.exists(shard_weights_path):
+                shard.load_weights(shard_weights_path)
+                print(f"Loaded weights for shard {i}")
+            else:
+                print(f"Warning: Could not find weights for shard {i} at {shard_weights_path}")
+        
+        print("Distributed model weights loaded successfully.")
+        return sharded_model

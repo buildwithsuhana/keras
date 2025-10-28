@@ -115,6 +115,49 @@ class CoordinatedOptimizer:
         else:
             return [np.copy(state_array) for _ in range(self.device_count)]
 
+    def save_sharded_state(self, filepath, rank):
+        """
+        Saves the sharded optimizer state for a specific rank.
+        """
+        state_to_save = {}
+        for state_name, state_value in self.sharded_states.items():
+            if isinstance(state_value, dict):
+                # For slot variables like 'momentum', 'velocity'
+                state_to_save[state_name] = {}
+                for param_name, param_states in state_value.items():
+                    # param_states is a list of arrays, get the one for this rank
+                    state_to_save[state_name][param_name] = param_states[rank]
+            else:
+                # For 'iterations'
+                state_to_save[state_name] = state_value[rank]
+                
+        # Use numpy.savez to save the dictionary of numpy arrays
+        np.savez(filepath, **state_to_save)
+
+    def load_sharded_state(self, filepath, rank):
+        """
+        Loads and populates the sharded optimizer state for a specific rank.
+        """
+        # allow_pickle=True is required to load the dictionary of slot variables
+        loaded_states = np.load(filepath, allow_pickle=True)
+        
+        for state_name in loaded_states.files:
+            state_value = loaded_states[state_name]
+            
+            if state_name == 'iterations':
+                self.sharded_states[state_name][rank] = state_value
+            elif state_name in self.sharded_states:
+                # This is a dict of slot variables (e.g., 'momentum')
+                # We must use .item() to get the dict from the npz file
+                slot_dict = state_value.item()
+                for param_name, param_state_shard in slot_dict.items():
+                    if param_name in self.sharded_states[state_name]:
+                        self.sharded_states[state_name][param_name][rank] = param_state_shard
+                    else:
+                        print(f"Warning: Optimizer state for {param_name} not found in model.")
+            else:
+                print(f"Warning: Unknown optimizer state '{state_name}' in checkpoint.")
+
     def apply_gradients(self, gradients_and_vars, shard_models):
         """Coordinates gradient synchronization and application.
 
@@ -541,6 +584,14 @@ class TensorParallelOptimizer(optimizers.Optimizer):
             )
         else:
             self.base_optimizer.apply_gradients(grads_and_vars)
+
+    def save_sharded_state(self, filepath, rank):
+        """Passes the save call to the internal coordinated optimizer."""
+        self.coordinated_optimizer.save_sharded_state(filepath, rank)
+
+    def load_sharded_state(self, filepath, rank):
+        """Passes the load call to the internal coordinated optimizer."""
+        self.coordinated_optimizer.load_sharded_state(filepath, rank)
 
     def update_step(self, gradient, variable, *args, **kwargs):
         """Delegates the single-variable update step to the base optimizer.
