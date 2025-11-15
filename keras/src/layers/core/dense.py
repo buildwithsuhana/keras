@@ -9,11 +9,8 @@ from keras.src import ops
 from keras.src import quantizers
 from keras.src import regularizers
 from keras.src.api_export import keras_export
-from keras.src.dtype_policies.dtype_policy import GPTQDTypePolicy
-from keras.src.dtype_policies.dtype_policy_map import DTypePolicyMap
 from keras.src.layers.input_spec import InputSpec
 from keras.src.layers.layer import Layer
-from keras.src.quantizers.gptq_config import GPTQConfig
 from keras.src.quantizers.quantizers import dequantize_with_sz_map
 
 
@@ -143,22 +140,47 @@ class Dense(Layer):
 
     @property
     def kernel(self):
+        from keras.src.quantizers import gptq_core
+
         if not self.built:
             raise AttributeError(
                 "You must build the layer before accessing `kernel`."
             )
-        if (
-            getattr(self, "is_gptq_calibrated", False)
-            and self.quantization_mode == "gptq"
-        ):
-            return self.quantized_kernel
-        kernel = self._kernel
-        if self.quantization_mode == "int4":
-            kernel = quantizers.unpack_int4(kernel, self._orig_input_dim)
+
+        mode = self.quantization_mode
+        is_gptq = mode == "gptq"
+        is_int4 = mode == "int4"
+        calibrated = bool(getattr(self, "is_gptq_calibrated", False))
+        gptq_bits = (
+            gptq_core.get_weight_bits_for_layer(self, None) if is_gptq else None
+        )
+
+        # Decide the source tensor first (packed vs already-quantized vs plain
+        # kernel)
+        if is_gptq and calibrated and gptq_bits != 4:
+            # calibrated GPTQ, not 4-bit, no unpacking needed
+            kernel = self.quantized_kernel
+        else:
+            # Start with the stored kernel
+            kernel = getattr(self, "_kernel", None)
+
+            # Handle int4 unpacking cases in one place
+            if is_int4:
+                kernel = quantizers.unpack_int4(kernel, self._orig_input_dim)
+            elif is_gptq and calibrated and gptq_bits == 4:
+                kernel = quantizers.unpack_int4(
+                    self.quantized_kernel,
+                    orig_len=self.units,
+                    axis=0,
+                    dtype="uint8",
+                )
+
+        # Apply LoRA once at the end.
         if self.lora_enabled:
-            return kernel + (self.lora_alpha / self.lora_rank) * ops.matmul(
+            kernel = kernel + (self.lora_alpha / self.lora_rank) * ops.matmul(
                 self.lora_kernel_a, self.lora_kernel_b
             )
+
         return kernel
 
     def call(self, inputs, training=None):
@@ -235,52 +257,26 @@ class Dense(Layer):
         # Do nothing if the layer isn't yet built
         if not self.built:
             return
-        # The keys of the `store` will be saved as determined because the
-        # default ordering will change after quantization
         mode = self.quantization_mode
-
-        # For int4/int8, the merged LoRA scale (if any) comes from
-        # `_get_kernel_with_merged_lora()` and is appended below.
-        MODE_SPEC = {
-            None: [],
-            "int4": [],
-            "int8": [],
-            "float8": [
-                "inputs_scale",
-                "inputs_amax_history",
-                "kernel_scale",
-                "kernel_amax_history",
-                "outputs_grad_scale",
-                "outputs_grad_amax_history",
-            ],
-            "gptq": [
-                "quantized_kernel",
-                "kernel_scale",
-                "kernel_zero",
-                "g_idx",
-            ],
-        }
-
-        if mode not in MODE_SPEC:
+        if mode not in self.variable_serialization_spec:
             raise self._quantization_mode_error(mode)
 
         # Kernel plus optional merged LoRA-aware scale (returns (kernel, None)
         # for None/gptq)
         kernel_value, merged_kernel_scale = self._get_kernel_with_merged_lora()
-
-        targets = []
-        if mode != "gptq":
-            targets.append(kernel_value)
-        if self.bias is not None:
-            targets.append(self.bias)
-        if merged_kernel_scale is not None and mode in ("int4", "int8"):
-            targets.append(merged_kernel_scale)
-
-        # Append per-mode attributes (order matters)
-        targets.extend(getattr(self, name) for name in MODE_SPEC[mode])
-
-        for i, var in enumerate(targets):
-            store[str(i)] = var
+        idx = 0
+        for name in self.variable_serialization_spec[mode]:
+            if name == "kernel":
+                store[str(idx)] = kernel_value
+            elif name == "bias" and self.bias is None:
+                continue
+            elif name == "kernel_scale" and mode in ("int4", "int8"):
+                # For int4/int8, the merged LoRA scale (if any) comes from
+                # `_get_kernel_with_merged_lora()`
+                store[str(idx)] = merged_kernel_scale
+            else:
+                store[str(idx)] = getattr(self, name)
+            idx += 1
 
     def load_own_variables(self, store):
         if not self.lora_enabled:
@@ -288,43 +284,22 @@ class Dense(Layer):
         # Do nothing if the layer isn't yet built
         if not self.built:
             return
-        # The keys of the `store` will be saved as determined because the
-        # default ordering will change after quantization
         mode = self.quantization_mode
-
-        # Per-mode variable spec (order matters).
-        MODE_SPEC = {
-            None: [],
-            "int8": ["kernel_scale"],
-            "int4": ["kernel_scale"],
-            "float8": [
-                "inputs_scale",
-                "inputs_amax_history",
-                "kernel_scale",
-                "kernel_amax_history",
-                "outputs_grad_scale",
-                "outputs_grad_amax_history",
-            ],
-            "gptq": [
-                "quantized_kernel",
-                "kernel_scale",
-                "kernel_zero",
-                "g_idx",
-            ],
-        }
-
-        if mode not in MODE_SPEC:
+        if mode not in self.variable_serialization_spec:
             raise self._quantization_mode_error(mode)
 
-        targets = []
-        if mode != "gptq":
-            targets.append(self._kernel)
-        if self.bias is not None:
-            targets.append(self.bias)
-        targets.extend(getattr(self, name) for name in MODE_SPEC[mode])
+        # A saved GPTQ quantized model will always be calibrated.
+        self.is_gptq_calibrated = mode == "gptq"
 
-        for i, variable in enumerate(targets):
-            variable.assign(store[str(i)])
+        idx = 0
+        for name in self.variable_serialization_spec[mode]:
+            if name == "kernel":
+                self._kernel.assign(store[str(idx)])
+            elif name == "bias" and self.bias is None:
+                continue
+            else:
+                getattr(self, name).assign(store[str(idx)])
+            idx += 1
         if self.lora_enabled:
             self.lora_kernel_a.assign(ops.zeros(self.lora_kernel_a.shape))
             self.lora_kernel_b.assign(ops.zeros(self.lora_kernel_b.shape))
@@ -351,39 +326,47 @@ class Dense(Layer):
             config["lora_alpha"] = self.lora_alpha
         return {**base_config, **config}
 
-    def _check_load_own_variables(self, store):
-        all_vars = self._trainable_variables + self._non_trainable_variables
-        if len(store.keys()) != len(all_vars):
-            if len(all_vars) == 0 and not self.built:
-                raise ValueError(
-                    f"Layer '{self.name}' was never built "
-                    "and thus it doesn't have any variables. "
-                    f"However the weights file lists {len(store.keys())} "
-                    "variables for this layer.\n"
-                    "In most cases, this error indicates that either:\n\n"
-                    "1. The layer is owned by a parent layer that "
-                    "implements a `build()` method, but calling the "
-                    "parent's `build()` method did NOT create the state of "
-                    f"the child layer '{self.name}'. A `build()` method "
-                    "must create ALL state for the layer, including "
-                    "the state of any children layers.\n\n"
-                    "2. You need to implement "
-                    "the `def build_from_config(self, config)` method "
-                    f"on layer '{self.name}', to specify how to rebuild "
-                    "it during loading. "
-                    "In this case, you might also want to implement the "
-                    "method that generates the build config at saving time, "
-                    "`def get_build_config(self)`. "
-                    "The method `build_from_config()` is meant "
-                    "to create the state "
-                    "of the layer (i.e. its variables) upon deserialization.",
-                )
-            raise ValueError(
-                f"Layer '{self.name}' expected {len(all_vars)} variables, "
-                "but received "
-                f"{len(store.keys())} variables during loading. "
-                f"Expected: {[v.name for v in all_vars]}"
-            )
+    @property
+    def variable_serialization_spec(self):
+        """Returns a dict mapping quantization modes to variable names in order.
+
+        This spec is used by `save_own_variables` and `load_own_variables` to
+        determine the correct ordering of variables during serialization for
+        each quantization mode. `None` means no quantization.
+        """
+        return {
+            None: [
+                "kernel",
+                "bias",
+            ],
+            "int8": [
+                "kernel",
+                "bias",
+                "kernel_scale",
+            ],
+            "int4": [
+                "kernel",
+                "bias",
+                "kernel_scale",
+            ],
+            "float8": [
+                "kernel",
+                "bias",
+                "inputs_scale",
+                "inputs_amax_history",
+                "kernel_scale",
+                "kernel_amax_history",
+                "outputs_grad_scale",
+                "outputs_grad_amax_history",
+            ],
+            "gptq": [
+                "bias",
+                "quantized_kernel",
+                "kernel_scale",
+                "kernel_zero",
+                "g_idx",
+            ],
+        }
 
     def quantized_build(self, kernel_shape, mode, config=None):
         if mode == "int8":
@@ -415,23 +398,33 @@ class Dense(Layer):
         )
 
     def _gptq_build(self, kernel_shape, config):
+        from keras.src.quantizers import gptq_core
+
         # Ensures the forward pass uses the original high-precision kernel
         # until calibration has been performed.
         self.is_gptq_calibrated = False
         self.kernel_shape = kernel_shape
+
+        weight_bits = gptq_core.get_weight_bits_for_layer(self, config)
+        # For 4-bit weights, we pack two values per byte.
+        units = (
+            (kernel_shape[1] + 1) // 2 if weight_bits == 4 else kernel_shape[1]
+        )
+
         self.quantized_kernel = self.add_weight(
             name="kernel",
-            shape=(kernel_shape[1], kernel_shape[0]),
+            shape=(units, kernel_shape[0]),
             initializer="zeros",
             dtype="uint8",
             trainable=False,
         )
 
-        group_size = self._get_gptq_group_size(config)
-        if group_size == -1:
-            n_groups = 1
-        else:
-            n_groups = math.ceil(self.kernel_shape[0] / group_size)
+        group_size = gptq_core.get_group_size_for_layer(self, config)
+        n_groups = (
+            1
+            if group_size == -1
+            else math.ceil(self.kernel_shape[0] / group_size)
+        )
         self.kernel_scale = self.add_weight(
             name="kernel_scale",
             shape=(self.units, n_groups),
@@ -454,18 +447,31 @@ class Dense(Layer):
         )
 
     def _gptq_call(self, inputs, training=False):
+        from keras.src.quantizers import gptq_core
+
         if not self.is_gptq_calibrated:
             W = self._kernel
         else:
+            should_unpack = (
+                gptq_core.get_weight_bits_for_layer(self, config=None) == 4
+            )
             W = (
-                ops.transpose(
-                    dequantize_with_sz_map(
-                        self.quantized_kernel,
-                        self.kernel_scale,
-                        self.kernel_zero,
-                        self.g_idx,
-                    )
-                ),
+                quantizers.unpack_int4(
+                    self.quantized_kernel,
+                    orig_len=self.units,
+                    axis=0,
+                    dtype="uint8",
+                )
+                if should_unpack
+                else self.quantized_kernel
+            )
+            W = ops.transpose(
+                dequantize_with_sz_map(
+                    W,
+                    self.kernel_scale,
+                    self.kernel_zero,
+                    self.g_idx,
+                )
             )
 
         y = ops.matmul(inputs, W)
@@ -876,43 +882,3 @@ class Dense(Layer):
         else:
             kernel_value = requantized_kernel
         return kernel_value, kernel_scale
-
-    def _get_gptq_group_size(self, config):
-        """Determine the group size for GPTQ quantization.
-
-        The group size can be specified either through the `config` argument
-        or through the `dtype_policy` if it is of type `GPTQDTypePolicy`.
-
-        The config argument is usually available when quantizing the layer
-        via the `quantize` method. If the layer was deserialized from a
-        saved model, the group size should be specified in the `dtype_policy`.
-
-        Args:
-            config: An optional configuration object that may contain the
-                `group_size` attribute.
-        Returns:
-            int. The determined group size for GPTQ quantization.
-        Raises:
-            ValueError: If the group size is not specified in either the
-                `config` or the `dtype_policy`.
-        """
-        if config and isinstance(config, GPTQConfig):
-            return config.group_size
-        elif isinstance(self.dtype_policy, GPTQDTypePolicy):
-            return self.dtype_policy.group_size
-        elif isinstance(self.dtype_policy, DTypePolicyMap):
-            policy = self.dtype_policy[self.path]
-            if not isinstance(policy, GPTQDTypePolicy):
-                # This should never happen based on how we set the
-                # quantization mode, but we check just in case.
-                raise ValueError(
-                    "Expected a `dtype_policy` of type `GPTQDTypePolicy`."
-                    f"Got: {type(policy)}"
-                )
-            return policy.group_size
-        else:
-            raise ValueError(
-                "For GPTQ quantization, the group_size must be specified"
-                "either through a `dtype_policy` of type "
-                "`GPTQDTypePolicy` or the `config` argument."
-            )

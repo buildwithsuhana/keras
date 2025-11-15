@@ -25,7 +25,7 @@ NUM_SAMPLES = 16
 W_BITS = 4
 NUM_CLASSES = 32
 
-CALIBRATION_TEXT = """
+CALIBRATION_TEXT = r"""
 GPTQ (Generative Pre-trained Transformer Quantization) is an advanced 
 post-training quantization (PTQ) algorithm designed to compress large 
 language models with minimal accuracy degradation. It addresses the 
@@ -131,7 +131,7 @@ class GPTQTest(testing.TestCase):
         dense_gptq.update_hessian_with_batch(calibration_data)
         dense_gptq.quantize_and_correct_layer()
 
-        self.assertEqual(dense.kernel.dtype, "uint8")
+        self.assertEqual(backend.standardize_dtype(dense.kernel.dtype), "uint8")
 
         dense_gptq.free()
         self.assertIsNone(getattr(dense_gptq, "hessian", None))
