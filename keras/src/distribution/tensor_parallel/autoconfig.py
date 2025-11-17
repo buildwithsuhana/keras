@@ -8,9 +8,7 @@ _split_fn_internal = split_tensor_for_parallelism
 
 
 def _split_rule(device_count, dim):
-    """
-    Creates a sharding rule for a specific dimension.
-    """
+    """Creates a sharding rule for a specific dimension."""
     return lambda x, index: _split_fn_internal(x, index, device_count, dim=dim)
 
 
@@ -89,15 +87,21 @@ def _apply_layer_sharding_rules(layer, full_name, device_count, state_rules, out
                 state_rules[f"{full_name}.bias"] = _split_rule(device_count, dim=0)
             output_rules[f"{full_name}"] = {0: "gather -1"}
 
-    elif isinstance(layer, (layers.Embedding,)):
-        weight_name = None 
-        if hasattr(layer, 'embeddings'):
-            weight_name = 'embeddings'
-        elif hasattr(layer, 'position_embeddings'):
-            weight_name = 'position_embeddings'
+    elif isinstance(layer, (layers.Embedding,)) or "Embedding" in layer.__class__.__name__:
+        if hasattr(layer, 'weights'):
+            for weight in layer.weights:
+                if "embedding" in weight.name or "weight" in weight.name:
+                    key_found = False
+                    for attr_candidate in ['embeddings', 'position_embeddings', 'weight']:
+                        if getattr(layer, attr_candidate, None) is weight:
+                            state_rules[f"{full_name}.{attr_candidate}"] = _split_rule(device_count, dim=1)
+                            key_found = True
+                            break
+                    
+                    if not key_found:
+                        clean_name = weight.name.split('/')[-1].split(':')[0]
+                        state_rules[f"{full_name}.{clean_name}"] = _split_rule(device_count, dim=1)
 
-        if weight_name:
-            state_rules[f"{full_name}.{weight_name}"] = _split_rule(device_count, dim=1)
             output_rules[f"{full_name}"] = {0: "no_comm"}
 
 
