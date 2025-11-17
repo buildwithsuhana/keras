@@ -391,42 +391,25 @@ class TensorParallelOptimizer(optimizers.Optimizer):
             tensor_parallel_config=tensor_parallel_config,
         )
 
-    def apply_gradients(self, grads_and_vars: list, **kwargs):
-        """Applies gradients to the model variables."""
-        is_sharded_grads = (
-            isinstance(grads_and_vars, list)
-            and grads_and_vars
-            and isinstance(grads_and_vars[0], list)
-        )
-        if is_sharded_grads:
-            if "shard_models" not in kwargs:
-                raise ValueError(
-                    "The `shard_models` keyword argument is required when "
-                    "applying sharded gradients (a list of lists)."
-                )
-            shard_models = kwargs.get("shard_models")
-            self.coordinated_optimizer.apply_gradients(
-                grads_and_vars, shard_models
-            )
-        else:
-            self.base_optimizer.apply_gradients(grads_and_vars)
-
-    def get_config(self) -> dict[str, Any]:
-
-        config = super().get_config()
-        config.pop("learning_rate", None)
-        config.pop("name", None)
-
-        config.update(
-            {
-                "base_optimizer": saving.serialize_keras_object(
-                    self.base_optimizer
-                ),
-                "device_count": self.device_count,
-                "tensor_parallel_config": self.coordinated_optimizer.tensor_parallel_config,
-            }
-        )
-        return config
+    # def apply_gradients(self, grads_and_vars: list, **kwargs):
+    #     """Applies gradients to the model variables."""
+    #     is_sharded_grads = (
+    #         isinstance(grads_and_vars, list)
+    #         and grads_and_vars
+    #         and isinstance(grads_and_vars[0], list)
+    #     )
+    #     if is_sharded_grads:
+    #         if "shard_models" not in kwargs:
+    #             raise ValueError(
+    #                 "The `shard_models` keyword argument is required when "
+    #                 "applying sharded gradients (a list of lists)."
+    #             )
+    #         shard_models = kwargs.get("shard_models")
+    #         self.coordinated_optimizer.apply_gradients(
+    #             grads_and_vars, shard_models
+    #         )
+    #     else:
+    #         self.base_optimizer.apply_gradients(grads_and_vars)
 
     def update_step(self, gradient, variable, *args, **kwargs):
         """Delegates the update step to the base optimizer."""
@@ -443,21 +426,21 @@ class TensorParallelOptimizer(optimizers.Optimizer):
         except TypeError:
             return super().update_step(gradient, variable)
 
-    @classmethod
-    def from_config(cls, config: dict[str, Any]) -> "TensorParallelOptimizer":
+    # @classmethod
+    # def from_config(cls, config: dict[str, Any]) -> "TensorParallelOptimizer":
 
-        base_optimizer_config = config.pop("base_optimizer")
-        base_optimizer = saving.deserialize_keras_object(base_optimizer_config)
+    #     base_optimizer_config = config.pop("base_optimizer")
+    #     base_optimizer = saving.deserialize_keras_object(base_optimizer_config)
 
-        init_kwargs = {
-            "device_count": config.get("device_count"), 
-            "tensor_parallel_config": config.get("tensor_parallel_config"),
-        }
+    #     init_kwargs = {
+    #         "device_count": config.get("device_count"), 
+    #         "tensor_parallel_config": config.get("tensor_parallel_config"),
+    #     }
 
-        config.pop("device_count", None) 
-        config.pop("tensor_parallel_config", None) 
+    #     config.pop("device_count", None) 
+    #     config.pop("tensor_parallel_config", None) 
         
-        return cls(base_optimizer=base_optimizer, **init_kwargs)
+    #     return cls(base_optimizer=base_optimizer, **init_kwargs)
 
     def build(self, variables: list):
         """Builds the optimizer and initializes sharded states."""
