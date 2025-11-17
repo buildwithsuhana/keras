@@ -4,7 +4,6 @@ from keras.src.distribution.tensor_parallel.tensor_layout import (
     LayoutMap
 )
 
-# Alias for internal split function
 _split_fn_internal = split_tensor_for_parallelism
 
 
@@ -131,43 +130,36 @@ def get_default_config_keras(module, device_ids):
 
         children_to_add = []
 
-        # 1. Check standard Keras sub-layers list
         if hasattr(current_layer, 'layers') and current_layer.layers:
             for sub_layer in current_layer.layers:
                 children_to_add.append((sub_layer, full_name))
 
-        # 2. [FIX] Explicitly check for common NLP attributes (e.g. OPT/GPT backbones)
-        # This ensures 'token_embedding' is found and sharded, preventing replication.
         for specific_attr in ['token_embedding', 'embeddings', 'position_embedding']:
             if hasattr(current_layer, specific_attr):
                 attr_val = getattr(current_layer, specific_attr)
                 if isinstance(attr_val, layers.Layer):
                     children_to_add.append((attr_val, full_name))
 
-        # 3. Check attributes for hidden layers (common in Subclassing API)
         for attr_name in dir(current_layer):
             if attr_name.startswith('__') and attr_name.endswith('__'):
                 continue
             
-            # Optimization: Skip known non-layer attributes
             if attr_name in ['trainable_variables', 'non_trainable_variables', 'weights']:
                 continue
 
-            try:
-                if not hasattr(current_layer, attr_name):
-                    continue
-                attr = getattr(current_layer, attr_name)
-            except Exception:
+            attr_value = getattr(current_layer, attr_name, None)
+
+            if attr_value is None:
                 continue
 
-            if isinstance(attr, layers.Layer) and attr is not current_layer:
-                children_to_add.append((attr, full_name))
-            elif isinstance(attr, (list, tuple)):
-                for item in attr:
+            if isinstance(attr_value, layers.Layer) and attr_value is not current_layer:
+                children_to_add.append((attr_value, full_name))
+            elif isinstance(attr_value, (list, tuple)):
+                for item in attr_value:
                     if isinstance(item, layers.Layer):
                         children_to_add.append((item, full_name))
         
-        stack.extend(children_to_add)
+        stack.extend(reversed(children_to_add))
 
     return LayoutMap(
         state_rules=state_rules,
