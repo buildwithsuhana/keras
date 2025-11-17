@@ -105,7 +105,7 @@ def _apply_layer_sharding_rules(layer, full_name, device_count, state_rules, out
             output_rules[f"{full_name}"] = {0: "no_comm"}
 
 
-def get_default_config_keras(module, device_ids):
+def get_default_config(module, device_ids):
     """
     Generates a default tensor parallelism configuration for a model using
     iterative graph traversal (stack-based).

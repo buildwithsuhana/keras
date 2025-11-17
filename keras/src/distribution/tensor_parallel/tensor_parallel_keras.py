@@ -12,7 +12,7 @@ import tensorflow as tf
 import keras
 from keras import ops
 from keras.src.distribution.tensor_parallel.autoconfig import (
-    get_default_config_keras,
+    get_default_config,
 )
 from keras.src.distribution.tensor_parallel.parameter_sharding import (
     make_parameter_sharded_model,
@@ -106,7 +106,7 @@ class TensorParallelKeras(Model):
 
         if self.tensor_parallel_config is None:
             device_names = [str(d) for d in self.devices]
-            self.tensor_parallel_config = get_default_config_keras(
+            self.tensor_parallel_config = get_default_config(
                 model, device_names
             )
             logger.info(

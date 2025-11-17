@@ -2,6 +2,7 @@ import re
 from typing import Any
 
 import numpy as np
+from keras.src import saving
 
 from keras.src import ops
 from keras.src import optimizers
@@ -411,7 +412,6 @@ class TensorParallelOptimizer(optimizers.Optimizer):
             self.base_optimizer.apply_gradients(grads_and_vars)
 
     def get_config(self) -> dict[str, Any]:
-        from keras.src import saving
 
         config = super().get_config()
         config.pop("learning_rate", None)
@@ -445,7 +445,6 @@ class TensorParallelOptimizer(optimizers.Optimizer):
 
     @classmethod
     def from_config(cls, config: dict[str, Any]) -> "TensorParallelOptimizer":
-        from keras.src import saving
 
         base_optimizer_config = config.pop("base_optimizer")
         base_optimizer = saving.deserialize_keras_object(base_optimizer_config)
