@@ -1,25 +1,22 @@
-from keras.src.distribution.tensor_parallel.tensor_layout import LayoutMap
-from keras.src.distribution.tensor_parallel.tensor_layout import Split
 from keras.src import layers
+from keras.src.distribution.tensor_parallel.tensor_layout import (
+    split_tensor_for_parallelism,
+    LayoutMap
+)
+
+_split_fn_internal = split_tensor_for_parallelism
+
+
+def _split_rule(device_count, dim):
+    """
+    Returns a sharding rule (lambda) that calls split_tensor_for_parallelism.
+    The lambda accepts (tensor, index) as expected by LayoutMap.
+    """
+    return lambda x, index: _split_fn_internal(x, index, device_count, dim=dim)
+
 
 def analyze_dense_layer(layer):
-    """Analyzes a Keras Dense layer to classify its sharding strategy.
-
-    This function inspects the input and output dimensions of a Dense layer
-    to determine if it functions as an expansion layer ("up-projection"), a
-    contraction layer ("down-projection"), or neither ("dense"). This
-    classification is a heuristic commonly used to apply tensor parallelism
-    in Transformer-based models, such as in an MLP block where an up-projection
-    is followed by a down-projection.
-
-    Args:
-        layer: The Keras `layers.Dense` instance to analyze.
-
-    Returns:
-        str: A string classifying the layer as 'up_projection',
-        'down_projection', or 'dense'.
-    """
-
+    """Analyzes a Keras Dense layer to classify its sharding strategy."""
     if not isinstance(layer, layers.Dense):
         return 'dense'
 
@@ -66,16 +63,12 @@ def _recursive_layer_traversal(
     output_rules,
     processed_layers,
 ):
-    """Recursively traverses the model graph to apply sharding rules.
+    """Recursively traverses the model graph to apply sharding rules."""
     
-    This function is necessary because Keras Model.layers property does not 
-    recursively find all sub-layers in all architectures.
-    """
     if id(current_layer) in processed_layers:
         return
     processed_layers.add(id(current_layer))
 
-    # The prefix logic must be kept for accurate naming in nested layers
     name = current_layer.name
     full_name = f"{prefix}.{name}" if prefix else name
     
@@ -84,29 +77,29 @@ def _recursive_layer_traversal(
         mlp_type = analyze_dense_layer(current_layer)
 
         if mlp_type == 'up_projection':
-            state_rules[f"{full_name}.kernel"] = Split(device_count, 1, "column")
+            state_rules[f"{full_name}.kernel"] = _split_rule(device_count, dim=1)
             if current_layer.use_bias:
-                state_rules[f"{full_name}.bias"] = Split(device_count, 0, "column")
+                state_rules[f"{full_name}.bias"] = _split_rule(device_count, dim=0)
             output_rules[f"{full_name}"] = {0: "gather"}
 
         elif mlp_type == 'down_projection':
-            state_rules[f"{full_name}.kernel"] = Split(device_count, 0, "row")
+            state_rules[f"{full_name}.kernel"] = _split_rule(device_count, dim=0)
             output_rules[f"{full_name}"] = {0: "allreduce"}
 
         else:
-            state_rules[f"{full_name}.kernel"] = Split(device_count, 1, "column")
+            state_rules[f"{full_name}.kernel"] = _split_rule(device_count, dim=1)
             if current_layer.use_bias:
-                state_rules[f"{full_name}.bias"] = Split(device_count, 0, "column")
+                state_rules[f"{full_name}.bias"] = _split_rule(device_count, dim=0)
             output_rules[f"{full_name}"] = {0: "gather -1"}
 
     elif isinstance(current_layer, layers.EinsumDense):
         if "attention_output" in full_name:
-            state_rules[f"{full_name}.kernel"] = Split(device_count, 0, "row")
+            state_rules[f"{full_name}.kernel"] = _split_rule(device_count, dim=0)
             output_rules[f"{full_name}"] = {0: "allreduce"}
         else:
-            state_rules[f"{full_name}.kernel"] = Split(device_count, 1, "column")
+            state_rules[f"{full_name}.kernel"] = _split_rule(device_count, dim=1)
             if hasattr(current_layer, 'bias') and current_layer.bias is not None:
-                state_rules[f"{full_name}.bias"] = Split(device_count, 0, "column")
+                state_rules[f"{full_name}.bias"] = _split_rule(device_count, dim=0)
             output_rules[f"{full_name}"] = {0: "gather -1"}
 
     elif isinstance(current_layer, (layers.Embedding,)):
@@ -118,13 +111,12 @@ def _recursive_layer_traversal(
             weight_name = 'position_embeddings'
 
         if weight_name:
-            state_rules[f"{full_name}.{weight_name}"] = Split(device_count, 1, "column")
+            state_rules[f"{full_name}.{weight_name}"] = _split_rule(device_count, dim=1)
             output_rules[f"{full_name}"] = {0: "no_comm"}
 
     elif isinstance(current_layer, (layers.LayerNormalization, layers.BatchNormalization, layers.GroupNormalization)):
         pass
 
-    # --- Recursive Traversal Logic (Restored) ---
     if hasattr(current_layer, 'layers') and current_layer.layers:
         for sub_layer in current_layer.layers:
             _recursive_layer_traversal(
@@ -132,7 +124,6 @@ def _recursive_layer_traversal(
                 state_rules, output_rules, processed_layers
             )
 
-    # Secondary check for layers attached as attributes (Restored)
     for attr_name in dir(current_layer):
         if attr_name.startswith('__') and attr_name.endswith('__'):
             continue
