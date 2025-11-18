@@ -236,7 +236,7 @@ def run_model_verification(preset_name, model_class):
 
     model_builder_fn = model_builder_factory(preset_name, model_class)
 
-    distribution = AutoTPDistribution(model_builder_fn, device_mesh=device_mesh)
+    distribution = AutoTPDistribution(model_builder_fn, device_mesh=device_mesh, dtype="float16")
     
     logger.info("\n--- Training Tensor Parallel (TP) Model (Inside Safe Scope) ---")
 
