@@ -21,7 +21,8 @@ except Exception:
 
 # --- Backend and Device Configuration ---
 os.environ["KERAS_BACKEND"] = "jax"
-os.environ["XLA_FLAGS"] = "--xla_force_host_platform_device_count=12"
+# Force host device count to simulate distributed environment if physical GPUs aren't enough
+os.environ["XLA_FLAGS"] = "--xla_force_host_platform_device_count=8"
 
 import jax
 import keras_hub
@@ -31,6 +32,7 @@ import tensorflow_datasets as tfds
 
 import keras
 
+# Ensure TF doesn't hog GPU memory needed by JAX
 tf.config.set_visible_devices([], "GPU")
 
 logging.basicConfig(level=logging.INFO, format="%(levelname)s - %(message)s")
@@ -45,17 +47,18 @@ try:
     if not host_devices:
         host_devices = devices
 
-    DEVICES_AVAILABLE = len(host_devices)
+    DEVICES_AVAILABLE = len(devices)
+    # Set target world size to available GPUs (e.g. 2 on Kaggle T4x2)
     WORLD_SIZE = 2
 
     if DEVICES_AVAILABLE < WORLD_SIZE:
         logger.warning(
             f"Requested {WORLD_SIZE} devices, but only {DEVICES_AVAILABLE} available."
         )
-        TARGET_DEVICES = host_devices
+        TARGET_DEVICES = devices
         TARGET_WORLD_SIZE = DEVICES_AVAILABLE
     else:
-        TARGET_DEVICES = host_devices[:WORLD_SIZE]
+        TARGET_DEVICES = devices[:WORLD_SIZE]
         TARGET_WORLD_SIZE = WORLD_SIZE
         logger.info(
             f"Targeting the first {TARGET_WORLD_SIZE} devices for parallelism: "
@@ -69,20 +72,18 @@ except Exception as e:
 
 from keras.src.distribution import DeviceMesh
 from keras.src.distribution import AutoTPDistribution
-from keras.src.distribution.tensor_parallel.tensor_parallel_keras import (
-    TensorParallelKeras,
-)
 
 # --- Constants ---
-BATCH_SIZE = 16
+BATCH_SIZE = 8  # Reduced batch size for safety
 SEQUENCE_LENGTH = 128
 LEARNING_RATE = 1e-4
-EPOCHS = 2
+EPOCHS = 1
 STEPS_PER_EPOCH = 1
 VALIDATION_STEPS = 5
 
 MODEL_MAPPING = {
-    "opt_6.7b_en": keras_hub.models.OPTCausalLM,
+    # "opt_125m_en": keras_hub.models.OPTCausalLM,  # Smaller model for testing flow
+    "opt_6.7b_en": keras_hub.models.OPTCausalLM, # Original large model
 }
 
 # ----------------------------------------------------------------------
@@ -99,6 +100,7 @@ def load_shakespeare_dataset(model_preset):
         example["text"].decode("utf-8") for example in ds.as_numpy_iterator()
     )
 
+    # CRITICAL: Use Tokenizer, NOT the full model, to avoid GPU OOM during data prep
     tokenizer = keras_hub.models.OPTTokenizer.from_preset(
         model_preset
     )
@@ -136,20 +138,45 @@ def format_for_causal_lm(data):
     return features, labels
 
 
-# --- NEW MODEL BUILDER FUNCTION ---
+# --- NEW MODEL BUILDER FUNCTION WITH LORA FIX ---
 def model_builder_factory(preset_name, model_class):
     """Returns a callable function that builds the model, required for OOM safety."""
+    
     def model_builder(**kwargs):
         logger.info(f"Creating {preset_name} model from KerasNLP preset (inside scope)...")
-        # Ensure preprocessor=None is passed so the model builder is minimal
+        
+        # 1. Create Base Model (Sharded automatically by AutoTPDistribution scope)
+        # 'dtype' is passed in via kwargs from AutoTPDistribution
         model = model_class.from_preset(preset_name, preprocessor=None, **kwargs)
-        logger.info(f"Model created with {model.count_params():,} parameters.")
+        
+        # 2. APPLY LORA (The Optimizer OOM Fix)
+        # This drastically reduces trainable parameters (optimizer state)
+        # from ~26GB to ~100MB, fitting easily in VRAM.
+        logger.info("--- Enabling LoRA (Rank=4) ---")
+        
+        # FIX: Handle different API structures where enable_lora might be on the backbone
+        if hasattr(model, "enable_lora"):
+             model.enable_lora(rank=4)
+        elif hasattr(model, "backbone") and hasattr(model.backbone, "enable_lora"):
+             logger.info("Called enable_lora on model.backbone")
+             model.backbone.enable_lora(rank=4)
+        else:
+             logger.warning("⚠️ enable_lora not found on Model or Backbone. Training full weights (OOM risk for 6.7B).")
+        
+        # FIX: Use np.prod(w.shape) instead of w.size, as Keras Variables lack .size
+        total_params = model.count_params()
+        trainable_params = sum(np.prod(w.shape) for w in model.trainable_variables)
+        
+        logger.info(f"Model created. Total params: {total_params:,}")
+        logger.info(f"Trainable params (LoRA only): {trainable_params:,}")
+        
         return model
+        
     return model_builder
 
 
 # ----------------------------------------------------------------------
-# --- Plotting Function (MODIFIED) ---
+# --- Plotting Function ---
 # ----------------------------------------------------------------------
 
 def plot_training_graphs(tp_history, preset_name):
@@ -158,13 +185,14 @@ def plot_training_graphs(tp_history, preset_name):
     fig.suptitle(f"{preset_name} - Tensor Parallel Training Metrics", fontsize=16)
 
     # Plotting Loss
-    ax1.plot(
-        tp_history.history["val_loss"],
-        label="Tensor Parallel - Validation Loss",
-        color="green",
-        linestyle="-",
-        marker="o",
-    )
+    if "val_loss" in tp_history.history:
+        ax1.plot(
+            tp_history.history["val_loss"],
+            label="Tensor Parallel - Validation Loss",
+            color="green",
+            linestyle="-",
+            marker="o",
+        )
     ax1.set_title("Validation Loss")
     ax1.set_ylabel("Loss")
     ax1.set_xlabel("Epoch")
@@ -172,13 +200,14 @@ def plot_training_graphs(tp_history, preset_name):
     ax1.grid(True)
 
     # Plotting Perplexity
-    ax2.plot(
-        tp_history.history["val_perplexity"],
-        label="Tensor Parallel - Validation Perplexity",
-        color="purple",
-        linestyle="-",
-        marker="o",
-    )
+    if "val_perplexity" in tp_history.history:
+        ax2.plot(
+            tp_history.history["val_perplexity"],
+            label="Tensor Parallel - Validation Perplexity",
+            color="purple",
+            linestyle="-",
+            marker="o",
+        )
     ax2.set_title("Validation Perplexity")
     ax2.set_ylabel("Perplexity")
     ax2.set_xlabel("Epoch")
@@ -193,7 +222,7 @@ def plot_training_graphs(tp_history, preset_name):
 
 
 # ----------------------------------------------------------------------
-# --- Main Verification Function (MODIFIED) ---
+# --- Main Verification Function ---
 # ----------------------------------------------------------------------
 
 def run_model_verification(preset_name, model_class):
@@ -228,21 +257,32 @@ def run_model_verification(preset_name, model_class):
 
     logger.info("\n--- Setting up AutoTPDistribution for OOM-Safe Build ---")
     
+    # Create mesh for 2 GPUs
     device_mesh = DeviceMesh(
         shape=(1, TARGET_WORLD_SIZE), 
         axis_names=('data', 'model'), 
         devices=TARGET_DEVICES
     )
 
+    # Prepare the builder
     model_builder_fn = model_builder_factory(preset_name, model_class)
 
-    distribution = AutoTPDistribution(model_builder_fn, device_mesh=device_mesh, dtype="float16")
+    # Initialize Strategy
+    # CRITICAL: Pass dtype="float16" to fit 6.7B model in GPU memory
+    distribution = AutoTPDistribution(
+        model_builder_fn, 
+        device_mesh=device_mesh, 
+        dtype="float16" 
+    )
     
     logger.info("\n--- Training Tensor Parallel (TP) Model (Inside Safe Scope) ---")
 
+    # Trigger safe build
     with distribution.scope():
         tp_model = distribution.model 
 
+    # Compile with AdamW
+    # Since LoRA is enabled, this optimizer will only track state for the adapters (~100MB)
     tp_model.compile(
         optimizer=keras.optimizers.AdamW(learning_rate=LEARNING_RATE),
         loss=keras.losses.SparseCategoricalCrossentropy(from_logits=True),
@@ -251,6 +291,7 @@ def run_model_verification(preset_name, model_class):
         ],
     )
 
+    # Fit
     tp_history = tp_model.fit(
         train_ds,
         validation_data=val_ds,
@@ -259,6 +300,7 @@ def run_model_verification(preset_name, model_class):
         validation_steps=VALIDATION_STEPS,
         verbose=1,
     )
+    
     tp_final_val_loss = tp_history.history["val_loss"][-1]
     logger.info("TP model training completed successfully.")
 
