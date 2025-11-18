@@ -49,7 +49,7 @@ try:
 
     DEVICES_AVAILABLE = len(devices)
     # Set target world size to available GPUs (e.g. 2 on Kaggle T4x2)
-    WORLD_SIZE = 2
+    WORLD_SIZE = 8
 
     if DEVICES_AVAILABLE < WORLD_SIZE:
         logger.warning(
