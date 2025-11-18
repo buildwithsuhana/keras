@@ -82,7 +82,7 @@ STEPS_PER_EPOCH = 1
 VALIDATION_STEPS = 5
 
 MODEL_MAPPING = {
-    "opt_125m_en": keras_hub.models.OPTCausalLM,
+    "opt_6.7b_en": keras_hub.models.OPTCausalLM,
 }
 
 # ----------------------------------------------------------------------
