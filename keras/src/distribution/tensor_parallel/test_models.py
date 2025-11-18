@@ -82,7 +82,7 @@ STEPS_PER_EPOCH = 1
 VALIDATION_STEPS = 5
 
 MODEL_MAPPING = {
-    "opt_6.7b_en": keras_hub.models.OPTCausalLM,
+    "opt_125m_en": keras_hub.models.OPTCausalLM,
 }
 
 # ----------------------------------------------------------------------
@@ -99,9 +99,9 @@ def load_shakespeare_dataset(model_preset):
         example["text"].decode("utf-8") for example in ds.as_numpy_iterator()
     )
 
-    tokenizer = keras_hub.models.OPTCausalLM.from_preset(
+    tokenizer = keras_hub.models.OPTTokenizer.from_preset(
         model_preset
-    ).preprocessor.tokenizer
+    )
     token_ids = tokenizer.tokenize(text)
 
     num_tokens = (len(token_ids) // (SEQUENCE_LENGTH + 1)) * (
