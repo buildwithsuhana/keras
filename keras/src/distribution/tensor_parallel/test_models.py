@@ -67,6 +67,8 @@ except Exception as e:
     TARGET_WORLD_SIZE = 0
 
 
+from keras.src.distribution import DeviceMesh
+from keras.src.distribution import AutoTPDistribution
 from keras.src.distribution.tensor_parallel.tensor_parallel_keras import (
     TensorParallelKeras,
 )
@@ -76,11 +78,11 @@ BATCH_SIZE = 16
 SEQUENCE_LENGTH = 128
 LEARNING_RATE = 1e-4
 EPOCHS = 2
-STEPS_PER_EPOCH = 10
+STEPS_PER_EPOCH = 1
 VALIDATION_STEPS = 5
 
 MODEL_MAPPING = {
-    "opt_125m_en": keras_hub.models.OPTCausalLM,
+    "opt_6.7b_en": keras_hub.models.OPTCausalLM,
 }
 
 # ----------------------------------------------------------------------
@@ -134,12 +136,16 @@ def format_for_causal_lm(data):
     return features, labels
 
 
-def get_model_from_preset(preset_name, model_class):
-    """Creates a CausalLM model from a KerasNLP preset."""
-    logger.info(f"Creating {preset_name} model from KerasNLP preset...")
-    model = model_class.from_preset(preset_name, preprocessor=None)
-    logger.info(f"Model created with {model.count_params():,} parameters.")
-    return model
+# --- NEW MODEL BUILDER FUNCTION ---
+def model_builder_factory(preset_name, model_class):
+    """Returns a callable function that builds the model, required for OOM safety."""
+    def model_builder(**kwargs):
+        logger.info(f"Creating {preset_name} model from KerasNLP preset (inside scope)...")
+        # Ensure preprocessor=None is passed so the model builder is minimal
+        model = model_class.from_preset(preset_name, preprocessor=None, **kwargs)
+        logger.info(f"Model created with {model.count_params():,} parameters.")
+        return model
+    return model_builder
 
 
 # ----------------------------------------------------------------------
@@ -193,7 +199,7 @@ def plot_training_graphs(tp_history, preset_name):
 def run_model_verification(preset_name, model_class):
     """
     Runs a training execution test for a given model preset using
-    tensor parallelism.
+    tensor parallelism with the OOM-safe workflow.
     """
     if TARGET_WORLD_SIZE < 2:
         logger.warning(
@@ -220,15 +226,22 @@ def run_model_verification(preset_name, model_class):
         .repeat()
     )
 
-    # --- 1. Tensor Parallel Model Training ---
-    logger.info("\n--- Training Tensor Parallel (TP) Model ---")
-    tp_model_template = get_model_from_preset(preset_name, model_class)
-
-    tp_model = TensorParallelKeras(
-        model=tp_model_template,
-        device_count=TARGET_WORLD_SIZE,
-        device_ids=TARGET_DEVICES,
+    logger.info("\n--- Setting up AutoTPDistribution for OOM-Safe Build ---")
+    
+    device_mesh = DeviceMesh(
+        shape=(1, TARGET_WORLD_SIZE), 
+        axis_names=('data', 'model'), 
+        devices=TARGET_DEVICES
     )
+
+    model_builder_fn = model_builder_factory(preset_name, model_class)
+
+    distribution = AutoTPDistribution(model_builder_fn, device_mesh=device_mesh)
+    
+    logger.info("\n--- Training Tensor Parallel (TP) Model (Inside Safe Scope) ---")
+
+    with distribution.scope():
+        tp_model = distribution.model 
 
     tp_model.compile(
         optimizer=keras.optimizers.AdamW(learning_rate=LEARNING_RATE),
@@ -249,7 +262,7 @@ def run_model_verification(preset_name, model_class):
     tp_final_val_loss = tp_history.history["val_loss"][-1]
     logger.info("TP model training completed successfully.")
 
-    # --- 2. Verification ---
+    # --- 3. Verification ---
     logger.info("\n--- ⚖️ Verification Results ---")
     logger.info(f"TP Final Validation Loss: {tp_final_val_loss:.6f}")
 

@@ -158,6 +158,8 @@ def initialize(job_addresses=None, num_processes=None, process_id=None):
 @keras_export("keras.distribution.DeviceMesh")
 class DeviceMesh:
     """A cluster of computation devices for distributed computation.
+    
+    
 
     This API is aligned with `jax.sharding.Mesh` and `tf.dtensor.Mesh`, which
     represents the computation devices in the global context.
@@ -818,6 +820,8 @@ class LayoutMap(collections.abc.MutableMapping):
         will be treated as a regex and map against the input key again. When
         there are multiple matches for the regex, an `ValueError` will be
         raised. Returns `None` if there isn't any match found.
+        
+        
 
         Args:
             key: String key to query a layout.
@@ -922,61 +926,68 @@ def set_distribution(value):
     """
     global_state.set_global_attribute(GLOBAL_ATTRIBUTE_NAME, value)
 
-@keras_export("keras.distribution.AutoTPDistribution")
-class AutoTPDistribution(Distribution):
-    """A distribution strategy for automated tensor and data parallelism."""
-    def __init__(self, model, device_mesh=None, auto_shard_dataset=True):
-        if device_mesh is None:
-            all_devices = list_devices()
-            if not all_devices:
-                raise RuntimeError("No computational devices found.")
-            device_mesh = DeviceMesh(
-                shape=(1, len(all_devices)),
-                axis_names=("data", "model"),
-                devices=all_devices,
-            )
 
-        if "data" not in device_mesh.axis_names:
-            raise ValueError(
-                "DeviceMesh for AutoTPDistribution must have a 'data' axis."
-            )
-        batch_dim_name = "data"
+# --- NEW OOM FIXING CLASSES ---
 
+class _AutoLayoutHeuristic(Distribution):
+    """INTERNAL: Distribution strategy that performs heuristic sharding.
+    
+    This class is the OOM fix (Pillar 1): it intercepts variable creation requests and 
+    returns a sharded layout based on heuristics, which forces the backend 
+    to allocate memory using Host-to-Device streaming.
+    """
+
+    def __init__(self, device_mesh, batch_dim_name="data", auto_shard_dataset=True):
         super().__init__(device_mesh, batch_dim_name, auto_shard_dataset)
-
-        self._original_model = model
+        self._device_mesh = device_mesh
         self._num_process = distribution_lib.num_processes()
         self._process_id = distribution_lib.process_id()
-        self._is_multi_process = self._num_process > 1
-        from keras.src.distribution.tensor_parallel.tensor_parallel_keras import (
-    TensorParallelKeras,
-)
-        self.model = TensorParallelKeras(
-            model=self._original_model,
-            device_count=np.prod(self.device_mesh.shape),
-            device_ids=self.device_mesh.devices.flatten().tolist(),
-        )
 
     def get_data_layout(self, data_shape):
+        # Standard Data Parallelism for inputs
         data_shard_spec = [None] * len(data_shape)
         data_shard_spec[0] = self.batch_dim_name
-        return TensorLayout(data_shard_spec, self.device_mesh)
+        return TensorLayout(data_shard_spec, self._device_mesh)
 
     def get_variable_layout(self, variable):
-        warnings.warn(
-            "Variable layout is determined automatically within "
-            "AutoTPDistribution. This method will return a replicated layout."
-        )
-        return TensorLayout([None] * len(variable.shape), self.device_mesh)
+        """Determines layout based on variable path and shape heuristics (OOM fix)."""
+        path = variable.path.lower()
+        shape = variable.shape
+        
+        # Heuristics for standard Transformer architectures:
+        column_keywords = ["query", "key", "value", "up_proj", "gate_proj", "ffw_gating"]
+        row_keywords = ["attention_output", "down_proj", "ffw_linear"]
+        
+        # 1. Embeddings (Vocab Parallel)
+        if "embedding" in path or "token_emb" in path:
+            if len(shape) >= 2:
+                return TensorLayout(["model"] + [None] * (len(shape) - 1), self._device_mesh)
+
+        # 2. Column Parallel Kernels (Split Output)
+        if "kernel" in path and any(k in path for k in column_keywords):
+            axes = [None] * (len(shape) - 1) + ["model"]
+            return TensorLayout(axes, self._device_mesh)
+
+        # 3. Row Parallel Kernels (Split Input)
+        if "kernel" in path and any(k in path for k in row_keywords):
+            axes = ["model"] + [None] * (len(shape) - 1)
+            return TensorLayout(axes, self._device_mesh)
+
+        # 4. Biases (If parent was Column Parallel, bias is sharded)
+        if "bias" in path and any(k in path for k in column_keywords):
+             return TensorLayout(["model"], self._device_mesh)
+
+        # Default: Replication
+        return TensorLayout([None] * len(shape), self._device_mesh)
 
     def get_tensor_layout(self, path):
         return None
-
+        
     def distribute_dataset(self, dataset):
-        """Distributes the dataset across processes based on the device mesh."""
         if not self._is_multi_process or not self.auto_shard_dataset:
             return dataset
 
+        # Try to distribute a global tf.data.Dataset.
         from keras.src.utils.module_utils import tensorflow as tf
 
         if not tf.available or not isinstance(dataset, tf.data.Dataset):
@@ -1001,7 +1012,7 @@ class AutoTPDistribution(Distribution):
             self.batch_dim_name
         )
         num_model_replicas = self.device_mesh.shape[mesh_batch_dim_index]
-
+        
         if num_model_replicas == 1:
             return dataset.prefetch(tf.data.AUTOTUNE)
 
@@ -1038,3 +1049,85 @@ class AutoTPDistribution(Distribution):
                 index=data_shard_id,
             )
             return distributed_dataset.prefetch(tf.data.AUTOTUNE)
+
+
+@keras_export("keras.distribution.AutoTPDistribution")
+class AutoTPDistribution:
+    """A distribution strategy for automated tensor and data parallelism.
+    
+    This class is the public interface, managing the device mesh and the 
+    OOM-prevention scope, returning a functional TensorParallelKeras model.
+    """
+    def __init__(self, model_builder_fn, device_mesh=None, **kwargs):
+        
+        # 1. Device Setup & Mesh Creation
+        if device_mesh is None:
+            world_size = len(list_devices())
+            devices = list_devices()[:world_size]
+            device_mesh = DeviceMesh(
+                (1, world_size), ["data", "model"], devices
+            )
+            
+        self.device_mesh = device_mesh
+        self.world_size = self.device_mesh.devices.size
+        self.devices = self.device_mesh.devices.flatten().tolist()
+        
+        # Store model builder function and arguments
+        self.model_builder_fn = model_builder_fn
+        self.model_kwargs = kwargs
+        
+        # 2. Create the internal OOM-Fixing Distribution strategy
+        self._strategy = _AutoLayoutHeuristic(
+            self.device_mesh, 
+            batch_dim_name="data", 
+            auto_shard_dataset=True
+        )
+        import keras.src.backend as backend
+        self._strategy._num_process = backend.distribution_lib.num_processes()
+        self._strategy._process_id = backend.distribution_lib.process_id()
+        self._tpk_model = None # Placeholder for the built TPK model
+
+    @contextlib.contextmanager
+    def scope(self):
+        """Context manager to activate the OOM-safe model building scope."""
+        
+        # 1. Activate the scope
+        original_scope = distribution()
+        set_distribution(self._strategy)
+        
+        try:
+            # 2. CRITICAL: Instantiate model inside the active scope
+            # This triggers the OOM-safe allocation (Pillar 1)
+            original_model = self.model_builder_fn(**self.model_kwargs)
+
+            # 3. Wrap the OOM-safe model in TPK (Pillar 2/3 orchestration)
+            from keras.src.distribution.tensor_parallel.tensor_parallel_keras import TensorParallelKeras
+
+            self._tpk_model = TensorParallelKeras(
+                model=original_model, # Pass the safely built model
+                world_size=self.world_size,
+                device_ids=self.devices,
+            )
+            
+            # 4. Yield the constructed TPK model back to the user
+            yield self._tpk_model
+            
+        finally:
+            # 5. Restore original scope
+            set_distribution(original_scope)
+            
+    @property
+    def model(self):
+        """
+        Returns the constructed TPK model.
+        
+        NOTE: This property access must occur inside the 'with distribution.scope()' 
+        block for the model to be guaranteed as built.
+        """
+        if self._tpk_model is None:
+            raise RuntimeError(
+                "The TensorParallel model must be constructed inside the "
+                "'with distribution.scope():' block. The model is built only "
+                "when the scope is activated."
+            )
+        return self._tpk_model
