@@ -77,8 +77,8 @@ from keras.src.distribution import AutoTPDistribution
 BATCH_SIZE = 8  # Reduced batch size for safety
 SEQUENCE_LENGTH = 128
 LEARNING_RATE = 1e-4
-EPOCHS = 1
-STEPS_PER_EPOCH = 1
+EPOCHS = 10
+STEPS_PER_EPOCH = 10
 VALIDATION_STEPS = 5
 
 MODEL_MAPPING = {
