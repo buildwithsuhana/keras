@@ -955,8 +955,16 @@ class _AutoLayoutHeuristic(Distribution):
         shape = variable.shape
         
         # Heuristics for standard Transformer architectures:
-        column_keywords = ["query", "key", "value", "up_proj", "gate_proj", "ffw_gating"]
-        row_keywords = ["attention_output", "down_proj", "ffw_linear"]
+        # UPDATED: Added OPT-specific FFN keywords ('feedforward_intermediate_dense', 'feedforward_output_dense')
+        # to catch the massive FFN weights that were causing 256MB replication crashes.
+        column_keywords = [
+            "query", "key", "value", "up_proj", "gate_proj", "ffw_gating", 
+            "feedforward_intermediate_dense" # OPT Expansion
+        ]
+        row_keywords = [
+            "attention_output", "down_proj", "ffw_linear",
+            "feedforward_output_dense" # OPT Reduction
+        ]
         
         # 1. Embeddings (Vocab Parallel)
         if "embedding" in path or "token_emb" in path:
@@ -1056,7 +1064,7 @@ class AutoTPDistribution:
     """A distribution strategy for automated tensor and data parallelism.
     
     This class is the public interface, managing the device mesh and the 
-    OOM-prevention scope, returning a functional TensorParallelKeras model.
+    OOM-prevention scope for the TensorParallelKeras implementation.
     """
     def __init__(self, model_builder_fn, device_mesh=None, **kwargs):
         
@@ -1077,12 +1085,14 @@ class AutoTPDistribution:
         self.model_kwargs = kwargs
         
         # 2. Create the internal OOM-Fixing Distribution strategy
+        # We ensure process and device info is available for dataset sharding logic within TPK, 
+        # even though we won't use the distribute_dataset method here.
+        import keras.src.backend as backend
         self._strategy = _AutoLayoutHeuristic(
             self.device_mesh, 
             batch_dim_name="data", 
             auto_shard_dataset=True
         )
-        import keras.src.backend as backend
         self._strategy._num_process = backend.distribution_lib.num_processes()
         self._strategy._process_id = backend.distribution_lib.process_id()
         self._tpk_model = None # Placeholder for the built TPK model
@@ -1090,44 +1100,29 @@ class AutoTPDistribution:
     @contextlib.contextmanager
     def scope(self):
         """Context manager to activate the OOM-safe model building scope."""
-        
-        # 1. Activate the scope
+        # This yields the calling context back to the user to execute model creation
         original_scope = distribution()
         set_distribution(self._strategy)
-        
         try:
-            # 2. CRITICAL: Instantiate model inside the active scope
-            # This triggers the OOM-safe allocation (Pillar 1)
+            yield
+        finally:
+            set_distribution(original_scope)
+
+    @property
+    def model(self):
+        """Returns the fully constructed, wrapped TensorParallelKeras model."""
+        if self._tpk_model is None:
+            # 1. Instantiate model inside the OOM-safe scope
+            from keras.src.distribution.tensor_parallel.tensor_parallel_keras import TensorParallelKeras
+            
+            # CRITICAL STEP: Execute the builder to get the model built inside the active scope.
             original_model = self.model_builder_fn(**self.model_kwargs)
 
-            # 3. Wrap the OOM-safe model in TPK (Pillar 2/3 orchestration)
-            from keras.src.distribution.tensor_parallel.tensor_parallel_keras import TensorParallelKeras
-
+            # 2. Wrap the OOM-safe model in your TensorParallelKeras logic
             self._tpk_model = TensorParallelKeras(
                 model=original_model, # Pass the safely built model
                 world_size=self.world_size,
                 device_ids=self.devices,
             )
             
-            # 4. Yield the constructed TPK model back to the user
-            yield self._tpk_model
-            
-        finally:
-            # 5. Restore original scope
-            set_distribution(original_scope)
-            
-    @property
-    def model(self):
-        """
-        Returns the constructed TPK model.
-        
-        NOTE: This property access must occur inside the 'with distribution.scope()' 
-        block for the model to be guaranteed as built.
-        """
-        if self._tpk_model is None:
-            raise RuntimeError(
-                "The TensorParallel model must be constructed inside the "
-                "'with distribution.scope():' block. The model is built only "
-                "when the scope is activated."
-            )
         return self._tpk_model
