@@ -22,7 +22,7 @@ except Exception:
 # --- Backend and Device Configuration ---
 os.environ["KERAS_BACKEND"] = "jax"
 # Force host device count to simulate distributed environment if physical GPUs aren't enough
-os.environ["XLA_FLAGS"] = "--xla_force_host_platform_device_count=8"
+os.environ["XLA_FLAGS"] = "--xla_force_host_platform_device_count=2"
 
 import jax
 import keras_hub
