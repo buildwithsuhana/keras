@@ -109,6 +109,7 @@ class TensorParallelKeras(Model):
             self.tensor_parallel_config = get_default_config(
                 model, device_names
             )
+            print(self.tensor_parallel_config)
             logger.info(
                 "Using automatic config with auto sharding strategy: sharding individual Dense/Conv/Embedding layers"
             )
@@ -289,7 +290,39 @@ class TensorParallelKeras(Model):
             for inp in self._original_model.inputs
         }
 
-        partial_outputs = [model(input_layers) for model in self.sharded_models]
+        partial_outputs = []
+        for shard in self.model_shards:
+            # Prefer the shard's declared input names, fall back to its input tensors.
+            shard_inputs = {}
+            try:
+                input_names = getattr(shard, "input_names", None)
+                if input_names:
+                    for name in input_names:
+                        clean_name = name.split(":")[0]
+                        if clean_name in input_layers:
+                            shard_inputs[clean_name] = input_layers[clean_name]
+                else:
+                    # Fall back to inspecting shard.inputs
+                    for inp in getattr(shard, "inputs", []):
+                        clean_name = inp.name.split(":")[0]
+                        if clean_name in input_layers:
+                            shard_inputs[clean_name] = input_layers[clean_name]
+
+                if not shard_inputs:
+                    # Last resort: forward the full mapping (may be positional in some cases)
+                    shard_inputs = dict(input_layers)
+
+                logger.info(
+                    f"Calling shard '{getattr(shard, 'name', '<shard>')}' with inputs: {list(shard_inputs.keys())}"
+                )
+                partial_outputs.append(shard(shard_inputs))
+            except Exception as e:
+                logger.exception(
+                    "Exception when calling shard %s with inputs=%s",
+                    getattr(shard, 'name', '<shard>'),
+                    list(shard_inputs.keys()),
+                )
+                raise
 
         final_layer = self._original_model.layers[-1]
         sharding_type = "unknown"
