@@ -83,7 +83,8 @@ VALIDATION_STEPS = 5
 
 MODEL_MAPPING = {
     # "opt_125m_en": keras_hub.models.OPTCausalLM,  # Smaller model for testing flow
-    "opt_6.7b_en": keras_hub.models.OPTCausalLM, # Original large model
+    # "opt_6.7b_en": keras_hub.models.OPTCausalLM, # Original large model
+    "gemma_7b_en": keras_hub.models.GemmaCausalLM,
 }
 
 # ----------------------------------------------------------------------
@@ -101,7 +102,7 @@ def load_shakespeare_dataset(model_preset):
     )
 
     # CRITICAL: Use Tokenizer, NOT the full model, to avoid GPU OOM during data prep
-    tokenizer = keras_hub.models.OPTTokenizer.from_preset(
+    tokenizer = keras_hub.models.GemmaTokenizer.from_preset(
         model_preset
     )
     token_ids = tokenizer.tokenize(text)
