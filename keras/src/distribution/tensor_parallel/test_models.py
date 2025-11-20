@@ -21,8 +21,10 @@ except Exception:
 
 # --- Backend and Device Configuration ---
 os.environ["KERAS_BACKEND"] = "jax"
-# Force host device count to simulate distributed environment if physical GPUs aren't enough
-os.environ["XLA_FLAGS"] = "--xla_force_host_platform_device_count=2"
+# JAX Memory Management (Prevents pre-allocation crashes)
+os.environ["XLA_PYTHON_CLIENT_PREALLOCATE"] = "false"
+os.environ["XLA_PYTHON_CLIENT_MEM_FRACTION"] = ".95"
+os.environ["XLA_PYTHON_CLIENT_ALLOCATOR"] = "platform"
 
 import jax
 import keras_hub
@@ -31,6 +33,10 @@ import tensorflow as tf
 import tensorflow_datasets as tfds
 
 import keras
+
+# --- 1. CRITICAL: Enable Mixed Precision ---
+# Computation in float16/bfloat16, Storage in int8 (QLoRA)
+keras.config.set_dtype_policy("mixed_float16") 
 
 # Ensure TF doesn't hog GPU memory needed by JAX
 tf.config.set_visible_devices([], "GPU")
@@ -43,27 +49,21 @@ logger = logging.getLogger(__name__)
 try:
     devices = jax.devices()
     logger.info(f"JAX devices found: {[str(d) for d in devices]}")
-    host_devices = [d for d in devices if d.platform == "cpu"]
-    if not host_devices:
-        host_devices = devices
+    
+    # Prefer GPUs
+    gpu_devices = [d for d in devices if d.platform == "gpu"]
+    if gpu_devices:
+        TARGET_DEVICES = gpu_devices
+        logger.info(f"✅ Using {len(TARGET_DEVICES)} GPUs.")
+    else:
+        # Fallback to CPU
+        TARGET_DEVICES = [d for d in devices if d.platform == "cpu"]
+        logger.warning("⚠️ No GPUs found! Using CPU.")
 
     DEVICES_AVAILABLE = len(devices)
-    # Set target world size to available GPUs (e.g. 2 on Kaggle T4x2)
-    WORLD_SIZE = 8
-
-    if DEVICES_AVAILABLE < WORLD_SIZE:
-        logger.warning(
-            f"Requested {WORLD_SIZE} devices, but only {DEVICES_AVAILABLE} available."
-        )
-        TARGET_DEVICES = devices
-        TARGET_WORLD_SIZE = DEVICES_AVAILABLE
-    else:
-        TARGET_DEVICES = devices[:WORLD_SIZE]
-        TARGET_WORLD_SIZE = WORLD_SIZE
-        logger.info(
-            f"Targeting the first {TARGET_WORLD_SIZE} devices for parallelism: "
-            f"{[str(d) for d in TARGET_DEVICES]}"
-        )
+    TARGET_WORLD_SIZE = len(TARGET_DEVICES)
+    # You can override WORLD_SIZE here if you want to limit GPUs used
+    WORLD_SIZE = TARGET_WORLD_SIZE 
 
 except Exception as e:
     logger.error(f"Could not initialize JAX or find devices. Error: {e}")
@@ -71,19 +71,18 @@ except Exception as e:
 
 
 from keras.src.distribution import DeviceMesh
-from keras.src.distribution import AutoTPDistribution
+from keras.src.distribution.tensor_parallel.tensor_parallel_keras import AutoTPDistribution
+
 
 # --- Constants ---
-BATCH_SIZE = 8  # Reduced batch size for safety
-SEQUENCE_LENGTH = 128
+BATCH_SIZE = 4         # Start small (4 or 8)
+SEQUENCE_LENGTH = 64   # Reduced from 128 to save VRAM
 LEARNING_RATE = 1e-4
-EPOCHS = 2
+EPOCHS = 1
 STEPS_PER_EPOCH = 10
 VALIDATION_STEPS = 5
 
 MODEL_MAPPING = {
-    # "opt_125m_en": keras_hub.models.OPTCausalLM,  # Smaller model for testing flow
-    # "opt_6.7b_en": keras_hub.models.OPTCausalLM, # Original large model
     "gemma_7b_en": keras_hub.models.GemmaCausalLM,
 }
 
@@ -101,11 +100,12 @@ def load_shakespeare_dataset(model_preset):
         example["text"].decode("utf-8") for example in ds.as_numpy_iterator()
     )
 
-    # CRITICAL: Use Tokenizer, NOT the full model, to avoid GPU OOM during data prep
-    tokenizer = keras_hub.models.GemmaTokenizer.from_preset(
-        model_preset
-    )
-    token_ids = tokenizer.tokenize(text)
+    # Use CPU for tokenization to save GPU memory
+    with keras.device("cpu"):
+        tokenizer = keras_hub.models.GemmaTokenizer.from_preset(
+            model_preset
+        )
+        token_ids = tokenizer.tokenize(text)
 
     num_tokens = (len(token_ids) // (SEQUENCE_LENGTH + 1)) * (
         SEQUENCE_LENGTH + 1
@@ -139,33 +139,35 @@ def format_for_causal_lm(data):
     return features, labels
 
 
-# --- NEW MODEL BUILDER FUNCTION WITH LORA FIX ---
+# --- MODIFIED MODEL BUILDER (QLoRA Fix) ---
 def model_builder_factory(preset_name, model_class):
     """Returns a callable function that builds the model, required for OOM safety."""
     
     def model_builder(**kwargs):
-        logger.info(f"Creating {preset_name} model from KerasNLP preset (inside scope)...")
+        logger.info(f"Creating {preset_name} model (inside scope)...")
         
-        # 1. Create Base Model (Sharded automatically by AutoTPDistribution scope)
-        # 'dtype' is passed in via kwargs from AutoTPDistribution
+        # --- 2. CRITICAL: Use Int8 Quantization ---
+        # This enables 8-bit weight loading (QLoRA style), dropping static
+        # memory usage by ~50%. Essential for 7B models on T4 GPUs.
+        kwargs["dtype"] = "int8" 
+        
+        # Create Model (Sharded automatically by AutoTPDistribution scope)
         model = model_class.from_preset(preset_name, preprocessor=None, **kwargs)
         
-        # 2. APPLY LORA (The Optimizer OOM Fix)
-        # This drastically reduces trainable parameters (optimizer state)
-        # from ~26GB to ~100MB, fitting easily in VRAM.
+        # --- 3. CRITICAL: Enable LoRA ---
+        # Reduces optimizer memory from 26GB to ~100MB.
         logger.info("--- Enabling LoRA (Rank=4) ---")
         
-        # FIX: Handle different API structures where enable_lora might be on the backbone
         if hasattr(model, "enable_lora"):
              model.enable_lora(rank=4)
         elif hasattr(model, "backbone") and hasattr(model.backbone, "enable_lora"):
              logger.info("Called enable_lora on model.backbone")
              model.backbone.enable_lora(rank=4)
         else:
-             logger.warning("⚠️ enable_lora not found on Model or Backbone. Training full weights (OOM risk for 6.7B).")
+             logger.warning("⚠️ enable_lora not found! Training full weights (High OOM Risk).")
         
-        # FIX: Use np.prod(w.shape) instead of w.size, as Keras Variables lack .size
         total_params = model.count_params()
+        # Safe count for sharded/quantized variables
         trainable_params = sum(np.prod(w.shape) for w in model.trainable_variables)
         
         logger.info(f"Model created. Total params: {total_params:,}")
@@ -185,32 +187,16 @@ def plot_training_graphs(tp_history, preset_name):
     fig, (ax1, ax2) = plt.subplots(2, 1, figsize=(12, 10))
     fig.suptitle(f"{preset_name} - Tensor Parallel Training Metrics", fontsize=16)
 
-    # Plotting Loss
     if "val_loss" in tp_history.history:
-        ax1.plot(
-            tp_history.history["val_loss"],
-            label="Tensor Parallel - Validation Loss",
-            color="green",
-            linestyle="-",
-            marker="o",
-        )
+        ax1.plot(tp_history.history["val_loss"], label="Validation Loss", color="green", marker="o")
     ax1.set_title("Validation Loss")
-    ax1.set_ylabel("Loss")
     ax1.set_xlabel("Epoch")
     ax1.legend()
     ax1.grid(True)
 
-    # Plotting Perplexity
     if "val_perplexity" in tp_history.history:
-        ax2.plot(
-            tp_history.history["val_perplexity"],
-            label="Tensor Parallel - Validation Perplexity",
-            color="purple",
-            linestyle="-",
-            marker="o",
-        )
+        ax2.plot(tp_history.history["val_perplexity"], label="Validation Perplexity", color="purple", marker="o")
     ax2.set_title("Validation Perplexity")
-    ax2.set_ylabel("Perplexity")
     ax2.set_xlabel("Epoch")
     ax2.legend()
     ax2.grid(True)
@@ -258,7 +244,7 @@ def run_model_verification(preset_name, model_class):
 
     logger.info("\n--- Setting up AutoTPDistribution for OOM-Safe Build ---")
     
-    # Create mesh for 2 GPUs
+    # Create mesh for GPUs
     device_mesh = DeviceMesh(
         shape=(1, TARGET_WORLD_SIZE), 
         axis_names=('data', 'model'), 
@@ -269,11 +255,11 @@ def run_model_verification(preset_name, model_class):
     model_builder_fn = model_builder_factory(preset_name, model_class)
 
     # Initialize Strategy
-    # CRITICAL: Pass dtype="float16" to fit 6.7B model in GPU memory
+    # Note: We don't pass dtype="float16" here because we handle it explicitly 
+    # inside the model_builder_factory as "int8" for weights.
     distribution = AutoTPDistribution(
         model_builder_fn, 
-        device_mesh=device_mesh, 
-        dtype="float16" 
+        device_mesh=device_mesh
     )
     
     logger.info("\n--- Training Tensor Parallel (TP) Model (Inside Safe Scope) ---")
@@ -283,7 +269,6 @@ def run_model_verification(preset_name, model_class):
         tp_model = distribution.model 
 
     # Compile with AdamW
-    # Since LoRA is enabled, this optimizer will only track state for the adapters (~100MB)
     tp_model.compile(
         optimizer=keras.optimizers.AdamW(learning_rate=LEARNING_RATE),
         loss=keras.losses.SparseCategoricalCrossentropy(from_logits=True),
@@ -305,7 +290,7 @@ def run_model_verification(preset_name, model_class):
     tp_final_val_loss = tp_history.history["val_loss"][-1]
     logger.info("TP model training completed successfully.")
 
-    # --- 3. Verification ---
+    # --- Verification ---
     logger.info("\n--- ⚖️ Verification Results ---")
     logger.info(f"TP Final Validation Loss: {tp_final_val_loss:.6f}")
 
