@@ -22,6 +22,10 @@ except Exception:
 # --- Backend and Device Configuration ---
 os.environ["KERAS_BACKEND"] = "jax"
 os.environ["XLA_FLAGS"] = "--xla_force_host_platform_device_count=12"
+# Prevent JAX from eating all VRAM at startup
+os.environ["XLA_PYTHON_CLIENT_PREALLOCATE"] = "false"
+os.environ["XLA_PYTHON_CLIENT_MEM_FRACTION"] = ".90" # Limit to 90%
+os.environ["XLA_PYTHON_CLIENT_ALLOCATOR"] = "platform"
 
 import jax
 import keras_hub
@@ -74,8 +78,9 @@ except Exception as e:
 
 
 # --- Constants ---
-BATCH_SIZE = 16
-SEQUENCE_LENGTH = 128
+# DRAMATICALLY reduce these for the first successful run
+BATCH_SIZE = 1          # Was 16
+SEQUENCE_LENGTH = 64    # Was 128
 LEARNING_RATE = 1e-4
 EPOCHS = 2
 STEPS_PER_EPOCH = 1
@@ -252,7 +257,8 @@ def run_model_verification(preset_name, model_class):
     logger.info("🚀 Compiling and Training...")
     
     tp_model.compile(
-        optimizer=keras.optimizers.AdamW(learning_rate=LEARNING_RATE),
+        # Use SGD just to verify Tensor Parallelism works without OOM
+        optimizer=keras.optimizers.SGD(learning_rate=LEARNING_RATE), 
         loss=keras.losses.SparseCategoricalCrossentropy(from_logits=True),
         metrics=[
             keras_hub.metrics.Perplexity(from_logits=True, name="perplexity")
