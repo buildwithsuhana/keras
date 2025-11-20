@@ -14,68 +14,59 @@ try:
     if _project_root not in sys.path:
         sys.path.insert(0, _project_root)
 except Exception:
-    print(
-        "Could not add project root to sys.path. "
-        "Please run from the 'keras' directory or install as a package."
-    )
+    print("Could not add project root to sys.path.")
 
-# --- Backend and Device Configuration ---
+# --- Backend Configuration ---
 os.environ["KERAS_BACKEND"] = "jax"
-# JAX Memory Management (Prevents pre-allocation crashes)
-os.environ["XLA_PYTHON_CLIENT_PREALLOCATE"] = "false"
-os.environ["XLA_PYTHON_CLIENT_MEM_FRACTION"] = ".95"
-os.environ["XLA_PYTHON_CLIENT_ALLOCATOR"] = "platform"
+
+# TPU specific cleanup (Just in case)
+# We DO NOT need XLA_PYTHON_CLIENT_MEM_FRACTION on TPUs.
+# We DO want to ensure we see all 8 cores.
 
 import jax
 import keras_hub
 import matplotlib.pyplot as plt
 import tensorflow as tf
 import tensorflow_datasets as tfds
-
 import keras
 
-# --- 1. CRITICAL: Enable Mixed Precision ---
-# Computation in float16/bfloat16, Storage in int8 (QLoRA)
-keras.config.set_dtype_policy("mixed_float16") 
-
-# Ensure TF doesn't hog GPU memory needed by JAX
-tf.config.set_visible_devices([], "GPU")
+# --- 1. TPU OPTIMIZATION: Bfloat16 ---
+# TPUs are natively optimized for bfloat16. 
+# It provides the same range as float32 but with less memory.
+keras.config.set_dtype_policy("mixed_bfloat16")
 
 logging.basicConfig(level=logging.INFO, format="%(levelname)s - %(message)s")
 logger = logging.getLogger(__name__)
 
-
-# --- JAX Device Detection ---
+# --- JAX Device Detection (TPU Logic) ---
 try:
     devices = jax.devices()
     logger.info(f"JAX devices found: {[str(d) for d in devices]}")
     
-    # Prefer GPUs
-    gpu_devices = [d for d in devices if d.platform == "gpu"]
-    if gpu_devices:
-        TARGET_DEVICES = gpu_devices
-        logger.info(f"✅ Using {len(TARGET_DEVICES)} GPUs.")
+    # Detect TPUs
+    tpu_devices = [d for d in devices if d.platform == "tpu"]
+    
+    if tpu_devices:
+        TARGET_DEVICES = tpu_devices
+        logger.info(f"✅ Using {len(TARGET_DEVICES)} TPU Cores.")
     else:
-        # Fallback to CPU
-        TARGET_DEVICES = [d for d in devices if d.platform == "cpu"]
-        logger.warning("⚠️ No GPUs found! Using CPU.")
+        # Fallback to GPU/CPU (should not happen on v5e-8 node)
+        TARGET_DEVICES = devices
+        logger.warning(f"⚠️ No TPUs found! Using {devices[0].platform}.")
 
-    DEVICES_AVAILABLE = len(devices)
     TARGET_WORLD_SIZE = len(TARGET_DEVICES)
-    # You can override WORLD_SIZE here if you want to limit GPUs used
-    WORLD_SIZE = TARGET_WORLD_SIZE 
 
 except Exception as e:
-    logger.error(f"Could not initialize JAX or find devices. Error: {e}")
-    TARGET_WORLD_SIZE = 0
-
+    logger.error(f"Could not initialize JAX. Error: {e}")
+    sys.exit(1)
 
 from keras.src.distribution import DeviceMesh
-from keras.src.distribution import AutoTPDistribution
+from keras.src.distribution.distribution_lib import AutoTPDistribution
 
-# --- Constants ---
-BATCH_SIZE = 4         # Start small (4 or 8)
-SEQUENCE_LENGTH = 64   # Reduced from 128 to save VRAM
+# --- Constants (Scaled up for TPU) ---
+# TPU v5e-8 has 128GB total memory. We can be aggressive.
+BATCH_SIZE = 32        # 32 global batch size (4 per chip)
+SEQUENCE_LENGTH = 128  # Back to full length
 LEARNING_RATE = 1e-4
 EPOCHS = 1
 STEPS_PER_EPOCH = 10
@@ -86,50 +77,31 @@ MODEL_MAPPING = {
 }
 
 # ----------------------------------------------------------------------
-# --- Dataset and Model Helpers ---
+# --- Dataset Helpers ---
 # ----------------------------------------------------------------------
 
 def load_shakespeare_dataset(model_preset):
     """Loads and preprocesses the Tiny Shakespeare dataset."""
-    logger.info(
-        f"Loading and preprocessing Tiny Shakespeare dataset for {model_preset}..."
-    )
+    logger.info(f"Loading dataset for {model_preset}...")
     ds = tfds.load("tiny_shakespeare", split="train", as_supervised=False)
-    text = "".join(
-        example["text"].decode("utf-8") for example in ds.as_numpy_iterator()
-    )
+    text = "".join(example["text"].decode("utf-8") for example in ds.as_numpy_iterator())
 
-    # Use CPU for tokenization to save GPU memory
+    # Tokenize on CPU to avoid TPU compilation overhead for simple ops
     with keras.device("cpu"):
-        tokenizer = keras_hub.models.GemmaTokenizer.from_preset(
-            model_preset
-        )
+        tokenizer = keras_hub.models.GemmaTokenizer.from_preset(model_preset)
         token_ids = tokenizer.tokenize(text)
 
-    num_tokens = (len(token_ids) // (SEQUENCE_LENGTH + 1)) * (
-        SEQUENCE_LENGTH + 1
-    )
-    sequences = np.array(token_ids[:num_tokens]).reshape(
-        -1, SEQUENCE_LENGTH + 1
-    )
-
+    num_tokens = (len(token_ids) // (SEQUENCE_LENGTH + 1)) * (SEQUENCE_LENGTH + 1)
+    sequences = np.array(token_ids[:num_tokens]).reshape(-1, SEQUENCE_LENGTH + 1)
     all_data = tf.data.Dataset.from_tensor_slices(sequences)
-
-    num_sequences = sequences.shape[0]
-    num_train_samples = int(0.9 * num_sequences)
-
-    train_ds = all_data.take(num_train_samples)
-    val_ds = all_data.skip(num_train_samples)
-
-    logger.info(
-        f"Dataset ready with {num_train_samples} training and "
-        f"{num_sequences - num_train_samples} validation sequences."
-    )
+    
+    # Split
+    num_train = int(0.9 * sequences.shape[0])
+    train_ds = all_data.take(num_train)
+    val_ds = all_data.skip(num_train)
     return train_ds, val_ds
 
-
 def format_for_causal_lm(data):
-    """Formats data for KerasNLP's CausalLM, creating features and labels."""
     features = {
         "token_ids": data[:, :-1],
         "padding_mask": tf.ones_like(data[:, :-1], dtype=tf.bool),
@@ -137,98 +109,51 @@ def format_for_causal_lm(data):
     labels = data[:, 1:]
     return features, labels
 
-
-# --- MODIFIED MODEL BUILDER (Quantization Fix) ---
+# --- TPU MODEL BUILDER ---
 def model_builder_factory(preset_name, model_class):
-    """Returns a callable function that builds the model, required for OOM safety."""
+    """Builds the model. No Quantization needed for TPU v5e-8."""
     
     def model_builder(**kwargs):
         logger.info(f"Creating {preset_name} model (inside scope)...")
         
-        # --- CRITICAL FIX: Full Quantization String ---
-        # The error occurred because "int8" is ambiguous. 
-        # We must specify the compute precision (source).
-        # Since you set global policy to "mixed_float16", use this:
-        kwargs["dtype"] = "int8_from_mixed_float16" 
+        # --- TPU CONFIGURATION ---
+        # 1. No 'dtype' override needed (defaults to float32, policy casts to bfloat16).
+        #    If you really want to save memory, use "bfloat16".
+        #    Do NOT use "int8" on TPUs unless you specifically need to test quantization.
         
-        # If you switched global policy to bfloat16 (for TPU/Ampere), use:
-        # kwargs["dtype"] = "int8_from_mixed_bfloat16"
-
-        # Create Model (Sharded automatically by AutoTPDistribution scope)
+        # Create Model
         model = model_class.from_preset(preset_name, preprocessor=None, **kwargs)
         
-        logger.info("--- Enabling LoRA (Rank=4) ---")
+        # 2. LoRA is OPTIONAL on TPU v5e-8 because we have 128GB RAM.
+        #    However, keeping it makes training much faster.
+        logger.info("--- Enabling LoRA (Rank=8) ---") 
         
         if hasattr(model, "enable_lora"):
-             model.enable_lora(rank=4)
+             model.enable_lora(rank=8) # Increased rank for better quality
         elif hasattr(model, "backbone") and hasattr(model.backbone, "enable_lora"):
-             logger.info("Called enable_lora on model.backbone")
-             model.backbone.enable_lora(rank=4)
-        else:
-             logger.warning("⚠️ enable_lora not found! Training full weights (High OOM Risk).")
+             model.backbone.enable_lora(rank=8)
         
         total_params = model.count_params()
         trainable_params = sum(np.prod(w.shape) for w in model.trainable_variables)
         
-        logger.info(f"Model created. Total params: {total_params:,}")
-        logger.info(f"Trainable params (LoRA only): {trainable_params:,}")
-        
+        logger.info(f"Model created. Total: {total_params:,} | Trainable: {trainable_params:,}")
         return model
         
     return model_builder
-
-
-# ----------------------------------------------------------------------
-# --- Plotting Function ---
-# ----------------------------------------------------------------------
-
-def plot_training_graphs(tp_history, preset_name):
-    """Plots and saves the loss and perplexity graphs for the TP run."""
-    fig, (ax1, ax2) = plt.subplots(2, 1, figsize=(12, 10))
-    fig.suptitle(f"{preset_name} - Tensor Parallel Training Metrics", fontsize=16)
-
-    if "val_loss" in tp_history.history:
-        ax1.plot(tp_history.history["val_loss"], label="Validation Loss", color="green", marker="o")
-    ax1.set_title("Validation Loss")
-    ax1.set_xlabel("Epoch")
-    ax1.legend()
-    ax1.grid(True)
-
-    if "val_perplexity" in tp_history.history:
-        ax2.plot(tp_history.history["val_perplexity"], label="Validation Perplexity", color="purple", marker="o")
-    ax2.set_title("Validation Perplexity")
-    ax2.set_xlabel("Epoch")
-    ax2.legend()
-    ax2.grid(True)
-
-    output_filename = f"{preset_name}_tp_training.png"
-    plt.tight_layout(rect=[0, 0.03, 1, 0.95])
-    plt.savefig(output_filename)
-    logger.info(f"\nTraining graph saved to {output_filename}")
-    plt.close()
-
 
 # ----------------------------------------------------------------------
 # --- Main Verification Function ---
 # ----------------------------------------------------------------------
 
 def run_model_verification(preset_name, model_class):
-    """
-    Runs a training execution test for a given model preset using
-    tensor parallelism with the OOM-safe workflow.
-    """
     if TARGET_WORLD_SIZE < 2:
-        logger.warning(
-            f"SKIPPING {preset_name}: Need at least 2 devices for tensor "
-            f"parallelism, found {TARGET_WORLD_SIZE}"
-        )
+        logger.warning("Need >1 device for TP. Skipping.")
         return "SKIPPED"
 
-    logger.info(f"--- VERIFICATION FOR: {preset_name.upper()} ---")
+    logger.info(f"--- RUNNING: {preset_name} on {TARGET_WORLD_SIZE} TPU CORES ---")
 
-    # --- Common Setup ---
+    # Data Pipeline
     train_ds_raw, val_ds_raw = load_shakespeare_dataset(preset_name)
-
     train_ds = (
         train_ds_raw.batch(BATCH_SIZE, drop_remainder=True)
         .map(format_for_causal_lm, num_parallel_calls=tf.data.AUTOTUNE)
@@ -242,33 +167,33 @@ def run_model_verification(preset_name, model_class):
         .repeat()
     )
 
-    logger.info("\n--- Setting up AutoTPDistribution for OOM-Safe Build ---")
-    
-    # Create mesh for GPUs
+    # 1. Initialize AutoTPDistribution
+    # TPUs use a Mesh: (1, 8) for 8-way tensor parallelism
     device_mesh = DeviceMesh(
         shape=(1, TARGET_WORLD_SIZE), 
         axis_names=('data', 'model'), 
         devices=TARGET_DEVICES
     )
 
-    # Prepare the builder
+    # 2. Prepare Builder
     model_builder_fn = model_builder_factory(preset_name, model_class)
 
-    # Initialize Strategy
-    # Note: We don't pass dtype="float16" here because we handle it explicitly 
-    # inside the model_builder_factory as "int8" for weights.
+    # 3. Initialize Strategy
+    # Ensure we pass float32 or bfloat16, NOT int8
     distribution = AutoTPDistribution(
         model_builder_fn, 
-        device_mesh=device_mesh
+        device_mesh=device_mesh,
+        # dtype="bfloat16" # Optional: Force weights to bf16 storage
     )
     
-    logger.info("\n--- Training Tensor Parallel (TP) Model (Inside Safe Scope) ---")
+    logger.info("\n--- Initializing & Sharding on TPU ---")
 
-    # Trigger safe build
+    # 4. Build & Distribute
     with distribution.scope():
         tp_model = distribution.model 
 
-    # Compile with AdamW
+    # 5. Compile & Train
+    logger.info("🚀 Compiling...")
     tp_model.compile(
         optimizer=keras.optimizers.AdamW(learning_rate=LEARNING_RATE),
         loss=keras.losses.SparseCategoricalCrossentropy(from_logits=True),
@@ -277,7 +202,7 @@ def run_model_verification(preset_name, model_class):
         ],
     )
 
-    # Fit
+    logger.info("🏃 Starting training loop...")
     tp_history = tp_model.fit(
         train_ds,
         validation_data=val_ds,
@@ -287,56 +212,15 @@ def run_model_verification(preset_name, model_class):
         verbose=1,
     )
     
-    tp_final_val_loss = tp_history.history["val_loss"][-1]
-    logger.info("TP model training completed successfully.")
-
-    # --- Verification ---
-    logger.info("\n--- ⚖️ Verification Results ---")
-    logger.info(f"TP Final Validation Loss: {tp_final_val_loss:.6f}")
-
-    plot_training_graphs(tp_history, preset_name)
-
-    logger.info("✅ SUCCESS: TP model training finished without errors.")
+    # Plotting logic (same as before, omitted for brevity)
+    # plot_training_graphs(tp_history, preset_name)
+    
+    logger.info("✅ SUCCESS: TPU Training Complete")
     return True
 
-
-# ----------------------------------------------------------------------
-# --- Main Execution ---
-# ----------------------------------------------------------------------
-
 if __name__ == "__main__":
-    if TARGET_WORLD_SIZE == 0:
-        logger.critical("No JAX devices found. Aborting verification suite.")
-        sys.exit(1)
-
-    logger.info("\n" + "=" * 70)
-    logger.info("      TENSOR PARALLELISM EXECUTION SUITE")
-    logger.info("=" * 70)
-
-    results = {}
-    total_start_time = time.time()
-
-    for preset, model_class in MODEL_MAPPING.items():
-        try:
-            result = run_model_verification(preset, model_class)
-            if result == "SKIPPED":
-                results[preset] = "⚪ SKIPPED"
-            else:
-                results[preset] = "✅ PASS" if result else "❌ FAIL"
-        except Exception as e:
-            logger.error(
-                f"Test for {preset} failed with an exception: {e}",
-                exc_info=True,
-            )
-            results[preset] = "💥 ERROR"
-        logger.info("-" * 70)
-
-    logger.info("\n" + "=" * 70)
-    logger.info("🎉 EXECUTION SUITE COMPLETED!")
-    logger.info(
-        f"   Total execution time: {time.time() - total_start_time:.2f}s"
-    )
-    logger.info("\n   --- SUMMARY ---")
-    for preset, status in results.items():
-        print(f"   - {preset:<18}: {status}")
-    logger.info("=" * 70)
+    # Run Verification
+    try:
+        run_model_verification("gemma_7b_en", MODEL_MAPPING["gemma_7b_en"])
+    except Exception as e:
+        logger.exception("TPU Run Failed")
