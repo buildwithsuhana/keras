@@ -25,10 +25,28 @@ def split_tensor_for_parallelism(tensor, index, device_count, dim):
     else:
         split_dim = dim
 
-    splits = ops.array_split(
-        tensor, indices_or_sections=device_count, axis=split_dim
-    )
-    return splits[index]
+    # --- MINIMAL OOM FIX START ---
+    # Replaced ops.array_split with direct slicing to avoid materializing
+    # unneeded shards for other devices in memory.
+    
+    shape = tensor.shape
+    total_length = shape[split_dim]
+    shard_size = total_length // device_count
+    
+    start = index * shard_size
+    
+    # Handle potential remainders on the last device
+    if index == device_count - 1:
+        end = total_length
+    else:
+        end = start + shard_size
+
+    # Create a slice object: [:, :, start:end, :]
+    slices = [slice(None)] * len(shape)
+    slices[split_dim] = slice(start, end)
+    
+    return tensor[tuple(slices)]
+    # --- MINIMAL OOM FIX END ---
 
 
 LayoutMap = collections.namedtuple("LayoutMap", ["state_rules", "output_rules"])

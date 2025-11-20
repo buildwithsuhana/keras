@@ -1,16 +1,14 @@
-"""
-Tensor Parallel implementation for Keras 3.0
-Port of the PyTorch tensor_parallel library
-"""
-
 import logging
 import re
+import contextlib
+import gc
 from typing import Collection, Optional, Sequence, Union
 
 import numpy as np
-import tensorflow as tf
 import keras
 from keras import ops
+from keras.src.models import Model
+from keras.src.backend import distribution_lib
 from keras.src.distribution.tensor_parallel.autoconfig import (
     get_default_config,
 )
@@ -20,12 +18,134 @@ from keras.src.distribution.tensor_parallel.parameter_sharding import (
 from keras.src.distribution.tensor_parallel.coordinated_optimizer import (
     TensorParallelOptimizer,
 )
-
-from keras.src.distribution import list_devices
+from keras.src.distribution import (
+    list_devices, 
+    DeviceMesh, 
+    TensorLayout, 
+    Distribution, 
+    set_distribution, 
+    distribution
+)
 
 logger = logging.getLogger(__file__)
 
-from keras.src.models import Model
+
+class _AutoLayoutHeuristic(Distribution):
+    """
+    Internal Distribution strategy that enforces sharding during initialization.
+    
+    This class prevents OOMs by calculating the layout based on shape heuristics 
+    (matching autoconfig.py) and enforcing sharded memory allocation instantly, 
+    rather than creating the full tensor on one device.
+    """
+
+    def __init__(self, device_mesh, batch_dim_name="data", auto_shard_dataset=True):
+        super().__init__(device_mesh, batch_dim_name, auto_shard_dataset)
+        self._device_mesh = device_mesh
+        self._num_process = distribution_lib.num_processes()
+        self._process_id = distribution_lib.process_id()
+
+    def get_data_layout(self, data_shape):
+        data_shard_spec = [None] * len(data_shape)
+        data_shard_spec[0] = self.batch_dim_name
+        return TensorLayout(data_shard_spec, self._device_mesh)
+
+    def get_variable_layout(self, variable):
+        """Determines layout based on variable path and shape heuristics."""
+        path = getattr(variable, "path", variable.name).lower()
+        shape = variable.shape
+        
+        # Heuristic: Embeddings (Vocab/Feature Parallel)
+        # Matching autoconfig: typically dim 1 for embeddings in your code
+        if "embedding" in path and len(shape) >= 2:
+             return TensorLayout([None, "model"] + [None] * (len(shape) - 2), self._device_mesh)
+
+        # Heuristic: Kernels (MLP/Attention)
+        if "kernel" in path and len(shape) == 2:
+            input_dim, output_dim = shape[0], shape[1]
+            
+            # Dense Layer Logic from autoconfig.py
+            expansion_threshold = 1.5
+            is_expansion = output_dim > input_dim * expansion_threshold
+            is_contraction = input_dim > output_dim * expansion_threshold
+            
+            if is_expansion: 
+                # up_projection -> Split col (dim 1)
+                return TensorLayout([None, "model"], self._device_mesh)
+            elif is_contraction: 
+                # down_projection -> Split row (dim 0)
+                return TensorLayout(["model", None], self._device_mesh)
+            else:
+                # Default dense -> Split col (dim 1)
+                return TensorLayout([None, "model"], self._device_mesh)
+
+        # Heuristic: Biases
+        if "bias" in path:
+            # Matching autoconfig: up_projection bias is split (dim 0)
+            # We can't easily know parent layer type here, but for safety 
+            # we often replicate bias or split if it's huge. 
+            # For now, replicating small biases is safer unless we map perfectly.
+            pass
+
+        # Default: Replication (safe for small variables like LayerNorm scales)
+        return TensorLayout([None] * len(shape), self._device_mesh)
+
+    def get_tensor_layout(self, path):
+        return None
+        
+    def distribute_dataset(self, dataset):
+        return dataset
+
+
+class AutoTPDistribution:
+    """
+    Public API for Automated Tensor Parallelism Distribution.
+    
+    Use this as a scope context manager to safely initialize large models
+    without OOM errors.
+    
+    Usage:
+        dist = AutoTPDistribution()
+        with dist.scope():
+            model = MyLargeModel()
+        
+        parallel_model = dist.distribute(model)
+    """
+    def __init__(self, device_mesh=None):
+        if device_mesh is None:
+            devices = list_devices()
+            # Default mesh shape (1, N)
+            device_mesh = DeviceMesh(
+                (1, len(devices)), ["data", "model"], devices
+            )
+            
+        self.device_mesh = device_mesh
+        self.devices = self.device_mesh.devices.flatten().tolist()
+        self.world_size = self.device_mesh.devices.size
+        
+        # Create the internal strategy
+        self._strategy = _AutoLayoutHeuristic(
+            self.device_mesh, 
+            batch_dim_name="data"
+        )
+
+    @contextlib.contextmanager
+    def scope(self):
+        """Context manager to activate the OOM-safe initialization scope."""
+        original_scope = distribution()
+        set_distribution(self._strategy)
+        try:
+            yield
+        finally:
+            set_distribution(original_scope)
+
+    def distribute(self, model):
+        """Wraps the built model into TensorParallelKeras."""
+        return TensorParallelKeras(
+            model=model,
+            device_count=self.world_size,
+            device_ids=self.devices,
+        )
 
 
 class TensorParallelKeras(Model):
@@ -38,8 +158,7 @@ class TensorParallelKeras(Model):
     ):
         super().__init__(**kwargs)
 
-        self._original_model = model
-
+        # 1. Device Setup
         if device_count is None:
             device_count, device_ids = self._auto_detect_parallelism()
         elif device_ids is None:
@@ -47,89 +166,32 @@ class TensorParallelKeras(Model):
 
         self.device_count = device_count
         self.device_ids = device_ids
-        self.sharding_strategy = "auto"
-        
-        self.tensor_parallel_config = None
-        self.distributed = True
-
-        self.sharded_models = [self._original_model]
-
-        accel_devices = list_devices()
-        device_ids = list(self.check_device_ids(device_ids))
-
-        if accel_devices:
-            backend_name = keras.backend.backend()
-            print(
-                f"🔍 Discovered {len(accel_devices)} devices for backend '{backend_name}'"
-            )
-            print(f"🔍 Devices: {[str(d) for d in accel_devices]}")
-
-            if len(accel_devices) >= device_count:
-                print(
-                    f"✅ Using REAL tensor parallelism on {device_count} discovered devices."
-                )
-                device_ids = accel_devices[:device_count]
-            else:
-                print(
-                    f"⚠️  Discovered {len(accel_devices)} devices but device_count={device_count} was requested."
-                )
-                print(
-                    f"⚠️  Reducing device_count to {len(accel_devices)} for real implementation."
-                )
-                device_count = len(accel_devices)
-                device_ids = accel_devices[:device_count]
-        else:
-            print(
-                f"⚠️  Could not discover accelerator devices. Falling back to configuration."
-            )
-
-        if not device_ids:
-            device_ids = self._auto_configure_devices(device_count)
-
-        if len(device_ids) != device_count:
-            device_ids = self._adjust_device_list(device_ids, device_count)
-
         self.devices = device_ids
-        self.device_count = device_count
+        self.sharding_strategy = "auto"
+        self.distributed = True
+        
+        # Temporary storage of original model
+        self._original_model = model
+        self.model_shards = []
+        self.sharded_models = [model] # Keeps ref for a moment
 
+        # 2. Validation
         if self.device_count <= 1:
+            logger.warning("Device count <= 1. Running in non-distributed mode.")
             self.model_shards = [model]
             self.distributed = False
-            if len(self.devices) == 1:
-                from keras import device
-
-                with device(self.devices[0]):
-                    self.model_shards[0] = model
             self.built = True
-            self.assembled_model = self._original_model
+            self.assembled_model = model
             return
 
-        if self.tensor_parallel_config is None:
-            device_names = [str(d) for d in self.devices]
-            self.tensor_parallel_config = get_default_config(
-                model, device_names
-            )
-            print(self.tensor_parallel_config)
-            logger.info(
-                "Using automatic config with auto sharding strategy: sharding individual Dense/Conv/Embedding layers"
-            )
-
-        print(
-            f"🔧 Creating REAL parameter shards for {model.name} across {len(self.devices)} devices"
+        # 3. Config Generation
+        self.tensor_parallel_config = get_default_config(
+            model, [str(d) for d in self.devices]
         )
+        print(f"🔧 Creating Parameter Shards for {model.name} across {len(self.devices)} devices")
 
-        self._is_multi_layer_model = len(model.layers) > 2
-        if self._is_multi_layer_model:
-            logger.info(
-                f"   - Multi-layer model detected: {len(model.layers)} layers"
-            )
-
-        self.model_shards = []
+        # 4. Sharding Process
         self.modified_parameters_names = set()
-
-        logger.info(
-            f"✅ Using '{keras.backend.backend()}' backend for parameter sharding."
-        )
 
         for rank, device_id in enumerate(self.devices):
             print(f"[{device_id}] ➡️  Starting sharding process for Rank {rank}")
@@ -142,157 +204,119 @@ class TensorParallelKeras(Model):
             )
             self.model_shards.append(shard)
             self.modified_parameters_names.update(modified_parameters_names)
-            
-
             logger.info(f"   ✅ Created shard {rank} for device {device_id}")
 
-        params_per_shard = []
-        for i, shard in enumerate(self.model_shards):
-            total_params = sum(np.prod(p.shape) for p in shard.weights)
-            params_per_shard.append(int(total_params))
-            logger.info(f"   📊 Shard {i} parameters: {int(total_params):,}")
+        # 5. CRITICAL OOM FIX: Aggressive Cleanup
+        # Now that shards are created, we MUST delete the original model
+        # to free up the 12GB-24GB of RAM it occupies.
+        print("🗑️  Cleaning up original model to free memory...")
+        
+        # Break references
+        self._original_model = None
+        self.sharded_models = [] 
+        
+        # Force Garbage Collection
+        del model
+        gc.collect()
+        keras.backend.clear_session()
+        print("✅ Cleanup complete. RAM freed.")
 
-        if len(set(params_per_shard)) > 1:
-            logger.info(
-                "✅ REAL SHARDING CONFIRMED: Different parameter counts across shards"
-            )
-            logger.info("✅ This is NOT using stubs - real tensor parallelism!")
-        else:
-            pass
-
-        logger.info(
-            f"Using '{keras.backend.backend()}' backend logic for distribution."
-        )
-
+        # 6. Build Assembled Model (Logic Reference)
+        # Since we deleted _original_model, we need to ensure build_assembled_model
+        # uses the structure from one of the shards (which share the structure) 
+        # or use a lightweight clone if needed.
+        # NOTE: In this architecture, shards preserve the Keras functional graph structure,
+        # so we can use shard[0] to inspect inputs/outputs if needed.
+        
+        # We need to restore a reference to a 'logical' model for `build_assembled_model`
+        # to inspect inputs/outputs. We use the first shard as the structural reference.
+        self._structure_ref = self.model_shards[0].original_model 
+        
         self.built = True
-        if self.distributed:
-            self.assembled_model = self.build_assembled_model()
-        else:
-            self.assembled_model = self._original_model
+        self.assembled_model = self.build_assembled_model()
 
+    # Properties (Delegate to shards)
     @property
     def variables(self):
-        unique_vars = {
-            id(var): var
-            for shard in self.model_shards
-            for var in shard.variables
-        }
+        unique_vars = {id(var): var for shard in self.model_shards for var in shard.variables}
         return list(unique_vars.values())
 
     @property
     def trainable_variables(self):
-        unique_vars = {
-            id(var): var
-            for shard in self.model_shards
-            for var in shard.trainable_variables
-        }
+        unique_vars = {id(var): var for shard in self.model_shards for var in shard.trainable_variables}
         return list(unique_vars.values())
 
     @property
     def non_trainable_variables(self):
-        unique_vars = {
-            id(var): var
-            for shard in self.model_shards
-            for var in shard.non_trainable_variables
-        }
+        unique_vars = {id(var): var for shard in self.model_shards for var in shard.non_trainable_variables}
         return list(unique_vars.values())
 
     @property
     def weights(self):
-        unique_vars = {
-            id(var): var
-            for shard in self.model_shards
-            for var in shard.weights
-        }
+        unique_vars = {id(var): var for shard in self.model_shards for var in shard.weights}
         return list(unique_vars.values())
 
     @property
     def trainable_weights(self):
-        unique_vars = {
-            id(var): var
-            for shard in self.model_shards
-            for var in shard.trainable_weights
-        }
+        unique_vars = {id(var): var for shard in self.model_shards for var in shard.trainable_weights}
         return list(unique_vars.values())
 
     @property
     def non_trainable_weights(self):
-        unique_vars = {
-            id(var): var
-            for shard in self.model_shards
-            for var in shard.non_trainable_weights
-        }
+        unique_vars = {id(var): var for shard in self.model_shards for var in shard.non_trainable_weights}
         return list(unique_vars.values())
 
+    # ... (Helper methods: _auto_detect_parallelism, _adjust_device_list, etc. remain same) ...
     def _auto_detect_parallelism(self):
-        """Auto-detect device_count and device_ids efficiently."""
         from keras.src.distribution import get_best_devices
-
         available_devices = list_devices()
         device_count = len(available_devices)
-        print(
-            f"🔍 Auto-detected device_count: {device_count} from {len(available_devices)} available devices"
-        )
-
         device_ids = get_best_devices(device_count)
-        print(f"🔍 Auto-detected device_ids: {device_ids}")
-
         return device_count, device_ids
 
     def _adjust_device_list(self, device_ids, target_device_count):
-        """Adjust device list to match target device_count intelligently."""
         current_size = len(device_ids)
         if current_size >= target_device_count:
             return device_ids[:target_device_count]
-
-        return list(device_ids) + [
-            f"cpu:{i}" for i in range(current_size, target_device_count)
-        ]
+        return list(device_ids) + [f"cpu:{i}" for i in range(current_size, target_device_count)]
 
     def _auto_configure_devices(self, device_count):
-        """Auto-configure devices - simplified version."""
         available_devices = list_devices()
         if available_devices:
-            devices = available_devices[:device_count]
-            logger.info(f"Auto-configured devices: {devices}")
-            return devices
-        else:
-            logger.warning("No devices available, using default CPU")
-            return ["cpu:0"]
+            return available_devices[:device_count]
+        return ["cpu:0"]
 
-    def check_device_ids(
-        self, device_ids: Optional[Sequence[str]]
-    ) -> Sequence[str]:
-        """Validate and normalize device IDs for Keras."""
+    def check_device_ids(self, device_ids):
         if device_ids is None:
-            device_ids = self._get_all_device_indices()
-
+            device_ids = list_devices()
         return tuple(self.canonicalize_device(d) for d in device_ids)
-
-    def _get_all_device_indices(self) -> Sequence[str]:
-        """Get all available device indices using distribution library."""
-        return list_devices()
+        
+    def canonicalize_device(self, device_spec: Union[str, int]) -> str:
+        if isinstance(device_spec, int):
+            return "cpu" if device_spec == -1 else f"gpu:{device_spec}"
+        elif isinstance(device_spec, str):
+            if device_spec == "cpu": return "cpu"
+            elif device_spec.startswith("gpu:") or device_spec.startswith("cuda:"):
+                return device_spec if device_spec.startswith("gpu:") else f"gpu:{device_spec.split(':')[1]}"
+            return device_spec
+        return "cpu"
 
     def build_assembled_model(self):
-        """
-        Builds a single, JIT-friendly Keras Functional model that encapsulates
-        the entire tensor parallel logic, correctly handling multiple inputs.
-        """
         if not self.distributed:
-            return self._original_model
+            return self._structure_ref
 
+        # Use structure reference for inputs
         input_layers = {
             inp.name.split(":")[0]: keras.Input(
                 shape=inp.shape[1:],
                 dtype=inp.dtype,
                 name=inp.name.split(":")[0],
             )
-            for inp in self._original_model.inputs
+            for inp in self._structure_ref.inputs
         }
 
         partial_outputs = []
         for shard in self.model_shards:
-            # Prefer the shard's declared input names, fall back to its input tensors.
             shard_inputs = {}
             try:
                 input_names = getattr(shard, "input_names", None)
@@ -302,49 +326,38 @@ class TensorParallelKeras(Model):
                         if clean_name in input_layers:
                             shard_inputs[clean_name] = input_layers[clean_name]
                 else:
-                    # Fall back to inspecting shard.inputs
                     for inp in getattr(shard, "inputs", []):
                         clean_name = inp.name.split(":")[0]
                         if clean_name in input_layers:
                             shard_inputs[clean_name] = input_layers[clean_name]
 
                 if not shard_inputs:
-                    # Last resort: forward the full mapping (may be positional in some cases)
                     shard_inputs = dict(input_layers)
 
-                logger.info(
-                    f"Calling shard '{getattr(shard, 'name', '<shard>')}' with inputs: {list(shard_inputs.keys())}"
-                )
                 partial_outputs.append(shard(shard_inputs))
-            except Exception as e:
-                logger.exception(
-                    "Exception when calling shard %s with inputs=%s",
-                    getattr(shard, 'name', '<shard>'),
-                    list(shard_inputs.keys()),
-                )
+            except Exception:
+                logger.exception("Exception calling shard")
                 raise
 
-        final_layer = self._original_model.layers[-1]
+        final_layer = self._structure_ref.layers[-1]
         sharding_type = "unknown"
         final_kernel_name = f"{final_layer.name}.kernel"
-        if hasattr(self._original_model, "name") and self._original_model.name:
-            final_kernel_name = (
-                f"{self._original_model.name}.{final_kernel_name}"
-            )
+        if hasattr(self._structure_ref, "name") and self._structure_ref.name:
+            final_kernel_name = f"{self._structure_ref.name}.{final_kernel_name}"
 
         for pattern, action in self.tensor_parallel_config.state_rules.items():
             if re.search(pattern, final_kernel_name):
-                if hasattr(action, "sharding_type"):
-                    sharding_type = action.sharding_type
+                # Check 'dim' in SplitAction
+                if hasattr(action, "dim"):
+                    # Heuristic mapping: dim=1 -> Column, dim=0 -> Row
+                    sharding_type = "column" if action.dim == 1 else "row"
                 break
 
         if sharding_type == "column":
             final_output = ops.concatenate(partial_outputs, axis=-1)
-            original_output_dim = self._original_model.output_shape[-1]
+            original_output_dim = self._structure_ref.output_shape[-1]
             if final_output.shape[-1] != original_output_dim:
-                final_output = keras.layers.Lambda(
-                    lambda x: x[..., :original_output_dim]
-                )(final_output)
+                final_output = keras.layers.Lambda(lambda x: x[..., :original_output_dim])(final_output)
         elif sharding_type == "row":
             if len(partial_outputs) > 1:
                 summed_output = keras.layers.Add()(partial_outputs)
@@ -353,109 +366,50 @@ class TensorParallelKeras(Model):
 
             if final_layer.use_bias:
                 bias = final_layer.bias
-                final_output = keras.layers.Lambda(
-                    lambda x: x - bias * (self.device_count - 1)
-                )(summed_output)
+                final_output = keras.layers.Lambda(lambda x: x - bias * (self.device_count - 1))(summed_output)
             else:
                 final_output = summed_output
         else:
             final_output = partial_outputs[0]
 
-        assembled_model = keras.Model(
-            inputs=list(input_layers.values()), outputs=final_output
-        )
-        return assembled_model
-
-    def canonicalize_device(self, device_spec: Union[str, int]) -> str:
-        """Convert device specification to canonical form."""
-        if isinstance(device_spec, int):
-            if device_spec == -1:
-                return "cpu"
-            else:
-                return f"gpu:{device_spec}"
-        elif isinstance(device_spec, str):
-            if device_spec == "cpu":
-                return "cpu"
-            elif device_spec.startswith("gpu:"):
-                return device_spec
-            elif device_spec.startswith("cuda:"):
-                return f"gpu:{device_spec.split(':')[1]}"
-            else:
-                return device_spec
-        else:
-            return "cpu"
+        return keras.Model(inputs=list(input_layers.values()), outputs=final_output)
 
     def call(self, inputs, training=None, **kwargs):
-        """
-        Forward pass for the tensor-parallel model.
-        """
         return self.assembled_model(inputs, training=training, **kwargs)
 
     def compile(self, optimizer=None, loss=None, metrics=None, **kwargs):
-        """
-        Compile the tensor parallel model.
-        """
         if len(self.model_shards) > 1 and optimizer is not None:
             self.coordinated_optimizer = TensorParallelOptimizer(
                 optimizer,
                 self.device_count,
                 tensor_parallel_config=self.tensor_parallel_config,
             )
-            logger.info(
-                f"Created coordinated optimizer for {self.device_count} shards"
-            )
             
+            # Register shard mapping
             try:
                 self.coordinated_optimizer._shard_models = self.model_shards
-
                 var_map = {}
-                assembled = getattr(self, "assembled_model", None)
-                assembled_vars = (
-                    assembled.variables if assembled is not None else []
-                )
-
+                assembled_vars = self.assembled_model.variables
                 for a_var in assembled_vars:
                     key = getattr(a_var, "path", None) or a_var.name
                     suffix = key.split("/")[-1]
                     per_shard = []
                     for shard in self.model_shards:
-                        match = next(
-                            (
-                                v
-                                for v in shard.variables
-                                if v.name.endswith(suffix)
-                            ),
-                            None,
-                        )
+                        match = next((v for v in shard.variables if v.name.endswith(suffix)), None)
                         per_shard.append(match)
                     var_map[key] = per_shard
-
-                self.coordinated_optimizer._shard_var_map = var_map
                 
-                inner = getattr(
-                    self.coordinated_optimizer, "coordinated_optimizer", None
-                )
-                if inner is not None:
+                self.coordinated_optimizer._shard_var_map = var_map
+                inner = getattr(self.coordinated_optimizer, "coordinated_optimizer", None)
+                if inner:
                     inner._shard_models = self.model_shards
                     inner._shard_var_map = var_map
             except Exception:
-                logger.exception(
-                    "Failed to register shard mapping on coordinated optimizer"
-                )
+                logger.exception("Failed to register shard mapping")
 
-            super().compile(
-                optimizer=self.coordinated_optimizer,
-                loss=loss,
-                metrics=metrics,
-                **kwargs,
-            )
-            logger.info(
-                "Compiled TensorParallelKeras model with coordinated optimizer."
-            )
-
+            super().compile(optimizer=self.coordinated_optimizer, loss=loss, metrics=metrics, **kwargs)
         else:
             super().compile(optimizer, loss, metrics, **kwargs)
 
     def fit(self, x=None, y=None, **kwargs):
-        """Use standard Keras training which correctly handles the train_step."""
         return super().fit(x, y, **kwargs)

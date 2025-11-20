@@ -165,41 +165,11 @@ class ParameterShardingStrategy:
         return sharded_model, modified_parameters
 
     def _store_original_weights(self, model):
-        """Store original weights for reference."""
-        
-        def find_weights_recursive(current_layer, prefix=""):
-            name = current_layer.name
-            full_name = f"{prefix}.{name}" if prefix else name
-
-            if hasattr(current_layer, "weights") and current_layer.weights:
-                for weight in current_layer.weights:
-                    cleaned_name = weight.name.split("/")[-1].split(":")[0]
-                    param_name = f"{full_name}.{cleaned_name}"
-                    
-                    # FIX: Check for numpy capability before access
-                    if hasattr(weight, 'numpy'):
-                        self.original_weights[param_name] = weight.numpy()
-
-            if hasattr(current_layer, "layers") and current_layer.layers:
-                for sub_layer in current_layer.layers:
-                    find_weights_recursive(sub_layer, full_name)
-
-            for attr_name in dir(current_layer):
-                if attr_name.startswith("__") and attr_name.endswith("__"):
-                    continue
-                try:
-                    attr = getattr(current_layer, attr_name)
-                except Exception:
-                    continue
-                if isinstance(attr, layers.Layer) and attr is not current_layer:
-                    find_weights_recursive(attr, full_name)
-                elif isinstance(attr, (list, tuple)):
-                    for item in attr:
-                        if isinstance(item, layers.Layer):
-                            find_weights_recursive(item, full_name)
-
-        # Start recursion
-        find_weights_recursive(model, prefix="")
+        """
+        OOM FIX: Disabled storing original weights.
+        Storing a copy of 3B+ parameters in RAM causes OOM.
+        """
+        pass
 
     def _find_matching_parameters(self, model, pattern: str) -> List[Tuple[str, Any]]:
         """

@@ -922,10 +922,16 @@ def set_distribution(value):
     """
     global_state.set_global_attribute(GLOBAL_ATTRIBUTE_NAME, value)
 
+# --- OOM FIX START ---
 @keras_export("keras.distribution.AutoTPDistribution")
 class AutoTPDistribution(Distribution):
-    """A distribution strategy for automated tensor and data parallelism."""
-    def __init__(self, model, device_mesh=None, auto_shard_dataset=True):
+    """A distribution strategy for automated tensor and data parallelism.
+    
+    OOM FIX IMPLEMENTATION:
+    This class implements Heuristic-based Layout determination to allow
+    memory-safe initialization of large models.
+    """
+    def __init__(self, device_mesh=None, auto_shard_dataset=True):
         if device_mesh is None:
             all_devices = list_devices()
             if not all_devices:
@@ -943,19 +949,10 @@ class AutoTPDistribution(Distribution):
         batch_dim_name = "data"
 
         super().__init__(device_mesh, batch_dim_name, auto_shard_dataset)
-
-        self._original_model = model
+        
         self._num_process = distribution_lib.num_processes()
         self._process_id = distribution_lib.process_id()
         self._is_multi_process = self._num_process > 1
-        from keras.src.distribution.tensor_parallel.tensor_parallel_keras import (
-    TensorParallelKeras,
-)
-        self.model = TensorParallelKeras(
-            model=self._original_model,
-            device_count=np.prod(self.device_mesh.shape),
-            device_ids=self.device_mesh.devices.flatten().tolist(),
-        )
 
     def get_data_layout(self, data_shape):
         data_shard_spec = [None] * len(data_shape)
@@ -963,11 +960,42 @@ class AutoTPDistribution(Distribution):
         return TensorLayout(data_shard_spec, self.device_mesh)
 
     def get_variable_layout(self, variable):
-        warnings.warn(
-            "Variable layout is determined automatically within "
-            "AutoTPDistribution. This method will return a replicated layout."
-        )
-        return TensorLayout([None] * len(variable.shape), self.device_mesh)
+        """
+        Returns a sharded layout based on shape heuristics to prevent OOM
+        during model initialization.
+        """
+        path = getattr(variable, "path", variable.name).lower()
+        shape = variable.shape
+        
+        # 1. Embeddings: usually Feature Parallel (dim 1) in your code
+        if "embedding" in path and len(shape) >= 2:
+             return TensorLayout([None, "model"] + [None] * (len(shape) - 2), self.device_mesh)
+
+        # 2. Dense Kernels: Expansion vs Contraction
+        if "kernel" in path and len(shape) == 2:
+            input_dim, output_dim = shape[0], shape[1]
+            
+            # Heuristic matching autoconfig.py
+            expansion_threshold = 1.5
+            is_expansion = output_dim > input_dim * expansion_threshold
+            is_contraction = input_dim > output_dim * expansion_threshold
+            
+            if is_expansion: 
+                # up_projection -> Split Col (dim 1)
+                return TensorLayout([None, "model"], self.device_mesh)
+            elif is_contraction: 
+                # down_projection -> Split Row (dim 0)
+                return TensorLayout(["model", None], self.device_mesh)
+            else:
+                # Default -> Split Col (dim 1)
+                return TensorLayout([None, "model"], self.device_mesh)
+
+        # 3. Biases
+        if "bias" in path:
+             # Default to replicated for safety unless we map parent layer
+             return TensorLayout([None] * len(shape), self.device_mesh)
+
+        return TensorLayout([None] * len(shape), self.device_mesh)
 
     def get_tensor_layout(self, path):
         return None
@@ -1038,3 +1066,17 @@ class AutoTPDistribution(Distribution):
                 index=data_shard_id,
             )
             return distributed_dataset.prefetch(tf.data.AUTOTUNE)
+            
+    def distribute_model(self, model):
+        """
+        Wraps a model for Tensor Parallelism.
+        """
+        from keras.src.distribution.tensor_parallel.tensor_parallel_keras import (
+            TensorParallelKeras,
+        )
+        return TensorParallelKeras(
+            model=model,
+            device_count=np.prod(self.device_mesh.shape),
+            device_ids=self.device_mesh.devices.flatten().tolist(),
+        )
+# --- OOM FIX END ---

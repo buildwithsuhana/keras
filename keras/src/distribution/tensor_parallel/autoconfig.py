@@ -7,9 +7,36 @@ from keras.src.distribution.tensor_parallel.tensor_layout import (
 _split_fn_internal = split_tensor_for_parallelism
 
 
+class SplitAction:
+    """
+    Helper class to store sharding metadata (dim) along with the logic.
+    Required for OOM-safe initialization so Keras knows the layout axes.
+    """
+
+    def __init__(self, device_count, dim):
+        self.device_count = device_count
+        self.dim = dim
+
+    def __call__(self, x, index):
+        return _split_fn_internal(x, index, self.device_count, dim=self.dim)
+
+
 def _split_rule(device_count, dim):
-    """Creates a sharding rule for a specific dimension."""
-    return lambda x, index: _split_fn_internal(x, index, device_count, dim=dim)
+    """
+    Creates a sharding rule for a specific dimension.
+
+    Returns a callable object compatible with LayoutMap that defines
+    how a tensor should be split across the available devices.
+
+    Args:
+        device_count: The total number of devices available for parallelism.
+        dim: The dimension of the tensor to split.
+
+    Returns:
+        SplitAction: A callable object accepting (tensor, index) that returns
+        the sharded layout and stores the 'dim' metadata.
+    """
+    return SplitAction(device_count, dim)
 
 
 def analyze_dense_layer(layer):

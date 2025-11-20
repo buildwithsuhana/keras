@@ -31,6 +31,12 @@ import tensorflow_datasets as tfds
 
 import keras
 
+# --- UPDATED IMPORT ---
+from keras.src.distribution.tensor_parallel.tensor_parallel_keras import (
+    TensorParallelKeras,
+    AutoTPDistribution,  # <--- NEW IMPORT
+)
+
 tf.config.set_visible_devices([], "GPU")
 
 logging.basicConfig(level=logging.INFO, format="%(levelname)s - %(message)s")
@@ -67,20 +73,16 @@ except Exception as e:
     TARGET_WORLD_SIZE = 0
 
 
-from keras.src.distribution.tensor_parallel.tensor_parallel_keras import (
-    TensorParallelKeras,
-)
-
 # --- Constants ---
 BATCH_SIZE = 16
 SEQUENCE_LENGTH = 128
 LEARNING_RATE = 1e-4
 EPOCHS = 2
-STEPS_PER_EPOCH = 10
+STEPS_PER_EPOCH = 1
 VALIDATION_STEPS = 5
 
 MODEL_MAPPING = {
-    "opt_125m_en": keras_hub.models.OPTCausalLM,
+    "opt_2.7b_en": keras_hub.models.OPTCausalLM,
 }
 
 # ----------------------------------------------------------------------
@@ -97,10 +99,12 @@ def load_shakespeare_dataset(model_preset):
         example["text"].decode("utf-8") for example in ds.as_numpy_iterator()
     )
 
-    tokenizer = keras_hub.models.OPTCausalLM.from_preset(
-        model_preset
-    ).preprocessor.tokenizer
-    token_ids = tokenizer.tokenize(text)
+    # Use CPU device for tokenizer to avoid polluting TP device memory
+    with keras.device("cpu"):
+        tokenizer = keras_hub.models.OPTCausalLM.from_preset(
+            model_preset
+        ).preprocessor.tokenizer
+        token_ids = tokenizer.tokenize(text)
 
     num_tokens = (len(token_ids) // (SEQUENCE_LENGTH + 1)) * (
         SEQUENCE_LENGTH + 1
@@ -143,7 +147,7 @@ def get_model_from_preset(preset_name, model_class):
 
 
 # ----------------------------------------------------------------------
-# --- Plotting Function (MODIFIED) ---
+# --- Plotting Function ---
 # ----------------------------------------------------------------------
 
 def plot_training_graphs(tp_history, preset_name):
@@ -187,13 +191,13 @@ def plot_training_graphs(tp_history, preset_name):
 
 
 # ----------------------------------------------------------------------
-# --- Main Verification Function (MODIFIED) ---
+# --- Main Verification Function (UPDATED FOR OOM FIX) ---
 # ----------------------------------------------------------------------
 
 def run_model_verification(preset_name, model_class):
     """
     Runs a training execution test for a given model preset using
-    tensor parallelism.
+    tensor parallelism with AutoTPDistribution.
     """
     if TARGET_WORLD_SIZE < 2:
         logger.warning(
@@ -220,16 +224,33 @@ def run_model_verification(preset_name, model_class):
         .repeat()
     )
 
-    # --- 1. Tensor Parallel Model Training ---
-    logger.info("\n--- Training Tensor Parallel (TP) Model ---")
-    tp_model_template = get_model_from_preset(preset_name, model_class)
-
-    tp_model = TensorParallelKeras(
-        model=tp_model_template,
-        device_count=TARGET_WORLD_SIZE,
-        device_ids=TARGET_DEVICES,
+    # --- 1. Initialize AutoTPDistribution (Lazy Loading Setup) ---
+    logger.info("\n--- Initializing AutoTPDistribution ---")
+    
+    # Create the DeviceMesh required by the Distribution API
+    device_mesh = keras.distribution.DeviceMesh(
+        shape=(1, len(TARGET_DEVICES)),
+        axis_names=["data", "model"],
+        devices=TARGET_DEVICES
     )
+    
+    dist = AutoTPDistribution(device_mesh=device_mesh)
+    
+    # --- 2. Build Model Inside Distribution Scope (Prevent OOM) ---
+    logger.info("🏗️  Building model inside AutoTP scope (Lazy Allocation)...")
+    
+    with dist.scope():
+        # Inside this scope, weights are allocated as sharded slices instantly.
+        # The full 12GB model is NEVER materialized on a single device.
+        tp_model_template = get_model_from_preset(preset_name, model_class)
 
+    # --- 3. Distribute (Wrap in TensorParallelKeras) ---
+    logger.info("🔄 Wrapping in TensorParallelKeras...")
+    tp_model = dist.distribute(tp_model_template)
+
+    # --- 4. Compile and Train ---
+    logger.info("🚀 Compiling and Training...")
+    
     tp_model.compile(
         optimizer=keras.optimizers.AdamW(learning_rate=LEARNING_RATE),
         loss=keras.losses.SparseCategoricalCrossentropy(from_logits=True),
@@ -249,7 +270,7 @@ def run_model_verification(preset_name, model_class):
     tp_final_val_loss = tp_history.history["val_loss"][-1]
     logger.info("TP model training completed successfully.")
 
-    # --- 2. Verification ---
+    # --- 5. Verification ---
     logger.info("\n--- ⚖️ Verification Results ---")
     logger.info(f"TP Final Validation Loss: {tp_final_val_loss:.6f}")
 

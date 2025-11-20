@@ -46,11 +46,6 @@ class CoordinatedOptimizer:
         """
         Partitions the optimizer's state variables across shards by inspecting
         the variables created by the base optimizer.
-
-        NOTE: Since the Keras BaseOptimizer does not expose a direct mapping 
-        from a model parameter to its optimizer state variables, this method 
-        infers the mapping by string parsing their paths/names. This addresses
-        the collaborator's request for clarity on the path-matching logic.
         """
         if not self.shard_optimizer_states or not self.base_optimizer.built:
             return
@@ -116,15 +111,46 @@ class CoordinatedOptimizer:
     def _partition_state(
         self, state_variable: Any, dim: int
     ) -> list[np.ndarray]:
-        """Splits a single state variable numpy array into chunks."""
-        state_array = ops.convert_to_numpy(state_variable)
-        if (
-            state_array.ndim > dim
-            and state_array.shape[dim] >= self.device_count
-        ):
-            return np.array_split(state_array, self.device_count, axis=dim)
-        else:
-            return [np.copy(state_array) for _ in range(self.device_count)]
+        """
+        Splits a single state variable numpy array into chunks using 
+        MEMORY-EFFICIENT slicing.
+        """
+        # --- MINIMAL OOM FIX START ---
+        # Access backend tensor directly (avoiding eager numpy conversion of full tensor)
+        tensor = getattr(state_variable, "value", state_variable)
+        
+        shape = tensor.shape
+        
+        # Check if splitting is possible on this dimension
+        if dim >= len(shape) or shape[dim] < self.device_count:
+            # Fallback: Replicate small tensors or scalars
+            val = ops.convert_to_numpy(tensor)
+            return [val for _ in range(self.device_count)]
+
+        total_dim_size = shape[dim]
+        chunk_size = total_dim_size // self.device_count
+        
+        partitions = []
+        
+        for i in range(self.device_count):
+            start = i * chunk_size
+            # Handle remainder on last device to match array_split behavior
+            if i == self.device_count - 1:
+                end = total_dim_size
+            else:
+                end = start + chunk_size
+            
+            # Create Slice Object
+            slices = [slice(None)] * len(shape)
+            slices[dim] = slice(start, end)
+            
+            # Slice Backend Tensor -> Convert ONLY slice to Numpy
+            # This avoids holding the full 12GB tensor in RAM.
+            tensor_slice = tensor[tuple(slices)]
+            partitions.append(ops.convert_to_numpy(tensor_slice))
+            
+        return partitions
+        # --- MINIMAL OOM FIX END ---
 
     def apply_gradients(
         self, gradients_and_vars: list[list[tuple]], shard_models: list
