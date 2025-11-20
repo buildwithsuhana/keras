@@ -138,23 +138,25 @@ def format_for_causal_lm(data):
     return features, labels
 
 
-# --- MODIFIED MODEL BUILDER (QLoRA Fix) ---
+# --- MODIFIED MODEL BUILDER (Quantization Fix) ---
 def model_builder_factory(preset_name, model_class):
     """Returns a callable function that builds the model, required for OOM safety."""
     
     def model_builder(**kwargs):
         logger.info(f"Creating {preset_name} model (inside scope)...")
         
-        # --- 2. CRITICAL: Use Int8 Quantization ---
-        # This enables 8-bit weight loading (QLoRA style), dropping static
-        # memory usage by ~50%. Essential for 7B models on T4 GPUs.
-        kwargs["dtype"] = "int8" 
+        # --- CRITICAL FIX: Full Quantization String ---
+        # The error occurred because "int8" is ambiguous. 
+        # We must specify the compute precision (source).
+        # Since you set global policy to "mixed_float16", use this:
+        kwargs["dtype"] = "int8_from_mixed_float16" 
         
+        # If you switched global policy to bfloat16 (for TPU/Ampere), use:
+        # kwargs["dtype"] = "int8_from_mixed_bfloat16"
+
         # Create Model (Sharded automatically by AutoTPDistribution scope)
         model = model_class.from_preset(preset_name, preprocessor=None, **kwargs)
         
-        # --- 3. CRITICAL: Enable LoRA ---
-        # Reduces optimizer memory from 26GB to ~100MB.
         logger.info("--- Enabling LoRA (Rank=4) ---")
         
         if hasattr(model, "enable_lora"):
@@ -166,7 +168,6 @@ def model_builder_factory(preset_name, model_class):
              logger.warning("⚠️ enable_lora not found! Training full weights (High OOM Risk).")
         
         total_params = model.count_params()
-        # Safe count for sharded/quantized variables
         trainable_params = sum(np.prod(w.shape) for w in model.trainable_variables)
         
         logger.info(f"Model created. Total params: {total_params:,}")
