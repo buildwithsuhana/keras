@@ -169,6 +169,14 @@ class TensorParallelKeras(Model):
             self.assembled_model = self.build_assembled_model()
         else:
             self.assembled_model = self._original_model
+        # Drop reference to the full original model to avoid keeping
+        # the unsharded weights reachable. The shards and sharded weights
+        # retain the necessary Variables; clearing this reference helps
+        # ensure the full model arrays can be garbage-collected.
+        try:
+            self._original_model = None
+        except Exception:
+            pass
 
     @property
     def variables(self):

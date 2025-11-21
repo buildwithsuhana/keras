@@ -957,28 +957,61 @@ class AutoTPDistribution(Distribution):
         from keras.src.distribution.tensor_parallel.tensor_parallel_keras import (
             TensorParallelKeras,
         )
-
-        # --- FIX: Convert JAX Device Objects to Canonical Strings ---
-        # Keras 'device()' context requires strings like "gpu:0", not objects.
+        # --- FIX: Convert backend device objects to canonical strings ---
+        # Keras 'device()' contexts expect strings such as 'cpu:0' or
+        # 'gpu:0'. Different backends expose device objects differently
+        # (JAX returns Device objects, TF returns strings/devices), so
+        # normalize them here.
         raw_devices = self.device_mesh.devices.flatten()
         canonical_device_ids = []
-        
         for d in raw_devices:
-            # Handle JAX/TF Device objects which have an 'id' attribute
-            if hasattr(d, 'id'): 
-                canonical_device_ids.append(f"gpu:{d.id}")
-            elif isinstance(d, str):
-                canonical_device_ids.append(d)
-            else:
+            try:
+                # JAX Device has .platform and .id attributes.
+                plat = getattr(d, "platform", None)
+                did = getattr(d, "id", None)
+                if plat is not None and did is not None:
+                    canonical_device_ids.append(f"{plat}:{did}")
+                    continue
+                # TF DeviceSpec-like objects may have .device_type and .id
+                dev_type = getattr(d, "device_type", None)
+                dev_id = getattr(d, "id", None)
+                if dev_type is not None and dev_id is not None:
+                    canonical_device_ids.append(f"{dev_type.lower()}:{dev_id}")
+                    continue
+                # If it's already a string, use it.
+                if isinstance(d, str):
+                    canonical_device_ids.append(d)
+                    continue
+                # Fallback to str()
+                canonical_device_ids.append(str(d))
+            except Exception:
                 canonical_device_ids.append(str(d))
 
-        # 2. Create the Sharded Wrapper
-        # This moves weights from CPU -> specific GPUs based on the layout
-        self.model = TensorParallelKeras(
-            model=self._original_model,
-            device_count=np.prod(self.device_mesh.shape),
-            device_ids=canonical_device_ids,
-        )
+        # Keep strong references to prevent early GC of intermediate
+        # sharded arrays or model objects which sometimes leads to
+        # "Array has been deleted" errors in JAX when arrays are
+        # weakly referenced.
+        self._strong_refs = [self._original_model]
+
+        # 2. Create the Sharded Wrapper under the current distribution
+        # context so that backends can query `distribution()` during
+        # wrapper/model initialization and avoid eager placement that
+        # can cause OOM. We temporarily set the global distribution
+        # to `self` while constructing the wrapper.
+        original_dist = distribution()
+        set_distribution(self)
+        try:
+            self.model = TensorParallelKeras(
+                model=self._original_model,
+                device_count=int(np.prod(self.device_mesh.shape)),
+                device_ids=canonical_device_ids,
+            )
+        finally:
+            # Restore previous global distribution.
+            set_distribution(original_dist)
+
+        # Hold a strong ref to the wrapper as well.
+        self._strong_refs.append(self.model)
 
     def get_data_layout(self, data_shape):
         data_shard_spec = [None] * len(data_shape)

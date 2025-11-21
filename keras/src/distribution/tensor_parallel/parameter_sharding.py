@@ -170,11 +170,26 @@ class ParameterShardingStrategy:
         print(
             f"🎯 Parameter sharding completed: {len(modified_parameters)} parameters sharded"
         )
+        # IMPORTANT: Release heavy references from the original model so that
+        # the full (unsharded) model weights are not retained in memory.
+        # We clear internal lists that hold Variables on each layer which
+        # reduces reference counts and allows GC to free the original arrays
+        # (assuming no other references exist).
+        try:
+            self._strip_weights_from_model(model)
+        except Exception:
+            logger.exception("Failed to strip weights from original model")
+
         return sharded_model, modified_parameters
 
     def _store_original_weights(self, model):
         """Store original weights for reference."""
         
+        # IMPORTANT: Avoid materializing `.numpy()` for every weight here.
+        # Materializing all weights at once duplicates memory and causes
+        # OOM for very large models. Instead, store a reference to the
+        # Variable object so that numpy() is only called when necessary
+        # (i.e., during sharding of a matched parameter).
         def find_weights_recursive(current_layer, prefix=""):
             name = current_layer.name
             full_name = f"{prefix}.{name}" if prefix else name
@@ -183,10 +198,12 @@ class ParameterShardingStrategy:
                 for weight in current_layer.weights:
                     cleaned_name = weight.name.split("/")[-1].split(":")[0]
                     param_name = f"{full_name}.{cleaned_name}"
-                    
-                    # FIX: Check for numpy capability before access
-                    if hasattr(weight, 'numpy'):
-                        self.original_weights[param_name] = weight.numpy()
+                    # Store the Variable object itself rather than calling
+                    # `weight.numpy()` to avoid duplicating large arrays in
+                    # host RAM. Consumers can call `.numpy()` lazily when
+                    # they actually need to materialize the data for a
+                    # particular shard.
+                    self.original_weights[param_name] = weight
 
             if hasattr(current_layer, "layers") and current_layer.layers:
                 for sub_layer in current_layer.layers:
@@ -256,6 +273,43 @@ class ParameterShardingStrategy:
 
         search_layer_recursive(model, prefix="")
         return matching_params
+
+    def _strip_weights_from_model(self, model):
+        """Clear internal weight references on the original model/layers.
+
+        This does not mutate the model architecture; it only clears
+        internal Python lists that reference Variable objects so they can be
+        garbage-collected once shards hold the real Variables.
+        """
+        # Clear model-level cached lists
+        try:
+            if hasattr(model, "_trainable_weights"):
+                model._trainable_weights = []
+            if hasattr(model, "_non_trainable_weights"):
+                model._non_trainable_weights = []
+            if hasattr(model, "_trainable_variables"):
+                model._trainable_variables = []
+            if hasattr(model, "_non_trainable_variables"):
+                model._non_trainable_variables = []
+        except Exception:
+            pass
+
+        # Iterate layers and clear their internal weight lists
+        for layer in getattr(model, "layers", []):
+            try:
+                if hasattr(layer, "_trainable_weights"):
+                    layer._trainable_weights = []
+                if hasattr(layer, "_non_trainable_weights"):
+                    layer._non_trainable_weights = []
+                if hasattr(layer, "_trainable_variables"):
+                    layer._trainable_variables = []
+                if hasattr(layer, "_non_trainable_variables"):
+                    layer._non_trainable_variables = []
+                if hasattr(layer, "_weights"):
+                    layer._weights = []
+            except Exception:
+                # Best-effort; ignore layers we can't mutate
+                continue
 
 
 def _define_parameter_sharded_model():
