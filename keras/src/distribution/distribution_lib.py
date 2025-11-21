@@ -924,8 +924,13 @@ def set_distribution(value):
 
 @keras_export("keras.distribution.AutoTPDistribution")
 class AutoTPDistribution(Distribution):
-    """A distribution strategy for automated tensor and data parallelism."""
+    """A distribution strategy for automated tensor and data parallelism.
+    
+    This class analyzes a model, creates a sharded TensorParallelKeras wrapper,
+    and manages the device mesh.
+    """
     def __init__(self, model, device_mesh=None, auto_shard_dataset=True):
+        # 1. Auto-Detect Mesh if not provided
         if device_mesh is None:
             all_devices = list_devices()
             if not all_devices:
@@ -948,13 +953,31 @@ class AutoTPDistribution(Distribution):
         self._num_process = distribution_lib.num_processes()
         self._process_id = distribution_lib.process_id()
         self._is_multi_process = self._num_process > 1
+        
         from keras.src.distribution.tensor_parallel.tensor_parallel_keras import (
-    TensorParallelKeras,
-)
+            TensorParallelKeras,
+        )
+
+        # --- FIX: Convert JAX Device Objects to Canonical Strings ---
+        # Keras 'device()' context requires strings like "gpu:0", not objects.
+        raw_devices = self.device_mesh.devices.flatten()
+        canonical_device_ids = []
+        
+        for d in raw_devices:
+            # Handle JAX/TF Device objects which have an 'id' attribute
+            if hasattr(d, 'id'): 
+                canonical_device_ids.append(f"gpu:{d.id}")
+            elif isinstance(d, str):
+                canonical_device_ids.append(d)
+            else:
+                canonical_device_ids.append(str(d))
+
+        # 2. Create the Sharded Wrapper
+        # This moves weights from CPU -> specific GPUs based on the layout
         self.model = TensorParallelKeras(
             model=self._original_model,
             device_count=np.prod(self.device_mesh.shape),
-            device_ids=self.device_mesh.devices.flatten().tolist(),
+            device_ids=canonical_device_ids,
         )
 
     def get_data_layout(self, data_shape):
@@ -1007,34 +1030,10 @@ class AutoTPDistribution(Distribution):
 
         num_model_replicas_per_process = num_model_replicas / self._num_process
         if num_model_replicas_per_process >= 1:
-            if global_batch_size % self._num_process != 0:
-                raise ValueError(
-                    "Global batch size must be divisible by the number of "
-                    f"processes. `global_batch_size`={global_batch_size} and "
-                    f"`num_process`={self._num_process}"
-                )
-            per_process_batch_size = global_batch_size // self._num_process
-            distributed_dataset = dataset.rebatch(per_process_batch_size)
-            distributed_dataset = distributed_dataset.shard(
-                num_shards=self._num_process,
-                index=self._process_id,
-            )
-            return distributed_dataset.prefetch(tf.data.AUTOTUNE)
+             per_process_batch_size = global_batch_size // self._num_process
+             return dataset.rebatch(per_process_batch_size).shard(self._num_process, self._process_id).prefetch(tf.data.AUTOTUNE)
         else:
-            if global_batch_size % num_model_replicas != 0:
-                raise ValueError(
-                    "Global batch size must be divisible by the number of "
-                    f"replicas. `global_batch_size`={global_batch_size} and "
-                    f"`num_model_replicas`={num_model_replicas}"
-                )
-            per_replica_batch_size = global_batch_size // num_model_replicas
-            distributed_dataset = dataset.rebatch(per_replica_batch_size)
-            
-            processes_per_replica = self._num_process // num_model_replicas
-            data_shard_id = self._process_id // processes_per_replica
-            
-            distributed_dataset = distributed_dataset.shard(
-                num_shards=num_model_replicas,
-                index=data_shard_id,
-            )
-            return distributed_dataset.prefetch(tf.data.AUTOTUNE)
+             per_replica_batch_size = global_batch_size // num_model_replicas
+             processes_per_replica = self._num_process // num_model_replicas
+             data_shard_id = self._process_id // processes_per_replica
+             return dataset.rebatch(per_replica_batch_size).shard(num_model_replicas, data_shard_id).prefetch(tf.data.AUTOTUNE)

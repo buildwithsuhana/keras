@@ -3,31 +3,35 @@ import collections
 from keras.src import ops
 
 
+# tensor_layout.py
+
+import numpy as np
+from keras.src import ops
+
 def split_tensor_for_parallelism(tensor, index, device_count, dim):
-    """Calculates a slice of a tensor along a specified dimension for a
-    given index.
-
-    This utility is used in tensor parallelism API to distribute a
-    tensor across multiple devices.
-
-    Args:
-        tensor: The full tensor to be sharded.
-        index: The index of the device/shard to return (e.g., 0, 1, 2...).
-        device_count: The total number of parallel devices or splits.
-        dim: The dimension along which to split the tensor. If -1, the
-            last dimension is used.
-
-    Returns:
-        A tensor slice corresponding to the given `index`.
     """
+    Splits tensor using Host Memory (NumPy) to avoid OOM on GPU.
+    """
+    # PILLAR 1: Ensure we are working with Host Memory (NumPy)
+    # This prevents allocating the full tensor on the GPU.
+    if hasattr(tensor, "numpy"):
+        tensor_data = tensor.numpy()
+    elif hasattr(tensor, "value"): 
+        tensor_data = ops.convert_to_numpy(tensor.value)
+    else:
+        tensor_data = ops.convert_to_numpy(tensor)
+
     if dim == -1:
-        split_dim = ops.ndim(tensor) - 1
+        split_dim = tensor_data.ndim - 1
     else:
         split_dim = dim
 
-    splits = ops.array_split(
-        tensor, indices_or_sections=device_count, axis=split_dim
+    # Perform the split on CPU RAM
+    splits = np.array_split(
+        tensor_data, indices_or_sections=device_count, axis=split_dim
     )
+    
+    # Return the specific slice (still as a NumPy array)
     return splits[index]
 
 

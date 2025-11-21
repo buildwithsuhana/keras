@@ -21,7 +21,8 @@ except Exception:
 
 # --- Backend and Device Configuration ---
 os.environ["KERAS_BACKEND"] = "jax"
-os.environ["XLA_FLAGS"] = "--xla_force_host_platform_device_count=12"
+# Force enough devices to simulate sharding if no physical GPUs are present
+os.environ["XLA_FLAGS"] = "--xla_force_host_platform_device_count=8"
 
 import jax
 import keras_hub
@@ -30,6 +31,12 @@ import tensorflow as tf
 import tensorflow_datasets as tfds
 
 import keras
+from keras.src.distribution import DeviceMesh # Standard Keras API
+
+# Import your custom AutoTP class
+from keras.src.distribution.distribution_lib import (
+    AutoTPDistribution,
+)
 
 tf.config.set_visible_devices([], "GPU")
 
@@ -67,10 +74,6 @@ except Exception as e:
     TARGET_WORLD_SIZE = 0
 
 
-from keras.src.distribution.tensor_parallel.tensor_parallel_keras import (
-    TensorParallelKeras,
-)
-
 # --- Constants ---
 BATCH_SIZE = 16
 SEQUENCE_LENGTH = 128
@@ -80,7 +83,7 @@ STEPS_PER_EPOCH = 10
 VALIDATION_STEPS = 5
 
 MODEL_MAPPING = {
-    "opt_125m_en": keras_hub.models.OPTCausalLM,
+    "opt_2.7b_en": keras_hub.models.OPTCausalLM,
 }
 
 # ----------------------------------------------------------------------
@@ -137,13 +140,17 @@ def format_for_causal_lm(data):
 def get_model_from_preset(preset_name, model_class):
     """Creates a CausalLM model from a KerasNLP preset."""
     logger.info(f"Creating {preset_name} model from KerasNLP preset...")
+    # Note: We initialize weights=None here if we want to skip downloading 
+    # and loading weights immediately, letting the Distribution handle it.
+    # However, for presets, we usually want the weights.
+    # The CPU context in the main loop handles the memory safety.
     model = model_class.from_preset(preset_name, preprocessor=None)
     logger.info(f"Model created with {model.count_params():,} parameters.")
     return model
 
 
 # ----------------------------------------------------------------------
-# --- Plotting Function (MODIFIED) ---
+# --- Plotting Function ---
 # ----------------------------------------------------------------------
 
 def plot_training_graphs(tp_history, preset_name):
@@ -187,13 +194,13 @@ def plot_training_graphs(tp_history, preset_name):
 
 
 # ----------------------------------------------------------------------
-# --- Main Verification Function (MODIFIED) ---
+# --- Main Verification Function (UPDATED) ---
 # ----------------------------------------------------------------------
 
 def run_model_verification(preset_name, model_class):
     """
     Runs a training execution test for a given model preset using
-    tensor parallelism.
+    AutoTPDistribution to prevent OOM.
     """
     if TARGET_WORLD_SIZE < 2:
         logger.warning(
@@ -220,23 +227,53 @@ def run_model_verification(preset_name, model_class):
         .repeat()
     )
 
-    # --- 1. Tensor Parallel Model Training ---
-    logger.info("\n--- Training Tensor Parallel (TP) Model ---")
-    tp_model_template = get_model_from_preset(preset_name, model_class)
-
-    tp_model = TensorParallelKeras(
-        model=tp_model_template,
-        device_count=TARGET_WORLD_SIZE,
-        device_ids=TARGET_DEVICES,
+    # --- 1. Device Mesh Configuration ---
+    # We create a mesh of shape (1, WORLD_SIZE) for (data, model) parallelism.
+    # This effectively puts batch size on 1 dim, and model sharding on the other.
+    logger.info("\n--- Configuring Device Mesh ---")
+    device_mesh = DeviceMesh(
+        shape=(1, TARGET_WORLD_SIZE),
+        axis_names=("data", "model"),
+        devices=TARGET_DEVICES
     )
+    logger.info(f"Mesh Shape: {device_mesh.shape}")
+    logger.info(f"Mesh Axis Names: {device_mesh.axis_names}")
 
-    tp_model.compile(
-        optimizer=keras.optimizers.AdamW(learning_rate=LEARNING_RATE),
-        loss=keras.losses.SparseCategoricalCrossentropy(from_logits=True),
-        metrics=[
-            keras_hub.metrics.Perplexity(from_logits=True, name="perplexity")
-        ],
+    # --- 2. Memory-Safe Model Initialization (PILLAR 1) ---
+    logger.info("\n--- Instantiating Model on CPU (Host RAM) ---")
+    
+    # CRITICAL: We must force model creation on the CPU.
+    # If we don't do this, Keras/JAX attempts to put the whole 7B model 
+    # on GPU:0 immediately, causing OOM.
+    cpu_device = jax.devices("cpu")[0]
+    
+    with jax.default_device(cpu_device):
+        model_template = get_model_from_preset(preset_name, model_class)
+        logger.info("Model instantiated on CPU. Ready for distribution.")
+
+    # --- 3. AutoTP Distribution (PILLARS 2 & 3) ---
+    logger.info("\n--- Applying AutoTPDistribution ---")
+    # This takes the CPU-resident model, calculates the split plan (LayoutMap),
+    # splits the weights in Host RAM, and streams them to the devices defined in the mesh.
+    distribution = AutoTPDistribution(
+        model_template, 
+        device_mesh=device_mesh
     )
+    
+    # AutoTP wraps the sharded model in .model
+    tp_model = distribution.model
+
+    # --- 4. Compilation & Training ---
+    logger.info("\n--- Compiling & Training ---")
+    
+    # We compile the *sharded* model
+    with distribution.scope():
+        logger.info("⚙️  Compiling...")
+        tp_model.compile(
+            optimizer=keras.optimizers.AdamW(learning_rate=LEARNING_RATE),
+            loss=keras.losses.SparseCategoricalCrossentropy(from_logits=True),
+            metrics=[keras_hub.metrics.Perplexity(from_logits=True, name="perplexity")],
+        )
 
     tp_history = tp_model.fit(
         train_ds,
@@ -246,10 +283,11 @@ def run_model_verification(preset_name, model_class):
         validation_steps=VALIDATION_STEPS,
         verbose=1,
     )
+    
     tp_final_val_loss = tp_history.history["val_loss"][-1]
     logger.info("TP model training completed successfully.")
 
-    # --- 2. Verification ---
+    # --- 5. Verification ---
     logger.info("\n--- ⚖️ Verification Results ---")
     logger.info(f"TP Final Validation Loss: {tp_final_val_loss:.6f}")
 
@@ -269,7 +307,7 @@ if __name__ == "__main__":
         sys.exit(1)
 
     logger.info("\n" + "=" * 70)
-    logger.info("      TENSOR PARALLELISM EXECUTION SUITE")
+    logger.info("      TENSOR PARALLELISM EXECUTION SUITE (AutoTP Mode)")
     logger.info("=" * 70)
 
     results = {}

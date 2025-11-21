@@ -25,15 +25,23 @@ class ShardedWeight:
 
     def __init__(self, tensor_shard, name, trainable=True, device_id=None):
         current_dev_name = device_id if device_id else "UNKNOWN_DEVICE"
-        print(
-            f"   [DEV: {current_dev_name}] 🧬 Creating Sharded Variable "
-            f"'{name}' with shape {tensor_shard.shape}"
-        )
-
+        
+        # PILLAR 2: Direct-to-Device Distribution
+        # We take the NumPy slice (tensor_shard) and create the variable 
+        # explicitly on the target device.
         with device(current_dev_name):
             self._variable = Variable(
-                initializer=tensor_shard, trainable=trainable, name=name
+                initializer=tensor_shard, # This is now a NumPy array, so it streams to GPU
+                trainable=trainable, 
+                name=name
             )
+            
+        # PILLAR 3: Ensuring JAX Memory Stability
+        # JAX is aggressive about freeing memory. We hold a strong reference 
+        # to the underlying value to prevent "Array has been deleted" errors.
+        if hasattr(self._variable.value, 'block_until_ready'):
+             self._keep_alive = self._variable.value
+        
         self.regularizer = None
 
     @property
