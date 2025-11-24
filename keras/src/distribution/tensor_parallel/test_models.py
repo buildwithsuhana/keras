@@ -80,7 +80,7 @@ STEPS_PER_EPOCH = 10
 VALIDATION_STEPS = 5
 
 MODEL_MAPPING = {
-    "opt_2.7b_en": keras_hub.models.OPTCausalLM,
+    "opt_1.3b_en": keras_hub.models.OPTCausalLM,
 }
 
 # ----------------------------------------------------------------------
@@ -126,11 +126,16 @@ def load_shakespeare_dataset(model_preset):
 
 def format_for_causal_lm(data):
     """Formats data for KerasNLP's CausalLM, creating features and labels."""
+    # Force a unique buffer for the input before slicing
+    data = tf.identity(data)
+    token_ids = tf.identity(data[:, :-1])
+    padding_mask = tf.identity(tf.ones_like(data[:, :-1], dtype=tf.bool))
+    labels = tf.identity(data[:, 1:])
     features = {
-        "token_ids": data[:, :-1],
-        "padding_mask": tf.ones_like(data[:, :-1], dtype=tf.bool),
+        "token_ids": tf.identity(token_ids),
+        "padding_mask": tf.identity(padding_mask),
     }
-    labels = data[:, 1:]
+    labels = tf.identity(labels)
     return features, labels
 
 
@@ -235,13 +240,22 @@ def run_model_verification(preset_name, model_class):
     logger.info(f"Device Mesh created: {device_mesh}")
 
     # --- 2. Instantiate Distribution ---
-    model_template = get_model_from_preset(preset_name, model_class)
+    # CRITICAL FIX: Create the template on CPU to avoid OOM on GPU 0
+    logger.info("Creating model template on CPU (to save VRAM)...")
+    with keras.device("cpu"):
+        model_template = get_model_from_preset(preset_name, model_class)
 
+    logger.info("Initializing AutoTPDistribution...")
     distribution = AutoTPDistribution(
         model=model_template,
         device_mesh=device_mesh,
         auto_shard_dataset=True
     )
+    
+    # OPTIONAL: Delete the template from CPU RAM to free up system memory
+    # del model_template 
+    # import gc
+    # gc.collect()
     
     # Get the wrapped TensorParallelKeras model
     tp_model = distribution.model
@@ -253,17 +267,13 @@ def run_model_verification(preset_name, model_class):
     
     with distribution.scope():
         logger.info("Compiling model (initializing sharded optimizer)...")
-        # NOTE: Avoid passing the KerasHub Perplexity metric directly here.
-        # In some distribution/backends (JAX) the metric object can end up
-        # being interpreted where a numeric scalar is expected which leads
-        # to errors like: "float() argument must be a string or a real number, not 'Perplexity'".
-        # Instead, compile without the Perplexity metric and compute
-        # validation perplexity from the validation loss after training.
+        # CRITICAL FIX: jit_compile=False prevents JAX from trying to donate 
+        # the shared embedding/output buffer twice, which causes XlaRuntimeError.
         tp_model.compile(
             optimizer=keras.optimizers.AdamW(learning_rate=LEARNING_RATE),
             loss=keras.losses.SparseCategoricalCrossentropy(from_logits=True),
             metrics=None,
-            loss_weights=None,
+            jit_compile=False,  # <--- ADD THIS LINE
         )
 
     logger.info("Starting training loop...")
