@@ -88,16 +88,44 @@ MODEL_MAPPING = {
 # ----------------------------------------------------------------------
 
 def load_shakespeare_dataset(model_preset):
-    # (Same implementation)
-    logger.info(f"Loading Tiny Shakespeare for {model_preset}...")
+    """Loads and preprocesses the Tiny Shakespeare dataset."""
+    logger.info(
+        f"Loading and preprocessing Tiny Shakespeare dataset for {model_preset}..."
+    )
     ds = tfds.load("tiny_shakespeare", split="train", as_supervised=False)
-    text = "".join(example["text"].decode("utf-8") for example in ds.as_numpy_iterator())
-    tokenizer = keras_hub.models.GemmaCausalLM.from_preset(model_preset).preprocessor.tokenizer
+    text = "".join(
+        example["text"].decode("utf-8") for example in ds.as_numpy_iterator()
+    )
+
+    # --- CRITICAL FIX: Load Tokenizer WITHOUT loading the Model ---
+    if "gemma" in model_preset:
+        tokenizer = keras_hub.models.GemmaTokenizer.from_preset(model_preset)
+    elif "opt" in model_preset:
+        tokenizer = keras_hub.models.OPTTokenizer.from_preset(model_preset)
+    else:
+        # Fallback (might OOM if model is huge, but safe for small tests)
+        logger.warning("Unknown model type, attempting to load via model preset...")
+        tokenizer = keras_hub.models.Backbone.from_preset(model_preset).tokenizer
+
     token_ids = tokenizer.tokenize(text)
-    num_tokens = (len(token_ids) // (SEQUENCE_LENGTH + 1)) * (SEQUENCE_LENGTH + 1)
-    sequences = np.array(token_ids[:num_tokens]).reshape(-1, SEQUENCE_LENGTH + 1)
+
+    num_tokens = (len(token_ids) // (SEQUENCE_LENGTH + 1)) * (
+        SEQUENCE_LENGTH + 1
+    )
+    sequences = np.array(token_ids[:num_tokens]).reshape(
+        -1, SEQUENCE_LENGTH + 1
+    )
+
     all_data = tf.data.Dataset.from_tensor_slices(sequences)
-    return all_data.take(100), all_data.skip(100).take(20) # Reduced dataset for quick test
+
+    # Reduce dataset size for verification speed
+    train_ds = all_data.take(100) 
+    val_ds = all_data.skip(100).take(20)
+
+    logger.info(
+        f"Dataset ready. (Subset used for verification stability)"
+    )
+    return train_ds, val_ds
 
 def format_for_causal_lm(data):
     """Formats data for KerasNLP's CausalLM, creating features and labels."""
