@@ -9,7 +9,9 @@ _split_fn_internal = split_tensor_for_parallelism
 
 def _split_rule(device_count, dim):
     """Creates a sharding rule for a specific dimension."""
-    return lambda x, index: _split_fn_internal(x, index, device_count, dim=dim)
+    fn = lambda x, index: _split_fn_internal(x, index, device_count, dim=dim)
+    fn.dim = dim
+    return fn
 
 
 def analyze_dense_layer(layer):

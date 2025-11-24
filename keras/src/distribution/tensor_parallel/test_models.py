@@ -66,10 +66,10 @@ except Exception as e:
     logger.error(f"Could not initialize JAX or find devices. Error: {e}")
     TARGET_WORLD_SIZE = 0
 
-
-from keras.src.distribution.tensor_parallel.tensor_parallel_keras import (
-    TensorParallelKeras,
-)
+# --- UPDATED IMPORTS ---
+# We now import the high-level API instead of the internal wrapper directly
+from keras.src.distribution.distribution_lib import AutoTPDistribution
+from keras.src.distribution.distribution_lib import DeviceMesh
 
 # --- Constants ---
 BATCH_SIZE = 16
@@ -143,18 +143,18 @@ def get_model_from_preset(preset_name, model_class):
 
 
 # ----------------------------------------------------------------------
-# --- Plotting Function (MODIFIED) ---
+# --- Plotting Function ---
 # ----------------------------------------------------------------------
 
 def plot_training_graphs(tp_history, preset_name):
     """Plots and saves the loss and perplexity graphs for the TP run."""
     fig, (ax1, ax2) = plt.subplots(2, 1, figsize=(12, 10))
-    fig.suptitle(f"{preset_name} - Tensor Parallel Training Metrics", fontsize=16)
+    fig.suptitle(f"{preset_name} - AutoTP Training Metrics", fontsize=16)
 
     # Plotting Loss
     ax1.plot(
         tp_history.history["val_loss"],
-        label="Tensor Parallel - Validation Loss",
+        label="AutoTP - Validation Loss",
         color="green",
         linestyle="-",
         marker="o",
@@ -168,7 +168,7 @@ def plot_training_graphs(tp_history, preset_name):
     # Plotting Perplexity
     ax2.plot(
         tp_history.history["val_perplexity"],
-        label="Tensor Parallel - Validation Perplexity",
+        label="AutoTP - Validation Perplexity",
         color="purple",
         linestyle="-",
         marker="o",
@@ -179,7 +179,7 @@ def plot_training_graphs(tp_history, preset_name):
     ax2.legend()
     ax2.grid(True)
 
-    output_filename = f"{preset_name}_tp_training.png"
+    output_filename = f"{preset_name}_autotp_training.png"
     plt.tight_layout(rect=[0, 0.03, 1, 0.95])
     plt.savefig(output_filename)
     logger.info(f"\nTraining graph saved to {output_filename}")
@@ -187,13 +187,17 @@ def plot_training_graphs(tp_history, preset_name):
 
 
 # ----------------------------------------------------------------------
-# --- Main Verification Function (MODIFIED) ---
+# --- Main Verification Function (UPDATED) ---
+# ----------------------------------------------------------------------
+
+# ----------------------------------------------------------------------
+# --- Main Verification Function (UPDATED for Scope) ---
 # ----------------------------------------------------------------------
 
 def run_model_verification(preset_name, model_class):
     """
     Runs a training execution test for a given model preset using
-    tensor parallelism.
+    AutoTPDistribution with the scope() context manager.
     """
     if TARGET_WORLD_SIZE < 2:
         logger.warning(
@@ -220,24 +224,44 @@ def run_model_verification(preset_name, model_class):
         .repeat()
     )
 
-    # --- 1. Tensor Parallel Model Training ---
-    logger.info("\n--- Training Tensor Parallel (TP) Model ---")
-    tp_model_template = get_model_from_preset(preset_name, model_class)
-
-    tp_model = TensorParallelKeras(
-        model=tp_model_template,
-        device_count=TARGET_WORLD_SIZE,
-        device_ids=TARGET_DEVICES,
+    # --- 1. Define Device Mesh for AutoTP ---
+    logger.info("\n--- Configuring AutoTP Distribution ---")
+    
+    device_mesh = DeviceMesh(
+        shape=(1, TARGET_WORLD_SIZE),
+        axis_names=["data", "model"],
+        devices=TARGET_DEVICES,
     )
+    logger.info(f"Device Mesh created: {device_mesh}")
 
-    tp_model.compile(
-        optimizer=keras.optimizers.AdamW(learning_rate=LEARNING_RATE),
-        loss=keras.losses.SparseCategoricalCrossentropy(from_logits=True),
-        metrics=[
-            keras_hub.metrics.Perplexity(from_logits=True, name="perplexity")
-        ],
+    # --- 2. Instantiate Distribution ---
+    model_template = get_model_from_preset(preset_name, model_class)
+
+    distribution = AutoTPDistribution(
+        model=model_template,
+        device_mesh=device_mesh,
+        auto_shard_dataset=True
     )
+    
+    # Get the wrapped TensorParallelKeras model
+    tp_model = distribution.model
 
+    # --- 3. Compile and Fit WITHIN Scope ---
+    # We use the scope to ensure optimizer variables are sharded 
+    # and the dataset is distributed correctly during fit.
+    logger.info("\n--- Entering Distribution Scope ---")
+    
+    with distribution.scope():
+        logger.info("Compiling model (initializing sharded optimizer)...")
+        tp_model.compile(
+            optimizer=keras.optimizers.AdamW(learning_rate=LEARNING_RATE),
+            loss=keras.losses.SparseCategoricalCrossentropy(from_logits=True),
+            metrics=[
+                keras_hub.metrics.Perplexity(from_logits=True, name="perplexity")
+            ],
+        )
+
+    logger.info("Starting training loop...")
     tp_history = tp_model.fit(
         train_ds,
         validation_data=val_ds,
@@ -246,16 +270,19 @@ def run_model_verification(preset_name, model_class):
         validation_steps=VALIDATION_STEPS,
         verbose=1,
     )
-    tp_final_val_loss = tp_history.history["val_loss"][-1]
-    logger.info("TP model training completed successfully.")
 
-    # --- 2. Verification ---
+    logger.info("--- Exited Distribution Scope ---")
+    
+    tp_final_val_loss = tp_history.history["val_loss"][-1]
+    logger.info("AutoTP model training completed successfully.")
+
+    # --- 4. Verification ---
     logger.info("\n--- ⚖️ Verification Results ---")
-    logger.info(f"TP Final Validation Loss: {tp_final_val_loss:.6f}")
+    logger.info(f"AutoTP Final Validation Loss: {tp_final_val_loss:.6f}")
 
     plot_training_graphs(tp_history, preset_name)
 
-    logger.info("✅ SUCCESS: TP model training finished without errors.")
+    logger.info("✅ SUCCESS: AutoTP model training finished without errors.")
     return True
 
 
@@ -269,7 +296,7 @@ if __name__ == "__main__":
         sys.exit(1)
 
     logger.info("\n" + "=" * 70)
-    logger.info("      TENSOR PARALLELISM EXECUTION SUITE")
+    logger.info("      AUTO-TP DISTRIBUTION EXECUTION SUITE")
     logger.info("=" * 70)
 
     results = {}

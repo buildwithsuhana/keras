@@ -57,11 +57,9 @@ def get_best_devices(count):
     return distribution_lib.get_best_devices(count)
 
 def all_reduce(x, op="sum", axis_name="model"):
-    # FIX: Pass the arguments received by the wrapper directly to the backend function.
     return distribution_lib.all_reduce(x, op, axis_name)
 
 def all_gather(x, axis, axis_name="model"):
-    # FIX: Pass all arguments to the backend function
     return distribution_lib.all_gather(x, axis, axis_name)
 
 
@@ -922,25 +920,31 @@ def set_distribution(value):
     """
     global_state.set_global_attribute(GLOBAL_ATTRIBUTE_NAME, value)
 
+
 @keras_export("keras.distribution.AutoTPDistribution")
 class AutoTPDistribution(Distribution):
-    """A distribution strategy for automated tensor and data parallelism."""
+    """A distribution strategy for automated tensor and data parallelism.
+
+    This class bridges the Keras Distribution API with the TensorParallelKeras
+    logic, allowing for OOM-free initialization of large sharded models.
+    """
     def __init__(self, model, device_mesh=None, auto_shard_dataset=True):
         if device_mesh is None:
             all_devices = list_devices()
             if not all_devices:
                 raise RuntimeError("No computational devices found.")
+            # Default to (1, N) mesh: 1 data parallel, N model parallel
             device_mesh = DeviceMesh(
                 shape=(1, len(all_devices)),
                 axis_names=("data", "model"),
                 devices=all_devices,
             )
 
-        if "data" not in device_mesh.axis_names:
+        if "model" not in device_mesh.axis_names:
             raise ValueError(
-                "DeviceMesh for AutoTPDistribution must have a 'data' axis."
+                "DeviceMesh for AutoTPDistribution must have a 'model' axis."
             )
-        batch_dim_name = "data"
+        batch_dim_name = "data" if "data" in device_mesh.axis_names else None
 
         super().__init__(device_mesh, batch_dim_name, auto_shard_dataset)
 
@@ -948,32 +952,102 @@ class AutoTPDistribution(Distribution):
         self._num_process = distribution_lib.num_processes()
         self._process_id = distribution_lib.process_id()
         self._is_multi_process = self._num_process > 1
+
+        # --- DEFERRED IMPORT START ---
+        # Moving imports here breaks the Model -> Distribution -> TP -> Model loop.
+        from keras.src.distribution.tensor_parallel.autoconfig import get_default_config
         from keras.src.distribution.tensor_parallel.tensor_parallel_keras import (
-    TensorParallelKeras,
-)
+            TensorParallelKeras,
+        )
+        # --- DEFERRED IMPORT END ---
+
+        # 1. GENERATE CONFIG IMMEDIATELY
+        # We need the sharding rules BEFORE variables are created.
+        # We use dummy device names because the config generator primarily needs the count.
+        device_names = [str(d) for d in device_mesh.devices.flatten()]
+        self._tp_config = get_default_config(model, device_names)
+
+        # 2. Initialize the wrapper (for runtime execution)
         self.model = TensorParallelKeras(
             model=self._original_model,
             device_count=np.prod(self.device_mesh.shape),
             device_ids=self.device_mesh.devices.flatten().tolist(),
+            # Inject the pre-calculated config so we don't calculate it twice
+            tensor_parallel_config=self._tp_config
         )
 
     def get_data_layout(self, data_shape):
         data_shard_spec = [None] * len(data_shape)
-        data_shard_spec[0] = self.batch_dim_name
+        if self.batch_dim_name:
+            data_shard_spec[0] = self.batch_dim_name
         return TensorLayout(data_shard_spec, self.device_mesh)
 
     def get_variable_layout(self, variable):
-        warnings.warn(
-            "Variable layout is determined automatically within "
-            "AutoTPDistribution. This method will return a replicated layout."
-        )
-        return TensorLayout([None] * len(variable.shape), self.device_mesh)
+        """
+        Determines the sharded layout for a variable using the AutoTP config.
+        This prevents OOM by ensuring Keras allocates only the shard on each device.
+        """
+        # 1. Check if variable path matches any regex in the TP config
+        var_path = variable.path
+        matched_rule = None
+
+        # We need to strip the model name prefix if it exists to match autoconfig logic
+        # autoconfig usually generates paths relative to the layer structure.
+        # However, Keras variable paths include the model name.
+        # Robust strategy: check match against full path first.
+
+        for pattern, rule in self._tp_config.state_rules.items():
+            if re.search(pattern, var_path):
+                matched_rule = rule
+                break
+
+        # 2. If no match, return Replicated layout (safe default)
+        if matched_rule is None:
+            return TensorLayout([None] * len(variable.shape), self.device_mesh)
+
+        # 3. If match found, extract the 'dim' from the function metadata
+        # (Requires the patch to autoconfig.py)
+        sharding_dim = getattr(matched_rule, 'dim', None)
+
+        if sharding_dim is None:
+            # Fallback if patch wasn't applied or rule is custom
+            warnings.warn(
+                f"Found sharding rule for {var_path} but could not determine 'dim'. "
+                "Falling back to replicated layout. Ensure autoconfig.py is patched."
+            )
+            return TensorLayout([None] * len(variable.shape), self.device_mesh)
+
+        # 4. Construct the TensorLayout
+        # Layout logic:
+        # The mesh is (data, model).
+        # If dim=0 (Row Split): We shard the 0th dimension on 'model' axis.
+        # If dim=1 (Col Split): We shard the 1st dimension on 'model' axis.
+
+        layout_axes = [None] * len(variable.shape)
+
+        # Handle negative indexing (though autoconfig usually gives 0 or 1)
+        if sharding_dim < 0:
+            sharding_dim += len(variable.shape)
+
+        if 0 <= sharding_dim < len(layout_axes):
+            layout_axes[sharding_dim] = "model"
+
+        return TensorLayout(tuple(layout_axes), self.device_mesh)
 
     def get_tensor_layout(self, path):
+        # We don't enforce layout on intermediate tensors for now,
+        # trusting TensorParallelKeras to handle the gather/reduces.
         return None
 
     def distribute_dataset(self, dataset):
         """Distributes the dataset across processes based on the device mesh."""
+        
+        # Check if we are running distributed (multi-process or multi-device simulated)
+        # For simulated multi-device (JAX XLA flags), num_process might be 1 but devices > 1.
+        # distribution_lib logic usually handles multi-process sharding.
+        # For single-process multi-device (like typical JAX), we rely on data parallel sharding via get_data_layout.
+        # But if the user wants explict data sharding (auto_shard_dataset=True), we use the logic below.
+        
         if not self._is_multi_process or not self.auto_shard_dataset:
             return dataset
 
@@ -997,10 +1071,13 @@ class AutoTPDistribution(Distribution):
                 "e.g., via `dataset.batch(batch_size)`"
             )
 
-        mesh_batch_dim_index = self.device_mesh.axis_names.index(
-            self.batch_dim_name
-        )
-        num_model_replicas = self.device_mesh.shape[mesh_batch_dim_index]
+        if self.batch_dim_name and self.batch_dim_name in self.device_mesh.axis_names:
+            mesh_batch_dim_index = self.device_mesh.axis_names.index(
+                self.batch_dim_name
+            )
+            num_model_replicas = self.device_mesh.shape[mesh_batch_dim_index]
+        else:
+            num_model_replicas = 1
 
         if num_model_replicas == 1:
             return dataset.prefetch(tf.data.AUTOTUNE)
@@ -1029,10 +1106,10 @@ class AutoTPDistribution(Distribution):
                 )
             per_replica_batch_size = global_batch_size // num_model_replicas
             distributed_dataset = dataset.rebatch(per_replica_batch_size)
-            
+
             processes_per_replica = self._num_process // num_model_replicas
             data_shard_id = self._process_id // processes_per_replica
-            
+
             distributed_dataset = distributed_dataset.shard(
                 num_shards=num_model_replicas,
                 index=data_shard_id,

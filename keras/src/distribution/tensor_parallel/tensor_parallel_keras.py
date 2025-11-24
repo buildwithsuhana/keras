@@ -22,10 +22,9 @@ from keras.src.distribution.tensor_parallel.coordinated_optimizer import (
 )
 
 from keras.src.distribution import list_devices
+from keras.src.models import Model
 
 logger = logging.getLogger(__file__)
-
-from keras.src.models import Model
 
 
 class TensorParallelKeras(Model):
@@ -34,6 +33,7 @@ class TensorParallelKeras(Model):
         model,
         device_count=None,
         device_ids=None,
+        tensor_parallel_config=None,
         **kwargs,
     ):
         super().__init__(**kwargs)
@@ -49,7 +49,7 @@ class TensorParallelKeras(Model):
         self.device_ids = device_ids
         self.sharding_strategy = "auto"
         
-        self.tensor_parallel_config = None
+        self.tensor_parallel_config = tensor_parallel_config
         self.distributed = True
 
         self.sharded_models = [self._original_model]
@@ -109,10 +109,11 @@ class TensorParallelKeras(Model):
             self.tensor_parallel_config = get_default_config(
                 model, device_names
             )
-            print(self.tensor_parallel_config)
             logger.info(
                 "Using automatic config with auto sharding strategy: sharding individual Dense/Conv/Embedding layers"
             )
+        else:
+            logger.info("Using injected tensor_parallel_config from AutoTPDistribution")
 
         print(
             f"🔧 Creating REAL parameter shards for {model.name} across {len(self.devices)} devices"
@@ -172,57 +173,67 @@ class TensorParallelKeras(Model):
 
     @property
     def variables(self):
+        # 1. Gather variables from all shards
         unique_vars = {
             id(var): var
             for shard in self.model_shards
             for var in shard.variables
         }
+        
+        # 2. CRITICAL FIX: Explicitly include Metric variables
+        # Keras 3 stores compiled metrics in self.metrics (via property aggregation)
+        if hasattr(self, 'metrics'):
+            for metric in self.metrics:
+                for var in metric.variables:
+                    unique_vars[id(var)] = var
+        
+        # 3. Safety: Check optimizer variables if attached locally
+        if self.optimizer and hasattr(self.optimizer, 'variables'):
+             for var in self.optimizer.variables:
+                 unique_vars[id(var)] = var
+
         return list(unique_vars.values())
 
     @property
     def trainable_variables(self):
+        # 1. Gather trainable variables from shards
         unique_vars = {
             id(var): var
             for shard in self.model_shards
             for var in shard.trainable_variables
         }
+        # Note: Metrics are typically non-trainable, so we don't add them here.
         return list(unique_vars.values())
 
     @property
     def non_trainable_variables(self):
+        # 1. Gather non-trainable variables from shards
         unique_vars = {
             id(var): var
             for shard in self.model_shards
             for var in shard.non_trainable_variables
         }
+        
+        # 2. CRITICAL FIX: Explicitly include Metric variables
+        # Most metric variables (counts, totals) are non-trainable.
+        if hasattr(self, 'metrics'):
+            for metric in self.metrics:
+                for var in metric.variables:
+                    unique_vars[id(var)] = var
+                    
         return list(unique_vars.values())
 
     @property
     def weights(self):
-        unique_vars = {
-            id(var): var
-            for shard in self.model_shards
-            for var in shard.weights
-        }
-        return list(unique_vars.values())
+        return self.variables
 
     @property
     def trainable_weights(self):
-        unique_vars = {
-            id(var): var
-            for shard in self.model_shards
-            for var in shard.trainable_weights
-        }
-        return list(unique_vars.values())
+        return self.trainable_variables
 
     @property
     def non_trainable_weights(self):
-        unique_vars = {
-            id(var): var
-            for shard in self.model_shards
-            for var in shard.non_trainable_weights
-        }
-        return list(unique_vars.values())
+        return self.non_trainable_variables
 
     def _auto_detect_parallelism(self):
         """Auto-detect device_count and device_ids efficiently."""
@@ -395,7 +406,14 @@ class TensorParallelKeras(Model):
         """
         Compile the tensor parallel model.
         """
-        if len(self.model_shards) > 1 and optimizer is not None:
+        # FIX: Only use manual CoordinatedOptimizer if NOT using AutoTPDistribution
+        use_manual_optimizer = (
+            len(self.model_shards) > 1 
+            and optimizer is not None 
+            and self.tensor_parallel_config is None 
+        )
+
+        if use_manual_optimizer:
             self.coordinated_optimizer = TensorParallelOptimizer(
                 optimizer,
                 self.device_count,
@@ -452,8 +470,11 @@ class TensorParallelKeras(Model):
             logger.info(
                 "Compiled TensorParallelKeras model with coordinated optimizer."
             )
-
+        
         else:
+            # AutoTP Mode: Just use the standard optimizer.
+            # Keras Distribution API will handle sharding the optimizer variables.
+            logger.info("Using standard optimizer (AutoTP distribution active).")
             super().compile(optimizer, loss, metrics, **kwargs)
 
     def fit(self, x=None, y=None, **kwargs):
