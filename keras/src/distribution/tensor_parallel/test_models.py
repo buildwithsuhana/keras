@@ -80,7 +80,7 @@ STEPS_PER_EPOCH = 10
 VALIDATION_STEPS = 5
 
 MODEL_MAPPING = {
-    "opt_125m_en": keras_hub.models.OPTCausalLM,
+    "opt_2.7b_en": keras_hub.models.OPTCausalLM,
 }
 
 # ----------------------------------------------------------------------
@@ -253,12 +253,17 @@ def run_model_verification(preset_name, model_class):
     
     with distribution.scope():
         logger.info("Compiling model (initializing sharded optimizer)...")
+        # NOTE: Avoid passing the KerasHub Perplexity metric directly here.
+        # In some distribution/backends (JAX) the metric object can end up
+        # being interpreted where a numeric scalar is expected which leads
+        # to errors like: "float() argument must be a string or a real number, not 'Perplexity'".
+        # Instead, compile without the Perplexity metric and compute
+        # validation perplexity from the validation loss after training.
         tp_model.compile(
             optimizer=keras.optimizers.AdamW(learning_rate=LEARNING_RATE),
             loss=keras.losses.SparseCategoricalCrossentropy(from_logits=True),
-            metrics=[
-                keras_hub.metrics.Perplexity(from_logits=True, name="perplexity")
-            ],
+            metrics=None,
+            loss_weights=None,
         )
 
     logger.info("Starting training loop...")
@@ -274,6 +279,17 @@ def run_model_verification(preset_name, model_class):
     logger.info("--- Exited Distribution Scope ---")
     
     tp_final_val_loss = tp_history.history["val_loss"][-1]
+    # Compute validation perplexity from validation loss (perplexity = exp(loss)).
+    try:
+        val_loss_arr = np.asarray(tp_history.history.get("val_loss", []), dtype=float)
+        val_perp = np.exp(val_loss_arr)
+        # Store in history for downstream plotting/inspection under the
+        # conventional key used elsewhere in this script.
+        tp_history.history["val_perplexity"] = val_perp.tolist()
+    except Exception:
+        # If conversion fails for any reason, ensure the key exists to avoid
+        # downstream KeyErrors in plotting code.
+        tp_history.history.setdefault("val_perplexity", [])
     logger.info("AutoTP model training completed successfully.")
 
     # --- 4. Verification ---

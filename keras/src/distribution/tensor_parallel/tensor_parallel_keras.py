@@ -171,57 +171,83 @@ class TensorParallelKeras(Model):
         else:
             self.assembled_model = self._original_model
 
-    @property
-    def variables(self):
-        # 1. Gather variables from all shards
-        unique_vars = {
-            id(var): var
-            for shard in self.model_shards
-            for var in shard.variables
-        }
-        
-        # 2. CRITICAL FIX: Explicitly include Metric variables
-        # Keras 3 stores compiled metrics in self.metrics (via property aggregation)
+    def _collect_variables(self, method="variables"):
+        """
+        Helper to collect unique variables from shards, metrics, loss, and optimizer.
+        Handles unwrapping of ShardedWeight objects.
+        """
+        unique_vars = {}
+
+        # 1. Collect from shards (using weights property + unwrapping)
+        for shard in self.model_shards:
+            if method == "trainable_variables":
+                source_weights = getattr(shard, "trainable_weights", [])
+            elif method == "non_trainable_variables":
+                source_weights = getattr(shard, "non_trainable_weights", [])
+            else:
+                source_weights = getattr(shard, "weights", [])
+            
+            for w in source_weights:
+                # Unwrap ShardedWeight if necessary
+                if hasattr(w, 'variable'):
+                    v = w.variable
+                else:
+                    v = w
+                
+                if method == "trainable_variables" and not v.trainable:
+                    continue
+                if method == "non_trainable_variables" and v.trainable:
+                    continue
+                    
+                unique_vars[id(v)] = v
+
+        # 2. Collect from Metrics
         if hasattr(self, 'metrics'):
             for metric in self.metrics:
-                for var in metric.variables:
-                    unique_vars[id(var)] = var
+                m_vars = metric.variables
+                for v in m_vars:
+                    if method == "trainable_variables" and not v.trainable:
+                        continue
+                    if method == "non_trainable_variables" and v.trainable:
+                        continue
+                    unique_vars[id(v)] = v
         
-        # 3. Safety: Check optimizer variables if attached locally
-        if self.optimizer and hasattr(self.optimizer, 'variables'):
-             for var in self.optimizer.variables:
-                 unique_vars[id(var)] = var
+        # 3. Collect from Loss
+        compiled_loss = getattr(self, 'compiled_loss', None)
+        if compiled_loss:
+            l_vars = compiled_loss.variables
+            for v in l_vars:
+                if method == "trainable_variables" and not v.trainable:
+                    continue
+                if method == "non_trainable_variables" and v.trainable:
+                    continue
+                unique_vars[id(v)] = v
+
+        # 4. Collect from Optimizer (SAFE ACCESS)
+        # Use getattr to avoid crashing if optimizer isn't set (e.g. pre-compile)
+        optimizer = getattr(self, 'optimizer', None)
+        if optimizer and hasattr(optimizer, 'variables'):
+            o_vars = optimizer.variables
+            for v in o_vars:
+                 if method == "trainable_variables" and not v.trainable:
+                    continue
+                 if method == "non_trainable_variables" and v.trainable:
+                    continue
+                 unique_vars[id(v)] = v
 
         return list(unique_vars.values())
+
+    @property
+    def variables(self):
+        return self._collect_variables(method="variables")
 
     @property
     def trainable_variables(self):
-        # 1. Gather trainable variables from shards
-        unique_vars = {
-            id(var): var
-            for shard in self.model_shards
-            for var in shard.trainable_variables
-        }
-        # Note: Metrics are typically non-trainable, so we don't add them here.
-        return list(unique_vars.values())
+        return self._collect_variables(method="trainable_variables")
 
     @property
     def non_trainable_variables(self):
-        # 1. Gather non-trainable variables from shards
-        unique_vars = {
-            id(var): var
-            for shard in self.model_shards
-            for var in shard.non_trainable_variables
-        }
-        
-        # 2. CRITICAL FIX: Explicitly include Metric variables
-        # Most metric variables (counts, totals) are non-trainable.
-        if hasattr(self, 'metrics'):
-            for metric in self.metrics:
-                for var in metric.variables:
-                    unique_vars[id(var)] = var
-                    
-        return list(unique_vars.values())
+        return self._collect_variables(method="non_trainable_variables")
 
     @property
     def weights(self):
