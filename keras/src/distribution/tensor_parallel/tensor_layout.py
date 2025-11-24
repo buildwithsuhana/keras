@@ -1,7 +1,6 @@
 import collections
-
+import numpy as np
 from keras.src import ops
-
 
 def split_tensor_for_parallelism(tensor, index, device_count, dim):
     """Calculates a slice of a tensor along a specified dimension for a
@@ -20,13 +19,19 @@ def split_tensor_for_parallelism(tensor, index, device_count, dim):
     Returns:
         A tensor slice corresponding to the given `index`.
     """
+    
+    if hasattr(tensor, 'numpy'):
+        tensor_cpu = tensor.numpy()
+    else:
+        tensor_cpu = np.array(tensor)
+
     if dim == -1:
-        split_dim = ops.ndim(tensor) - 1
+        split_dim = tensor_cpu.ndim - 1
     else:
         split_dim = dim
 
-    splits = ops.array_split(
-        tensor, indices_or_sections=device_count, axis=split_dim
+    splits = np.array_split(
+        tensor_cpu, indices_or_sections=device_count, axis=split_dim
     )
     return splits[index]
 
