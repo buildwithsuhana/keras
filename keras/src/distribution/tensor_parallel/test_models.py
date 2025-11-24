@@ -142,12 +142,12 @@ def format_for_causal_lm(data):
     return features, labels
 
 
-def get_model_from_preset(preset_name, model_class):
-    """Creates a CausalLM model from a KerasNLP preset."""
-    logger.info(f"Creating {preset_name} model from KerasNLP preset...")
-    model = model_class.from_preset(preset_name, preprocessor=None)
-    logger.info(f"Model created with {model.count_params():,} parameters.")
-    return model
+# def get_model_from_preset(preset_name, model_class):
+#     """Creates a CausalLM model from a KerasNLP preset."""
+#     logger.info(f"Creating {preset_name} model from KerasNLP preset...")
+#     model = model_class.from_preset(preset_name, preprocessor=None)
+#     logger.info(f"Model created with {model.count_params():,} parameters.")
+#     return model
 
 def plot_training_graphs(history, preset_name):
     # (Same implementation)
@@ -171,31 +171,45 @@ def run_model_verification(preset_name, model_class):
 
     logger.info(f"--- VERIFICATION FOR: {preset_name.upper()} ---")
 
-    # 1. Dataset Setup
+    # --- Common Setup ---
     train_ds_raw, val_ds_raw = load_shakespeare_dataset(preset_name)
+
     train_ds = (
         train_ds_raw.batch(BATCH_SIZE, drop_remainder=True)
         .map(format_for_causal_lm, num_parallel_calls=tf.data.AUTOTUNE)
-        .prefetch(tf.data.AUTOTUNE).repeat()
+        .prefetch(tf.data.AUTOTUNE)
+        .repeat()
     )
     val_ds = (
         val_ds_raw.batch(BATCH_SIZE, drop_remainder=True)
         .map(format_for_causal_lm, num_parallel_calls=tf.data.AUTOTUNE)
-        .prefetch(tf.data.AUTOTUNE).repeat()
+        .prefetch(tf.data.AUTOTUNE)
+        .repeat()
     )
 
-    # 2. Device Mesh
+    # --- 1. Define Device Mesh for AutoTP ---
+    logger.info("\n--- Configuring AutoTP Distribution ---")
+    
     device_mesh = DeviceMesh(
         shape=(1, TARGET_WORLD_SIZE),
         axis_names=["data", "model"],
         devices=TARGET_DEVICES,
     )
+    logger.info(f"Device Mesh created: {device_mesh}")
 
-    # 3. Instantiate Distribution & Template
-    # CRITICAL: Template must be on CPU to avoid VRAM OOM
-    logger.info("Creating model template on CPU...")
+    # --- 2. Instantiate Distribution ---
+    # CRITICAL FIX: Initialize weights in bfloat16 to save 50% memory
+    # Use "float16" if your hardware does not support bfloat16 (e.g., older GPUs)
+    target_dtype = "bfloat16" 
+    
+    logger.info(f"Creating model template on CPU in {target_dtype}...")
     with keras.device("cpu"):
-        model_template = get_model_from_preset(preset_name, model_class)
+        model_template = get_model_from_preset(
+            preset_name, 
+            model_class, 
+            # This argument forces the weights to be loaded/created in 16-bit
+            dtype=target_dtype 
+        )
 
     logger.info("Initializing AutoTPDistribution...")
     distribution = AutoTPDistribution(
@@ -204,40 +218,59 @@ def run_model_verification(preset_name, model_class):
         auto_shard_dataset=True
     )
     
-    # 4. CRITICAL MEMORY CLEANUP
-    # Gemma 7B template takes ~15-30GB RAM. We MUST delete it before training.
-    logger.info("🗑️ Deleting CPU template to free System RAM...")
-    del model_template
-    gc.collect()
-    jax.clear_caches()
+    # Clear CPU memory
+    # del model_template
+    # import gc
+    # gc.collect()
     
-    # Get wrapped model
+    # Get the wrapped TensorParallelKeras model
     tp_model = distribution.model
 
-    # 5. Compile and Fit
+    # --- 3. Compile and Fit WITHIN Scope ---
     logger.info("\n--- Entering Distribution Scope ---")
+    
     with distribution.scope():
         logger.info("Compiling model...")
-        # Using AdamW with low epsilon for float16 stability
         tp_model.compile(
-            optimizer=keras.optimizers.AdamW(learning_rate=LEARNING_RATE, epsilon=1e-5),
+            optimizer=keras.optimizers.AdamW(learning_rate=LEARNING_RATE),
             loss=keras.losses.SparseCategoricalCrossentropy(from_logits=True),
-            metrics=[keras_hub.metrics.Perplexity(from_logits=True, name="perplexity")],
+            metrics=[
+                keras_hub.metrics.Perplexity(from_logits=True, name="perplexity")
+            ],
         )
 
-    logger.info("Starting training loop...")
-    tp_history = tp_model.fit(
+        logger.info("Starting training loop...")
+        tp_history = tp_model.fit(
             train_ds,
             validation_data=val_ds,
             epochs=EPOCHS,
             steps_per_epoch=STEPS_PER_EPOCH,
             validation_steps=VALIDATION_STEPS,
             verbose=1,
-    )
+        )
 
     logger.info("--- Exited Distribution Scope ---")
-    logger.info("✅ SUCCESS: Gemma 7B trained successfully.")
+    
+    tp_final_val_loss = tp_history.history["val_loss"][-1]
+    logger.info("AutoTP model training completed successfully.")
+
+    # --- 4. Verification ---
+    logger.info("\n--- ⚖️ Verification Results ---")
+    logger.info(f"AutoTP Final Validation Loss: {tp_final_val_loss:.6f}")
+
+    plot_training_graphs(tp_history, preset_name)
+
+    logger.info("✅ SUCCESS: AutoTP model training finished without errors.")
     return True
+
+# Helper update needed for get_model_from_preset to accept kwargs
+def get_model_from_preset(preset_name, model_class, **kwargs):
+    """Creates a CausalLM model from a KerasNLP preset."""
+    logger.info(f"Creating {preset_name} model from KerasNLP preset...")
+    # Pass kwargs (like dtype) through to from_preset
+    model = model_class.from_preset(preset_name, preprocessor=None, **kwargs)
+    logger.info(f"Model created with {model.count_params():,} parameters.")
+    return model
 
 if __name__ == "__main__":
     # (Same main block)
