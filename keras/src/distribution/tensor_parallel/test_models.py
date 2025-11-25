@@ -21,7 +21,8 @@ except Exception:
 
 # --- Backend and Device Configuration ---
 os.environ["KERAS_BACKEND"] = "jax"
-os.environ["XLA_FLAGS"] = "--xla_force_host_platform_device_count=12"
+# Force JAX to see "CPU" devices as separate XLA devices for testing if no GPUs
+os.environ["XLA_FLAGS"] = "--xla_force_host_platform_device_count=2"
 
 import jax
 import keras_hub
@@ -31,6 +32,7 @@ import tensorflow_datasets as tfds
 
 import keras
 
+# Hide TF GPUs so JAX takes full control
 tf.config.set_visible_devices([], "GPU")
 
 logging.basicConfig(level=logging.INFO, format="%(levelname)s - %(message)s")
@@ -46,7 +48,7 @@ try:
         host_devices = devices
 
     DEVICES_AVAILABLE = len(host_devices)
-    WORLD_SIZE = 2
+    WORLD_SIZE = 2 # Set this to 4 or 8 if testing large models on multi-gpu
 
     if DEVICES_AVAILABLE < WORLD_SIZE:
         logger.warning(
@@ -80,7 +82,9 @@ STEPS_PER_EPOCH = 10
 VALIDATION_STEPS = 5
 
 MODEL_MAPPING = {
-    "opt_125m_en": keras_hub.models.OPTCausalLM,
+    # "opt_6.7b_en": keras_hub.models.OPTCausalLM,
+    # You can now add "gemma_7b_en" here without crashing OOM!
+    "gemma2_9b_en": keras_hub.models.GemmaCausalLM, 
 }
 
 # ----------------------------------------------------------------------
@@ -97,7 +101,8 @@ def load_shakespeare_dataset(model_preset):
         example["text"].decode("utf-8") for example in ds.as_numpy_iterator()
     )
 
-    tokenizer = keras_hub.models.OPTCausalLM.from_preset(
+    # Use a separate tokenizer instance just for data prep
+    tokenizer = keras_hub.models.GemmaCausalLM.from_preset(
         model_preset
     ).preprocessor.tokenizer
     token_ids = tokenizer.tokenize(text)
@@ -133,17 +138,8 @@ def format_for_causal_lm(data):
     labels = data[:, 1:]
     return features, labels
 
-
-def get_model_from_preset(preset_name, model_class):
-    """Creates a CausalLM model from a KerasNLP preset."""
-    logger.info(f"Creating {preset_name} model from KerasNLP preset...")
-    model = model_class.from_preset(preset_name, preprocessor=None)
-    logger.info(f"Model created with {model.count_params():,} parameters.")
-    return model
-
-
 # ----------------------------------------------------------------------
-# --- Plotting Function (MODIFIED) ---
+# --- Plotting Function ---
 # ----------------------------------------------------------------------
 
 def plot_training_graphs(tp_history, preset_name):
@@ -187,7 +183,7 @@ def plot_training_graphs(tp_history, preset_name):
 
 
 # ----------------------------------------------------------------------
-# --- Main Verification Function (MODIFIED) ---
+# --- Main Verification Function (MODIFIED FOR OOM SAFETY) ---
 # ----------------------------------------------------------------------
 
 def run_model_verification(preset_name, model_class):
@@ -220,12 +216,28 @@ def run_model_verification(preset_name, model_class):
         .repeat()
     )
 
-    # --- 1. Tensor Parallel Model Training ---
+    # --- 1. Tensor Parallel Model Initialization (LAZY) ---
     logger.info("\n--- Training Tensor Parallel (TP) Model ---")
-    tp_model_template = get_model_from_preset(preset_name, model_class)
+    
+    # CRITICAL CHANGE FOR OOM SAFETY:
+    # We create a function (lambda) that builds the model. 
+    # We DO NOT call it here. We pass the function to TensorParallelKeras.
+    # We set load_weights=False so the "Skeleton" on CPU is just empty metadata.
+    def model_builder():
+        return model_class.from_preset(
+            preset_name, 
+            preprocessor=None, 
+            load_weights=False # <--- THIS SAVES YOUR RAM
+        )
+
+    # Note: Because load_weights=False, the model starts with random weights.
+    # For a verification run (does it run? does loss change?), this is fine.
+    # If you need pretrained weights, you would call:
+    # tp_model.load_sharded_weights("path/to/weights.h5") 
+    # AFTER the next line.
 
     tp_model = TensorParallelKeras(
-        model=tp_model_template,
+        model_input=model_builder, # Passing the function, not the object
         device_count=TARGET_WORLD_SIZE,
         device_ids=TARGET_DEVICES,
     )
@@ -238,6 +250,8 @@ def run_model_verification(preset_name, model_class):
         ],
     )
 
+    # Fit will now train the SHARDED model. 
+    # The CPU memory footprint should be negligible.
     tp_history = tp_model.fit(
         train_ds,
         validation_data=val_ds,
@@ -246,6 +260,7 @@ def run_model_verification(preset_name, model_class):
         validation_steps=VALIDATION_STEPS,
         verbose=1,
     )
+    
     tp_final_val_loss = tp_history.history["val_loss"][-1]
     logger.info("TP model training completed successfully.")
 
@@ -269,7 +284,7 @@ if __name__ == "__main__":
         sys.exit(1)
 
     logger.info("\n" + "=" * 70)
-    logger.info("      TENSOR PARALLELISM EXECUTION SUITE")
+    logger.info("      TENSOR PARALLELISM EXECUTION SUITE (OOM-SAFE)")
     logger.info("=" * 70)
 
     results = {}

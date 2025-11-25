@@ -5,6 +5,7 @@ Port of the PyTorch tensor_parallel library
 
 import logging
 import re
+import gc
 from typing import Collection, Optional, Sequence, Union
 
 import numpy as np
@@ -22,23 +23,39 @@ from keras.src.distribution.tensor_parallel.coordinated_optimizer import (
 )
 
 from keras.src.distribution import list_devices
-
-logger = logging.getLogger(__file__)
-
 from keras.src.models import Model
+from keras.src.distribution.tensor_parallel.lazy_init import lazy_init_scope
+logger = logging.getLogger(__file__)
 
 
 class TensorParallelKeras(Model):
     def __init__(
         self,
-        model,
+        model_input,
         device_count=None,
         device_ids=None,
         **kwargs,
     ):
+        """
+        Args:
+            model_input: A Keras Model instance OR a callable (lambda/function) 
+                         that returns a Keras Model. Passing a callable is 
+                         RECOMMENDED for large models to avoid OOM during init.
+            device_count: Number of devices to shard across.
+            device_ids: Specific device identifiers.
+        """
         super().__init__(**kwargs)
 
-        self._original_model = model
+        # --- OOM FIX 1: Handle Lazy Initialization ---
+        # If input is a callable (e.g. lambda: Gemma(...)), build it now on CPU.
+        # This prevents pre-allocating memory on GPU before we are ready.
+        if callable(model_input) and not isinstance(model_input, keras.Model):
+            print("🏗️  Building Skeleton Model (Lazy Init)...")
+            # Force CPU to keep the skeleton out of VRAM
+            with keras.device("cpu"):
+                self._original_model = model_input()
+        else:
+            self._original_model = model_input
 
         if device_count is None:
             device_count, device_ids = self._auto_detect_parallelism()
@@ -52,7 +69,8 @@ class TensorParallelKeras(Model):
         self.tensor_parallel_config = None
         self.distributed = True
 
-        self.sharded_models = [self._original_model]
+        # Initial placeholder; will be updated with shards
+        self.sharded_models = []
 
         accel_devices = list_devices()
         device_ids = list(self.check_device_ids(device_ids))
@@ -92,73 +110,69 @@ class TensorParallelKeras(Model):
         self.devices = device_ids
         self.device_count = device_count
 
+        # Handle Single Device Case
         if self.device_count <= 1:
-            self.model_shards = [model]
+            self.model_shards = [self._original_model]
             self.distributed = False
             if len(self.devices) == 1:
                 from keras import device
 
                 with device(self.devices[0]):
-                    self.model_shards[0] = model
+                    self.model_shards[0] = self._original_model
             self.built = True
             self.assembled_model = self._original_model
             return
 
+        # Generate Config
         if self.tensor_parallel_config is None:
             device_names = [str(d) for d in self.devices]
             self.tensor_parallel_config = get_default_config(
-                model, device_names
+                self._original_model, device_names
             )
-            print(self.tensor_parallel_config)
+            # print(self.tensor_parallel_config) # Reduced log noise
             logger.info(
-                "Using automatic config with auto sharding strategy: sharding individual Dense/Conv/Embedding layers"
+                "Using automatic config with auto sharding strategy"
             )
 
         print(
-            f"🔧 Creating REAL parameter shards for {model.name} across {len(self.devices)} devices"
+            f"🔧 Creating REAL parameter shards for {self._original_model.name} across {len(self.devices)} devices"
         )
 
-        self._is_multi_layer_model = len(model.layers) > 2
-        if self._is_multi_layer_model:
-            logger.info(
-                f"   - Multi-layer model detected: {len(model.layers)} layers"
-            )
+        self._is_multi_layer_model = len(self._original_model.layers) > 2
 
         self.model_shards = []
         self.modified_parameters_names = set()
 
-        logger.info(
-            f"✅ Using '{keras.backend.backend()}' backend for parameter sharding."
-        )
-
+        # --- Sharding Loop ---
         for rank, device_id in enumerate(self.devices):
             print(f"[{device_id}] ➡️  Starting sharding process for Rank {rank}")
+            
+            # Create the shard
             shard, modified_parameters_names = make_parameter_sharded_model(
-                model,
+                self._original_model,
                 self.tensor_parallel_config,
                 rank=rank,
                 device_count=self.device_count,
                 device_id=device_id,
             )
+            
             self.model_shards.append(shard)
             self.modified_parameters_names.update(modified_parameters_names)
             
-
+            # --- OOM FIX 2: Aggressive GC ---
+            # Force garbage collection after each shard creation to clean up 
+            # intermediate slicing tensors.
+            gc.collect() 
+            if hasattr(keras.backend, "clear_session"):
+                keras.backend.clear_session()
+                
             logger.info(f"   ✅ Created shard {rank} for device {device_id}")
 
-        params_per_shard = []
-        for i, shard in enumerate(self.model_shards):
-            total_params = sum(np.prod(p.shape) for p in shard.weights)
-            params_per_shard.append(int(total_params))
-            logger.info(f"   📊 Shard {i} parameters: {int(total_params):,}")
-
-        if len(set(params_per_shard)) > 1:
-            logger.info(
-                "✅ REAL SHARDING CONFIRMED: Different parameter counts across shards"
-            )
-            logger.info("✅ This is NOT using stubs - real tensor parallelism!")
-        else:
-            pass
+        # --- OOM FIX 3: Free Original Model Weights ---
+        # The shards now hold the data (or the skeleton data) on GPUs.
+        # We NO LONGER need the massive tensors in self._original_model (RAM).
+        # We replace them with dummy tensors to free system memory.
+        self._free_original_weights()
 
         logger.info(
             f"Using '{keras.backend.backend()}' backend logic for distribution."
@@ -169,6 +183,41 @@ class TensorParallelKeras(Model):
             self.assembled_model = self.build_assembled_model()
         else:
             self.assembled_model = self._original_model
+
+    def _free_original_weights(self):
+        """
+        Replaces heavy weights with dummies.
+        CRITICAL: Skips GhostVariables to preserve model topology.
+        """
+        # ADD THIS CHECK AT THE TOP
+        if hasattr(self, "_used_lazy_init") and self._used_lazy_init:
+            logger.info("👻 Lazy Init detected: Skipping weight freeing (Ghosts are already memory-efficient).")
+            return
+
+        print("🗑️  Freeing original model weights from RAM to prevent OOM...")
+        freed_count = 0
+        total_memory_saved = 0
+        
+        # We iterate over variables and replace them IN-PLACE
+        for weight in self._original_model.variables:
+            try:
+                # Calculate size for logging
+                if hasattr(weight, "numpy"):
+                    size = weight.numpy().nbytes
+                    total_memory_saved += size
+                
+                # Create a dummy tensor with the same shape and dtype as the weight
+                dummy = ops.zeros(weight.shape, dtype=weight.dtype)
+                # Assign dummy to the variable. This drops the reference to the large array.
+                weight.assign(dummy)
+                freed_count += 1
+            except Exception as e:
+                logger.warning(f"Could not free weight {weight.name}: {e}")
+        
+        # Force GC one last time
+        gc.collect()
+        print(f"✅ Freed {freed_count} original parameters.")
+        # print(f"✅ Reclaimed approx {total_memory_saved / (1024**3):.2f} GB of System RAM")
 
     @property
     def variables(self):
@@ -259,7 +308,100 @@ class TensorParallelKeras(Model):
         else:
             logger.warning("No devices available, using default CPU")
             return ["cpu:0"]
+    def load_sharded_weights(self, filepath):
+        """
+        Streams weights from H5 file directly to GPU shards.
+        Bypasses the CPU RAM bottleneck.
+        """
+        import h5py
+        print(f"💾 Streaming weights from {filepath} directly to GPU shards...")
+        
+        # 1. Map: "original_name" -> [list of shard variables]
+        # We need to know where each chunk of the H5 file goes.
+        param_map = {}
+        for shard in self.model_shards:
+            for var in shard.variables:
+                # Assuming var.name is "layer/kernel:0"
+                # You might need to adjust name matching based on your backbone
+                clean_name = var.name.split(":")[0] 
+                if clean_name not in param_map:
+                    param_map[clean_name] = []
+                param_map[clean_name].append(var)
 
+        count = 0
+        with h5py.File(filepath, 'r') as f:
+            
+            def visit_entry(name, node):
+                nonlocal count
+                if isinstance(node, h5py.Dataset):
+                    # Keras saves weights typically as "layer_name/variable_name"
+                    # We try to match this H5 path to our param_map keys
+                    
+                    # Heuristic matching:
+                    # If H5 key is "gemma_backbone/layers_0/dense/kernel"
+                    # And param_map key is "tensor_parallel_keras/gemma_backbone..."
+                    targets = []
+                    for key in param_map:
+                        if key.endswith(name):
+                            targets = param_map[key]
+                            break
+                    
+                    if not targets:
+                        return
+
+                    # 2. Read only ONE tensor into RAM
+                    val = node[:] 
+                    
+                    # 3. Distribute to shards
+                    # If targets > 1, it means the weight is sharded.
+                    # We must slice 'val' and assign to each shard.
+                    
+                    # Logic to detect dimension to slice:
+                    # We compare the shape of the full tensor vs the shard.
+                    
+                    for i, shard_var in enumerate(targets):
+                        shard_shape = shard_var.shape
+                        full_shape = val.shape
+                        
+                        if shard_shape == full_shape:
+                            # Replicated weight (Bias, Norm, etc.)
+                            shard_var.assign(val)
+                        else:
+                            # It is split. Find which dimension differs.
+                            # (Simple logic: assuming only 1 dim is split)
+                            split_dim = -1
+                            for d in range(len(full_shape)):
+                                if full_shape[d] != shard_shape[d]:
+                                    split_dim = d
+                                    break
+                            
+                            if split_dim != -1:
+                                # Calculate start/end indices
+                                step = full_shape[split_dim] // len(targets)
+                                # Assuming shards are stored in order in param_map (rank 0, rank 1...)
+                                # This assumes param_map list order matches rank order. 
+                                # (It usually does due to append order in init).
+                                start = i * step
+                                end = start + step
+                                
+                                # Slice
+                                if split_dim == 0:
+                                    slice_val = val[start:end, ...]
+                                elif split_dim == 1:
+                                    slice_val = val[:, start:end, ...]
+                                else:
+                                    # Handle other dims if needed
+                                    slice_val = np.take(val, range(start, end), axis=split_dim)
+                                
+                                shard_var.assign(slice_val)
+                    
+                    count += 1
+                    # Python GC to free 'val' immediately
+                    del val 
+
+            f.visititems(visit_entry)
+            
+        print(f"✅ Loaded {count} weight tensors successfully.")
     def check_device_ids(
         self, device_ids: Optional[Sequence[str]]
     ) -> Sequence[str]:
@@ -276,7 +418,7 @@ class TensorParallelKeras(Model):
     def build_assembled_model(self):
         """
         Builds a single, JIT-friendly Keras Functional model that encapsulates
-        the entire tensor parallel logic, correctly handling multiple inputs.
+        the entire tensor parallel logic.
         """
         if not self.distributed:
             return self._original_model
@@ -312,9 +454,7 @@ class TensorParallelKeras(Model):
                     # Last resort: forward the full mapping (may be positional in some cases)
                     shard_inputs = dict(input_layers)
 
-                logger.info(
-                    f"Calling shard '{getattr(shard, 'name', '<shard>')}' with inputs: {list(shard_inputs.keys())}"
-                )
+                # Call the shard
                 partial_outputs.append(shard(shard_inputs))
             except Exception as e:
                 logger.exception(

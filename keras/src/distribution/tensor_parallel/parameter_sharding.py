@@ -82,7 +82,7 @@ class ParameterShardingStrategy:
         self.device_count = device_count
         self.rank = rank
         self.sharded_weights = {}
-        self.original_weights = {}
+        # self.original_weights = {}
         self.weight_mapping = {}
         self.sharded_weights_by_id = {}
 
@@ -99,7 +99,7 @@ class ParameterShardingStrategy:
 
         print(f"🔧 Applying parameter-level sharding to {model.name}")
 
-        self._store_original_weights(model)
+        # self._store_original_weights(model)
         modified_parameters = set()
 
         for pattern, action in config.state_rules.items():
@@ -140,6 +140,15 @@ class ParameterShardingStrategy:
 
                     self.sharded_weights[param_name] = sharded_tensor
                     self.sharded_weights_by_id[param_id] = sharded_tensor
+                    if self.rank == self.device_count - 1:
+                         # We replace the massive tensor with a 1-byte placeholder
+                         # Keras Variables are mutable.
+                         try:
+                             dummy = np.zeros((1,), dtype=param.dtype)
+                             param.assign(dummy)
+                             print(f"   🗑️  Freed original memory for {param_name}")
+                         except:
+                             pass
 
                     self.weight_mapping[param_name] = {
                         "original_shape": param.shape,
