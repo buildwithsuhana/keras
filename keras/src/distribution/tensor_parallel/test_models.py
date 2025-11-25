@@ -18,10 +18,8 @@ except Exception:
 
 # --- Backend Configuration ---
 os.environ["KERAS_BACKEND"] = "jax"
-
-# TPU specific cleanup (Just in case)
-# We DO NOT need XLA_PYTHON_CLIENT_MEM_FRACTION on TPUs.
-# We DO want to ensure we see all 8 cores.
+# Ensure we see all devices (Force host platform count for JAX simulation if needed)
+os.environ["XLA_FLAGS"] = "--xla_force_host_platform_device_count=2"
 
 import jax
 import keras_hub
@@ -31,8 +29,6 @@ import tensorflow_datasets as tfds
 import keras
 
 # --- 1. TPU OPTIMIZATION: Bfloat16 ---
-# TPUs are natively optimized for bfloat16. 
-# It provides the same range as float32 but with less memory.
 keras.config.set_dtype_policy("mixed_bfloat16")
 
 logging.basicConfig(level=logging.INFO, format="%(levelname)s - %(message)s")
@@ -50,7 +46,7 @@ try:
         TARGET_DEVICES = tpu_devices
         logger.info(f"✅ Using {len(TARGET_DEVICES)} TPU Cores.")
     else:
-        # Fallback to GPU/CPU (should not happen on v5e-8 node)
+        # Fallback to GPU/CPU
         TARGET_DEVICES = devices
         logger.warning(f"⚠️ No TPUs found! Using {devices[0].platform}.")
 
@@ -60,20 +56,19 @@ except Exception as e:
     logger.error(f"Could not initialize JAX. Error: {e}")
     sys.exit(1)
 
-from keras.src.distribution import DeviceMesh
+from keras.src.distribution.distribution_lib import DeviceMesh
 from keras.src.distribution.distribution_lib import AutoTPDistribution
 
-# --- Constants (Scaled up for TPU) ---
-# TPU v5e-8 has 128GB total memory. We can be aggressive.
-BATCH_SIZE = 32        # 32 global batch size (4 per chip)
-SEQUENCE_LENGTH = 128  # Back to full length
+# --- Constants ---
+BATCH_SIZE = 32
+SEQUENCE_LENGTH = 128
 LEARNING_RATE = 1e-4
 EPOCHS = 1
 STEPS_PER_EPOCH = 10
 VALIDATION_STEPS = 5
 
 MODEL_MAPPING = {
-    "gemma_7b_en": keras_hub.models.GemmaCausalLM,
+    "opt_125m_en": keras_hub.models.OPTCausalLM,
 }
 
 # ----------------------------------------------------------------------
@@ -86,9 +81,9 @@ def load_shakespeare_dataset(model_preset):
     ds = tfds.load("tiny_shakespeare", split="train", as_supervised=False)
     text = "".join(example["text"].decode("utf-8") for example in ds.as_numpy_iterator())
 
-    # Tokenize on CPU to avoid TPU compilation overhead for simple ops
+    # Tokenize on CPU
     with keras.device("cpu"):
-        tokenizer = keras_hub.models.GemmaTokenizer.from_preset(model_preset)
+        tokenizer = keras_hub.models.OPTTokenizer.from_preset(model_preset)
         token_ids = tokenizer.tokenize(text)
 
     num_tokens = (len(token_ids) // (SEQUENCE_LENGTH + 1)) * (SEQUENCE_LENGTH + 1)
@@ -111,25 +106,13 @@ def format_for_causal_lm(data):
 
 # --- TPU MODEL BUILDER ---
 def model_builder_factory(preset_name, model_class):
-    """Builds the model. No Quantization needed for TPU v5e-8."""
-    
     def model_builder(**kwargs):
         logger.info(f"Creating {preset_name} model (inside scope)...")
-        
-        # --- TPU CONFIGURATION ---
-        # 1. No 'dtype' override needed (defaults to float32, policy casts to bfloat16).
-        #    If you really want to save memory, use "bfloat16".
-        #    Do NOT use "int8" on TPUs unless you specifically need to test quantization.
-        
-        # Create Model
         model = model_class.from_preset(preset_name, preprocessor=None, **kwargs)
         
-        # 2. LoRA is OPTIONAL on TPU v5e-8 because we have 128GB RAM.
-        #    However, keeping it makes training much faster.
         logger.info("--- Enabling LoRA (Rank=8) ---") 
-        
         if hasattr(model, "enable_lora"):
-             model.enable_lora(rank=8) # Increased rank for better quality
+             model.enable_lora(rank=8)
         elif hasattr(model, "backbone") and hasattr(model.backbone, "enable_lora"):
              model.backbone.enable_lora(rank=8)
         
@@ -138,8 +121,63 @@ def model_builder_factory(preset_name, model_class):
         
         logger.info(f"Model created. Total: {total_params:,} | Trainable: {trainable_params:,}")
         return model
-        
     return model_builder
+
+# ----------------------------------------------------------------------
+# --- NEW: Physical Sharding Verification ("Truth Check") ---
+# ----------------------------------------------------------------------
+def inspect_physical_memory(model):
+    """
+    Directly checks JAX buffers on the device to prove sharding works.
+    Calculates the Ratio of (Logical Global Size) / (Physical Local Size).
+    """
+    logger.info("\n" + "="*50)
+    logger.info("🔍 PERFORMING PHYSICAL MEMORY INSPECTION")
+    logger.info("="*50)
+    
+    target_var = None
+    # Try to find a specific large weight (Value projection in Attention is usually a good target)
+    for v in model.trainable_variables:
+        # Check for path keywords to identify a kernel in self-attention
+        if "self_attention" in v.path and "kernel" in v.path and "value" in v.path:
+            target_var = v
+            break
+            
+    # Fallback if specific layer not found
+    if target_var is None:
+        target_var = model.trainable_variables[0]
+
+    # Get the underlying JAX array
+    jax_array = target_var.value
+    
+    try:
+        # jax_array.addressable_shards returns a list of shards stored on the *current* process's devices.
+        # We look at the first one [0] to see how big the chunk is on a single chip.
+        local_shard = jax_array.addressable_shards[0].data
+        
+        global_shape = jax_array.shape
+        local_shape = local_shard.shape
+        
+        global_params = np.prod(global_shape)
+        local_params = np.prod(local_shape)
+        
+        logger.info(f"   Target Variable:        {target_var.path}")
+        logger.info(f"   Logical Shape (Global): {global_shape} ({global_params:,} params)")
+        logger.info(f"   Physical Shape (Chip):  {local_shape}  ({local_params:,} params)")
+        
+        if local_params < global_params:
+            ratio = global_params / local_params
+            logger.info(f"   🎉 SUCCESS: Variable is physically sharded!")
+            logger.info(f"   ⬇️  Memory footprint reduced by {ratio:.1f}x per chip.")
+        else:
+            logger.warning("   ⚠️ WARNING: Variable appears REPLICATED (Local size == Global size).")
+            logger.warning("   Check if your layout heuristics matched this variable name.")
+            
+    except Exception as e:
+        logger.error(f"   Could not inspect addressable shards. Error: {e}")
+    
+    logger.info("="*50 + "\n")
+
 
 # ----------------------------------------------------------------------
 # --- Main Verification Function ---
@@ -148,7 +186,7 @@ def model_builder_factory(preset_name, model_class):
 def run_model_verification(preset_name, model_class):
     if TARGET_WORLD_SIZE < 2:
         logger.warning("Need >1 device for TP. Skipping.")
-        return "SKIPPED"
+        # return "SKIPPED" # Uncomment if strictly skipping, else let it run for debug
 
     logger.info(f"--- RUNNING: {preset_name} on {TARGET_WORLD_SIZE} TPU CORES ---")
 
@@ -168,7 +206,6 @@ def run_model_verification(preset_name, model_class):
     )
 
     # 1. Initialize AutoTPDistribution
-    # TPUs use a Mesh: (1, 8) for 8-way tensor parallelism
     device_mesh = DeviceMesh(
         shape=(1, TARGET_WORLD_SIZE), 
         axis_names=('data', 'model'), 
@@ -179,20 +216,26 @@ def run_model_verification(preset_name, model_class):
     model_builder_fn = model_builder_factory(preset_name, model_class)
 
     # 3. Initialize Strategy
-    # Ensure we pass float32 or bfloat16, NOT int8
     distribution = AutoTPDistribution(
         model_builder_fn, 
         device_mesh=device_mesh,
-        # dtype="bfloat16" # Optional: Force weights to bf16 storage
     )
     
     logger.info("\n--- Initializing & Sharding on TPU ---")
 
     # 4. Build & Distribute
+    # Note: distribution.model automatically handles the scope internally, 
+    # but the explicit scope here is safe and clear.
     with distribution.scope():
         tp_model = distribution.model 
 
-    # 5. Compile & Train
+    # ---------------------------------------------------------
+    # 5. VERIFY SHARDING (The Truth Check)
+    # ---------------------------------------------------------
+    inspect_physical_memory(tp_model)
+    # ---------------------------------------------------------
+
+    # 6. Compile & Train
     logger.info("🚀 Compiling...")
     tp_model.compile(
         optimizer=keras.optimizers.AdamW(learning_rate=LEARNING_RATE),
@@ -212,15 +255,12 @@ def run_model_verification(preset_name, model_class):
         verbose=1,
     )
     
-    # Plotting logic (same as before, omitted for brevity)
-    # plot_training_graphs(tp_history, preset_name)
-    
     logger.info("✅ SUCCESS: TPU Training Complete")
     return True
 
 if __name__ == "__main__":
     # Run Verification
     try:
-        run_model_verification("gemma_7b_en", MODEL_MAPPING["gemma_7b_en"])
+        run_model_verification("opt_125m_en", MODEL_MAPPING["opt_125m_en"])
     except Exception as e:
         logger.exception("TPU Run Failed")
