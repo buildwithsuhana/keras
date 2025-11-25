@@ -197,19 +197,23 @@ def run_model_verification(preset_name, model_class):
 
     # --- Tensor Parallel Model Initialization ---
     logger.info("\n--- Initializing Tensor Parallel (TP) Model ---")
-    
-    # 1. Define the builder (Lazy Load)
-    def model_builder():
-        # load_weights=False is CRITICAL for 9B models to avoid host OOM
-        # The weights will be initialized randomly on the device.
-        return model_class.from_preset(
-            preset_name, 
-            load_weights=False 
-        )
 
-    # 2. Instantiate TP Keras
+    # 1. Get the CPU device explicitly
+    cpu_device = jax.devices("cpu")[0]
+
+    # 2. Define the builder with CPU forcing
+    def model_builder():
+        # 🟢 CRITICAL FIX: Force the "Master" weights to live on CPU RAM.
+        # This prevents TPU:0 from exploding before distribution happens.
+        with jax.default_device(cpu_device):
+            return model_class.from_preset(
+                preset_name, 
+                load_weights=False
+            )
+
+    # 3. Instantiate TP Keras (Model builder runs on CPU, Shards go to TPUs)
     tp_model = TensorParallelKeras(
-        model_input=model_builder,
+        model_input=model_builder, 
         device_count=TARGET_WORLD_SIZE,
         device_ids=TARGET_DEVICES,
     )
