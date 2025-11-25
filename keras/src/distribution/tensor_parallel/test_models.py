@@ -92,6 +92,12 @@ MODEL_MAPPING = {
 # ----------------------------------------------------------------------
 
 def load_shakespeare_dataset(model_preset):
+
+    TOKENIZER_MAPPING = {
+    "opt_125m_en": keras_hub.models.OPTTokenizer,
+    "gemma_7b_en": keras_hub.models.GemmaTokenizer,
+    "gemma2_9b_en": keras_hub.models.GemmaTokenizer,
+}
     """Loads and preprocesses the Tiny Shakespeare dataset."""
     logger.info(
         f"Loading and preprocessing Tiny Shakespeare dataset for {model_preset}..."
@@ -101,10 +107,16 @@ def load_shakespeare_dataset(model_preset):
         example["text"].decode("utf-8") for example in ds.as_numpy_iterator()
     )
 
-    # Use a separate tokenizer instance just for data prep
-    tokenizer = keras_hub.models.GemmaCausalLM.from_preset(
-        model_preset
-    ).preprocessor.tokenizer
+    # --- FIX: Load ONLY the tokenizer, not the whole model ---
+    if model_preset in TOKENIZER_MAPPING:
+        tokenizer_cls = TOKENIZER_MAPPING[model_preset]
+        logger.info(f"Loading tokenizer {tokenizer_cls.__name__} (lightweight)...")
+        tokenizer = tokenizer_cls.from_preset(model_preset)
+    else:
+        # Fallback (Risk of OOM if this loads the backbone)
+        logger.warning("Preset not in TOKENIZER_MAPPING, attempting generic load...")
+        tokenizer = keras_hub.models.GemmaTokenizer.from_preset(model_preset)
+
     token_ids = tokenizer.tokenize(text)
 
     num_tokens = (len(token_ids) // (SEQUENCE_LENGTH + 1)) * (
