@@ -1,4 +1,5 @@
 import collections
+import numpy as np  # <--- 1. ADD THIS IMPORT
 
 from keras.src import ops
 
@@ -31,14 +32,31 @@ def split_tensor_for_parallelism(tensor, index, device_count, dim):
         new_shape = list(tensor_shape)
         new_shape[split_dim] = shard_size
         
-        # We return a standard Keras Tensor/Variable initialized with Zeros (or Empty)
-        # This allocates memory on the CURRENT device (which is set by the loop in tensor_layout)
+        # We return a standard Keras Tensor/Variable initialized with Zeros
+        # This allocates memory on the CURRENT device (set by the loop in tensor_layout)
         return ops.zeros(tuple(new_shape), dtype=tensor.dtype)
 
-    # 3. Standard logic for Real tensors (if you still have them)
-    splits = ops.array_split(
-        tensor, indices_or_sections=device_count, axis=split_dim
+    # 3. Standard logic for Real tensors
+    # 🔴 OLD CODE (Causes OOM because ops.array_split uses the TPU):
+    # splits = ops.array_split(
+    #     tensor, indices_or_sections=device_count, axis=split_dim
+    # )
+    # return splits[index]
+
+    # 🟢 NEW CODE (Fixes OOM by keeping the master weights on CPU):
+    
+    # Convert to standard NumPy array. This forces the data to live on the CPU RAM.
+    # Even if 'tensor' was already on CPU, this ensures it doesn't accidentally 
+    # move to TPU for the split operation.
+    tensor_cpu = np.array(tensor) 
+    
+    splits = np.array_split(
+        tensor_cpu, indices_or_sections=device_count, axis=split_dim
     )
+    
+    # We return a NumPy array shard. 
+    # When this shard is assigned to a Variable later, JAX will automatically 
+    # transfer JUST this small chunk to the specific TPU core.
     return splits[index]
 
 LayoutMap = collections.namedtuple("LayoutMap", ["state_rules", "output_rules"])
