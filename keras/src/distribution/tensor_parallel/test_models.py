@@ -103,12 +103,20 @@ def load_shakespeare_dataset(model_preset):
 
 def format_for_causal_lm(data):
     """Formats data for KerasNLP's CausalLM."""
-    # 🟢 FIX: Return simple tuple (x, y). 
-    # Dropping 'padding_mask' prevents the JAX 'Abstract Tracer' error
-    # and the 'Structure Mismatch' error.
+    # 🟢 FIX: Return both input and label with padding mask
+    # GemmaCausalLM expects: {"token_ids": ..., "padding_mask": ...}
     x = data[:-1]
     y = data[1:]
-    return x, y
+    
+    # Create padding mask (all ones = all tokens are valid)
+    padding_mask = np.ones(x.shape, dtype=np.int32)
+    
+    # Return input as dict with token_ids and padding_mask
+    x_dict = {
+        "token_ids": x,
+        "padding_mask": padding_mask,
+    }
+    return x_dict, y
 
 # ----------------------------------------------------------------------
 # --- Main Verification ---
@@ -159,7 +167,24 @@ def run_model_verification(preset_name, model_class):
         device_ids=TARGET_DEVICES,
     )
 
-    # 4. Compile
+    # 4. Build the model explicitly before compile
+    # Create a sample batch to build the model
+    logger.info("Building model with sample batch...")
+    sample_batch = next(iter(train_ds))
+    if isinstance(sample_batch, tuple):
+        x_sample, y_sample = sample_batch
+    else:
+        x_sample, y_sample = sample_batch, None
+    
+    # Build by calling the model
+    try:
+        tp_model(x_sample, training=False)
+        logger.info("✅ Model built successfully.")
+    except Exception as e:
+        logger.warning(f"Could not build model with forward pass: {e}")
+        logger.info("Will attempt to build during fit...")
+
+    # 5. Compile
     tp_model.compile(
         optimizer=keras.optimizers.AdamW(learning_rate=LEARNING_RATE),
         loss=keras.losses.SparseCategoricalCrossentropy(from_logits=True),
