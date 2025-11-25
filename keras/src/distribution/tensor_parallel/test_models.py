@@ -68,7 +68,7 @@ STEPS_PER_EPOCH = 10
 VALIDATION_STEPS = 5
 
 MODEL_MAPPING = {
-    "opt_125m_en": keras_hub.models.OPTCausalLM,
+    "opt_6.7b_en": keras_hub.models.OPTCausalLM,
 }
 
 # ----------------------------------------------------------------------
@@ -261,6 +261,6 @@ def run_model_verification(preset_name, model_class):
 if __name__ == "__main__":
     # Run Verification
     try:
-        run_model_verification("opt_125m_en", MODEL_MAPPING["opt_125m_en"])
+        run_model_verification("opt_6.7b_en", MODEL_MAPPING["opt_6.7b_en"])
     except Exception as e:
         logger.exception("TPU Run Failed")
