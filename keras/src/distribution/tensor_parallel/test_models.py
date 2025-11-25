@@ -22,7 +22,7 @@ except Exception:
 # --- Backend and Device Configuration ---
 os.environ["KERAS_BACKEND"] = "jax"
 # Force JAX to see "CPU" devices as separate XLA devices for testing if no GPUs
-os.environ["XLA_FLAGS"] = "--xla_force_host_platform_device_count=2"
+os.environ["XLA_FLAGS"] = "--xla_force_host_platform_device_count=8"
 
 import jax
 import keras_hub
@@ -48,7 +48,7 @@ try:
         host_devices = devices
 
     DEVICES_AVAILABLE = len(host_devices)
-    WORLD_SIZE = 2 # Set this to 4 or 8 if testing large models on multi-gpu
+    WORLD_SIZE = 8 # Set this to 4 or 8 if testing large models on multi-gpu
 
     if DEVICES_AVAILABLE < WORLD_SIZE:
         logger.warning(
