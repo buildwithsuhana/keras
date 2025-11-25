@@ -51,9 +51,14 @@ class TensorParallelKeras(Model):
         # This prevents pre-allocating memory on GPU before we are ready.
         if callable(model_input) and not isinstance(model_input, keras.Model):
             print("🏗️  Building Skeleton Model (Lazy Init)...")
-            # Force CPU to keep the skeleton out of VRAM
-            with keras.device("cpu"):
+            
+            # --- CHANGE START ---
+            # Use lazy_init_scope to ensure variables are 0-byte Ghosts
+            with keras.device("cpu"), lazy_init_scope():
                 self._original_model = model_input()
+                self._used_lazy_init = True 
+            # --- CHANGE END ---
+            
         else:
             self._original_model = model_input
 

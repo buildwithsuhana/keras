@@ -1,4 +1,5 @@
 import collections
+import numpy as np
 from keras.src import ops
 
 def split_tensor_for_parallelism(tensor, index, device_count, dim):
@@ -31,19 +32,14 @@ def split_tensor_for_parallelism(tensor, index, device_count, dim):
         new_shape[split_dim] = shard_size
         new_shape_tuple = tuple(new_shape)
         
-        # --- CHANGE: Use the original initializer if available ---
-        if hasattr(tensor, "initializer") and tensor.initializer is not None:
-            try:
-                # Call the original initializer with the new SHARDED shape
-                return tensor.initializer(shape=new_shape_tuple, dtype=tensor.dtype)
-            except Exception:
-                # Fallback if initializer fails (e.g. complex state)
-                return ops.zeros(new_shape_tuple, dtype=tensor.dtype)
-        else:
-            # Default fallback
-            return ops.zeros(new_shape_tuple, dtype=tensor.dtype)
+        # --- FIX: Use CPU Numpy to avoid premature TPU allocation ---
+        # We return a standard numpy array (CPU). The ParameterShardingStrategy
+        # (in lazy_init.py) will handle moving this to the specific GPU/TPU 
+        # shard when it creates the Keras Variable inside the device scope.
+        return np.zeros(new_shape_tuple, dtype=tensor.dtype)
 
     # 3. Standard logic for Real tensors (if you still have them)
+    # This path is taken only if you are NOT using lazy_init_scope
     splits = ops.array_split(
         tensor, indices_or_sections=device_count, axis=split_dim
     )
