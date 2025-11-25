@@ -60,9 +60,9 @@ from keras.src.distribution.distribution_lib import DeviceMesh
 from keras.src.distribution.distribution_lib import AutoTPDistribution
 
 # --- Constants ---
-BATCH_SIZE = 32
-SEQUENCE_LENGTH = 128
-LEARNING_RATE = 1e-4
+BATCH_SIZE = 1
+SEQUENCE_LENGTH = 8
+LEARNING_RATE = 5e-4
 EPOCHS = 1
 STEPS_PER_EPOCH = 10
 VALIDATION_STEPS = 5
