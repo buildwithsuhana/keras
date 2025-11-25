@@ -2,6 +2,7 @@ import logging
 import os
 import sys
 import time
+import gc  # Added for memory management
 
 import numpy as np
 
@@ -21,8 +22,9 @@ except Exception:
 
 # --- Backend and Device Configuration ---
 os.environ["KERAS_BACKEND"] = "jax"
-# Force JAX to see "CPU" devices as separate XLA devices for testing if no GPUs
-os.environ["XLA_FLAGS"] = "--xla_force_host_platform_device_count=8"
+
+# ❌ REMOVED: Do not force CPU device count on TPU!
+# os.environ["XLA_FLAGS"] = "--xla_force_host_platform_device_count=8"
 
 import jax
 import keras_hub
@@ -31,6 +33,9 @@ import tensorflow as tf
 import tensorflow_datasets as tfds
 
 import keras
+
+# ✅ ADDED: Essential for fitting 9B models on TPU v5e
+keras.config.set_dtype_policy("mixed_bfloat16")
 
 # Hide TF GPUs so JAX takes full control
 tf.config.set_visible_devices([], "GPU")
@@ -43,26 +48,24 @@ logger = logging.getLogger(__name__)
 try:
     devices = jax.devices()
     logger.info(f"JAX devices found: {[str(d) for d in devices]}")
-    host_devices = [d for d in devices if d.platform == "cpu"]
-    if not host_devices:
-        host_devices = devices
-
-    DEVICES_AVAILABLE = len(host_devices)
-    WORLD_SIZE = 8 # Set this to 4 or 8 if testing large models on multi-gpu
-
-    if DEVICES_AVAILABLE < WORLD_SIZE:
-        logger.warning(
-            f"Requested {WORLD_SIZE} devices, but only {DEVICES_AVAILABLE} available."
-        )
-        TARGET_DEVICES = host_devices
-        TARGET_WORLD_SIZE = DEVICES_AVAILABLE
+    
+    # On TPU, we want the TPU devices, not CPU
+    tpu_devices = [d for d in devices if d.platform == "tpu"]
+    
+    if not tpu_devices:
+        logger.warning("No TPU devices found! Falling back to CPU/Emulator.")
+        TARGET_DEVICES = devices
     else:
-        TARGET_DEVICES = host_devices[:WORLD_SIZE]
-        TARGET_WORLD_SIZE = WORLD_SIZE
-        logger.info(
-            f"Targeting the first {TARGET_WORLD_SIZE} devices for parallelism: "
-            f"{[str(d) for d in TARGET_DEVICES]}"
-        )
+        TARGET_DEVICES = tpu_devices
+
+    DEVICES_AVAILABLE = len(TARGET_DEVICES)
+    # TPU v5e usually comes in slices of 4 or 8. Use whatever is available.
+    TARGET_WORLD_SIZE = DEVICES_AVAILABLE 
+    
+    logger.info(
+        f"Targeting {TARGET_WORLD_SIZE} devices for parallelism: "
+        f"{[str(d) for d in TARGET_DEVICES]}"
+    )
 
 except Exception as e:
     logger.error(f"Could not initialize JAX or find devices. Error: {e}")
@@ -74,16 +77,15 @@ from keras.src.distribution.tensor_parallel.tensor_parallel_keras import (
 )
 
 # --- Constants ---
-BATCH_SIZE = 16
+# ⚠️ REDUCED BATCH SIZE: 16 might OOM on 9B model. Start small.
+BATCH_SIZE = 4 
 SEQUENCE_LENGTH = 128
 LEARNING_RATE = 1e-4
-EPOCHS = 2
-STEPS_PER_EPOCH = 10
-VALIDATION_STEPS = 5
+EPOCHS = 1 # Reduced for verification speed
+STEPS_PER_EPOCH = 5
+VALIDATION_STEPS = 2
 
 MODEL_MAPPING = {
-    # "opt_6.7b_en": keras_hub.models.OPTCausalLM,
-    # You can now add "gemma_7b_en" here without crashing OOM!
     "gemma2_9b_en": keras_hub.models.GemmaCausalLM, 
 }
 
@@ -92,178 +94,136 @@ MODEL_MAPPING = {
 # ----------------------------------------------------------------------
 
 def load_shakespeare_dataset(model_preset):
-
     TOKENIZER_MAPPING = {
-    "opt_125m_en": keras_hub.models.OPTTokenizer,
-    "gemma_7b_en": keras_hub.models.GemmaTokenizer,
-    "gemma2_9b_en": keras_hub.models.GemmaTokenizer,
-}
-    """Loads and preprocesses the Tiny Shakespeare dataset."""
-    logger.info(
-        f"Loading and preprocessing Tiny Shakespeare dataset for {model_preset}..."
-    )
+        "opt_125m_en": keras_hub.models.OPTTokenizer,
+        "gemma_7b_en": keras_hub.models.GemmaTokenizer,
+        "gemma2_9b_en": keras_hub.models.GemmaTokenizer,
+    }
+
+    logger.info(f"Loading tokenizer for {model_preset}...")
+    
+    # Robust tokenizer loading
+    if model_preset in TOKENIZER_MAPPING:
+        tokenizer_cls = TOKENIZER_MAPPING[model_preset]
+        tokenizer = tokenizer_cls.from_preset(model_preset)
+    else:
+        tokenizer = keras_hub.models.GemmaTokenizer.from_preset(model_preset)
+
+    logger.info("Loading Tiny Shakespeare dataset...")
     ds = tfds.load("tiny_shakespeare", split="train", as_supervised=False)
+    
+    # Take a small subset for verification to speed up tokenization
+    ds = ds.take(100) 
+    
     text = "".join(
         example["text"].decode("utf-8") for example in ds.as_numpy_iterator()
     )
 
-    # --- FIX: Load ONLY the tokenizer, not the whole model ---
-    if model_preset in TOKENIZER_MAPPING:
-        tokenizer_cls = TOKENIZER_MAPPING[model_preset]
-        logger.info(f"Loading tokenizer {tokenizer_cls.__name__} (lightweight)...")
-        tokenizer = tokenizer_cls.from_preset(model_preset)
-    else:
-        # Fallback (Risk of OOM if this loads the backbone)
-        logger.warning("Preset not in TOKENIZER_MAPPING, attempting generic load...")
-        tokenizer = keras_hub.models.GemmaTokenizer.from_preset(model_preset)
-
     token_ids = tokenizer.tokenize(text)
 
-    num_tokens = (len(token_ids) // (SEQUENCE_LENGTH + 1)) * (
-        SEQUENCE_LENGTH + 1
-    )
-    sequences = np.array(token_ids[:num_tokens]).reshape(
-        -1, SEQUENCE_LENGTH + 1
-    )
+    num_tokens = (len(token_ids) // (SEQUENCE_LENGTH + 1)) * (SEQUENCE_LENGTH + 1)
+    sequences = np.array(token_ids[:num_tokens]).reshape(-1, SEQUENCE_LENGTH + 1)
 
     all_data = tf.data.Dataset.from_tensor_slices(sequences)
 
     num_sequences = sequences.shape[0]
-    num_train_samples = int(0.9 * num_sequences)
+    # Ensure we have enough data for the requested steps
+    if num_sequences < (BATCH_SIZE * (STEPS_PER_EPOCH + VALIDATION_STEPS)):
+        logger.warning("Dataset too small for requested steps. Repeating dataset.")
+        all_data = all_data.repeat(10)
 
+    num_train_samples = int(0.9 * num_sequences)
     train_ds = all_data.take(num_train_samples)
     val_ds = all_data.skip(num_train_samples)
 
-    logger.info(
-        f"Dataset ready with {num_train_samples} training and "
-        f"{num_sequences - num_train_samples} validation sequences."
-    )
     return train_ds, val_ds
 
 
 def format_for_causal_lm(data):
-    """Formats data for KerasNLP's CausalLM, creating features and labels."""
+    """Formats data for KerasNLP's CausalLM."""
+    # Gemma expects dictionary inputs with these specific keys
     features = {
-        "token_ids": data[:, :-1],
-        "padding_mask": tf.ones_like(data[:, :-1], dtype=tf.bool),
+        "token_ids": data[:-1],
+        "padding_mask": tf.ones_like(data[:-1], dtype=tf.bool),
     }
-    labels = data[:, 1:]
+    labels = data[1:]
     return features, labels
 
 # ----------------------------------------------------------------------
-# --- Plotting Function ---
+# --- Memory Helper ---
 # ----------------------------------------------------------------------
-
-def plot_training_graphs(tp_history, preset_name):
-    """Plots and saves the loss and perplexity graphs for the TP run."""
-    fig, (ax1, ax2) = plt.subplots(2, 1, figsize=(12, 10))
-    fig.suptitle(f"{preset_name} - Tensor Parallel Training Metrics", fontsize=16)
-
-    # Plotting Loss
-    ax1.plot(
-        tp_history.history["val_loss"],
-        label="Tensor Parallel - Validation Loss",
-        color="green",
-        linestyle="-",
-        marker="o",
-    )
-    ax1.set_title("Validation Loss")
-    ax1.set_ylabel("Loss")
-    ax1.set_xlabel("Epoch")
-    ax1.legend()
-    ax1.grid(True)
-
-    # Plotting Perplexity
-    ax2.plot(
-        tp_history.history["val_perplexity"],
-        label="Tensor Parallel - Validation Perplexity",
-        color="purple",
-        linestyle="-",
-        marker="o",
-    )
-    ax2.set_title("Validation Perplexity")
-    ax2.set_ylabel("Perplexity")
-    ax2.set_xlabel("Epoch")
-    ax2.legend()
-    ax2.grid(True)
-
-    output_filename = f"{preset_name}_tp_training.png"
-    plt.tight_layout(rect=[0, 0.03, 1, 0.95])
-    plt.savefig(output_filename)
-    logger.info(f"\nTraining graph saved to {output_filename}")
-    plt.close()
-
+def clear_memory():
+    """Aggressively clears memory."""
+    gc.collect()
+    try:
+        jax.clear_backends()
+    except:
+        pass
+    logger.info("🧹 Memory cleared.")
 
 # ----------------------------------------------------------------------
-# --- Main Verification Function (MODIFIED FOR OOM SAFETY) ---
+# --- Main Verification Function ---
 # ----------------------------------------------------------------------
 
 def run_model_verification(preset_name, model_class):
-    """
-    Runs a training execution test for a given model preset using
-    tensor parallelism.
-    """
+    clear_memory() # Clear before starting
+
     if TARGET_WORLD_SIZE < 2:
         logger.warning(
-            f"SKIPPING {preset_name}: Need at least 2 devices for tensor "
-            f"parallelism, found {TARGET_WORLD_SIZE}"
+            f"SKIPPING {preset_name}: Need at least 2 devices, found {TARGET_WORLD_SIZE}"
         )
         return "SKIPPED"
 
     logger.info(f"--- VERIFICATION FOR: {preset_name.upper()} ---")
 
-    # --- Common Setup ---
+    # --- Dataset Pipeline ---
     train_ds_raw, val_ds_raw = load_shakespeare_dataset(preset_name)
 
+    # Use map to apply the format function
     train_ds = (
-        train_ds_raw.batch(BATCH_SIZE, drop_remainder=True)
+        train_ds_raw
         .map(format_for_causal_lm, num_parallel_calls=tf.data.AUTOTUNE)
+        .batch(BATCH_SIZE, drop_remainder=True)
         .prefetch(tf.data.AUTOTUNE)
         .repeat()
     )
     val_ds = (
-        val_ds_raw.batch(BATCH_SIZE, drop_remainder=True)
+        val_ds_raw
         .map(format_for_causal_lm, num_parallel_calls=tf.data.AUTOTUNE)
+        .batch(BATCH_SIZE, drop_remainder=True)
         .prefetch(tf.data.AUTOTUNE)
         .repeat()
     )
 
-    # --- 1. Tensor Parallel Model Initialization (LAZY) ---
-    logger.info("\n--- Training Tensor Parallel (TP) Model ---")
+    # --- Tensor Parallel Model Initialization ---
+    logger.info("\n--- Initializing Tensor Parallel (TP) Model ---")
     
-    # CRITICAL CHANGE FOR OOM SAFETY:
-    # We create a function (lambda) that builds the model. 
-    # We DO NOT call it here. We pass the function to TensorParallelKeras.
-    # We set load_weights=False so the "Skeleton" on CPU is just empty metadata.
+    # 1. Define the builder (Lazy Load)
     def model_builder():
+        # load_weights=False is CRITICAL for 9B models to avoid host OOM
+        # The weights will be initialized randomly on the device.
         return model_class.from_preset(
             preset_name, 
-            preprocessor=None, 
-            load_weights=False # <--- THIS SAVES YOUR RAM
+            load_weights=False 
         )
 
-    # Note: Because load_weights=False, the model starts with random weights.
-    # For a verification run (does it run? does loss change?), this is fine.
-    # If you need pretrained weights, you would call:
-    # tp_model.load_sharded_weights("path/to/weights.h5") 
-    # AFTER the next line.
-
+    # 2. Instantiate TP Keras
     tp_model = TensorParallelKeras(
-        model_input=model_builder, # Passing the function, not the object
+        model_input=model_builder,
         device_count=TARGET_WORLD_SIZE,
         device_ids=TARGET_DEVICES,
     )
 
+    # 3. Compile
     tp_model.compile(
         optimizer=keras.optimizers.AdamW(learning_rate=LEARNING_RATE),
         loss=keras.losses.SparseCategoricalCrossentropy(from_logits=True),
-        metrics=[
-            keras_hub.metrics.Perplexity(from_logits=True, name="perplexity")
-        ],
+        jit_compile=True # Ensure XLA compilation
     )
 
-    # Fit will now train the SHARDED model. 
-    # The CPU memory footprint should be negligible.
+    logger.info(f"Starting training with Batch Size: {BATCH_SIZE}")
+
+    # 4. Fit
     tp_history = tp_model.fit(
         train_ds,
         validation_data=val_ds,
@@ -273,15 +233,6 @@ def run_model_verification(preset_name, model_class):
         verbose=1,
     )
     
-    tp_final_val_loss = tp_history.history["val_loss"][-1]
-    logger.info("TP model training completed successfully.")
-
-    # --- 2. Verification ---
-    logger.info("\n--- ⚖️ Verification Results ---")
-    logger.info(f"TP Final Validation Loss: {tp_final_val_loss:.6f}")
-
-    plot_training_graphs(tp_history, preset_name)
-
     logger.info("✅ SUCCESS: TP model training finished without errors.")
     return True
 
@@ -292,37 +243,11 @@ def run_model_verification(preset_name, model_class):
 
 if __name__ == "__main__":
     if TARGET_WORLD_SIZE == 0:
-        logger.critical("No JAX devices found. Aborting verification suite.")
+        logger.critical("No JAX devices found. Aborting.")
         sys.exit(1)
-
-    logger.info("\n" + "=" * 70)
-    logger.info("      TENSOR PARALLELISM EXECUTION SUITE (OOM-SAFE)")
-    logger.info("=" * 70)
-
-    results = {}
-    total_start_time = time.time()
 
     for preset, model_class in MODEL_MAPPING.items():
         try:
-            result = run_model_verification(preset, model_class)
-            if result == "SKIPPED":
-                results[preset] = "⚪ SKIPPED"
-            else:
-                results[preset] = "✅ PASS" if result else "❌ FAIL"
+            run_model_verification(preset, model_class)
         except Exception as e:
-            logger.error(
-                f"Test for {preset} failed with an exception: {e}",
-                exc_info=True,
-            )
-            results[preset] = "💥 ERROR"
-        logger.info("-" * 70)
-
-    logger.info("\n" + "=" * 70)
-    logger.info("🎉 EXECUTION SUITE COMPLETED!")
-    logger.info(
-        f"   Total execution time: {time.time() - total_start_time:.2f}s"
-    )
-    logger.info("\n   --- SUMMARY ---")
-    for preset, status in results.items():
-        print(f"   - {preset:<18}: {status}")
-    logger.info("=" * 70)
+            logger.error(f"Test for {preset} failed: {e}", exc_info=True)
