@@ -4,8 +4,16 @@ import sys
 import time
 
 import numpy as np
-os.environ["KERAS_BACKEND_CONFIG_SKIP_SPLASH_ATTENTION"] = "1" 
+# ---------------------------------------------------------------------------
+# MUST BE SET BEFORE IMPORTING TENSORFLOW, JAX, OR KERAS
+# ---------------------------------------------------------------------------
+# 1. Disable Splash Attention (Fixes ConcretizationTypeError)
+os.environ["KERAS_BACKEND_CONFIG_SKIP_SPLASH_ATTENTION"] = "1"
 os.environ["GEMMA_DISABLE_PALLAS"] = "true"
+
+# 2. Minimize Memory Fragmentation (Helps with the 81MB OOM error)
+os.environ["XLA_PYTHON_CLIENT_MEM_FRACTION"] = "0.90" # Leave 10% for runtime overhead
+# ---------------------------------------------------------------------------
 # --- Project Root Setup ---
 try:
     _script_dir = os.path.dirname(os.path.abspath(__file__))

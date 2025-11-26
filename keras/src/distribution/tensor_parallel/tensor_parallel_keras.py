@@ -541,25 +541,22 @@ class TensorParallelKeras(Model):
 
     def call(self, inputs, training=None, mask=None, **kwargs):
         """
-        Forward pass with input structure recovery.
-        JAX/TPU often flattens dictionary inputs into a list of tensors.
-        We must repack them for the underlying Keras model.
+        Forward pass for the tensor-parallel model.
+        CRITICAL FIX: Reconstructs dictionary inputs from JAX flattened lists.
         """
-        # Detect if inputs were flattened by JAX distribution logic
+        # 1. Detect if inputs were flattened by JAX (list) but model expects dict
         if isinstance(inputs, (list, tuple)) and not isinstance(inputs, dict):
-            # Heuristic for Gemma: [token_ids, padding_mask]
-            # If your dataset yields more items, adjust indices accordingly.
+            # Heuristic for Gemma/Transformers: usually [token_ids, padding_mask]
+            # We assume inputs[0] is tokens, inputs[1] is mask
             if len(inputs) >= 2:
-                reconstructed_inputs = {
+                inputs = {
                     "token_ids": inputs[0],
                     "padding_mask": inputs[1]
                 }
-                inputs = reconstructed_inputs
             elif len(inputs) == 1:
-                 # Case where only token_ids are passed
-                 inputs = {"token_ids": inputs[0]}
-        
-        # Pass the mask explicitly if provided, though usually it's inside 'inputs' for LLMs
+                inputs = {"token_ids": inputs[0]}
+                
+        # 2. Forward to the assembled functional model
         return self.assembled_model(inputs, training=training, mask=mask, **kwargs)
 
     def compile(self, optimizer=None, loss=None, metrics=None, **kwargs):
