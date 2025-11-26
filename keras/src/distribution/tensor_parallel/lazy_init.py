@@ -37,7 +37,7 @@ class GhostVariable:
     def numpy(self):
         # Return a tiny placeholder if accessed.
         # This prevents OOM if Keras tries to inspect the value.
-        print(f"⚠️  Warning: Accessing numpy value of GhostVariable {self.name} (Returning 1-element zero)")
+        # We use np.zeros (CPU) to ensure we don't trigger backend allocations
         return np.zeros((1,), dtype=self._dtype)
 
     def __repr__(self):
@@ -54,7 +54,8 @@ class GhostVariable:
     def value(self):
         return self
 
-    def __array__(self):
+    # --- FIX: Accept *args and **kwargs (specifically dtype) ---
+    def __array__(self, *args, **kwargs):
         return self.numpy()
 
 @contextlib.contextmanager
