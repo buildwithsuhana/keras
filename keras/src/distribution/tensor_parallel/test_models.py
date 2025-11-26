@@ -74,8 +74,8 @@ from keras.src.distribution.tensor_parallel.tensor_parallel_keras import (
 )
 
 # --- Constants ---
-BATCH_SIZE = 16
-SEQUENCE_LENGTH = 128
+BATCH_SIZE = 1
+SEQUENCE_LENGTH = 32
 LEARNING_RATE = 1e-4
 EPOCHS = 2
 STEPS_PER_EPOCH = 10
@@ -84,7 +84,7 @@ VALIDATION_STEPS = 5
 MODEL_MAPPING = {
     # "opt_6.7b_en": keras_hub.models.OPTCausalLM,
     # You can now add "gemma_7b_en" here without crashing OOM!
-    "gemma2_9b_en": keras_hub.models.GemmaCausalLM, 
+    "gemma2_7b_en": keras_hub.models.GemmaCausalLM, 
 }
 
 # ----------------------------------------------------------------------
