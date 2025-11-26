@@ -159,6 +159,18 @@ class TensorParallelKeras(Model):
                 )
             self.model_shards.append(shard)
             self.modified_parameters_names.update(modified_parameters_names)
+
+            # --- PATCH: FORCE DISABLE CACHE ON SHARD ---
+            # The shard is a new instance and may have reverted use_cache=True.
+            # We must recursively disable it again to prevent OOM/Crash.
+            def _recursive_disable_cache(layer):
+                if hasattr(layer, 'use_cache'):
+                    layer.use_cache = False
+                if hasattr(layer, 'layers'):
+                    for child in layer.layers:
+                        _recursive_disable_cache(child)
+            _recursive_disable_cache(shard)
+            # -------------------------------------------
             
             # --- OOM FIX 2: Aggressive GC ---
             # Force garbage collection after each shard creation to clean up 
@@ -539,22 +551,12 @@ class TensorParallelKeras(Model):
         else:
             return "cpu"
 
+    
+    
+    
     def call(self, inputs, training=None, mask=None, **kwargs):
-        """
-        Forward pass for the tensor-parallel model.
-        CRITICAL FIX: Reconstructs dictionary inputs from JAX flattened lists.
-        """
-        def debug_printer(x):
-            # We use a formatted string to identify the object type
-            jax.debug.print("DEBUG: Input Type: {x} | Shape: {s}", x=type(x), s=x.shape)
-            return x
-
-        # Use tree_map to print details for every item in the input structure
-        jax.tree_util.tree_map(debug_printer, inputs)
-        # 1. Detect if inputs were flattened by JAX (list) but model expects dict
+        # 1. Fix Input Flattening (List -> Dict)
         if isinstance(inputs, (list, tuple)) and not isinstance(inputs, dict):
-            # Heuristic for Gemma/Transformers: usually [token_ids, padding_mask]
-            # We assume inputs[0] is tokens, inputs[1] is mask
             if len(inputs) >= 2:
                 inputs = {
                     "token_ids": inputs[0],
@@ -562,9 +564,18 @@ class TensorParallelKeras(Model):
                 }
             elif len(inputs) == 1:
                 inputs = {"token_ids": inputs[0]}
-                
-        # 2. Forward to the assembled functional model
-        return self.assembled_model(inputs, training=training, mask=mask, **kwargs)
+
+        # 2. Force Training Mode (Bypasses inference-only logic)
+        training = True
+
+        # 3. CRITICAL FIX: Sanitize Kwargs
+        # We explicitly remove 'cache' and 'cache_update_index'.
+        # If these are passed as None, Gemma's internal layers crash.
+        safe_kwargs = kwargs.copy()
+        safe_kwargs.pop('cache', None)
+        safe_kwargs.pop('cache_update_index', None)
+
+        return self.assembled_model(inputs, training=training, mask=mask, **safe_kwargs)
 
     def compile(self, optimizer=None, loss=None, metrics=None, **kwargs):
         """
