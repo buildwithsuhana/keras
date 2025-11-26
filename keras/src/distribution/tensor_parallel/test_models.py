@@ -4,7 +4,8 @@ import sys
 import time
 
 import numpy as np
-
+os.environ["KERAS_BACKEND_CONFIG_SKIP_SPLASH_ATTENTION"] = "1" 
+os.environ["GEMMA_DISABLE_PALLAS"] = "true"
 # --- Project Root Setup ---
 try:
     _script_dir = os.path.dirname(os.path.abspath(__file__))
@@ -48,7 +49,7 @@ try:
         host_devices = devices
 
     DEVICES_AVAILABLE = len(host_devices)
-    WORLD_SIZE = 2 # Set this to 4 or 8 if testing large models on multi-gpu
+    WORLD_SIZE = 4 # Set this to 4 or 8 if testing large models on multi-gpu
 
     if DEVICES_AVAILABLE < WORLD_SIZE:
         logger.warning(

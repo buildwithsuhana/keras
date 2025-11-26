@@ -434,27 +434,40 @@ class TensorParallelKeras(Model):
 
         partial_outputs = []
         for shard in self.model_shards:
-            # Prefer the shard's declared input names, fall back to its input tensors.
             shard_inputs = {}
-            try:
-                input_names = getattr(shard, "input_names", None)
-                if input_names:
-                    for name in input_names:
-                        clean_name = name.split(":")[0]
-                        if clean_name in input_layers:
-                            shard_inputs[clean_name] = input_layers[clean_name]
-                else:
-                    # Fall back to inspecting shard.inputs
+            
+            # Logic to find which inputs this specific shard needs
+            # We iterate over the GLOBAL input layers we defined earlier
+            for input_name, input_layer in input_layers.items():
+                # We check if this shard has an input with this name
+                # We check both the input tensors and the input_names attribute
+                shard_input_names = getattr(shard, "input_names", [])
+                
+                # Check if the shard explicitly asks for this input name
+                needs_input = False
+                if shard_input_names:
+                    for s_name in shard_input_names:
+                        if s_name.startswith(input_name):
+                            needs_input = True
+                            break
+                
+                # Fallback: Check standard Keras inputs
+                if not needs_input:
                     for inp in getattr(shard, "inputs", []):
-                        clean_name = inp.name.split(":")[0]
-                        if clean_name in input_layers:
-                            shard_inputs[clean_name] = input_layers[clean_name]
+                        if inp.name.startswith(input_name):
+                            needs_input = True
+                            break
 
-                if not shard_inputs:
-                    # Last resort: forward the full mapping (may be positional in some cases)
-                    shard_inputs = dict(input_layers)
+                if needs_input:
+                    shard_inputs[input_name] = input_layer
 
-                # Call the shard
+            # SAFETY FALLBACK: If we couldn't map specific inputs, 
+            # give the shard everything. This fixes cases where shards 
+            # implicitly expect all inputs (common in HuggingFace/KerasHub models).
+            if not shard_inputs:
+                shard_inputs = dict(input_layers)
+
+            try:
                 partial_outputs.append(shard(shard_inputs))
             except Exception as e:
                 logger.exception(
@@ -525,11 +538,28 @@ class TensorParallelKeras(Model):
         else:
             return "cpu"
 
-    def call(self, inputs, training=None, **kwargs):
+    def call(self, inputs, training=None, mask=None, **kwargs):
         """
-        Forward pass for the tensor-parallel model.
+        Forward pass with input structure recovery.
+        JAX/TPU often flattens dictionary inputs into a list of tensors.
+        We must repack them for the underlying Keras model.
         """
-        return self.assembled_model(inputs, training=training, **kwargs)
+        # Detect if inputs were flattened by JAX distribution logic
+        if isinstance(inputs, (list, tuple)) and not isinstance(inputs, dict):
+            # Heuristic for Gemma: [token_ids, padding_mask]
+            # If your dataset yields more items, adjust indices accordingly.
+            if len(inputs) >= 2:
+                reconstructed_inputs = {
+                    "token_ids": inputs[0],
+                    "padding_mask": inputs[1]
+                }
+                inputs = reconstructed_inputs
+            elif len(inputs) == 1:
+                 # Case where only token_ids are passed
+                 inputs = {"token_ids": inputs[0]}
+        
+        # Pass the mask explicitly if provided, though usually it's inside 'inputs' for LLMs
+        return self.assembled_model(inputs, training=training, mask=mask, **kwargs)
 
     def compile(self, optimizer=None, loss=None, metrics=None, **kwargs):
         """
