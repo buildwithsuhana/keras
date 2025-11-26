@@ -417,16 +417,55 @@ def _define_parameter_sharded_model():
                                 layer_inputs.append(tensor_cache[clean_name])
                             elif name and name in tensor_cache:
                                 layer_inputs.append(tensor_cache[name])
-                
-                # --- CRITICAL FIX: Handle Dictionary Inputs for Backbones ---
-                if (
-                    (isinstance(layer, Functional) or isinstance(layer, Model))
-                    and hasattr(layer, "input_names")
-                ):
-                    if len(layer_inputs) == len(layer.input_names) and len(layer_inputs) > 0:
-                        layer_inputs = dict(zip(layer.input_names, layer_inputs))
-                
-                elif len(layer_inputs) == 1:
+
+                # --- Robust handling for Functional/Model inputs ---
+                # Some backbone models (Gemma/Transformers) expect dictionary
+                # inputs keyed by the input tensor names (e.g. 'token_ids').
+                # Rather than rely on `input_names` length matches, prefer
+                # reconstructing a dict using the layer.symbolic `inputs`
+                # objects which give precise names we cached earlier.
+                if isinstance(layer, (Functional, Model)) and getattr(layer, "inputs", None):
+                    mapped_inputs = {}
+                    for sym in layer.inputs:
+                        try:
+                            sym_id = id(sym)
+                            name = getattr(sym, "name", None)
+                            clean_name = name.split(":")[0] if name else None
+                        except Exception:
+                            sym_id = None
+                            name = None
+                            clean_name = None
+
+                        val = None
+                        if sym_id is not None and sym_id in tensor_cache:
+                            val = tensor_cache[sym_id]
+                        elif clean_name and clean_name in tensor_cache:
+                            val = tensor_cache[clean_name]
+                        elif name and name in tensor_cache:
+                            val = tensor_cache[name]
+
+                        if val is not None:
+                            # Use the cleaned name as the key when possible
+                            key = clean_name or name
+                            mapped_inputs[key] = val
+
+                    # If we recovered at least one named input, prefer the dict form.
+                    # If we recovered all expected inputs, definitely use it.
+                    if mapped_inputs:
+                        # If we got all expected inputs, use mapped_inputs directly.
+                        if len(mapped_inputs) == len(layer.inputs):
+                            layer_inputs = mapped_inputs
+                        else:
+                            # Partial mapping: fall back to previous positional list
+                            # unless the layer clearly expects named kwargs (input_names).
+                            if getattr(layer, "input_names", None):
+                                # try to align by input_names where available
+                                cleaned_names = [n.split(":")[0] for n in layer.input_names]
+                                if all(n in mapped_inputs for n in cleaned_names):
+                                    layer_inputs = {n: mapped_inputs[n] for n in cleaned_names}
+
+                # Preserve previous single-element behavior
+                if isinstance(layer_inputs, (list, tuple)) and len(layer_inputs) == 1:
                     layer_inputs = layer_inputs[0]
 
                 try:
