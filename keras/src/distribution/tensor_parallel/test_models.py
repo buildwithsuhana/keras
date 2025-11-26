@@ -84,7 +84,7 @@ VALIDATION_STEPS = 5
 MODEL_MAPPING = {
     # "opt_6.7b_en": keras_hub.models.OPTCausalLM,
     # You can now add "gemma_7b_en" here without crashing OOM!
-    "gemma2_9b_en": keras_hub.models.GemmaCausalLM, 
+    "gemma2_2b_en": keras_hub.models.GemmaCausalLM, 
 }
 
 # ----------------------------------------------------------------------
