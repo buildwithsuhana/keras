@@ -121,6 +121,15 @@ def get_default_config(module, device_ids):
     while stack:
         current_layer, prefix = stack.pop()
 
+        # --- FIX START: Guard clauses for Ellipsis/None/Invalid Objects ---
+        if current_layer is ... or current_layer is None:
+            continue
+        
+        # Skip objects that don't look like Keras layers (no 'name' attr)
+        if not hasattr(current_layer, 'name'):
+            continue
+        # --- FIX END ---
+
         if id(current_layer) in processed_layers:
             continue
         processed_layers.add(id(current_layer))

@@ -13,6 +13,13 @@ os.environ["GEMMA_DISABLE_PALLAS"] = "true"
 
 # 2. Minimize Memory Fragmentation (Helps with the 81MB OOM error)
 os.environ["XLA_PYTHON_CLIENT_MEM_FRACTION"] = "0.90" # Leave 10% for runtime overhead
+# --- DEBUG MODE: ON ---
+# Uncomment this line to force JAX to run line-by-line.
+# This will show you exactly which line causes the "ConcretizationTypeError".
+# WARNING: This will be slow and might OOM if the model is massive, 
+# but it is the best way to find logic bugs.
+
+# os.environ["JAX_DISABLE_JIT"] = "1"
 # ---------------------------------------------------------------------------
 # --- Project Root Setup ---
 try:
@@ -224,32 +231,40 @@ def run_model_verification(preset_name, model_class):
         .repeat()
     )
 
+    # --- Memory Logger Helper ---
+    def log_memory_status(step_name):
+        import gc
+        gc.collect()
+        keras.backend.clear_session()
+        try:
+            import psutil
+            vm_mem = psutil.virtual_memory()
+            logger.info(f"[{step_name}] Host RAM: {vm_mem.percent}% used")
+        except:
+            pass
+
     # --- 1. Tensor Parallel Model Initialization (LAZY) ---
     logger.info("\n--- Training Tensor Parallel (TP) Model ---")
     
-    # CRITICAL CHANGE FOR OOM SAFETY:
-    # We create a function (lambda) that builds the model. 
-    # We DO NOT call it here. We pass the function to TensorParallelKeras.
-    # We set load_weights=False so the "Skeleton" on CPU is just empty metadata.
     def model_builder():
         return model_class.from_preset(
             preset_name, 
             preprocessor=None, 
-            load_weights=False # <--- THIS SAVES YOUR RAM
+            load_weights=False
         )
 
-    # Note: Because load_weights=False, the model starts with random weights.
-    # For a verification run (does it run? does loss change?), this is fine.
-    # If you need pretrained weights, you would call:
-    # tp_model.load_sharded_weights("path/to/weights.h5") 
-    # AFTER the next line.
+    log_memory_status("Before Init")
 
+    # Correct Initialization
     tp_model = TensorParallelKeras(
-        model_input=model_builder, # Passing the function, not the object
+        model_input=model_builder,
         device_count=TARGET_WORLD_SIZE,
         device_ids=TARGET_DEVICES,
     )
 
+    log_memory_status("After Init")
+
+    # Correct Compilation
     tp_model.compile(
         optimizer=keras.optimizers.Adafactor(
             learning_rate=LEARNING_RATE,
@@ -261,8 +276,9 @@ def run_model_verification(preset_name, model_class):
         ],
     )
 
-    # Fit will now train the SHARDED model. 
-    # The CPU memory footprint should be negligible.
+    log_memory_status("After Compile")
+
+    # --- 2. Training ---
     tp_history = tp_model.fit(
         train_ds,
         validation_data=val_ds,
@@ -275,7 +291,7 @@ def run_model_verification(preset_name, model_class):
     tp_final_val_loss = tp_history.history["val_loss"][-1]
     logger.info("TP model training completed successfully.")
 
-    # --- 2. Verification ---
+    # --- 3. Verification ---
     logger.info("\n--- ⚖️ Verification Results ---")
     logger.info(f"TP Final Validation Loss: {tp_final_val_loss:.6f}")
 

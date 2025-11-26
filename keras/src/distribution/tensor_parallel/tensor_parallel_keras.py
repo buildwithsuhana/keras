@@ -544,6 +544,13 @@ class TensorParallelKeras(Model):
         Forward pass for the tensor-parallel model.
         CRITICAL FIX: Reconstructs dictionary inputs from JAX flattened lists.
         """
+        def debug_printer(x):
+            # We use a formatted string to identify the object type
+            jax.debug.print("DEBUG: Input Type: {x} | Shape: {s}", x=type(x), s=x.shape)
+            return x
+
+        # Use tree_map to print details for every item in the input structure
+        jax.tree_util.tree_map(debug_printer, inputs)
         # 1. Detect if inputs were flattened by JAX (list) but model expects dict
         if isinstance(inputs, (list, tuple)) and not isinstance(inputs, dict):
             # Heuristic for Gemma/Transformers: usually [token_ids, padding_mask]
