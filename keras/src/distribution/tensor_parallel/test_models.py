@@ -68,7 +68,7 @@ STEPS_PER_EPOCH = 10
 VALIDATION_STEPS = 5
 
 MODEL_MAPPING = {
-    "gemma2_9b_en": keras_hub.models.GemmaCausalLM, 
+    "gemma_7b_en": keras_hub.models.GemmaCausalLM, 
 }
 
 # ----------------------------------------------------------------------
