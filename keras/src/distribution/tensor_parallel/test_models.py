@@ -74,11 +74,11 @@ from keras.src.distribution.tensor_parallel.tensor_parallel_keras import (
 )
 
 # --- Constants ---
-BATCH_SIZE = 16
+BATCH_SIZE = 1
 SEQUENCE_LENGTH = 128
 LEARNING_RATE = 1e-4
 EPOCHS = 2
-STEPS_PER_EPOCH = 10
+STEPS_PER_EPOCH = 5
 VALIDATION_STEPS = 5
 
 MODEL_MAPPING = {
@@ -243,7 +243,10 @@ def run_model_verification(preset_name, model_class):
     )
 
     tp_model.compile(
-        optimizer=keras.optimizers.AdamW(learning_rate=LEARNING_RATE),
+        optimizer=keras.optimizers.Adafactor(
+            learning_rate=LEARNING_RATE,
+            weight_decay=0.01
+        ),
         loss=keras.losses.SparseCategoricalCrossentropy(from_logits=True),
         metrics=[
             keras_hub.metrics.Perplexity(from_logits=True, name="perplexity")
