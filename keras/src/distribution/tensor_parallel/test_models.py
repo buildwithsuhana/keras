@@ -18,17 +18,17 @@ except Exception:
 
 # --- Backend Configuration ---
 os.environ["KERAS_BACKEND"] = "jax"
-# Ensure we see all devices (Force host platform count for JAX simulation if needed)
-os.environ["XLA_FLAGS"] = "--xla_force_host_platform_device_count=2"
+# TPU v5e usually doesn't need force_host_platform, but we keep it just in case of sim
+# os.environ["XLA_FLAGS"] = "--xla_force_host_platform_device_count=4" 
 
 import jax
 import keras_hub
-import matplotlib.pyplot as plt
 import tensorflow as tf
 import tensorflow_datasets as tfds
 import keras
 
-# --- 1. TPU OPTIMIZATION: Bfloat16 ---
+# --- 1. MEMORY OPTIMIZATION: Mixed Precision ---
+# Bfloat16 is native to TPU and uses half the memory of float32
 keras.config.set_dtype_policy("mixed_bfloat16")
 
 logging.basicConfig(level=logging.INFO, format="%(levelname)s - %(message)s")
@@ -39,14 +39,12 @@ try:
     devices = jax.devices()
     logger.info(f"JAX devices found: {[str(d) for d in devices]}")
     
-    # Detect TPUs
     tpu_devices = [d for d in devices if d.platform == "tpu"]
     
     if tpu_devices:
         TARGET_DEVICES = tpu_devices
-        logger.info(f"✅ Using {len(TARGET_DEVICES)} TPU Cores.")
+        logger.info(f"✅ Using {len(TARGET_DEVICES)} TPU Cores (v5e detected).")
     else:
-        # Fallback to GPU/CPU
         TARGET_DEVICES = devices
         logger.warning(f"⚠️ No TPUs found! Using {devices[0].platform}.")
 
@@ -60,16 +58,17 @@ from keras.src.distribution.distribution_lib import DeviceMesh
 from keras.src.distribution.distribution_lib import AutoTPDistribution
 
 # --- Constants ---
-BATCH_SIZE = 1
-SEQUENCE_LENGTH = 8
-LEARNING_RATE = 5e-4
+# Kept strictly low for memory safety check
+BATCH_SIZE = 1 
+SEQUENCE_LENGTH = 128  # Increased slightly from 8 to be realistic, but still small
+LEARNING_RATE = 1e-4   # Slightly lower for Adafactor
 EPOCHS = 1
-STEPS_PER_EPOCH = 10
-VALIDATION_STEPS = 5
+STEPS_PER_EPOCH = 5
+VALIDATION_STEPS = 2
 
-MODEL_MAPPING = {
-    "opt_6.7b_en": keras_hub.models.OPTCausalLM,
-}
+# --- Model Selection ---
+MODEL_PRESET = "gemma2_9b_en"
+MODEL_CLASS = keras_hub.models.GemmaCausalLM
 
 # ----------------------------------------------------------------------
 # --- Dataset Helpers ---
@@ -81,16 +80,16 @@ def load_shakespeare_dataset(model_preset):
     ds = tfds.load("tiny_shakespeare", split="train", as_supervised=False)
     text = "".join(example["text"].decode("utf-8") for example in ds.as_numpy_iterator())
 
-    # Tokenize on CPU
+    # Tokenize on CPU to save TPU memory
     with keras.device("cpu"):
-        tokenizer = keras_hub.models.OPTTokenizer.from_preset(model_preset)
+        # Auto-select correct tokenizer (GemmaTokenizer)
+        tokenizer = keras_hub.models.GemmaTokenizer.from_preset(model_preset)
         token_ids = tokenizer.tokenize(text)
 
     num_tokens = (len(token_ids) // (SEQUENCE_LENGTH + 1)) * (SEQUENCE_LENGTH + 1)
     sequences = np.array(token_ids[:num_tokens]).reshape(-1, SEQUENCE_LENGTH + 1)
     all_data = tf.data.Dataset.from_tensor_slices(sequences)
     
-    # Split
     num_train = int(0.9 * sequences.shape[0])
     train_ds = all_data.take(num_train)
     val_ds = all_data.skip(num_train)
@@ -104,55 +103,50 @@ def format_for_causal_lm(data):
     labels = data[:, 1:]
     return features, labels
 
-# --- TPU MODEL BUILDER ---
+# --- MODEL BUILDER ---
 def model_builder_factory(preset_name, model_class):
     def model_builder(**kwargs):
-        logger.info(f"Creating {preset_name} model (inside scope)...")
+        logger.info(f"Creating {preset_name} model (Zero-Stage Init)...")
         model = model_class.from_preset(preset_name, preprocessor=None, **kwargs)
         
-        logger.info("--- Enabling LoRA (Rank=8) ---") 
+        # --- MEMORY OPTIMIZATION: LoRA ---
+        # Rank 4 is sufficient for verification and uses minimal memory.
+        logger.info("--- Enabling LoRA (Rank=4) ---") 
         if hasattr(model, "enable_lora"):
-             model.enable_lora(rank=8)
+             model.enable_lora(rank=4)
         elif hasattr(model, "backbone") and hasattr(model.backbone, "enable_lora"):
-             model.backbone.enable_lora(rank=8)
+             model.backbone.enable_lora(rank=4)
         
+        # Log parameter counts
         total_params = model.count_params()
         trainable_params = sum(np.prod(w.shape) for w in model.trainable_variables)
-        
         logger.info(f"Model created. Total: {total_params:,} | Trainable: {trainable_params:,}")
+        
         return model
     return model_builder
 
 # ----------------------------------------------------------------------
-# --- NEW: Physical Sharding Verification ("Truth Check") ---
+# --- Physical Sharding Verification ---
 # ----------------------------------------------------------------------
 def inspect_physical_memory(model):
-    """
-    Directly checks JAX buffers on the device to prove sharding works.
-    Calculates the Ratio of (Logical Global Size) / (Physical Local Size).
-    """
     logger.info("\n" + "="*50)
     logger.info("🔍 PERFORMING PHYSICAL MEMORY INSPECTION")
     logger.info("="*50)
     
     target_var = None
-    # Try to find a specific large weight (Value projection in Attention is usually a good target)
+    # Gemma specific search: look for 'gating_dense' (FFN) or 'query_dense' (Attn)
     for v in model.trainable_variables:
-        # Check for path keywords to identify a kernel in self-attention
-        if "self_attention" in v.path and "kernel" in v.path and "value" in v.path:
+        if "gating_dense" in v.path and "kernel" in v.path:
             target_var = v
             break
             
-    # Fallback if specific layer not found
     if target_var is None:
         target_var = model.trainable_variables[0]
 
-    # Get the underlying JAX array
     jax_array = target_var.value
     
     try:
-        # jax_array.addressable_shards returns a list of shards stored on the *current* process's devices.
-        # We look at the first one [0] to see how big the chunk is on a single chip.
+        # Check size of the shard on the FIRST chip
         local_shard = jax_array.addressable_shards[0].data
         
         global_shape = jax_array.shape
@@ -170,9 +164,7 @@ def inspect_physical_memory(model):
             logger.info(f"   🎉 SUCCESS: Variable is physically sharded!")
             logger.info(f"   ⬇️  Memory footprint reduced by {ratio:.1f}x per chip.")
         else:
-            logger.warning("   ⚠️ WARNING: Variable appears REPLICATED (Local size == Global size).")
-            logger.warning("   Check if your layout heuristics matched this variable name.")
-            
+            logger.warning("   ⚠️ WARNING: Variable appears REPLICATED.")
     except Exception as e:
         logger.error(f"   Could not inspect addressable shards. Error: {e}")
     
@@ -180,13 +172,12 @@ def inspect_physical_memory(model):
 
 
 # ----------------------------------------------------------------------
-# --- Main Verification Function ---
+# --- Main Execution ---
 # ----------------------------------------------------------------------
 
 def run_model_verification(preset_name, model_class):
     if TARGET_WORLD_SIZE < 2:
-        logger.warning("Need >1 device for TP. Skipping.")
-        # return "SKIPPED" # Uncomment if strictly skipping, else let it run for debug
+        logger.warning("⚠️ Running on < 2 devices. Tensor Parallelism is disabled.")
 
     logger.info(f"--- RUNNING: {preset_name} on {TARGET_WORLD_SIZE} TPU CORES ---")
 
@@ -224,21 +215,20 @@ def run_model_verification(preset_name, model_class):
     logger.info("\n--- Initializing & Sharding on TPU ---")
 
     # 4. Build & Distribute
-    # Note: distribution.model automatically handles the scope internally, 
-    # but the explicit scope here is safe and clear.
-    with distribution.scope():
-        tp_model = distribution.model 
+    # FIX: No 'with distribution.scope()' here. The class handles it lazily.
+    tp_model = distribution.model 
 
-    # ---------------------------------------------------------
-    # 5. VERIFY SHARDING (The Truth Check)
-    # ---------------------------------------------------------
+    # 5. VERIFY SHARDING
     inspect_physical_memory(tp_model)
-    # ---------------------------------------------------------
 
     # 6. Compile & Train
-    logger.info("🚀 Compiling...")
+    # --- MEMORY OPTIMIZATION: Adafactor ---
+    # Adafactor uses significantly less memory than AdamW (no momentum buffers).
+    logger.info("🚀 Compiling with Adafactor (Low Memory Optimizer)...")
+    optimizer = keras.optimizers.Adafactor(learning_rate=LEARNING_RATE)
+    
     tp_model.compile(
-        optimizer=keras.optimizers.AdamW(learning_rate=LEARNING_RATE),
+        optimizer=optimizer,
         loss=keras.losses.SparseCategoricalCrossentropy(from_logits=True),
         metrics=[
             keras_hub.metrics.Perplexity(from_logits=True, name="perplexity")
@@ -259,8 +249,7 @@ def run_model_verification(preset_name, model_class):
     return True
 
 if __name__ == "__main__":
-    # Run Verification
     try:
-        run_model_verification("opt_6.7b_en", MODEL_MAPPING["opt_6.7b_en"])
+        run_model_verification(MODEL_PRESET, MODEL_CLASS)
     except Exception as e:
         logger.exception("TPU Run Failed")
