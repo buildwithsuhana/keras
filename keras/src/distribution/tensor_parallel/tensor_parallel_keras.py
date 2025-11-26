@@ -20,9 +20,12 @@ from keras.src.distribution.tensor_parallel.parameter_sharding import (
 from keras.src.distribution.tensor_parallel.coordinated_optimizer import (
     TensorParallelOptimizer,
 )
-
+from keras.src import backend
 from keras.src.distribution import list_devices
-
+# Add/Confirm these at the top
+from keras.src import layers
+from keras.src import models
+from keras.src import ops
 logger = logging.getLogger(__file__)
 
 from keras.src.models import Model
@@ -58,7 +61,7 @@ class TensorParallelKeras(Model):
         device_ids = list(self.check_device_ids(device_ids))
 
         if accel_devices:
-            backend_name = keras.backend.backend()
+            backend_name = backend.backend()
             print(
                 f"🔍 Discovered {len(accel_devices)} devices for backend '{backend_name}'"
             )
@@ -128,7 +131,7 @@ class TensorParallelKeras(Model):
         self.modified_parameters_names = set()
 
         logger.info(
-            f"✅ Using '{keras.backend.backend()}' backend for parameter sharding."
+            f"✅ Using '{backend.backend()}' backend for parameter sharding."
         )
 
         for rank, device_id in enumerate(self.devices):
@@ -161,7 +164,7 @@ class TensorParallelKeras(Model):
             pass
 
         logger.info(
-            f"Using '{keras.backend.backend()}' backend logic for distribution."
+            f"Using '{backend.backend()}' backend logic for distribution."
         )
 
         self.built = True
@@ -281,40 +284,67 @@ class TensorParallelKeras(Model):
         if not self.distributed:
             return self._original_model
 
-        input_layers = {
-            inp.name.split(":")[0]: keras.Input(
+        # FIX: Use InputLayer names (when available) to define keys.
+        # This avoids mismatches where an input tensor is named
+        # 'keras_tensor' but the model's InputLayer is named 'input_layer'.
+        input_layers = {}
+
+        # Get input names safely; prefer `input_names`, then InputLayer name via
+        # the tensor's `_keras_history`, and finally fall back to tensor name.
+        model_input_names = getattr(self._original_model, "input_names", [])
+        if not model_input_names:
+            model_input_names = []
+            for inp in self._original_model.inputs:
+                input_name = None
+                kh = getattr(inp, "_keras_history", None)
+                if kh:
+                    layer = kh[0]
+                    input_name = getattr(layer, "name", None)
+                if not input_name:
+                    input_name = inp.name.split(":")[0]
+                model_input_names.append(input_name)
+
+        # Zip names with input tensors to ensure alignment
+        for name, inp in zip(model_input_names, self._original_model.inputs):
+            input_layers[name] = layers.Input(
                 shape=inp.shape[1:],
                 dtype=inp.dtype,
-                name=inp.name.split(":")[0],
+                name=name  # Force the new input to match the expected name
             )
-            for inp in self._original_model.inputs
-        }
 
         partial_outputs = []
         for shard in self.model_shards:
             # Prefer the shard's declared input names, fall back to its input tensors.
             shard_inputs = {}
             try:
-                input_names = getattr(shard, "input_names", None)
-                if input_names:
-                    for name in input_names:
+                # Shard input matching logic
+                shard_input_names = getattr(shard, "input_names", None)
+                if shard_input_names:
+                    for name in shard_input_names:
                         clean_name = name.split(":")[0]
                         if clean_name in input_layers:
                             shard_inputs[clean_name] = input_layers[clean_name]
-                else:
-                    # Fall back to inspecting shard.inputs
+
+                # If matching failed or shard has no names, check raw inputs
+                if not shard_inputs:
                     for inp in getattr(shard, "inputs", []):
-                        clean_name = inp.name.split(":")[0]
+                        # Prefer InputLayer name from `_keras_history` when available
+                        clean_name = None
+                        kh = getattr(inp, "_keras_history", None)
+                        if kh:
+                            layer = kh[0]
+                            clean_name = getattr(layer, "name", None)
+                        if not clean_name:
+                            clean_name = inp.name.split(":")[0]
                         if clean_name in input_layers:
                             shard_inputs[clean_name] = input_layers[clean_name]
 
                 if not shard_inputs:
-                    # Last resort: forward the full mapping (may be positional in some cases)
+                    # Last resort: forward the full mapping.
+                    # Since input_layers now has correct keys, this usually works.
                     shard_inputs = dict(input_layers)
 
-                logger.info(
-                    f"Calling shard '{getattr(shard, 'name', '<shard>')}' with inputs: {list(shard_inputs.keys())}"
-                )
+                # logger.info(...) # Optional logging
                 partial_outputs.append(shard(shard_inputs))
             except Exception as e:
                 logger.exception(
@@ -324,6 +354,7 @@ class TensorParallelKeras(Model):
                 )
                 raise
 
+        # --- Reassembly Logic (Add/Concatenate) ---
         final_layer = self._original_model.layers[-1]
         sharding_type = "unknown"
         final_kernel_name = f"{final_layer.name}.kernel"
@@ -342,18 +373,21 @@ class TensorParallelKeras(Model):
             final_output = ops.concatenate(partial_outputs, axis=-1)
             original_output_dim = self._original_model.output_shape[-1]
             if final_output.shape[-1] != original_output_dim:
-                final_output = keras.layers.Lambda(
+                # Use layers.Lambda
+                final_output = layers.Lambda(
                     lambda x: x[..., :original_output_dim]
                 )(final_output)
         elif sharding_type == "row":
             if len(partial_outputs) > 1:
-                summed_output = keras.layers.Add()(partial_outputs)
+                # Use layers.Add
+                summed_output = layers.Add()(partial_outputs)
             else:
                 summed_output = partial_outputs[0]
 
             if final_layer.use_bias:
                 bias = final_layer.bias
-                final_output = keras.layers.Lambda(
+                # Use layers.Lambda
+                final_output = layers.Lambda(
                     lambda x: x - bias * (self.device_count - 1)
                 )(summed_output)
             else:
@@ -361,7 +395,8 @@ class TensorParallelKeras(Model):
         else:
             final_output = partial_outputs[0]
 
-        assembled_model = keras.Model(
+        # Use models.Model
+        assembled_model = models.Model(
             inputs=list(input_layers.values()), outputs=final_output
         )
         return assembled_model
@@ -452,6 +487,46 @@ class TensorParallelKeras(Model):
             logger.info(
                 "Compiled TensorParallelKeras model with coordinated optimizer."
             )
+
+            # Ensure variable layouts for model and optimizer variables are
+            # assigned according to the global distribution. This helps the
+            # JAX trainer produce consistent sharding specs for state.
+            try:
+                from keras.src.distribution import distribution_lib as top_dist
+
+                dist = top_dist.distribution()
+                if dist is not None:
+                    all_vars = list(self.trainable_variables) + list(
+                        self.non_trainable_variables
+                    )
+                    opt_vars = getattr(self.coordinated_optimizer, "variables", None)
+                    if opt_vars:
+                        all_vars += list(opt_vars)
+
+                    for v in all_vars:
+                        try:
+                            v._layout = dist.get_variable_layout(v)
+                        except Exception:
+                            # Best-effort: skip if layout cannot be determined
+                            continue
+                        # Re-apply distribution to stored value so backend sees
+                        # the correct sharding.
+                        try:
+                            current_val = getattr(v, "_value", None)
+                            if current_val is None:
+                                try:
+                                    current_val = v.value
+                                except Exception:
+                                    current_val = None
+                            if current_val is not None:
+                                try:
+                                    v._direct_assign(current_val)
+                                except Exception:
+                                    pass
+                        except Exception:
+                            pass
+            except Exception:
+                pass
 
         else:
             super().compile(optimizer, loss, metrics, **kwargs)

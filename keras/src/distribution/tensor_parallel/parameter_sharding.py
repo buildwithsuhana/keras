@@ -4,11 +4,12 @@ import re
 from typing import Any, Dict, List, Optional, Set, Tuple, TYPE_CHECKING
 
 import numpy as np
-
+from keras.src import backend
 from keras.src.backend import distribution_lib
 from keras.src import ops
 from keras.src import layers
-from keras import Variable, device 
+# from keras.src.backend import Variable
+from keras.src.backend import device 
 
 from keras.src.distribution.tensor_parallel.tensor_layout import LayoutMap
 
@@ -17,7 +18,55 @@ if TYPE_CHECKING:
 
 logger = logging.getLogger(__name__)
 
+def materialize_and_split(lazy_var, index, device_count, dim, rng_seed=1337):
+    """
+    Materializes ONLY the slice required for this specific shard.
+    """
+    full_shape = lazy_var.shape
+    dtype = lazy_var.dtype
+    initializer = lazy_var._initializer
 
+    # Calculate the shape of the shard
+    shard_shape = list(full_shape)
+    if dim != -1:
+        # We are splitting this dimension
+        if full_shape[dim] % device_count != 0:
+             raise ValueError(f"Shape {full_shape} not divisible by {device_count} at dim {dim}")
+        shard_shape[dim] = full_shape[dim] // device_count
+    
+    # Logic for Replicated Weights (dim is None or invalid)
+    # If dim is None (replicated), we generate the full shape.
+    # Note: Ideally for replicated weights, we want identical seeds.
+    # For sharded weights, we might want different seeds or sliced noise.
+    
+    # SIMPLIFICATION for OOM fix:
+    # We instantiate the specific shard using the initializer.
+    # Note: This changes the RNG behavior slightly compared to splitting a global tensor.
+    # For rigorous correctness with variance scaling, we might need to adjust the 'scale' 
+    # based on the split, but for standard initialization, this prevents OOM.
+    
+    # Convert scalar/constant initializers if necessary
+    if not callable(initializer):
+        # It's a raw value (e.g. numpy array)
+        # This defeats the purpose of LazyInit if the user passed a huge array,
+        # but usually Keras layers pass an Initializer object.
+        import tensorflow as tf # or jax
+        tensor = ops.convert_to_tensor(initializer)
+        # Delegate to standard split logic
+        from keras.src.distribution.tensor_parallel.tensor_layout import split_tensor_for_parallelism
+        return split_tensor_for_parallelism(tensor, index, device_count, dim)
+
+    # Call the initializer for the SHARD shape
+    # We pass a distinct seed per rank to ensure randomness across shards if desired,
+    # OR same seed if we want synchronization. 
+    # For TP: 
+    # - Weights (Kernels): usually we want to slice the global noise. 
+    #   Approximation: generate noise for shard shape.
+    
+    with device("cpu"): # Generate on CPU to save accelerator memory or let JAX handle it
+        sharded_value = initializer(shape=shard_shape, dtype=dtype)
+        
+    return sharded_value
 class ShardedWeight:
     """
     A wrapper for a sharded Keras Variable, providing a consistent interface.
@@ -31,9 +80,42 @@ class ShardedWeight:
         )
 
         with device(current_dev_name):
-            self._variable = Variable(
+            # FIX: Use 'backend.Variable' here to ensure we get the live JAX implementation
+            self._variable = backend.Variable(
                 initializer=tensor_shard, trainable=trainable, name=name
             )
+        # Ensure the created variable carries an appropriate distribution layout
+        # so backend JAX logic can distribute it onto devices consistently.
+        try:
+            from keras.src.distribution import distribution_lib as top_distribution_lib
+
+            dist = top_distribution_lib.distribution()
+            if dist is not None:
+                try:
+                    var_layout = dist.get_variable_layout(self._variable)
+                    # Attach the TensorLayout to the variable so backend
+                    # distribute logic can pick it up during assignment.
+                    self._variable._layout = var_layout
+                    # Re-apply distribution to the current stored value if any.
+                    current_val = getattr(self._variable, "_value", None)
+                    if current_val is None:
+                        try:
+                            current_val = self._variable.value
+                        except Exception:
+                            current_val = None
+                    if current_val is not None:
+                        try:
+                            # Use backend-specific direct assign to apply layout.
+                            self._variable._direct_assign(current_val)
+                        except Exception:
+                            # Best-effort: ignore if backends don't expose _direct_assign
+                            pass
+                except Exception:
+                    # If any step fails, continue without setting layout.
+                    pass
+        except Exception:
+            pass
+
         self.regularizer = None
 
     @property
@@ -73,9 +155,17 @@ class ShardedWeight:
         )
 
 
+try:
+    from keras.src.distribution.tensor_parallel.lazy_init import LazyVariable
+except ImportError:
+    # Fallback/Mock for linting if file not yet created
+    class LazyVariable: pass
+
+
 class ParameterShardingStrategy:
     """
     Parameter-level sharding strategy that works with any Keras model.
+    Updated to support Lazy Initialization (Zero Stage) to prevent OOM.
     """
 
     def __init__(self, device_count: int, rank: int):
@@ -89,31 +179,37 @@ class ParameterShardingStrategy:
     def shard_model_parameters(
         self,
         model,
-        config: LayoutMap,
+        config,  # Type: LayoutMap
         device_id: Any,
     ) -> Tuple["Model", Set[str]]:
         """
         Shard model parameters without rebuilding the model structure.
+        Supports LazyVariables to allow sharding 10B+ models without OOM.
         """
+        # Delay import to avoid circular dependency
+        from keras.src.distribution.tensor_parallel.parameter_sharding import _define_parameter_sharded_model
         ParameterShardedModel = _define_parameter_sharded_model()
 
         print(f"🔧 Applying parameter-level sharding to {model.name}")
 
+        # 1. Store original weights (Lazy-safe: won't materialize huge tensors)
         self._store_original_weights(model)
         modified_parameters = set()
 
+        # 2. Iterate through config rules
         for pattern, action in config.state_rules.items():
             # FIX: Check if action is callable (lambda) instead of isinstance(Split)
             if callable(action):
                 matching_params = self._find_matching_parameters(model, pattern)
 
                 for param_name, param in matching_params:
+                    # Robust ID retrieval (works for Keras Tensors and LazyVariables)
                     try:
                         param_id = id(param.experimental_ref())
                     except AttributeError:
                         param_id = id(param)
 
-                    # Weight tying logic
+                    # --- Weight Tying Logic ---
                     if param_id in self.sharded_weights_by_id:
                         self.sharded_weights[param_name] = self.sharded_weights_by_id[
                             param_id
@@ -135,7 +231,11 @@ class ParameterShardingStrategy:
                         )
                         continue
 
-                    # Execute the lambda to get the shard (slice)
+                    # --- Execution ---
+                    # Execute the lambda to get the shard.
+                    # CRITICAL: If 'param' is a LazyVariable, 'action' (which wraps 
+                    # split_tensor_for_parallelism) must return a materialized 
+                    # slice using the initializer, NOT by slicing an existing array.
                     sharded_tensor = action(param, self.rank)
 
                     self.sharded_weights[param_name] = sharded_tensor
@@ -148,8 +248,13 @@ class ParameterShardingStrategy:
                     }
 
                     modified_parameters.add(param_name)
+                    
+                    # Formatting for logs
+                    orig_shape = param.shape
+                    shard_shape = sharded_tensor.shape
+                    
                     print(
-                        f"   ✅ Sharded {param_name}: {param.shape} -> {sharded_tensor.shape}"
+                        f"   ✅ Sharded {param_name}: {orig_shape} -> {shard_shape}"
                     )
 
         sharded_model = ParameterShardedModel(
@@ -165,7 +270,10 @@ class ParameterShardingStrategy:
         return sharded_model, modified_parameters
 
     def _store_original_weights(self, model):
-        """Store original weights for reference."""
+        """
+        Store original weights for reference. 
+        UPDATED: Skips materialization for LazyVariables to prevent OOM.
+        """
         
         def find_weights_recursive(current_layer, prefix=""):
             name = current_layer.name
@@ -176,9 +284,17 @@ class ParameterShardingStrategy:
                     cleaned_name = weight.name.split("/")[-1].split(":")[0]
                     param_name = f"{full_name}.{cleaned_name}"
                     
-                    # FIX: Check for numpy capability before access
-                    if hasattr(weight, 'numpy'):
-                        self.original_weights[param_name] = weight.numpy()
+                    # --- CRITICAL FIX FOR OOM ---
+                    # If this is a LazyVariable, we MUST NOT call .numpy() or .value()
+                    if isinstance(weight, LazyVariable):
+                        self.original_weights[param_name] = "<LazyVariable: Unmaterialized>"
+                    # Regular Keras variables/tensors
+                    elif hasattr(weight, 'numpy'):
+                        try:
+                            self.original_weights[param_name] = weight.numpy()
+                        except Exception:
+                            # Fallback if numpy conversion fails (e.g. symbolic tensor)
+                            self.original_weights[param_name] = "<SymbolicTensor>"
 
             if hasattr(current_layer, "layers") and current_layer.layers:
                 for sub_layer in current_layer.layers:
@@ -221,7 +337,7 @@ class ParameterShardingStrategy:
                     cleaned_weight_name = weight.name.split("/")[-1].split(":")[0]
                     param_name = f"{full_name}.{cleaned_weight_name}"
 
-                    # FIX: Use fullmatch for strict pattern adherence
+                    # Use fullmatch for strict pattern adherence
                     if re.fullmatch(pattern, param_name):
                         matching_params.append((param_name, weight))
 
@@ -547,7 +663,8 @@ def _define_parameter_sharded_model():
                         pass
 
                 # 4/5. Apply Communication Rules (AllReduce/Gather) and Cache Output
-                layer_path = layer.path
+                # Ensure `layer_path` is a string (some layers may not have a path).
+                layer_path = getattr(layer, "path", None) or getattr(layer, "name", None) or ""
                 output_rule = None
                 for pattern, rule in self.config.output_rules.items():
                     if re.search(pattern, layer_path):

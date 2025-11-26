@@ -402,7 +402,12 @@ def arctanh(x):
 
 
 def argmax(x, axis=None, keepdims=False):
-    from keras.src.testing.test_case import uses_cpu
+    try:
+        from keras.src.testing.test_case import uses_cpu
+    except Exception:
+        # tests-only helper not available at runtime; assume CPU by default.
+        def uses_cpu():
+            return True
 
     x = convert_to_tensor(x)
     dtype = standardize_dtype(x.dtype)
@@ -419,7 +424,11 @@ def argmax(x, axis=None, keepdims=False):
 
 
 def argmin(x, axis=None, keepdims=False):
-    from keras.src.testing.test_case import uses_cpu
+    try:
+        from keras.src.testing.test_case import uses_cpu
+    except Exception:
+        def uses_cpu():
+            return True
 
     x = convert_to_tensor(x)
     dtype = standardize_dtype(x.dtype)
