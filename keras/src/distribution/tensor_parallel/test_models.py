@@ -40,6 +40,7 @@ import tensorflow as tf
 import tensorflow_datasets as tfds
 
 import keras
+keras.mixed_precision.set_global_policy("mixed_bfloat16")
 
 # Hide TF GPUs so JAX takes full control
 tf.config.set_visible_devices([], "GPU")
@@ -111,9 +112,7 @@ def load_shakespeare_dataset(model_preset):
     )
 
     # Use a separate tokenizer instance just for data prep
-    tokenizer = keras_hub.models.GemmaCausalLM.from_preset(
-        model_preset
-    ).preprocessor.tokenizer
+    tokenizer = keras_hub.models.GemmaTokenizer.from_preset(model_preset)
     token_ids = tokenizer.tokenize(text)
 
     num_tokens = (len(token_ids) // (SEQUENCE_LENGTH + 1)) * (
