@@ -1,4 +1,5 @@
 import collections
+import numpy as np  # <--- ADD THIS
 from keras.src import ops
 
 def split_tensor_for_parallelism(tensor, index, device_count, dim):
@@ -31,7 +32,7 @@ def split_tensor_for_parallelism(tensor, index, device_count, dim):
         new_shape[split_dim] = shard_size
         new_shape_tuple = tuple(new_shape)
         
-        # --- CHANGE: Use the original initializer if available ---
+        # Use the original initializer if available
         if hasattr(tensor, "initializer") and tensor.initializer is not None:
             try:
                 # Call the original initializer with the new SHARDED shape
@@ -43,10 +44,23 @@ def split_tensor_for_parallelism(tensor, index, device_count, dim):
             # Default fallback
             return ops.zeros(new_shape_tuple, dtype=tensor.dtype)
 
-    # 3. Standard logic for Real tensors (if you still have them)
-    splits = ops.array_split(
-        tensor, indices_or_sections=device_count, axis=split_dim
+    # 3. Standard logic for Real tensors
+    # --- CRITICAL FIX START ---
+    # We use NumPy (CPU) for splitting to prevent OOM.
+    # ops.array_split() would force the full tensor onto the TPU, causing the crash.
+    
+    if hasattr(tensor, "numpy"):
+        # If it's a Keras/TF/JAX tensor, pull it to CPU RAM
+        tensor_cpu = tensor.numpy()
+    else:
+        # If it's a list or other object, wrap it
+        tensor_cpu = np.array(tensor)
+
+    splits = np.array_split(
+        tensor_cpu, indices_or_sections=device_count, axis=split_dim
     )
+    # --- CRITICAL FIX END ---
+    
     return splits[index]
 
 LayoutMap = collections.namedtuple("LayoutMap", ["state_rules", "output_rules"])

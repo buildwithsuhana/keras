@@ -7,7 +7,7 @@ import logging
 import re
 import gc
 from typing import Collection, Optional, Sequence, Union
-
+import jax
 import numpy as np
 import tensorflow as tf
 import keras
@@ -147,15 +147,16 @@ class TensorParallelKeras(Model):
         for rank, device_id in enumerate(self.devices):
             print(f"[{device_id}] ➡️  Starting sharding process for Rank {rank}")
             
-            # Create the shard
-            shard, modified_parameters_names = make_parameter_sharded_model(
-                self._original_model,
-                self.tensor_parallel_config,
-                rank=rank,
-                device_count=self.device_count,
-                device_id=device_id,
-            )
-            
+            with jax.default_device(jax.devices("cpu")[0]):
+                
+                # Create the shard
+                shard, modified_parameters_names = make_parameter_sharded_model(
+                    self._original_model,
+                    self.tensor_parallel_config,
+                    rank=rank,
+                    device_count=self.device_count,
+                    device_id=device_id,
+                )
             self.model_shards.append(shard)
             self.modified_parameters_names.update(modified_parameters_names)
             
