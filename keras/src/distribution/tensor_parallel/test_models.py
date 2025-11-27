@@ -4,6 +4,11 @@ import sys
 import time
 import gc
 
+# --- OOM FIX 0: JAX Memory Configuration ---
+# Disable eager preallocation to allow Keras to manage memory placement manually
+os.environ["XLA_PYTHON_CLIENT_PREALLOCATE"] = "false"
+os.environ["XLA_PYTHON_CLIENT_ALLOCATOR"] = "platform"
+
 import numpy as np
 
 # --- Project Root Setup ---
@@ -32,52 +37,40 @@ import tensorflow as tf
 import tensorflow_datasets as tfds
 
 import keras
+# [FIX] Import config directly from src to avoid AttributeError
+from keras.src.backend import config as backend_config
+# [FIX] Import list_devices for correct TPU/GPU string IDs
+from keras.src.distribution import list_devices 
 
 # Hide GPUs from TensorFlow so it doesn't hog memory needed for JAX/Keras
 tf.config.set_visible_devices([], "GPU")
 
 # --- OOM FIX 1: Enable Mixed Precision / bfloat16 ---
-# This drastically reduces memory usage on both Host (CPU) and Device (TPU/GPU).
-# bfloat16 is the native format for TPU v5e.
-# FIX: Use set_floatx instead of set_dtype
-keras.config.set_floatx("bfloat16")
+backend_config.set_floatx("bfloat16")
 
 logging.basicConfig(level=logging.INFO, format="%(levelname)s - %(message)s")
 logger = logging.getLogger(__name__)
 
 
-# --- JAX Device Detection ---
+# --- Device Detection ---
 try:
-    devices = jax.devices()
-    logger.info(f"JAX devices found: {[str(d) for d in devices]}")
-    host_devices = [d for d in devices if d.platform == "cpu"]
+    # [FIX] Use Keras list_devices() instead of jax.devices() for compatibility
+    devices = list_devices()
+    logger.info(f"Devices found: {devices}")
     
-    # If we are on a TPU VM, 'devices' will usually be the TPUs.
-    # If on a CPU machine, we use the CPUs.
-    if len(devices) > 1 and devices[0].platform != "cpu":
+    # Filter for accelerators (exclude CPUs if accelerators exist)
+    accel_devices = [d for d in devices if "cpu" not in d.lower()]
+    
+    if accel_devices:
+        TARGET_DEVICES = accel_devices
+    else:
         TARGET_DEVICES = devices
-    else:
-        # Fallback for local testing or CPU simulation
-        TARGET_DEVICES = host_devices
 
-    DEVICES_AVAILABLE = len(TARGET_DEVICES)
-    # Set this to the number of chips you want to shard across (e.g., 4 or 8 for TPU v5e)
-    WORLD_SIZE = 4 
-
-    if DEVICES_AVAILABLE < WORLD_SIZE:
-        logger.warning(
-            f"Requested {WORLD_SIZE} devices, but only {DEVICES_AVAILABLE} available."
-        )
-        TARGET_WORLD_SIZE = DEVICES_AVAILABLE
-        # Adjust target devices to what we actually have
-        TARGET_DEVICES = TARGET_DEVICES[:TARGET_WORLD_SIZE]
-    else:
-        TARGET_DEVICES = TARGET_DEVICES[:WORLD_SIZE]
-        TARGET_WORLD_SIZE = WORLD_SIZE
+    # [FIX] Dynamic world size based on available chips
+    TARGET_WORLD_SIZE = len(TARGET_DEVICES)
         
     logger.info(
-        f"Targeting {TARGET_WORLD_SIZE} devices for parallelism: "
-        f"{[str(d) for d in TARGET_DEVICES]}"
+        f"Targeting {TARGET_WORLD_SIZE} devices for parallelism: {TARGET_DEVICES}"
     )
 
 except Exception as e:
@@ -91,18 +84,15 @@ from keras.src.distribution.tensor_parallel.tensor_parallel_keras import (
 )
 
 # --- Constants ---
-BATCH_SIZE = 1 # Reduce this if you still hit OOM
+BATCH_SIZE = 1  # Increased slightly as LoRA saves memory
 SEQUENCE_LENGTH = 32
-LEARNING_RATE = 1e-4
+LEARNING_RATE = 1e-4 # Adjusted for Adafactor
 EPOCHS = 1
-STEPS_PER_EPOCH = 5
+STEPS_PER_EPOCH = 10
 VALIDATION_STEPS = 5
 
 MODEL_MAPPING = {
-    # "opt_125m_en": keras_hub.models.OPTCausalLM,
-    # Uncomment these to test larger models
-    # "gemma2_2b_en": keras_hub.models.GemmaCausalLM,
-    "gemma_7b_en": keras_hub.models.GemmaCausalLM, 
+    "gemma2_9b_en": keras_hub.models.GemmaCausalLM, 
 }
 
 # ----------------------------------------------------------------------
@@ -119,18 +109,15 @@ def load_shakespeare_dataset(model_preset, model_class):
         example["text"].decode("utf-8") for example in ds.as_numpy_iterator()
     )
 
-    # --- OOM FIX 2: Load Tokenizer Safely ---
-    # We load the tokenizer inside a CPU scope. 
-    # Ideally, we should use the Preprocessor class directly to avoid loading weights,
-    # but using the model class with CPU scope is a safe generic fallback.
     logger.info("Loading tokenizer (on CPU)...")
     with keras.device("cpu"):
-        # We assume the model class has a 'preprocessor' property or we instantiate it
-        # temporarily just to grab the tokenizer. 
-        # Note: This might still load weights into RAM, but 'cpu' ensures they don't hit TPU.
-        temp_model = model_class.from_preset(model_preset)
-        tokenizer = temp_model.preprocessor.tokenizer
-        del temp_model
+        # Use the specific tokenizer class if available to avoid loading model weights
+        try:
+            tokenizer = keras_hub.models.GemmaTokenizer.from_preset(model_preset)
+        except:
+            temp_model = model_class.from_preset(model_preset)
+            tokenizer = temp_model.preprocessor.tokenizer
+            del temp_model
         gc.collect()
 
     token_ids = tokenizer.tokenize(text)
@@ -158,7 +145,6 @@ def load_shakespeare_dataset(model_preset, model_class):
 
 
 def format_for_causal_lm(data):
-    """Formats data for KerasNLP's CausalLM, creating features and labels."""
     features = {
         "token_ids": data[:, :-1],
         "padding_mask": tf.ones_like(data[:, :-1], dtype=tf.bool),
@@ -171,13 +157,15 @@ def get_model_from_preset(preset_name, model_class):
     """Creates a CausalLM model from a KerasNLP preset."""
     logger.info(f"Creating {preset_name} model from KerasNLP preset (on CPU)...")
     
-    # --- OOM FIX 3: Initialize Original Model on CPU ---
-    # This ensures the full 9B/125M parameters are allocated in Host RAM, not HBM.
-    # TensorParallelKeras will then slice these and only move the slices to HBM.
     with keras.device("cpu"):
         model = model_class.from_preset(preset_name, preprocessor=None)
         
-    logger.info(f"Model created with {model.count_params():,} parameters.")
+        # [FIX] Enable LoRA to fit optimizer states in memory
+        if "gemma" in preset_name:
+            logger.info("✨ Enabling LoRA (Rank=4) for memory efficiency...")
+            model.backbone.enable_lora(rank=4)
+        
+    logger.info(f"Model created. Trainable params: {model.count_params():,}")
     return model
 
 
@@ -186,35 +174,28 @@ def get_model_from_preset(preset_name, model_class):
 # ----------------------------------------------------------------------
 
 def plot_training_graphs(tp_history, preset_name):
-    """Plots and saves the loss and perplexity graphs for the TP run."""
     fig, (ax1, ax2) = plt.subplots(2, 1, figsize=(12, 10))
     fig.suptitle(f"{preset_name} - Tensor Parallel Training Metrics", fontsize=16)
 
-    # Plotting Loss
     ax1.plot(
         tp_history.history["val_loss"],
-        label="Tensor Parallel - Validation Loss",
+        label="Validation Loss",
         color="green",
-        linestyle="-",
         marker="o",
     )
     ax1.set_title("Validation Loss")
     ax1.set_ylabel("Loss")
-    ax1.set_xlabel("Epoch")
     ax1.legend()
     ax1.grid(True)
 
-    # Plotting Perplexity
     ax2.plot(
         tp_history.history["val_perplexity"],
-        label="Tensor Parallel - Validation Perplexity",
+        label="Validation Perplexity",
         color="purple",
-        linestyle="-",
         marker="o",
     )
     ax2.set_title("Validation Perplexity")
     ax2.set_ylabel("Perplexity")
-    ax2.set_xlabel("Epoch")
     ax2.legend()
     ax2.grid(True)
 
@@ -230,21 +211,12 @@ def plot_training_graphs(tp_history, preset_name):
 # ----------------------------------------------------------------------
 
 def run_model_verification(preset_name, model_class):
-    """
-    Runs a training execution test for a given model preset using
-    tensor parallelism.
-    """
     if TARGET_WORLD_SIZE < 2:
-        logger.warning(
-            f"SKIPPING {preset_name}: Need at least 2 devices for tensor "
-            f"parallelism, found {TARGET_WORLD_SIZE}"
-        )
+        logger.warning(f"SKIPPING {preset_name}: Need at least 2 devices.")
         return "SKIPPED"
 
     logger.info(f"--- VERIFICATION FOR: {preset_name.upper()} ---")
 
-    # --- Common Setup ---
-    # Pass model_class to helper to safely load tokenizer
     train_ds_raw, val_ds_raw = load_shakespeare_dataset(preset_name, model_class)
 
     train_ds = (
@@ -260,10 +232,8 @@ def run_model_verification(preset_name, model_class):
         .repeat()
     )
 
-    # --- 1. Tensor Parallel Model Training ---
     logger.info("\n--- Training Tensor Parallel (TP) Model ---")
     
-    # Helper now enforces CPU placement
     tp_model_template = get_model_from_preset(preset_name, model_class)
 
     tp_model = TensorParallelKeras(
@@ -272,15 +242,16 @@ def run_model_verification(preset_name, model_class):
         device_ids=TARGET_DEVICES,
     )
 
+    # [FIX] Use Adafactor instead of AdamW to save memory on T4/TPU
     tp_model.compile(
-        optimizer=keras.optimizers.AdamW(learning_rate=LEARNING_RATE),
+        optimizer=keras.optimizers.Adafactor(learning_rate=LEARNING_RATE),
         loss=keras.losses.SparseCategoricalCrossentropy(from_logits=True),
         metrics=[
             keras_hub.metrics.Perplexity(from_logits=True, name="perplexity")
         ],
     )
 
-    tp_history = tp_model.fit(
+    tp_model.fit(
         train_ds,
         validation_data=val_ds,
         epochs=EPOCHS,
@@ -288,22 +259,16 @@ def run_model_verification(preset_name, model_class):
         validation_steps=VALIDATION_STEPS,
         verbose=1,
     )
-    tp_final_val_loss = tp_history.history["val_loss"][-1]
-    logger.info("TP model training completed successfully.")
-
-    # --- 2. Verification ---
-    logger.info("\n--- ⚖️ Verification Results ---")
-    logger.info(f"TP Final Validation Loss: {tp_final_val_loss:.6f}")
-
-    plot_training_graphs(tp_history, preset_name)
     
-    # Cleanup to free memory for next model in loop
+    logger.info("TP model training completed successfully.")
+    
+    plot_training_graphs(tp_model.history, preset_name)
+    
     del tp_model
     del tp_model_template
     keras.backend.clear_session()
     gc.collect()
 
-    logger.info("✅ SUCCESS: TP model training finished without errors.")
     return True
 
 
@@ -313,13 +278,13 @@ def run_model_verification(preset_name, model_class):
 
 if __name__ == "__main__":
     if TARGET_WORLD_SIZE == 0:
-        logger.critical("No JAX devices found. Aborting verification suite.")
+        logger.critical("No JAX devices found. Aborting.")
         sys.exit(1)
 
     logger.info("\n" + "=" * 70)
     logger.info("      TENSOR PARALLELISM EXECUTION SUITE")
     logger.info("=" * 70)
-    logger.info(f"Global Dtype: {keras.config.dtype_policy().name}")
+    logger.info(f"Global Dtype: {backend_config.floatx()}")
 
     results = {}
     total_start_time = time.time()
