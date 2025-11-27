@@ -102,7 +102,7 @@ MODEL_MAPPING = {
     # "opt_125m_en": keras_hub.models.OPTCausalLM,
     # Uncomment these to test larger models
     # "gemma2_2b_en": keras_hub.models.GemmaCausalLM,
-    "gemma2_9b_en": keras_hub.models.GemmaCausalLM, 
+    "gemma_7b_en": keras_hub.models.GemmaCausalLM, 
 }
 
 # ----------------------------------------------------------------------
