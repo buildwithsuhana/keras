@@ -13,7 +13,6 @@ from keras.src.distribution.tensor_parallel.tensor_layout import split_tensor_fo
 
 try:
     import jax
-    import jax.numpy as jnp
     from jax.sharding import Mesh, PartitionSpec, NamedSharding
     from jax.experimental import mesh_utils
 except ImportError:
@@ -36,7 +35,6 @@ class ShardedWeight:
         else:
             clean_name = "sharded_var"
             
-        # SPMD: tensor_val is already a global jax.Array
         self._variable = Variable(
             initializer=tensor_val, 
             trainable=trainable, 
@@ -58,57 +56,92 @@ class ParameterShardingStrategy:
         
         if self.is_spmd:
             print(f"   [Strategy] SPMD Mode: Managing {len(self.local_devices)} local GPUs.")
-            # Create the mesh needed for Input Distribution
             self.mesh = Mesh(mesh_utils.create_device_mesh((1, self.device_count)), axis_names=('batch', 'model'))
         else:
             print(f"   [Strategy] MPMD Mode: Managing Rank {self.rank}.")
             self.mesh = None
 
     def shard_model_parameters(self, model, config, device_id: Any) -> Tuple["Model", Set[str]]:
-        # Pass the mesh to the model so it can distribute inputs
         ParameterShardedModel = _define_parameter_sharded_model()
         
-        print(f"🔧 Applying parameter sharding [v11-Input-Dist]...")
+        print(f"🔧 Applying parameter sharding [v12-Robust-Traversal]...")
         log_memory("Start")
         
         modified_parameters = set()
-        self._recursive_shard_layers(model, config, modified_parameters)
+        visited_layers = set()
+        
+        # Start robust recursion
+        self._recursive_shard_layers(model, config, modified_parameters, visited_layers)
 
         sharded_model = ParameterShardedModel(
             original_model=model,
             sharding_strategy=self,
             config=config,
             device_id=device_id,
-            mesh=self.mesh # <--- Pass mesh here
+            mesh=self.mesh
         )
         
         print(f"🎯 Sharding Complete. Replaced {len(modified_parameters)} parameters.")
         log_memory("Final")
+        
+        # Sanity Check
+        if len(modified_parameters) < 10:
+            print("⚠️ WARNING: Very few parameters were replaced. Check layer traversal!")
+            
         return sharded_model, modified_parameters
 
-    def _recursive_shard_layers(self, current_layer, config, modified_set):
+    def _recursive_shard_layers(self, current_layer, config, modified_set, visited_layers):
+        """
+        Recursively walks layers and swaps weights matching config rules.
+        Uses robust scanning (attributes + lists) to find hidden sub-layers.
+        """
+        if id(current_layer) in visited_layers:
+            return
+        visited_layers.add(id(current_layer))
+
+        # 1. Process weights of THIS layer
+        self._shard_and_swap_layer_weights(current_layer, config, modified_set)
+
+        # 2. Find children via standard API
         if hasattr(current_layer, 'layers'):
             for sub_layer in current_layer.layers:
-                self._recursive_shard_layers(sub_layer, config, modified_set)
-                
-        layer_vars = []
-        if hasattr(current_layer, "weights"):
-            layer_vars = current_layer.weights
-        
-        if not layer_vars: return
+                self._recursive_shard_layers(sub_layer, config, modified_set, visited_layers)
 
-        for variable in layer_vars:
+        # 3. Find children via Attribute Scanning (Crucial for KerasNLP Backbones)
+        for attr_name in dir(current_layer):
+            if attr_name.startswith("__") or attr_name.startswith("_"): continue
+            
+            try:
+                val = getattr(current_layer, attr_name)
+            except:
+                continue
+            
+            if isinstance(val, layers.Layer):
+                self._recursive_shard_layers(val, config, modified_set, visited_layers)
+            elif isinstance(val, (list, tuple)):
+                for item in val:
+                    if isinstance(item, layers.Layer):
+                        self._recursive_shard_layers(item, config, modified_set, visited_layers)
+
+    def _shard_and_swap_layer_weights(self, layer, config, modified_set):
+        # Get variables
+        if not hasattr(layer, "weights"): return
+        
+        for variable in layer.weights:
+            # Match rule
             rule = config.get(variable.path, config.get(variable.name, None))
+            
             if rule is None:
+                # Regex fallback
                 for pattern, r in config.items():
                     if isinstance(pattern, str) and (re.fullmatch(pattern, variable.path) or re.fullmatch(pattern, variable.name)):
                         rule = r
                         break
             
             if rule is not None:
-                self._shard_and_swap(current_layer, variable, rule, modified_set)
+                self._apply_swap(layer, variable, rule, modified_set)
 
-    def _shard_and_swap(self, layer, variable, rule, modified_set):
+    def _apply_swap(self, layer, variable, rule, modified_set):
         param_name = variable.name
         if param_name in modified_set: return
 
@@ -123,11 +156,13 @@ class ParameterShardingStrategy:
 
             if split_dim is None: return
 
+            # Force Freeze Check
             is_trainable = False
             if "lora" in param_name.lower():
                 is_trainable = True
                 print(f"      🔥 Keeping LoRA Trainable: {param_name}")
 
+            # SPMD Creation
             if self.is_spmd:
                 device_buffers = []
                 for dev_idx in range(self.device_count):
@@ -157,7 +192,7 @@ class ParameterShardingStrategy:
                 new_var = ShardedWeight(shard_np, param_name, trainable=is_trainable)
                 del shard_np
 
-            # Swap in place
+            # In-Place Attribute Swap
             found = False
             for attr_name in dir(layer):
                 if attr_name.startswith("__"): continue
@@ -175,6 +210,10 @@ class ParameterShardingStrategy:
                     variable.assign(dummy)
                 except: pass
                 gc.collect()
+                
+                # Feedback
+                if len(modified_set) % 20 == 0:
+                    print(f"   [Swap] {len(modified_set)} params replaced...")
 
         except Exception as e:
             print(f"   ❌ Failed to swap {param_name}: {e}")
@@ -191,43 +230,19 @@ def _define_parameter_sharded_model():
             self.sharding_strategy = sharding_strategy
             self.config = config
             self.device_id = device_id
-            self.mesh = mesh # JAX Mesh for inputs
+            self.mesh = mesh
 
         def _distribute_inputs(self, inputs):
-            """
-            Forces inputs to be replicated across the mesh to prevent
-            JAX from gathering weights to a single GPU.
-            """
-            if self.mesh is None or jax is None:
-                return inputs
-
-            # Helper to put a single tensor on the mesh (Replicated)
+            if self.mesh is None or jax is None: return inputs
             def _put(x):
-                if not isinstance(x, (np.ndarray, jax.Array)):
-                    return x
-                # If already distributed, skip
-                if hasattr(x, 'sharding') and x.sharding is not None:
-                    return x
-                
-                # Replicate: We want x to be available on ALL devices.
-                # Spec: (None, None) means replicated on all axes if axis_names are used, 
-                # but we need explicit NamedSharding.
-                # Since our mesh is (1, 2) ['batch', 'model'],
-                # we want data to be replicated on 'model' axis.
-                # Usually data is partitioned on 'batch' axis? 
-                # Wait, our mesh size 1 on 'batch' means "All devices process full batch"??
-                # No, standard TP means we split 'model' axis. Data is usually replicated.
-                
-                # Let's effectively replicate it everywhere.
-                sharding = NamedSharding(self.mesh, PartitionSpec()) # Fully replicated
+                if not isinstance(x, (np.ndarray, jax.Array)): return x
+                if hasattr(x, 'sharding') and x.sharding is not None: return x
+                sharding = NamedSharding(self.mesh, PartitionSpec()) 
                 return jax.device_put(x, sharding)
-
             return jax.tree.map(_put, inputs)
 
         def call(self, inputs, training=None, mask=None):
-            # [CRITICAL] Distribute inputs before execution
             d_inputs = self._distribute_inputs(inputs)
-            
             outputs = self.original_model(d_inputs, training=training, mask=mask)
             
             if hasattr(self.config, "output_rules"):
