@@ -25,7 +25,7 @@ def split_tensor_for_parallelism(tensor, index, device_count, dim):
     """
     global _ML_DTYPES_LOGGED
     if not _ML_DTYPES_LOGGED:
-        print(f"   ℹ️ [Layout] ML_DTYPES available: {HAS_ML_DTYPES}. Using bfloat16 optimization? {HAS_ML_DTYPES}")
+        print(f"   ℹ️ [Layout] ML_DTYPES available: {HAS_ML_DTYPES}")
         _ML_DTYPES_LOGGED = True
 
     # 1. Resolve negative dimensions
@@ -59,7 +59,10 @@ def split_tensor_for_parallelism(tensor, index, device_count, dim):
 
     # 5. Downcast to save memory
     if HAS_ML_DTYPES:
+        # Debug: check if we are actually saving memory
+        # print(f"      - Downcasting to bfloat16 (Original: {shard.dtype})")
         return shard.astype(ml_dtypes.bfloat16)
     else:
         # Fallback if ml_dtypes missing (risky for precision, but saves memory)
+        print("      ⚠️ [Warning] ml_dtypes not found. Falling back to float16.")
         return shard.astype(np.float16)

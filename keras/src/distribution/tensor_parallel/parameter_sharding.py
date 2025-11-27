@@ -1,6 +1,8 @@
 import logging
 import gc
 import re
+import os
+import psutil  # Used for debug logging of RAM
 from typing import Any, Tuple, Set
 import numpy as np
 
@@ -19,6 +21,12 @@ except ImportError:
     jax = None
 
 logger = logging.getLogger(__name__)
+
+def log_memory(stage=""):
+    """Helper to print current Host RAM usage."""
+    process = psutil.Process(os.getpid())
+    mem = process.memory_info().rss / (1024 ** 3)  # Convert to GB
+    print(f"   [MEM] {stage}: {mem:.2f} GB RAM used")
 
 class ShardedWeight:
     """Wrapper for a sharded variable on a specific device."""
@@ -60,13 +68,24 @@ class ParameterShardingStrategy:
     def shard_model_parameters(self, model, config, device_id: Any) -> Tuple["Model", Set[str]]:
         ParameterShardedModel = _define_parameter_sharded_model()
         
-        print(f"🔧 Applying manual parameter sharding [v5-Nuclear-Memory] (Rank {self.rank}/{self.device_count})...")
+        print(f"🔧 [DEBUG MODE] Applying parameter sharding (Rank {self.rank}/{self.device_count})...")
+        log_memory("Start Sharding")
+        
         modified_parameters = set()
+        
+        # 1. Count total items for progress bar
+        total_items = 0
+        for pattern, rule in config.items():
+            matches = self._find_matching_parameters(model, pattern)
+            total_items += len(matches)
+        
+        current_idx = 0
 
         for pattern, rule in config.items():
             matching_params = self._find_matching_parameters(model, pattern)
 
             for param_name, param in matching_params:
+                current_idx += 1
                 try:
                     split_dim = None
                     if isinstance(rule, (tuple, list)):
@@ -81,6 +100,8 @@ class ParameterShardingStrategy:
                                 break
 
                     if split_dim is not None:
+                        print(f"   [{current_idx}/{total_items}] Sharding {param_name}...")
+                        
                         # 1. Slice on CPU (NumPy)
                         sharded_tensor_np = split_tensor_for_parallelism(
                             param, 
@@ -101,12 +122,9 @@ class ParameterShardingStrategy:
                         modified_parameters.add(param_name)
                         
                         # 4. [NUCLEAR FIX] Force JAX Synchronization & Cache Clear
-                        # This prevents JAX from queueing up gigabytes of pending allocs
                         if jax is not None:
                             try:
-                                # Force execution to finish
                                 jax.block_until_ready(sharded_var.value)
-                                # Clear internal fragmentation
                                 jax.clear_caches()
                             except Exception:
                                 pass
@@ -123,11 +141,17 @@ class ParameterShardingStrategy:
                         
                         gc.collect()
                         
+                        # Log memory every 10 steps to reduce noise
+                        if current_idx % 10 == 0:
+                            log_memory("After GC")
+                        
                     else:
+                        # Replicate case (optional logging)
                         pass 
 
                 except Exception as e:
                     print(f"   ❌ FATAL: Failed to shard {param_name}: {e}")
+                    log_memory("Crash State")
                     raise e
 
         sharded_model = ParameterShardedModel(
@@ -137,6 +161,7 @@ class ParameterShardingStrategy:
             device_id=device_id,
         )
         
+        print(f"🎯 Parameter sharding completed.")
         return sharded_model, modified_parameters
 
     def _find_matching_parameters(self, model, pattern):
