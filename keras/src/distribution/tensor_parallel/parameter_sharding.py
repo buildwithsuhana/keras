@@ -13,6 +13,8 @@ from keras.src.distribution.tensor_parallel.tensor_layout import split_tensor_fo
 
 try:
     import jax
+    from jax.sharding import Mesh, PartitionSpec, NamedSharding
+    from jax.experimental import mesh_utils
 except ImportError:
     jax = None
 
@@ -27,23 +29,25 @@ def log_memory(stage=""):
         pass
 
 class ShardedWeight:
-    def __init__(self, tensor_shard, name, trainable=True, device_id=None):
-        current_dev = device_id if device_id else "cpu"
+    """
+    Creates a Distributed Variable spanning multiple devices.
+    """
+    def __init__(self, distributed_array, name, trainable=True):
         
-        # Sanitization
+        # Name Sanitization
         if name:
             clean_name = re.sub(r'[^a-zA-Z0-9_]', '_', name)
         else:
             clean_name = "sharded_var"
             
-        with device(current_dev):
-            # Explicitly pass dtype to prevent Keras from upcasting to float32
-            self._variable = Variable(
-                initializer=tensor_shard, 
-                trainable=trainable, 
-                name=clean_name,
-                dtype=tensor_shard.dtype 
-            )
+        # We don't use 'with device(...)' here because distributed_array 
+        # is already placed on the correct mesh of devices.
+        self._variable = Variable(
+            initializer=distributed_array, 
+            trainable=trainable, 
+            name=clean_name,
+            dtype=distributed_array.dtype 
+        )
 
     @property
     def name(self): return self._variable.name
@@ -65,16 +69,25 @@ class ParameterShardingStrategy:
         self.device_count = device_count
         self.rank = rank
         self.sharded_weights = {} 
+        
+        # Detect if we are in a Single-Process Multi-Device env (Notebook)
+        self.local_devices = jax.local_devices()
+        self.is_spmd = len(self.local_devices) >= self.device_count
+        
+        if self.is_spmd:
+            print(f"   [Strategy] SPMD Mode Detected. Managing {len(self.local_devices)} local devices directly.")
+            # Create a 1D Mesh for simple splitting
+            self.mesh = Mesh(mesh_utils.create_device_mesh((1, self.device_count)), axis_names=('batch', 'model'))
 
     def shard_model_parameters(self, model, config, device_id: Any) -> Tuple["Model", Set[str]]:
         ParameterShardedModel = _define_parameter_sharded_model()
         
-        print(f"🔧 Applying manual parameter sharding [v7-Trainable-Fix] (Rank {self.rank}/{self.device_count})...")
-        log_memory("Start Sharding")
+        print(f"🔧 Applying parameter sharding [v8-SPMD-Fixed]...")
+        log_memory("Start")
         
         modified_parameters = set()
         
-        # Progress tracking
+        # Count total items
         total_items = 0
         for pattern, rule in config.items():
             matches = self._find_matching_parameters(model, pattern)
@@ -101,46 +114,73 @@ class ParameterShardingStrategy:
                                 break
 
                     if split_dim is not None:
-                        print(f"   [{current_idx}/{total_items}] Sharding {param_name} | Trainable: {param.trainable}")
-                        
-                        # 1. Slice (CPU) - Returns bfloat16/float16
-                        sharded_tensor_np = split_tensor_for_parallelism(
-                            param, 
-                            index=self.rank, 
-                            device_count=self.device_count, 
-                            dim=split_dim
-                        )
-                        
-                        # 2. Upload to Device (Preserving Dtype AND Trainable Status)
-                        sharded_var = ShardedWeight(
-                            sharded_tensor_np, 
-                            name=param_name, 
-                            trainable=param.trainable, # <--- [CRITICAL FIX]
-                            device_id=device_id
-                        )
-                        
+                        # -----------------------------------------------------------
+                        # SPMD LOGIC: Load shards for ALL devices in this process
+                        # -----------------------------------------------------------
+                        if self.is_spmd:
+                            device_buffers = []
+                            
+                            # 1. Generate & Upload Shard for EACH device
+                            for dev_idx in range(self.device_count):
+                                # Slice on CPU
+                                shard_np = split_tensor_for_parallelism(
+                                    param, 
+                                    index=dev_idx, 
+                                    device_count=self.device_count, 
+                                    dim=split_dim
+                                )
+                                # Push to specific GPU (e.g., gpu:0, then gpu:1)
+                                target_dev = self.local_devices[dev_idx]
+                                dev_buffer = jax.device_put(shard_np, target_dev)
+                                device_buffers.append(dev_buffer)
+                                
+                                # Clean CPU RAM immediately
+                                del shard_np
+                            
+                            # 2. Construct Global Sharded Array
+                            # This creates a logical array that spans both GPUs
+                            # We need to define the Sharding Spec
+                            # For 1D split on 'model' axis:
+                            out_sharding = NamedSharding(self.mesh, PartitionSpec(None, 'model') if split_dim == 1 else PartitionSpec('model', None))
+                            
+                            # Combine buffers
+                            distributed_array = jax.make_array_from_single_device_arrays(
+                                shape=param.shape,
+                                sharding=out_sharding,
+                                arrays=device_buffers
+                            )
+                            
+                            # 3. Create Variable
+                            sharded_var = ShardedWeight(
+                                distributed_array,
+                                name=param_name,
+                                trainable=param.trainable
+                            )
+                            
+                        else:
+                            # Fallback for Multi-Process (MPMD) - Original Logic
+                            # (Only loads ONE shard for current rank)
+                            shard_np = split_tensor_for_parallelism(
+                                param, index=self.rank, device_count=self.device_count, dim=split_dim
+                            )
+                            sharded_var = ShardedWeight(
+                                shard_np, name=param_name, trainable=param.trainable
+                            )
+                            del shard_np
+
                         self.sharded_weights[param_name] = sharded_var
                         modified_parameters.add(param_name)
                         
-                        # 3. JAX Cleanup
-                        if jax is not None:
-                            try:
-                                jax.block_until_ready(sharded_var.value)
-                                jax.clear_caches()
-                            except Exception:
-                                pass
-
                         # 4. Host Cleanup
-                        del sharded_tensor_np
                         try:
                             dummy = np.zeros((1,), dtype=param.dtype)
                             param.assign(dummy)
                         except:
                             pass
-                        gc.collect()
                         
                         if current_idx % 20 == 0:
-                            log_memory("After GC")
+                            gc.collect()
+                            log_memory(f"Step {current_idx}")
                         
                     else:
                         pass 
