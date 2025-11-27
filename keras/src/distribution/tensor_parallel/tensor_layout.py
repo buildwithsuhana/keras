@@ -2,23 +2,23 @@ import numpy as np
 
 class LayoutMap(dict):
     """
-    A dictionary-based LayoutMap that stores sharding rules.
-    Replaces the namedtuple to allow mutable item assignment.
+    A flexible dictionary-based LayoutMap for manual Tensor Parallelism.
+    Inherits from dict to allow arbitrary attribute storage (output_rules).
     """
     def __init__(self, device_mesh=None):
         super().__init__()
         self.device_mesh = device_mesh
+        # Stores communication rules for layers (e.g. 'allreduce sum')
         self.output_rules = {}
 
     @property
     def state_rules(self):
-        """Alias for compatibility with sharding strategies."""
+        """Alias self to match Keras distribution API expectation."""
         return self
 
 def split_tensor_for_parallelism(tensor, index, device_count, dim):
     """
-    Slices a tensor for Tensor Parallelism.
-    CRITICAL: Performs slicing on CPU (NumPy) to avoid Accelerator OOM.
+    Slices a tensor for Tensor Parallelism on the CPU to avoid OOM.
     """
     # 1. Resolve negative dimensions
     ndim = len(tensor.shape)
@@ -28,9 +28,8 @@ def split_tensor_for_parallelism(tensor, index, device_count, dim):
         split_dim = dim
 
     # [OOM FIX] Force conversion to Host RAM (NumPy) immediately.
-    # If we don't do this, the backend might try to load the full tensor 
-    # onto the TPU to perform the slice op, causing instant OOM.
-    # We detach, move to CPU, and cast to numpy.
+    # We detaching from the graph/device prevents allocating the full 9B tensor 
+    # on the TPU just to slice it.
     if hasattr(tensor, "numpy"):
         tensor_numpy = tensor.numpy()
     else:
