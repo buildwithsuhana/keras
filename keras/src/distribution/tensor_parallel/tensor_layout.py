@@ -1,56 +1,54 @@
-import collections
 import numpy as np
-from keras.src import ops
+
+class LayoutMap(dict):
+    """
+    A dictionary-based LayoutMap that stores sharding rules.
+    Replaces the namedtuple to allow mutable item assignment.
+    """
+    def __init__(self, device_mesh=None):
+        super().__init__()
+        self.device_mesh = device_mesh
+        self.output_rules = {}
+
+    @property
+    def state_rules(self):
+        """Alias for compatibility with sharding strategies."""
+        return self
 
 def split_tensor_for_parallelism(tensor, index, device_count, dim):
-    """Calculates a slice of a tensor along a specified dimension for a
-    given index.
-
-    This utility is used in tensor parallelism API to distribute a
-    tensor across multiple devices.
-
-    Args:
-        tensor: The full tensor to be sharded.
-        index: The index of the device/shard to return (e.g., 0, 1, 2...).
-        device_count: The total number of parallel devices or splits.
-        dim: The dimension along which to split the tensor. If -1, the
-            last dimension is used.
-
-    Returns:
-        A tensor slice corresponding to the given `index`.
     """
-    # 1. Resolve negative dimensions (e.g. -1)
-    if dim == -1:
-        split_dim = len(tensor.shape) - 1
+    Slices a tensor for Tensor Parallelism.
+    CRITICAL: Performs slicing on CPU (NumPy) to avoid Accelerator OOM.
+    """
+    # 1. Resolve negative dimensions
+    ndim = len(tensor.shape)
+    if dim < 0:
+        split_dim = ndim + dim
     else:
         split_dim = dim
 
-    # [CRITICAL FIX] Force conversion to standard NumPy array.
-    # This is the MAGIC LINE that fixes the OOM.
-    # It pulls the data to Host RAM (CPU) so we don't use TPU memory
-    # as a scratchpad for the full 1.7GB tensor.
-    tensor_numpy = np.array(tensor)
+    # [OOM FIX] Force conversion to Host RAM (NumPy) immediately.
+    # If we don't do this, the backend might try to load the full tensor 
+    # onto the TPU to perform the slice op, causing instant OOM.
+    # We detach, move to CPU, and cast to numpy.
+    if hasattr(tensor, "numpy"):
+        tensor_numpy = tensor.numpy()
+    else:
+        tensor_numpy = np.array(tensor)
 
-    # 2. Calculate slice indices on CPU
-    shape = tensor_numpy.shape
-    total_length = shape[split_dim]
+    # 2. Calculate slice indices
+    total_length = tensor_numpy.shape[split_dim]
     shard_size = total_length // device_count
     
     start_idx = index * shard_size
-    
-    # Handle remainder for the last shard (if any)
     if index == device_count - 1:
         end_idx = total_length
     else:
         end_idx = (index + 1) * shard_size
         
-    # 3. Create the slice object
-    slice_indices = [slice(None)] * len(shape)
-    slice_indices[split_dim] = slice(start_idx, end_idx)
+    # 3. Create slicing tuple
+    slices = [slice(None)] * ndim
+    slices[split_dim] = slice(start_idx, end_idx)
     
-    # 4. Perform slicing on CPU memory
-    # This returns a small ~215MB chunk (1.7GB / 8) which fits easily on TPU.
-    return tensor_numpy[tuple(slice_indices)]
-
-
-LayoutMap = collections.namedtuple("LayoutMap", ["state_rules", "output_rules"])
+    # 4. Return the specific shard (small chunk)
+    return tensor_numpy[tuple(slices)]
