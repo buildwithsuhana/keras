@@ -3,12 +3,20 @@ import gc
 import re
 from typing import Any, Tuple, Set
 import numpy as np
+
+# Keras Imports
 from keras import Variable, device
 from keras.src.models import Model
 from keras.src.backend import distribution_lib
 
-# Import our custom logic
+# Import local utility
 from keras.src.distribution.tensor_parallel.tensor_layout import split_tensor_for_parallelism
+
+# Try to import JAX for memory management
+try:
+    import jax
+except ImportError:
+    jax = None
 
 logger = logging.getLogger(__name__)
 
@@ -23,9 +31,6 @@ class ShardedWeight:
         else:
             clean_name = "sharded_var"
             
-        # [CRITICAL] Create Variable directly on target device.
-        # tensor_shard should effectively be bfloat16 (via ml_dtypes) here 
-        # to minimize VRAM usage during upload.
         with device(current_dev):
             self._variable = Variable(
                 initializer=tensor_shard, 
@@ -33,6 +38,8 @@ class ShardedWeight:
                 name=clean_name 
             )
 
+    @property
+    def name(self): return self._variable.name
     @property
     def value(self): return self._variable.value
     @property
@@ -53,7 +60,7 @@ class ParameterShardingStrategy:
     def shard_model_parameters(self, model, config, device_id: Any) -> Tuple["Model", Set[str]]:
         ParameterShardedModel = _define_parameter_sharded_model()
         
-        print(f"🔧 Applying manual parameter sharding [v4-Bfloat16-Fix] (Rank {self.rank}/{self.device_count})...")
+        print(f"🔧 Applying manual parameter sharding [v5-Nuclear-Memory] (Rank {self.rank}/{self.device_count})...")
         modified_parameters = set()
 
         for pattern, rule in config.items():
@@ -61,7 +68,6 @@ class ParameterShardingStrategy:
 
             for param_name, param in matching_params:
                 try:
-                    # Interpret Layout
                     split_dim = None
                     if isinstance(rule, (tuple, list)):
                         for axis_idx, axis_name in enumerate(rule):
@@ -75,7 +81,7 @@ class ParameterShardingStrategy:
                                 break
 
                     if split_dim is not None:
-                        # 1. Get Slice (Optimized bfloat16/float16 on CPU)
+                        # 1. Slice on CPU (NumPy)
                         sharded_tensor_np = split_tensor_for_parallelism(
                             param, 
                             index=self.rank, 
@@ -83,21 +89,33 @@ class ParameterShardingStrategy:
                             dim=split_dim
                         )
                         
-                        # 2. Move to Device
+                        # 2. Upload to Device
                         sharded_var = ShardedWeight(
                             sharded_tensor_np, 
                             name=param_name, 
                             device_id=device_id
                         )
                         
+                        # 3. Store Reference
                         self.sharded_weights[param_name] = sharded_var
                         modified_parameters.add(param_name)
                         
-                        # 3. Cleanup
+                        # 4. [NUCLEAR FIX] Force JAX Synchronization & Cache Clear
+                        # This prevents JAX from queueing up gigabytes of pending allocs
+                        if jax is not None:
+                            try:
+                                # Force execution to finish
+                                jax.block_until_ready(sharded_var.value)
+                                # Clear internal fragmentation
+                                jax.clear_caches()
+                            except Exception:
+                                pass
+
+                        # 5. Clean up Host RAM
                         del sharded_tensor_np
                         
-                        # 4. Free original weight (CPU/RAM)
                         try:
+                            # Free source model weight
                             dummy = np.zeros((1,), dtype=param.dtype)
                             param.assign(dummy)
                         except:
@@ -110,7 +128,6 @@ class ParameterShardingStrategy:
 
                 except Exception as e:
                     print(f"   ❌ FATAL: Failed to shard {param_name}: {e}")
-                    # Stop immediately to avoid cascading OOM
                     raise e
 
         sharded_model = ParameterShardedModel(
@@ -149,7 +166,6 @@ def _define_parameter_sharded_model():
                 
         def call(self, inputs, training=None, mask=None):
             outputs = self.original_model(inputs, training=training, mask=mask)
-            
             if hasattr(self.config, "output_rules"):
                 for layer_name, rule in self.config.output_rules.items():
                     if rule == "allreduce sum":

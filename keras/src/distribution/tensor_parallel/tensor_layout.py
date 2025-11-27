@@ -1,18 +1,15 @@
-import logging
 import numpy as np
 
-# Try to import ml_dtypes for bfloat16 support on CPU
+# Global flag to check import status
 try:
     import ml_dtypes
     HAS_ML_DTYPES = True
 except ImportError:
     HAS_ML_DTYPES = False
 
+_ML_DTYPES_LOGGED = False
+
 class LayoutMap(dict):
-    """
-    A flexible dictionary-based LayoutMap for manual Tensor Parallelism.
-    Inherits from dict to allow arbitrary attribute storage (output_rules).
-    """
     def __init__(self, device_mesh=None):
         super().__init__()
         self.device_mesh = device_mesh
@@ -26,6 +23,11 @@ def split_tensor_for_parallelism(tensor, index, device_count, dim):
     """
     Slices a tensor on CPU and downcasts to bfloat16 to save Device Memory.
     """
+    global _ML_DTYPES_LOGGED
+    if not _ML_DTYPES_LOGGED:
+        print(f"   ℹ️ [Layout] ML_DTYPES available: {HAS_ML_DTYPES}. Using bfloat16 optimization? {HAS_ML_DTYPES}")
+        _ML_DTYPES_LOGGED = True
+
     # 1. Resolve negative dimensions
     ndim = len(tensor.shape)
     if dim < 0:
@@ -34,7 +36,6 @@ def split_tensor_for_parallelism(tensor, index, device_count, dim):
         split_dim = dim
 
     # 2. Move to Host RAM (NumPy)
-    # NOTE: This usually promotes bfloat16 -> float32
     if hasattr(tensor, "numpy"):
         tensor_numpy = tensor.numpy()
     else:
@@ -56,11 +57,9 @@ def split_tensor_for_parallelism(tensor, index, device_count, dim):
     # 4. Perform Slice
     shard = tensor_numpy[tuple(slices)]
 
-    # 5. [CRITICAL OOM FIX] Downcast on CPU before sending to GPU
-    # This prevents the backend from allocating a massive float32 buffer on VRAM.
+    # 5. Downcast to save memory
     if HAS_ML_DTYPES:
-        # Convert float32 -> bfloat16 (numpy compatible)
         return shard.astype(ml_dtypes.bfloat16)
     else:
-        # Fallback to float16 if ml_dtypes is missing (saves memory, slight precision risk)
+        # Fallback if ml_dtypes missing (risky for precision, but saves memory)
         return shard.astype(np.float16)
