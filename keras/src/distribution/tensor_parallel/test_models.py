@@ -153,14 +153,15 @@ def format_for_causal_lm(data):
     return features, labels
 
 
+# ... inside test_models.py ...
+
 def get_model_from_preset(preset_name, model_class):
-    """Creates a CausalLM model from a KerasNLP preset."""
     logger.info(f"Creating {preset_name} model from KerasNLP preset (on CPU)...")
     
+    # [CRITICAL] The context manager MUST wrap the entire creation logic
     with keras.device("cpu"):
         model = model_class.from_preset(preset_name, preprocessor=None)
         
-        # [FIX] Enable LoRA to fit optimizer states in memory
         if "gemma" in preset_name:
             logger.info("✨ Enabling LoRA (Rank=4) for memory efficiency...")
             model.backbone.enable_lora(rank=4)
