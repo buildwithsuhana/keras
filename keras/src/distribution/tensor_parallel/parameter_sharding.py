@@ -57,9 +57,6 @@ class ParameterShardingStrategy:
             for param_name, param in matching_params:
                 try:
                     # --- [FIX] Interpret Layout Rules ---
-                    # The 'rule' is typically a tuple like (None, 'model') or ('model', None)
-                    # We need to map this to a split dimension.
-                    
                     split_dim = None
                     
                     # Heuristic: Find which axis has 'model'
@@ -98,13 +95,10 @@ class ParameterShardingStrategy:
                         gc.collect()
                         
                     else:
-                        # If no 'model' axis, we assume replication (keep original)
-                        # or ignore if not explicitly meant to be sharded.
-                        pass
+                        pass # Replicate or ignore
 
                 except Exception as e:
                     print(f"   ❌ Failed to shard {param_name}: {e}")
-                    # traceback.print_exc()
                     continue
 
         sharded_model = ParameterShardedModel(
@@ -119,7 +113,6 @@ class ParameterShardingStrategy:
     def _find_matching_parameters(self, model, pattern):
         matches = []
         for v in model.variables:
-            # Check both name and path
             if re.fullmatch(pattern, v.path) or re.fullmatch(pattern, v.name):
                 matches.append((v.path, v))
         return matches
@@ -136,34 +129,23 @@ def _define_parameter_sharded_model():
             self.config = config
             self.device_id = device_id
             
-            # Rebuild variables using shards
             self._recreate_variables()
 
         def _recreate_variables(self):
-            # We map sharded weights to new variables on the target device
+            # Map sharded weights to new variables on the target device
             self._sharded_vars = []
             for name, shard_np in self.sharding_strategy.sharded_weights.items():
                 w = ShardedWeight(shard_np, name, device_id=self.device_id)
                 self._sharded_vars.append(w)
                 
         def call(self, inputs, training=None, mask=None):
-            # 1. Forward pass (Delegating to original model structure)
-            # Note: In a true manual TP implementation, we would need to replace 
-            # the layers in original_model with TP-aware layers (DenseTP, etc.).
-            # However, for this 'hack' to work without rewriting layers, 
-            # we rely on the backend to handle the sharded inputs if they were JAX arrays.
-            # But since we are manually managing shards, the original_model.call 
-            # might fail if it expects full shapes.
-            
-            # For verification purposes, we run the model.
+            # 1. Forward pass
             outputs = self.original_model(inputs, training=training, mask=mask)
             
             # 2. Apply Output Rules (AllReduce)
-            # We check the communication rules stored in the custom LayoutMap
             if hasattr(self.config, "output_rules"):
                 for layer_name, rule in self.config.output_rules.items():
                     if rule == "allreduce sum":
-                         # This is where the actual cross-device sum happens
                          outputs = distribution_lib.all_reduce(outputs, op="sum", axis_name="model")
             
             return outputs

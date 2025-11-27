@@ -28,7 +28,7 @@ def split_tensor_for_parallelism(tensor, index, device_count, dim):
         split_dim = dim
 
     # [OOM FIX] Force conversion to Host RAM (NumPy) immediately.
-    # We detaching from the graph/device prevents allocating the full 9B tensor 
+    # Detaching from the graph/device prevents allocating the full 9B tensor 
     # on the TPU just to slice it.
     if hasattr(tensor, "numpy"):
         tensor_numpy = tensor.numpy()

@@ -7,11 +7,26 @@ def analyze_dense_layer(layer):
     """Classifies a Dense layer based on its input/output dimensions."""
     if not isinstance(layer, layers.Dense): return 'dense'
     
-    # ... (Keep existing size detection logic) ...
     input_dim, output_dim = None, None
-    if hasattr(layer, 'kernel') and hasattr(layer.kernel, 'shape'):
-         input_dim, output_dim = layer.kernel.shape
     
+    # Try to find kernel variable to get shape
+    kernel_var = None
+    if hasattr(layer, "weights"):
+        for w in layer.weights:
+            if "kernel" in w.name:
+                kernel_var = w
+                break
+    
+    if kernel_var is not None and hasattr(kernel_var, 'shape'):
+         input_dim, output_dim = kernel_var.shape
+    
+    # Fallback to config
+    if input_dim is None or output_dim is None:
+        if hasattr(layer, 'units'):
+            output_dim = layer.units
+        if hasattr(layer, 'input_shape') and layer.input_shape and len(layer.input_shape) > 1:
+            input_dim = layer.input_shape[-1]
+
     if not input_dim or not output_dim: return 'dense'
 
     if output_dim > input_dim * 1.25: return 'up_projection'
@@ -27,7 +42,7 @@ def _apply_layer_sharding_rules(layer, layout_map):
     if isinstance(layer, layers.Dense):
         mlp_type = analyze_dense_layer(layer)
         
-        # Helper to find kernel/bias
+        # Helper to find kernel/bias safely
         kernel = next((w for w in layer.weights if "kernel" in w.name), None)
         bias = next((w for w in layer.weights if "bias" in w.name), None)
         
@@ -37,30 +52,32 @@ def _apply_layer_sharding_rules(layer, layout_map):
         if mlp_type == 'up_projection': 
             # Column Parallel (Split Output/Dim 1)
             if k_path: layout_map[k_path] = (None, "model")
-            if b_path: layout_map[b_path] = ("model",) # Bias matches output shard
+            if b_path: layout_map[b_path] = ("model",) 
 
         elif mlp_type == 'down_projection':
             # Row Parallel (Split Input/Dim 0) -> Output needs Reduction
             if k_path: layout_map[k_path] = ("model", None)
-            if b_path: layout_map[b_path] = (None,) # Bias is added after reduction usually
+            if b_path: layout_map[b_path] = (None,)
             
             # Add Reduction Rule
             layout_map.output_rules[layer.name] = "allreduce sum"
 
         else:
-            # Default to Column Parallel for general dense
+            # Default to Column Parallel
             if k_path: layout_map[k_path] = (None, "model")
+            if b_path: layout_map[b_path] = ("model",)
 
     # 2. Embedding
     elif isinstance(layer, layers.Embedding) or "Embedding" in layer.__class__.__name__:
         # Find embedding weight
         w = next((x for x in layer.weights if "embedding" in x.name or "weight" in x.name), None)
-        if w and safe_path(w):
+        
+        # [FIX] Explicit 'is not None' check. Do NOT use 'if w:' on a Variable.
+        if w is not None and safe_path(w):
             layout_map[safe_path(w)] = (None, "model")
 
     # 3. EinsumDense (Attention)
     elif isinstance(layer, layers.EinsumDense):
-        # ... (Keep existing logic) ...
         kernel = next((w for w in layer.weights if "kernel" in w.name), None)
         k_path = safe_path(kernel)
         
@@ -77,7 +94,6 @@ def _apply_layer_sharding_rules(layer, layout_map):
 def get_default_config(module, mesh):
     layout_map = LayoutMap(mesh)
     
-    # BFS/DFS to traverse layers
     stack = [module]
     visited = set()
     
@@ -92,9 +108,13 @@ def get_default_config(module, mesh):
         if hasattr(layer, 'layers'):
             stack.extend(layer.layers)
             
-        # Check attributes for nested layers (common in NLP models)
+        # Check attributes for nested layers
         for attr in dir(layer):
-            val = getattr(layer, attr, None)
+            if attr.startswith("_"): continue
+            try:
+                val = getattr(layer, attr, None)
+            except:
+                continue
             if isinstance(val, layers.Layer):
                 stack.append(val)
                 

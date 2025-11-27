@@ -13,12 +13,6 @@ logger = logging.getLogger(__name__)
 
 class TensorParallelKeras(models.Model):
     def __init__(self, model, device_count=None, device_ids=None, rank=0, **kwargs):
-        """
-        Args:
-            model: The source model.
-            device_count: Total devices.
-            rank: The rank of the current device (default 0 for single-device simulation).
-        """
         super().__init__(**kwargs)
         
         # 1. Detect Devices
@@ -37,26 +31,23 @@ class TensorParallelKeras(models.Model):
 
         print(f"✅ TP Setup: Rank {self.rank}/{self.device_count} on {self.current_device}")
 
-        # 2. Create Mesh (Logical)
+        # 2. Create Mesh
         self.mesh = DeviceMesh(
             shape=(1, self.device_count),
             axis_names=["batch", "model"],
             devices=self.devices
         )
 
-        # 3. Generate Layout (Using fixed LayoutMap class)
+        # 3. Generate Layout
         self.layout_map = get_default_config(model, self.mesh)
         
         # 4. Initialize Manual Strategy
-        # We DO NOT use ModelParallel class. We use ParameterShardingStrategy.
         self.strategy = ParameterShardingStrategy(
             device_count=self.device_count, 
             rank=self.rank
         )
 
         # 5. Shard the model
-        # This will internally convert weights to numpy, slice them, 
-        # and create a new model with only the shards for THIS rank.
         self.distributed_model, _ = self.strategy.shard_model_parameters(
             model, 
             self.layout_map, 
