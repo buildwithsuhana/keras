@@ -88,7 +88,7 @@ BATCH_SIZE = 1  # Increased slightly as LoRA saves memory
 SEQUENCE_LENGTH = 32
 LEARNING_RATE = 1e-4 # Adjusted for Adafactor
 EPOCHS = 1
-STEPS_PER_EPOCH = 10
+STEPS_PER_EPOCH = 5
 VALIDATION_STEPS = 5
 
 MODEL_MAPPING = {

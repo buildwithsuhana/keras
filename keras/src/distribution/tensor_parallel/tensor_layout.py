@@ -19,37 +19,37 @@ def split_tensor_for_parallelism(tensor, index, device_count, dim):
     Returns:
         A tensor slice corresponding to the given `index`.
     """
+    # 1. Resolve negative dimensions (e.g. -1)
     if dim == -1:
         split_dim = len(tensor.shape) - 1
     else:
         split_dim = dim
 
-    # [CRITICAL FIX] Force conversion to standard NumPy array (Host Memory).
-    # This is essential for large models (like Gemma 9B).
-    # Without this, JAX attempts to load the FULL tensor (e.g. 1.71GB embedding)
-    # onto the default TPU device (TPU 0) just to slice it. Since TPU 0 is 
-    # already holding shards, it runs out of memory (RESOURCE_EXHAUSTED).
-    # Converting to 'np.array' forces the slice to execute on the CPU.
+    # [CRITICAL FIX] Force conversion to standard NumPy array.
+    # This is the MAGIC LINE that fixes the OOM.
+    # It pulls the data to Host RAM (CPU) so we don't use TPU memory
+    # as a scratchpad for the full 1.7GB tensor.
     tensor_numpy = np.array(tensor)
 
+    # 2. Calculate slice indices on CPU
     shape = tensor_numpy.shape
     total_length = shape[split_dim]
     shard_size = total_length // device_count
     
     start_idx = index * shard_size
     
-    # Handle remainder for the last shard
+    # Handle remainder for the last shard (if any)
     if index == device_count - 1:
         end_idx = total_length
     else:
         end_idx = (index + 1) * shard_size
         
-    # Construct the slice tuple: (:, :, start:end, :)
+    # 3. Create the slice object
     slice_indices = [slice(None)] * len(shape)
     slice_indices[split_dim] = slice(start_idx, end_idx)
     
-    # Perform the slice on Host RAM and return
-    # This returns a small chunk (e.g. ~200MB) that fits easily on the TPU.
+    # 4. Perform slicing on CPU memory
+    # This returns a small ~215MB chunk (1.7GB / 8) which fits easily on TPU.
     return tensor_numpy[tuple(slice_indices)]
 
 

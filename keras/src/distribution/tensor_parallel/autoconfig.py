@@ -1,171 +1,114 @@
-from keras.src import layers
-from keras.src.distribution.tensor_parallel.tensor_layout import (
-    split_tensor_for_parallelism,
-    LayoutMap
-)
-
-_split_fn_internal = split_tensor_for_parallelism
-
-
-def _split_rule(device_count, dim):
-    """Creates a sharding rule for a specific dimension."""
-    return lambda x, index: _split_fn_internal(x, index, device_count, dim=dim)
-
+import keras
+from keras import layers
+from keras.distribution import LayoutMap
 
 def analyze_dense_layer(layer):
-    """
-    Classifies a Dense layer based on its input/output dimensions.
-    """
+    """Classifies a Dense layer based on its input/output dimensions."""
     if not isinstance(layer, layers.Dense):
         return 'dense'
 
     input_dim = None
     output_dim = None
 
+    # Try to infer shapes from built kernel or config
     if hasattr(layer, 'kernel') and layer.kernel is not None:
-        kernel_shape = layer.kernel.shape
-        if len(kernel_shape) == 2:
-            input_dim = kernel_shape[0]
-            output_dim = kernel_shape[1]
-
-    if input_dim is None or output_dim is None:
-        if hasattr(layer, 'units'):
-            output_dim = layer.units
-        else:
-            return 'dense'
-
-        if hasattr(layer, 'input_shape') and layer.input_shape and len(layer.input_shape) > 1:
-            input_dim = layer.input_shape[-1]
-        else:
-            return 'dense'
+        input_dim, output_dim = layer.kernel.shape
+    elif hasattr(layer, 'units') and hasattr(layer, 'input_shape') and layer.input_shape:
+        output_dim = layer.units
+        input_dim = layer.input_shape[-1]
 
     if not input_dim or not output_dim:
         return 'dense'
 
     expansion_threshold = 1.5
-    is_expansion = output_dim > input_dim * expansion_threshold
-    is_contraction = input_dim > output_dim * expansion_threshold
-
-    if is_expansion:
+    if output_dim > input_dim * expansion_threshold:
         return 'up_projection'
-    elif is_contraction:
+    elif input_dim > output_dim * expansion_threshold:
         return 'down_projection'
     else:
         return 'dense'
 
-
-def _apply_layer_sharding_rules(layer, full_name, device_count, state_rules, output_rules):
-    """
-    Helper function that applies rules to a single layer instance.
-    """
+def _apply_layer_sharding_rules(layer, full_name, device_count, layout_map):
+    """Applies Keras Layout rules to a single layer."""
+    
+    # 1. Dense Layers (MLP / Projections)
     if isinstance(layer, layers.Dense):
         mlp_type = analyze_dense_layer(layer)
 
-        if mlp_type == 'up_projection':
-            state_rules[f"{full_name}.kernel"] = _split_rule(device_count, dim=1)
+        if mlp_type == 'up_projection': # Column Parallel
+            layout_map[f"{full_name}/kernel"] = (None, "model")
             if layer.use_bias:
-                state_rules[f"{full_name}.bias"] = _split_rule(device_count, dim=0)
-            output_rules[f"{full_name}"] = {0: "gather"}
-
-        elif mlp_type == 'down_projection':
-            state_rules[f"{full_name}.kernel"] = _split_rule(device_count, dim=0)
-            output_rules[f"{full_name}"] = {0: "allreduce"}
-
+                layout_map[f"{full_name}/bias"] = ("model",)
+                
+        elif mlp_type == 'down_projection': # Row Parallel
+            layout_map[f"{full_name}/kernel"] = ("model", None)
+            if layer.use_bias:
+                # Bias is usually applied after AllReduce, so it's replicated
+                layout_map[f"{full_name}/bias"] = (None,)
         else:
-            state_rules[f"{full_name}.kernel"] = _split_rule(device_count, dim=1)
+            # Default Dense (e.g. Heads): Column Parallel usually safer default
+            layout_map[f"{full_name}/kernel"] = (None, "model")
             if layer.use_bias:
-                state_rules[f"{full_name}.bias"] = _split_rule(device_count, dim=0)
-            output_rules[f"{full_name}"] = {0: "gather -1"}
+                layout_map[f"{full_name}/bias"] = ("model",)
 
+    # 2. EinsumDense (Attention projections often use this in KerasNLP)
     elif isinstance(layer, layers.EinsumDense):
-        if "attention_output" in full_name:
-            state_rules[f"{full_name}.kernel"] = _split_rule(device_count, dim=0)
-            output_rules[f"{full_name}"] = {0: "allreduce"}
-        else:
-            state_rules[f"{full_name}.kernel"] = _split_rule(device_count, dim=1)
+        # Heuristic: Output projections often end with 'attention_output'
+        if "attention_output" in full_name: # Row Parallel
+            layout_map[f"{full_name}/kernel"] = ("model", None)
             if hasattr(layer, 'bias') and layer.bias is not None:
-                state_rules[f"{full_name}.bias"] = _split_rule(device_count, dim=0)
-            output_rules[f"{full_name}"] = {0: "gather -1"}
+                layout_map[f"{full_name}/bias"] = (None,)
+        else: # Query/Key/Value projections: Column Parallel
+            layout_map[f"{full_name}/kernel"] = (None, "model")
+            if hasattr(layer, 'bias') and layer.bias is not None:
+                layout_map[f"{full_name}/bias"] = ("model",)
 
+    # 3. Embeddings
     elif isinstance(layer, (layers.Embedding,)) or "Embedding" in layer.__class__.__name__:
-        if hasattr(layer, 'weights'):
-            for weight in layer.weights:
-                if "embedding" in weight.name or "weight" in weight.name:
-                    key_found = False
-                    for attr_candidate in ['embeddings', 'position_embeddings', 'weight']:
-                        if getattr(layer, attr_candidate, None) is weight:
-                            state_rules[f"{full_name}.{attr_candidate}"] = _split_rule(device_count, dim=1)
-                            key_found = True
-                            break
-                    
-                    if not key_found:
-                        clean_name = weight.name.split('/')[-1].split(':')[0]
-                        state_rules[f"{full_name}.{clean_name}"] = _split_rule(device_count, dim=1)
-
-            output_rules[f"{full_name}"] = {0: "no_comm"}
+        # Vocab splitting (Column Parallel equivalent)
+        layout_map[f"{full_name}/embeddings"] = (None, "model")
+        layout_map[f"{full_name}/weights"] = (None, "model")
 
 
-def get_default_config(module, device_ids):
-    """
-    Generates a default tensor parallelism configuration for a model using
-    iterative graph traversal (stack-based).
-    """
-    device_count = len(device_ids)
-    state_rules = {}
-    output_rules = {}
+def get_default_config(module, mesh):
+    """Generates a Keras LayoutMap for the model."""
+    layout_map = LayoutMap(mesh)
+    
+    # [FIX] Correctly access mesh shape via index
+    if "model" in mesh.axis_names:
+        model_idx = mesh.axis_names.index("model")
+        device_count = mesh.shape[model_idx]
+    else:
+        device_count = 1
     
     processed_layers = set()
-    
     stack = [(module, "")]
 
     while stack:
         current_layer, prefix = stack.pop()
-
-        if id(current_layer) in processed_layers:
-            continue
+        if id(current_layer) in processed_layers: continue
         processed_layers.add(id(current_layer))
 
+        # Keras variable paths usually use '/' instead of '.'
         name = current_layer.name
-        full_name = f"{prefix}.{name}" if prefix else name
+        full_name = f"{prefix}/{name}" if prefix else name
 
-        _apply_layer_sharding_rules(
-            current_layer, full_name, device_count, state_rules, output_rules
-        )
+        _apply_layer_sharding_rules(current_layer, full_name, device_count, layout_map)
 
-        children_to_add = []
-
-        if hasattr(current_layer, 'layers') and current_layer.layers:
-            for sub_layer in current_layer.layers:
-                children_to_add.append((sub_layer, full_name))
-
-        for specific_attr in ['token_embedding', 'embeddings', 'position_embedding']:
-            if hasattr(current_layer, specific_attr):
-                attr_val = getattr(current_layer, specific_attr)
-                if isinstance(attr_val, layers.Layer):
-                    children_to_add.append((attr_val, full_name))
-
-        for attr_name in dir(current_layer):
-            if attr_name.startswith('__') and attr_name.endswith('__'):
-                continue
-            
-            if attr_name in ['trainable_variables', 'non_trainable_variables', 'weights']:
-                continue
-
-            attr_value = getattr(current_layer, attr_name, None)
-
-            if attr_value is None:
-                continue
-
-            if isinstance(attr_value, layers.Layer) and attr_value is not current_layer:
-                children_to_add.append((attr_value, full_name))
-            elif isinstance(attr_value, (list, tuple)):
-                for item in attr_value:
-                    if isinstance(item, layers.Layer):
-                        children_to_add.append((item, full_name))
+        # Recurse children
+        children = []
         
-        stack.extend(reversed(children_to_add))
+        # Standard sub-layers
+        if hasattr(current_layer, 'layers'):
+            children.extend([(l, full_name) for l in current_layer.layers])
+            
+        # Specific attributes for Backbones (e.g. GemmaBackbone)
+        for attr in ['token_embedding', 'embeddings']:
+            if hasattr(current_layer, attr):
+                val = getattr(current_layer, attr)
+                if isinstance(val, layers.Layer):
+                    children.append((val, full_name))
 
-    return LayoutMap(
-        state_rules=state_rules,
-        output_rules=output_rules
-    )
+        stack.extend(reversed(children))
+
+    return layout_map
