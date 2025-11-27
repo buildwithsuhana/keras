@@ -85,7 +85,7 @@ from keras.src.distribution.tensor_parallel.tensor_parallel_keras import (
 
 # --- Constants ---
 BATCH_SIZE = 1  # Increased slightly as LoRA saves memory
-SEQUENCE_LENGTH = 32
+SEQUENCE_LENGTH = 8
 LEARNING_RATE = 1e-4 # Adjusted for Adafactor
 EPOCHS = 1
 STEPS_PER_EPOCH = 5
