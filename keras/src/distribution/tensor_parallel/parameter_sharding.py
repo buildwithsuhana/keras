@@ -2,7 +2,7 @@ import logging
 import gc
 import re
 import os
-import psutil  # Used for debug logging of RAM
+import time
 from typing import Any, Tuple, Set
 import numpy as np
 
@@ -14,19 +14,25 @@ from keras.src.backend import distribution_lib
 # Import local utility
 from keras.src.distribution.tensor_parallel.tensor_layout import split_tensor_for_parallelism
 
-# Try to import JAX for memory management
+# Optional Imports for Optimization/Debug
 try:
     import jax
 except ImportError:
     jax = None
 
+try:
+    import psutil
+except ImportError:
+    psutil = None
+
 logger = logging.getLogger(__name__)
 
 def log_memory(stage=""):
-    """Helper to print current Host RAM usage."""
-    process = psutil.Process(os.getpid())
-    mem = process.memory_info().rss / (1024 ** 3)  # Convert to GB
-    print(f"   [MEM] {stage}: {mem:.2f} GB RAM used")
+    """Logs current Host RAM usage."""
+    if psutil:
+        process = psutil.Process(os.getpid())
+        mem = process.memory_info().rss / (1024 ** 3)  # GB
+        print(f"   [MEM] {stage}: {mem:.2f} GB")
 
 class ShardedWeight:
     """Wrapper for a sharded variable on a specific device."""
@@ -39,11 +45,14 @@ class ShardedWeight:
         else:
             clean_name = "sharded_var"
             
+        # [CRITICAL] Create Variable on device with EXPLICIT dtype.
+        # This prevents Keras from casting bfloat16 back to float32 during init.
         with device(current_dev):
             self._variable = Variable(
                 initializer=tensor_shard, 
                 trainable=trainable, 
-                name=clean_name 
+                name=clean_name,
+                dtype=tensor_shard.dtype # <--- THE FIX
             )
 
     @property
@@ -68,17 +77,18 @@ class ParameterShardingStrategy:
     def shard_model_parameters(self, model, config, device_id: Any) -> Tuple["Model", Set[str]]:
         ParameterShardedModel = _define_parameter_sharded_model()
         
-        print(f"🔧 [DEBUG MODE] Applying parameter sharding (Rank {self.rank}/{self.device_count})...")
-        log_memory("Start Sharding")
+        print(f"🔧 [DEBUG] Starting Sharding (Rank {self.rank}/{self.device_count}) on {device_id}")
+        log_memory("Initial State")
         
         modified_parameters = set()
         
-        # 1. Count total items for progress bar
-        total_items = 0
+        # 1. Calculate Total Work
+        total_params = 0
         for pattern, rule in config.items():
             matches = self._find_matching_parameters(model, pattern)
-            total_items += len(matches)
+            total_params += len(matches)
         
+        print(f"   [INFO] Found {total_params} parameters to shard.")
         current_idx = 0
 
         for pattern, rule in config.items():
@@ -100,9 +110,11 @@ class ParameterShardingStrategy:
                                 break
 
                     if split_dim is not None:
-                        print(f"   [{current_idx}/{total_items}] Sharding {param_name}...")
+                        # Log progress
+                        print(f"   [{current_idx}/{total_params}] Processing: {param_name}")
                         
-                        # 1. Slice on CPU (NumPy)
+                        # 1. Slice (CPU)
+                        # This returns a numpy array (hopefully bfloat16)
                         sharded_tensor_np = split_tensor_for_parallelism(
                             param, 
                             index=self.rank, 
@@ -117,23 +129,21 @@ class ParameterShardingStrategy:
                             device_id=device_id
                         )
                         
-                        # 3. Store Reference
                         self.sharded_weights[param_name] = sharded_var
                         modified_parameters.add(param_name)
                         
-                        # 4. [NUCLEAR FIX] Force JAX Synchronization & Cache Clear
+                        # 3. Nuclear Memory Cleanup
                         if jax is not None:
                             try:
                                 jax.block_until_ready(sharded_var.value)
                                 jax.clear_caches()
-                            except Exception:
+                            except:
                                 pass
 
-                        # 5. Clean up Host RAM
+                        # 4. Host Cleanup
                         del sharded_tensor_np
-                        
                         try:
-                            # Free source model weight
+                            # Replace source with dummy
                             dummy = np.zeros((1,), dtype=param.dtype)
                             param.assign(dummy)
                         except:
@@ -141,17 +151,17 @@ class ParameterShardingStrategy:
                         
                         gc.collect()
                         
-                        # Log memory every 10 steps to reduce noise
-                        if current_idx % 10 == 0:
-                            log_memory("After GC")
+                        # Log memory occasionally
+                        if current_idx % 20 == 0:
+                            log_memory(f"Step {current_idx}")
                         
                     else:
-                        # Replicate case (optional logging)
+                        # Skip non-sharded
                         pass 
 
                 except Exception as e:
-                    print(f"   ❌ FATAL: Failed to shard {param_name}: {e}")
-                    log_memory("Crash State")
+                    print(f"   ❌ [CRASH] Failed at {param_name}")
+                    log_memory("CRASH STATE")
                     raise e
 
         sharded_model = ParameterShardedModel(
@@ -161,7 +171,8 @@ class ParameterShardingStrategy:
             device_id=device_id,
         )
         
-        print(f"🎯 Parameter sharding completed.")
+        print(f"🎯 Sharding Complete. Modified {len(modified_parameters)} params.")
+        log_memory("Final")
         return sharded_model, modified_parameters
 
     def _find_matching_parameters(self, model, pattern):

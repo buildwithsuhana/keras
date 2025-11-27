@@ -1,177 +1,112 @@
 import keras
 from keras import layers
-# Import LOCAL tensor_layout to get the dict-based LayoutMap
 from keras.src.distribution.tensor_parallel.tensor_layout import LayoutMap
 
 def analyze_dense_layer(layer):
-    """
-    Classifies a Dense layer based on its input/output dimensions.
-    Returns: 'up_projection' (Column Parallel), 'down_projection' (Row Parallel), or 'dense'.
-    """
-    if not isinstance(layer, layers.Dense):
-        return 'dense'
+    if not isinstance(layer, layers.Dense): return 'dense'
 
-    input_dim = None
-    output_dim = None
-
-    # Try to find kernel variable to get shape directly
+    input_dim, output_dim = None, None
     kernel_var = None
+    
     if hasattr(layer, "weights"):
         for w in layer.weights:
             if "kernel" in w.name:
                 kernel_var = w
                 break
     
-    if kernel_var is None and hasattr(layer, 'kernel'):
-        kernel_var = layer.kernel
+    if kernel_var is None and hasattr(layer, 'kernel'): kernel_var = layer.kernel
 
     if kernel_var is not None and hasattr(kernel_var, 'shape'):
-        kernel_shape = kernel_var.shape
-        if len(kernel_shape) == 2:
-            input_dim = kernel_shape[0]
-            output_dim = kernel_shape[1]
+        input_dim, output_dim = kernel_var.shape[0], kernel_var.shape[1]
 
-    # Fallback to layer config attributes
     if input_dim is None or output_dim is None:
-        if hasattr(layer, 'units'):
-            output_dim = layer.units
-        else:
-            return 'dense'
-        if hasattr(layer, 'input_shape') and layer.input_shape and len(layer.input_shape) > 1:
-            input_dim = layer.input_shape[-1]
-        else:
-            return 'dense'
+        if hasattr(layer, 'units'): output_dim = layer.units
+        if hasattr(layer, 'input_shape') and len(layer.input_shape) > 1: input_dim = layer.input_shape[-1]
 
-    if not input_dim or not output_dim:
-        return 'dense'
+    if not input_dim or not output_dim: return 'dense'
 
-    # Heuristic: 
-    expansion_threshold = 1.25
-    if output_dim > input_dim * expansion_threshold:
-        return 'up_projection'
-    elif input_dim > output_dim * expansion_threshold:
-        return 'down_projection'
-    else:
-        return 'dense'
+    # Heuristic
+    if output_dim > input_dim * 1.25: return 'up_projection'
+    elif input_dim > output_dim * 1.25: return 'down_projection'
+    return 'dense'
 
 def _get_variable_by_name_suffix(layer, suffix):
-    """Helper to find a variable in a layer by its name suffix (e.g. 'kernel')."""
     if hasattr(layer, "weights"):
         for w in layer.weights:
-            if w.name.endswith(suffix) or f"/{suffix}" in w.name:
-                return w
+            if w.name.endswith(suffix) or f"/{suffix}" in w.name: return w
     return None
 
 def _apply_layer_sharding_rules(layer, layout_map):
-    """
-    Applies Keras LayoutMap rules to a single layer instance.
-    Populates both state_rules (sharding) and output_rules (communication).
-    """
-    
-    def safe_path(var):
-        return getattr(var, "path", None)
+    def safe_path(var): return getattr(var, "path", None)
 
-    # 1. Dense Layers
     if isinstance(layer, layers.Dense):
         mlp_type = analyze_dense_layer(layer)
-        
-        kernel_var = _get_variable_by_name_suffix(layer, "kernel")
-        bias_var = _get_variable_by_name_suffix(layer, "bias")
-
-        kernel_path = safe_path(kernel_var) if kernel_var is not None else None
-        bias_path = safe_path(bias_var) if bias_var is not None else None
+        kernel = _get_variable_by_name_suffix(layer, "kernel")
+        bias = _get_variable_by_name_suffix(layer, "bias")
+        k_path = safe_path(kernel) if kernel is not None else None
+        b_path = safe_path(bias) if bias is not None else None
 
         if mlp_type == 'up_projection': 
-            # Column Parallel
-            if kernel_path: layout_map[kernel_path] = (None, "model")
-            if layer.use_bias and bias_path: layout_map[bias_path] = ("model",)
-
+            if k_path: layout_map[k_path] = (None, "model")
+            if bias and b_path: layout_map[b_path] = ("model",)
         elif mlp_type == 'down_projection':
-            # Row Parallel
-            if kernel_path: layout_map[kernel_path] = ("model", None)
-            if layer.use_bias and bias_path: layout_map[bias_path] = (None,)
+            if k_path: layout_map[k_path] = ("model", None)
+            if bias and b_path: layout_map[b_path] = (None,)
             layout_map.output_rules[layer.name] = "allreduce sum"
-
         else:
-            if kernel_path: layout_map[kernel_path] = (None, "model")
-            if layer.use_bias and bias_path: layout_map[bias_path] = ("model",)
+            if k_path: layout_map[k_path] = (None, "model")
+            if bias and b_path: layout_map[b_path] = ("model",)
 
-    # 2. EinsumDense
     elif isinstance(layer, layers.EinsumDense):
-        kernel_var = _get_variable_by_name_suffix(layer, "kernel")
-        bias_var = _get_variable_by_name_suffix(layer, "bias")
+        kernel = _get_variable_by_name_suffix(layer, "kernel")
+        k_path = safe_path(kernel) if kernel is not None else None
         
-        kernel_path = safe_path(kernel_var) if kernel_var is not None else None
-        bias_path = safe_path(bias_var) if bias_var is not None else None
-
         is_attn_output = "attention_output" in layer.name
-        if not is_attn_output and kernel_path and "attention_output" in kernel_path:
-            is_attn_output = True
+        if not is_attn_output and k_path and "attention_output" in k_path: is_attn_output = True
             
         if is_attn_output:
-            if kernel_path: layout_map[kernel_path] = ("model", None)
-            if bias_path: layout_map[bias_path] = (None,)
+            if k_path: layout_map[k_path] = ("model", None)
             layout_map.output_rules[layer.name] = "allreduce sum"
         else:
-            if kernel_path: layout_map[kernel_path] = (None, "model")
-            if bias_path: layout_map[bias_path] = ("model",)
+            if k_path: layout_map[k_path] = (None, "model")
 
-    # 3. Embeddings
     elif isinstance(layer, (layers.Embedding,)) or "Embedding" in layer.__class__.__name__:
-        emb_var = _get_variable_by_name_suffix(layer, "embeddings")
-        if emb_var is None: 
-            emb_var = _get_variable_by_name_suffix(layer, "weight")
-        
-        if emb_var is None and hasattr(layer, 'embeddings'):
-            if hasattr(layer.embeddings, 'path'):
-                emb_var = layer.embeddings
+        emb = _get_variable_by_name_suffix(layer, "embeddings")
+        if emb is None: emb = _get_variable_by_name_suffix(layer, "weight")
+        if emb is None and hasattr(layer, 'embeddings'): emb = layer.embeddings
             
-        if emb_var is not None and safe_path(emb_var):
-            layout_map[safe_path(emb_var)] = (None, "model")
-
+        # [FIX] Boolean Safety
+        if emb is not None and safe_path(emb):
+            layout_map[safe_path(emb)] = (None, "model")
 
 def get_default_config(module, mesh):
     layout_map = LayoutMap(mesh)
     processed_layers = set()
     stack = [module]
-
-    print("ℹ️ [AutoConfig] Analyzing model structure...")
+    
+    print("ℹ️ [AutoConfig] Scanning layer graph...")
 
     while stack:
         current_layer = stack.pop()
-
-        if id(current_layer) in processed_layers:
-            continue
+        if id(current_layer) in processed_layers: continue
         processed_layers.add(id(current_layer))
 
         _apply_layer_sharding_rules(current_layer, layout_map)
 
-        children_to_add = []
+        children = []
         if hasattr(current_layer, 'layers') and current_layer.layers:
-            children_to_add.extend(current_layer.layers)
-
-        for specific_attr in ['token_embedding', 'embeddings', 'position_embedding']:
-            if hasattr(current_layer, specific_attr):
-                attr_val = getattr(current_layer, specific_attr)
-                if isinstance(attr_val, layers.Layer):
-                    children_to_add.append(attr_val)
-
-        for attr_name in dir(current_layer):
-            if attr_name.startswith('__') or attr_name in ['trainable_variables', 'weights', 'layers', 'variables']:
-                continue
-            try:
-                attr_value = getattr(current_layer, attr_name, None)
-            except Exception:
-                continue
-
-            if isinstance(attr_value, layers.Layer) and attr_value is not current_layer:
-                children_to_add.append(attr_value)
-            elif isinstance(attr_value, (list, tuple)):
-                for item in attr_value:
-                    if isinstance(item, layers.Layer):
-                        children_to_add.append(item)
+            children.extend(current_layer.layers)
         
-        stack.extend(reversed(children_to_add))
-
-    print(f"ℹ️ [AutoConfig] Generated rules for {len(layout_map)} parameters.")
+        for attr in dir(current_layer):
+            if attr.startswith('__'): continue
+            try: val = getattr(current_layer, attr, None)
+            except: continue
+            if isinstance(val, layers.Layer): children.append(val)
+            elif isinstance(val, (list, tuple)):
+                for item in val:
+                    if isinstance(item, layers.Layer): children.append(item)
+        
+        stack.extend(reversed(children))
+        
+    print(f"ℹ️ [AutoConfig] Rules generated for {len(layout_map)} tensors.")
     return layout_map

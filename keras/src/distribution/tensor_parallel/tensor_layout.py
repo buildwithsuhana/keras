@@ -21,48 +21,44 @@ class LayoutMap(dict):
 
 def split_tensor_for_parallelism(tensor, index, device_count, dim):
     """
-    Slices a tensor on CPU and downcasts to bfloat16 to save Device Memory.
+    Slices a tensor on CPU and downcasts to bfloat16.
     """
     global _ML_DTYPES_LOGGED
     if not _ML_DTYPES_LOGGED:
-        print(f"   ℹ️ [Layout] ML_DTYPES available: {HAS_ML_DTYPES}")
+        print(f"   ℹ️ [Layout] ML_DTYPES installed? {HAS_ML_DTYPES}")
         _ML_DTYPES_LOGGED = True
 
-    # 1. Resolve negative dimensions
+    # 1. Resolve dimensions
     ndim = len(tensor.shape)
-    if dim < 0:
-        split_dim = ndim + dim
-    else:
-        split_dim = dim
+    if dim < 0: split_dim = ndim + dim
+    else: split_dim = dim
 
-    # 2. Move to Host RAM (NumPy)
+    # 2. Host RAM Move
     if hasattr(tensor, "numpy"):
         tensor_numpy = tensor.numpy()
     else:
         tensor_numpy = np.array(tensor)
 
-    # 3. Calculate slice indices
+    # 3. Calc Slice
     total_length = tensor_numpy.shape[split_dim]
     shard_size = total_length // device_count
     
     start_idx = index * shard_size
-    if index == device_count - 1:
-        end_idx = total_length
-    else:
-        end_idx = (index + 1) * shard_size
+    if index == device_count - 1: end_idx = total_length
+    else: end_idx = (index + 1) * shard_size
         
     slices = [slice(None)] * ndim
     slices[split_dim] = slice(start_idx, end_idx)
     
-    # 4. Perform Slice
     shard = tensor_numpy[tuple(slices)]
 
-    # 5. Downcast to save memory
+    # 4. Downcast & Log
     if HAS_ML_DTYPES:
-        # Debug: check if we are actually saving memory
-        # print(f"      - Downcasting to bfloat16 (Original: {shard.dtype})")
+        # Check if we are accidentally using float32
+        if shard.dtype == np.float32:
+             # This is expected before cast, but we want to confirm cast happens
+             pass
         return shard.astype(ml_dtypes.bfloat16)
     else:
-        # Fallback if ml_dtypes missing (risky for precision, but saves memory)
-        print("      ⚠️ [Warning] ml_dtypes not found. Falling back to float16.")
+        print("      ⚠️ [WARN] ml_dtypes missing! Falling back to float16 (potential precision loss)")
         return shard.astype(np.float16)
