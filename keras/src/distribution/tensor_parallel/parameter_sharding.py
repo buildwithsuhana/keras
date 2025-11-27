@@ -17,6 +17,7 @@ class ShardedWeight:
     """Wrapper for a sharded variable on a specific device."""
     def __init__(self, tensor_shard, name, trainable=True, device_id=None):
         current_dev = device_id if device_id else "cpu"
+        # Create Variable directly on target device (GPU/TPU)
         with device(current_dev):
             self._variable = Variable(
                 initializer=tensor_shard, 
@@ -39,7 +40,7 @@ class ParameterShardingStrategy:
     def __init__(self, device_count: int, rank: int):
         self.device_count = device_count
         self.rank = rank
-        self.sharded_weights = {}
+        self.sharded_weights = {} # Stores ShardedWeight objects (Device Memory)
 
     def shard_model_parameters(self, model, config, device_id: Any) -> Tuple["Model", Set[str]]:
         """
@@ -56,17 +57,13 @@ class ParameterShardingStrategy:
 
             for param_name, param in matching_params:
                 try:
-                    # --- [FIX] Interpret Layout Rules ---
+                    # --- Interpret Layout Rules ---
                     split_dim = None
-                    
-                    # Heuristic: Find which axis has 'model'
                     if isinstance(rule, (tuple, list)):
                         for axis_idx, axis_name in enumerate(rule):
                             if axis_name == "model":
                                 split_dim = axis_idx
                                 break
-                    
-                    # If rule is a class (TensorLayout), try to read its axes
                     elif hasattr(rule, "axes"):
                         for axis_idx, axis_name in enumerate(rule.axes):
                             if axis_name == "model":
@@ -75,6 +72,7 @@ class ParameterShardingStrategy:
 
                     # If valid split dimension found, perform the split
                     if split_dim is not None:
+                        # 1. Get Slice (Loads to CPU RAM temporarily)
                         sharded_tensor_np = split_tensor_for_parallelism(
                             param, 
                             index=self.rank, 
@@ -82,20 +80,33 @@ class ParameterShardingStrategy:
                             dim=split_dim
                         )
                         
-                        self.sharded_weights[param_name] = sharded_tensor_np
+                        # 2. [CRITICAL] Move to Device Immediately
+                        # Creating ShardedWeight pushes the numpy array to GPU/TPU VRAM.
+                        sharded_var = ShardedWeight(
+                            sharded_tensor_np, 
+                            name=param_name, 
+                            device_id=device_id
+                        )
+                        
+                        # 3. Store reference to Device Variable (Not CPU Numpy)
+                        self.sharded_weights[param_name] = sharded_var
                         modified_parameters.add(param_name)
                         
-                        # [OOM FIX] Free original weight memory aggressively
+                        # 4. Free CPU memory immediately
+                        del sharded_tensor_np
+                        
+                        # [OOM FIX] Free original weight memory
                         try:
-                            # Replace with tiny dummy to free Host RAM
                             dummy = np.zeros((1,), dtype=param.dtype)
                             param.assign(dummy)
                         except:
                             pass
+                        
+                        # Force GC to reclaim the massive float32/bfloat16 numpy buffer
                         gc.collect()
                         
                     else:
-                        pass # Replicate or ignore
+                        pass 
 
                 except Exception as e:
                     print(f"   ❌ Failed to shard {param_name}: {e}")
@@ -132,17 +143,17 @@ def _define_parameter_sharded_model():
             self._recreate_variables()
 
         def _recreate_variables(self):
-            # Map sharded weights to new variables on the target device
+            # We map sharded weights to new variables
             self._sharded_vars = []
-            for name, shard_np in self.sharding_strategy.sharded_weights.items():
-                w = ShardedWeight(shard_np, name, device_id=self.device_id)
-                self._sharded_vars.append(w)
+            # In the fixed strategy, these are already ShardedWeight objects on device
+            for name, weight_obj in self.sharding_strategy.sharded_weights.items():
+                self._sharded_vars.append(weight_obj)
                 
         def call(self, inputs, training=None, mask=None):
-            # 1. Forward pass
+            # Forward pass
             outputs = self.original_model(inputs, training=training, mask=mask)
             
-            # 2. Apply Output Rules (AllReduce)
+            # Apply Output Rules (AllReduce)
             if hasattr(self.config, "output_rules"):
                 for layer_name, rule in self.config.output_rules.items():
                     if rule == "allreduce sum":

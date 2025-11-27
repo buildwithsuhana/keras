@@ -48,6 +48,8 @@ class TensorParallelKeras(models.Model):
         )
 
         # 5. Shard the model
+        # This will internally convert weights to numpy, slice them, 
+        # IMMEDIATELY push to GPU/TPU, and free CPU RAM.
         self.distributed_model, _ = self.strategy.shard_model_parameters(
             model, 
             self.layout_map, 

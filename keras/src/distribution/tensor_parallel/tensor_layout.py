@@ -18,7 +18,7 @@ class LayoutMap(dict):
 
 def split_tensor_for_parallelism(tensor, index, device_count, dim):
     """
-    Slices a tensor for Tensor Parallelism on the CPU to avoid OOM.
+    Slices a tensor for Tensor Parallelism on the CPU.
     """
     # 1. Resolve negative dimensions
     ndim = len(tensor.shape)
@@ -27,9 +27,11 @@ def split_tensor_for_parallelism(tensor, index, device_count, dim):
     else:
         split_dim = dim
 
-    # [OOM FIX] Force conversion to Host RAM (NumPy) immediately.
-    # Detaching from the graph/device prevents allocating the full 9B tensor 
-    # on the TPU just to slice it.
+    # [OOM FIX] Force conversion to Host RAM (NumPy).
+    # We use np.array explicitly. 
+    # NOTE: If input is bfloat16, this might cast to float32 in standard NumPy.
+    # We accept this temporarily because we will immediately push it to GPU 
+    # and free the CPU memory in parameter_sharding.py.
     if hasattr(tensor, "numpy"):
         tensor_numpy = tensor.numpy()
     else:

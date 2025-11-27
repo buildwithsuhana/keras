@@ -72,7 +72,7 @@ def _apply_layer_sharding_rules(layer, layout_map):
         # Find embedding weight
         w = next((x for x in layer.weights if "embedding" in x.name or "weight" in x.name), None)
         
-        # [FIX] Explicit 'is not None' check. Do NOT use 'if w:' on a Variable.
+        # [FIX] Explicit 'is not None' check.
         if w is not None and safe_path(w):
             layout_map[safe_path(w)] = (None, "model")
 
