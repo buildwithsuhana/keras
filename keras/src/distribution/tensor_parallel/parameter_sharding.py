@@ -64,7 +64,7 @@ class ParameterShardingStrategy:
     def shard_model_parameters(self, model, config, device_id: Any) -> Tuple["Model", Set[str]]:
         ParameterShardedModel = _define_parameter_sharded_model()
         
-        print(f"🔧 Applying parameter sharding [v12-Robust-Traversal]...")
+        print(f"🔧 Applying parameter sharding [v13-Aggressive-Traversal]...")
         log_memory("Start")
         
         modified_parameters = set()
@@ -84,17 +84,16 @@ class ParameterShardingStrategy:
         print(f"🎯 Sharding Complete. Replaced {len(modified_parameters)} parameters.")
         log_memory("Final")
         
-        # Sanity Check
         if len(modified_parameters) < 10:
-            print("⚠️ WARNING: Very few parameters were replaced. Check layer traversal!")
+            print("⚠️ WARNING: Extremely low replacement count! Model is likely still on CPU/GPU0.")
             
         return sharded_model, modified_parameters
 
     def _recursive_shard_layers(self, current_layer, config, modified_set, visited_layers):
         """
-        Recursively walks layers and swaps weights matching config rules.
-        Uses robust scanning (attributes + lists) to find hidden sub-layers.
+        Recursively walks layers and swaps weights.
         """
+        # Prevent infinite recursion / cycles
         if id(current_layer) in visited_layers:
             return
         visited_layers.add(id(current_layer))
@@ -102,14 +101,15 @@ class ParameterShardingStrategy:
         # 1. Process weights of THIS layer
         self._shard_and_swap_layer_weights(current_layer, config, modified_set)
 
-        # 2. Find children via standard API
+        # 2. Find children via standard API (Keras tracking)
         if hasattr(current_layer, 'layers'):
             for sub_layer in current_layer.layers:
                 self._recursive_shard_layers(sub_layer, config, modified_set, visited_layers)
 
-        # 3. Find children via Attribute Scanning (Crucial for KerasNLP Backbones)
+        # 3. Aggressive Attribute Scanning (Finds untracked/private sublayers)
+        # [FIX] Removed startswith("_") check to find private layers
         for attr_name in dir(current_layer):
-            if attr_name.startswith("__") or attr_name.startswith("_"): continue
+            if attr_name.startswith("__"): continue 
             
             try:
                 val = getattr(current_layer, attr_name)
@@ -124,19 +124,23 @@ class ParameterShardingStrategy:
                         self._recursive_shard_layers(item, config, modified_set, visited_layers)
 
     def _shard_and_swap_layer_weights(self, layer, config, modified_set):
-        # Get variables
         if not hasattr(layer, "weights"): return
         
         for variable in layer.weights:
-            # Match rule
+            # Try exact path match first
             rule = config.get(variable.path, config.get(variable.name, None))
             
+            # Fuzzy/Regex match fallback
             if rule is None:
-                # Regex fallback
                 for pattern, r in config.items():
-                    if isinstance(pattern, str) and (re.fullmatch(pattern, variable.path) or re.fullmatch(pattern, variable.name)):
-                        rule = r
-                        break
+                    if isinstance(pattern, str):
+                        if re.fullmatch(pattern, variable.path) or re.fullmatch(pattern, variable.name):
+                            rule = r
+                            break
+                        # Allow partial endswith match for robustness (e.g. "kernel" matching "dense/kernel")
+                        if variable.name.endswith(pattern) or variable.path.endswith(pattern):
+                             rule = r
+                             break
             
             if rule is not None:
                 self._apply_swap(layer, variable, rule, modified_set)
@@ -193,6 +197,7 @@ class ParameterShardingStrategy:
                 del shard_np
 
             # In-Place Attribute Swap
+            # This is the magic that actually replaces the weight in the model
             found = False
             for attr_name in dir(layer):
                 if attr_name.startswith("__"): continue
@@ -211,7 +216,6 @@ class ParameterShardingStrategy:
                 except: pass
                 gc.collect()
                 
-                # Feedback
                 if len(modified_set) % 20 == 0:
                     print(f"   [Swap] {len(modified_set)} params replaced...")
 

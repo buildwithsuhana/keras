@@ -48,8 +48,6 @@ class TensorParallelKeras(models.Model):
             device_id=self.current_device
         )
 
-        print("🚀 [TP Init] Model successfully manually sharded!")
-
     def call(self, inputs, **kwargs):
         return self.distributed_model(inputs, **kwargs)
 
