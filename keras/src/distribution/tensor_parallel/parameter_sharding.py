@@ -2,57 +2,47 @@ import logging
 import gc
 import re
 import os
-import time
+import psutil
 from typing import Any, Tuple, Set
 import numpy as np
 
-# Keras Imports
 from keras import Variable, device
 from keras.src.models import Model
 from keras.src.backend import distribution_lib
-
-# Import local utility
 from keras.src.distribution.tensor_parallel.tensor_layout import split_tensor_for_parallelism
 
-# Optional Imports for Optimization/Debug
 try:
     import jax
 except ImportError:
     jax = None
 
-try:
-    import psutil
-except ImportError:
-    psutil = None
-
 logger = logging.getLogger(__name__)
 
 def log_memory(stage=""):
-    """Logs current Host RAM usage."""
-    if psutil:
+    try:
         process = psutil.Process(os.getpid())
-        mem = process.memory_info().rss / (1024 ** 3)  # GB
-        print(f"   [MEM] {stage}: {mem:.2f} GB")
+        mem = process.memory_info().rss / (1024 ** 3)
+        print(f"   [MEM] {stage}: {mem:.2f} GB RAM used")
+    except:
+        pass
 
 class ShardedWeight:
-    """Wrapper for a sharded variable on a specific device."""
     def __init__(self, tensor_shard, name, trainable=True, device_id=None):
         current_dev = device_id if device_id else "cpu"
         
-        # Name Sanitization
+        # Sanitization
         if name:
             clean_name = re.sub(r'[^a-zA-Z0-9_]', '_', name)
         else:
             clean_name = "sharded_var"
             
-        # [CRITICAL] Create Variable on device with EXPLICIT dtype.
-        # This prevents Keras from casting bfloat16 back to float32 during init.
         with device(current_dev):
+            # Explicitly pass dtype to prevent Keras from upcasting to float32
             self._variable = Variable(
                 initializer=tensor_shard, 
                 trainable=trainable, 
                 name=clean_name,
-                dtype=tensor_shard.dtype # <--- THE FIX
+                dtype=tensor_shard.dtype 
             )
 
     @property
@@ -65,6 +55,8 @@ class ShardedWeight:
     def shape(self): return self._variable.shape
     @property
     def dtype(self): return self._variable.dtype
+    @property
+    def trainable(self): return self._variable.trainable
     def assign(self, value): self._variable.assign(value)
 
 
@@ -77,18 +69,17 @@ class ParameterShardingStrategy:
     def shard_model_parameters(self, model, config, device_id: Any) -> Tuple["Model", Set[str]]:
         ParameterShardedModel = _define_parameter_sharded_model()
         
-        print(f"🔧 [DEBUG] Starting Sharding (Rank {self.rank}/{self.device_count}) on {device_id}")
-        log_memory("Initial State")
+        print(f"🔧 Applying manual parameter sharding [v7-Trainable-Fix] (Rank {self.rank}/{self.device_count})...")
+        log_memory("Start Sharding")
         
         modified_parameters = set()
         
-        # 1. Calculate Total Work
-        total_params = 0
+        # Progress tracking
+        total_items = 0
         for pattern, rule in config.items():
             matches = self._find_matching_parameters(model, pattern)
-            total_params += len(matches)
+            total_items += len(matches)
         
-        print(f"   [INFO] Found {total_params} parameters to shard.")
         current_idx = 0
 
         for pattern, rule in config.items():
@@ -110,11 +101,9 @@ class ParameterShardingStrategy:
                                 break
 
                     if split_dim is not None:
-                        # Log progress
-                        print(f"   [{current_idx}/{total_params}] Processing: {param_name}")
+                        print(f"   [{current_idx}/{total_items}] Sharding {param_name} | Trainable: {param.trainable}")
                         
-                        # 1. Slice (CPU)
-                        # This returns a numpy array (hopefully bfloat16)
+                        # 1. Slice (CPU) - Returns bfloat16/float16
                         sharded_tensor_np = split_tensor_for_parallelism(
                             param, 
                             index=self.rank, 
@@ -122,46 +111,42 @@ class ParameterShardingStrategy:
                             dim=split_dim
                         )
                         
-                        # 2. Upload to Device
+                        # 2. Upload to Device (Preserving Dtype AND Trainable Status)
                         sharded_var = ShardedWeight(
                             sharded_tensor_np, 
                             name=param_name, 
+                            trainable=param.trainable, # <--- [CRITICAL FIX]
                             device_id=device_id
                         )
                         
                         self.sharded_weights[param_name] = sharded_var
                         modified_parameters.add(param_name)
                         
-                        # 3. Nuclear Memory Cleanup
+                        # 3. JAX Cleanup
                         if jax is not None:
                             try:
                                 jax.block_until_ready(sharded_var.value)
                                 jax.clear_caches()
-                            except:
+                            except Exception:
                                 pass
 
                         # 4. Host Cleanup
                         del sharded_tensor_np
                         try:
-                            # Replace source with dummy
                             dummy = np.zeros((1,), dtype=param.dtype)
                             param.assign(dummy)
                         except:
                             pass
-                        
                         gc.collect()
                         
-                        # Log memory occasionally
                         if current_idx % 20 == 0:
-                            log_memory(f"Step {current_idx}")
+                            log_memory("After GC")
                         
                     else:
-                        # Skip non-sharded
                         pass 
 
                 except Exception as e:
-                    print(f"   ❌ [CRASH] Failed at {param_name}")
-                    log_memory("CRASH STATE")
+                    print(f"   ❌ FATAL: Failed to shard {param_name}: {e}")
                     raise e
 
         sharded_model = ParameterShardedModel(
@@ -171,8 +156,7 @@ class ParameterShardingStrategy:
             device_id=device_id,
         )
         
-        print(f"🎯 Sharding Complete. Modified {len(modified_parameters)} params.")
-        log_memory("Final")
+        print(f"🎯 Parameter sharding completed.")
         return sharded_model, modified_parameters
 
     def _find_matching_parameters(self, model, pattern):
