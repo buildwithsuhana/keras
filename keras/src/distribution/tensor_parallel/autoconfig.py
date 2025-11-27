@@ -25,7 +25,6 @@ def analyze_dense_layer(layer):
 
     if not input_dim or not output_dim: return 'dense'
 
-    # Heuristic
     if output_dim > input_dim * 1.25: return 'up_projection'
     elif input_dim > output_dim * 1.25: return 'down_projection'
     return 'dense'
@@ -75,7 +74,6 @@ def _apply_layer_sharding_rules(layer, layout_map):
         if emb is None: emb = _get_variable_by_name_suffix(layer, "weight")
         if emb is None and hasattr(layer, 'embeddings'): emb = layer.embeddings
             
-        # [FIX] Boolean Safety
         if emb is not None and safe_path(emb):
             layout_map[safe_path(emb)] = (None, "model")
 
