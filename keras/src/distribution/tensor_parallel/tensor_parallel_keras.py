@@ -5,6 +5,7 @@ Port of the PyTorch tensor_parallel library
 
 import logging
 import re
+import gc
 from typing import Collection, Optional, Sequence, Union
 
 import numpy as np
@@ -52,7 +53,8 @@ class TensorParallelKeras(Model):
         self.tensor_parallel_config = None
         self.distributed = True
 
-        self.sharded_models = [self._original_model]
+        # [OOM FIX] Removed redundant self.sharded_models = [self._original_model]
+        # to prevent holding extra references to the full model.
 
         accel_devices = list_devices()
         device_ids = list(self.check_device_ids(device_ids))
@@ -109,7 +111,7 @@ class TensorParallelKeras(Model):
             self.tensor_parallel_config = get_default_config(
                 model, device_names
             )
-            print(self.tensor_parallel_config)
+            # Avoid printing full config for large models to keep logs clean
             logger.info(
                 "Using automatic config with auto sharding strategy: sharding individual Dense/Conv/Embedding layers"
             )
@@ -133,6 +135,10 @@ class TensorParallelKeras(Model):
 
         for rank, device_id in enumerate(self.devices):
             print(f"[{device_id}] ➡️  Starting sharding process for Rank {rank}")
+            
+            # [OOM FIX] Force garbage collection before allocating new shard
+            gc.collect()
+            
             shard, modified_parameters_names = make_parameter_sharded_model(
                 model,
                 self.tensor_parallel_config,
@@ -142,12 +148,16 @@ class TensorParallelKeras(Model):
             )
             self.model_shards.append(shard)
             self.modified_parameters_names.update(modified_parameters_names)
-            
 
             logger.info(f"   ✅ Created shard {rank} for device {device_id}")
+            
+            # [OOM FIX] Aggressive cleanup after each shard creation
+            gc.collect()
 
         params_per_shard = []
         for i, shard in enumerate(self.model_shards):
+            # Use ops.size to avoid materializing all weights to numpy if possible, 
+            # though np.prod(p.shape) is metadata-only and safe.
             total_params = sum(np.prod(p.shape) for p in shard.weights)
             params_per_shard.append(int(total_params))
             logger.info(f"   📊 Shard {i} parameters: {int(total_params):,}")

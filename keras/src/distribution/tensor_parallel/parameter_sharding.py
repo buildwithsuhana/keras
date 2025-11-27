@@ -1,6 +1,7 @@
 import logging
 import inspect
 import re
+import gc  # [OOM FIX] Added for garbage collection
 from typing import Any, Dict, List, Optional, Set, Tuple, TYPE_CHECKING
 
 import numpy as np
@@ -99,11 +100,13 @@ class ParameterShardingStrategy:
 
         print(f"🔧 Applying parameter-level sharding to {model.name}")
 
-        self._store_original_weights(model)
+        # [OOM FIX] DISABLE this to save massive host memory.
+        # Storing a copy of 9B weights in numpy doubles RAM usage.
+        # self._store_original_weights(model)
+        
         modified_parameters = set()
 
         for pattern, action in config.state_rules.items():
-            # FIX: Check if action is callable (lambda) instead of isinstance(Split)
             if callable(action):
                 matching_params = self._find_matching_parameters(model, pattern)
 
@@ -119,7 +122,6 @@ class ParameterShardingStrategy:
                             param_id
                         ]
                         
-                        # Find existing name for logging/mapping
                         existing_param_name = "unknown"
                         for name, shard in self.sharded_weights.items():
                             if shard is self.sharded_weights_by_id[param_id]:
@@ -152,6 +154,23 @@ class ParameterShardingStrategy:
                         f"   ✅ Sharded {param_name}: {param.shape} -> {sharded_tensor.shape}"
                     )
 
+                    # [OOM FIX] Aggressive Memory Cleanup
+                    # Once we have the shard, we delete the content of the original weight
+                    # from the "blueprint" model to free up RAM/HBM immediately.
+                    try:
+                        if hasattr(param, "assign"):
+                            # Replace with a tiny tensor to release the large memory block
+                            import keras 
+                            # Ensure this op happens on CPU to avoid device side effects
+                            with keras.device("cpu"):
+                                dummy = np.zeros((1,), dtype=param.dtype)
+                                param.assign(dummy)
+                    except Exception:
+                        pass
+                    
+                    # Force garbage collection to reclaim memory before next layer
+                    gc.collect()
+
         sharded_model = ParameterShardedModel(
             original_model=model,
             sharding_strategy=self,
@@ -176,7 +195,6 @@ class ParameterShardingStrategy:
                     cleaned_name = weight.name.split("/")[-1].split(":")[0]
                     param_name = f"{full_name}.{cleaned_name}"
                     
-                    # FIX: Check for numpy capability before access
                     if hasattr(weight, 'numpy'):
                         self.original_weights[param_name] = weight.numpy()
 
@@ -221,7 +239,6 @@ class ParameterShardingStrategy:
                     cleaned_weight_name = weight.name.split("/")[-1].split(":")[0]
                     param_name = f"{full_name}.{cleaned_weight_name}"
 
-                    # FIX: Use fullmatch for strict pattern adherence
                     if re.fullmatch(pattern, param_name):
                         matching_params.append((param_name, weight))
 
@@ -326,21 +343,13 @@ def _define_parameter_sharded_model():
         def weights(self):
             return self._weights_list
         
-        # --- FIX: Robust Output Spec handling ---
         def compute_output_shape(self, input_shape):
             return self.original_model.compute_output_shape(input_shape)
 
         def compute_output_spec(self, *args, **kwargs):
-            """
-            Fix: Accept *args and **kwargs to handle 'mask' or other arguments 
-            Keras passes during symbolic execution, but only forward the input_spec 
-            to the underlying model.
-            """
-            # Usually args[0] is the input_spec/inputs
             try:
                 return self.original_model.compute_output_spec(args[0])
             except Exception:
-                # Fallback for older Keras versions or differing signatures
                 return self.original_model.compute_output_spec(*args, **kwargs)
 
         def call(self, inputs, training=None, mask=None):
@@ -352,7 +361,6 @@ def _define_parameter_sharded_model():
                 for inp_tensor in self.original_model.inputs:
                     name = inp_tensor.name
                     clean_name = name.split(":")[0]
-                    # Prefer exact name key, then cleaned name; store by id
                     if name in inputs:
                         val = inputs[name]
                     elif clean_name in inputs:
@@ -362,7 +370,6 @@ def _define_parameter_sharded_model():
 
                     if val is not None:
                         tensor_cache[id(inp_tensor)] = val
-                        # also store by cleaned name so lookups can match
                         tensor_cache[clean_name] = val
                         tensor_cache[name] = val
             else:
@@ -380,7 +387,6 @@ def _define_parameter_sharded_model():
                             tensor_cache[clean_name] = val
                             tensor_cache[name] = val
                         except Exception:
-                            # best-effort: ignore if symbolic name not available
                             pass
 
             # 2. Iterate Layers
@@ -388,7 +394,6 @@ def _define_parameter_sharded_model():
                 if isinstance(layer, layers.InputLayer):
                     continue
                 
-                # Reconstruct inputs for this layer from the cache
                 layer_inputs = []
                 for node in layer._inbound_nodes:
                     for symbolic_input_tensor in node.input_tensors:
@@ -396,7 +401,6 @@ def _define_parameter_sharded_model():
                         if key_id in tensor_cache:
                             layer_inputs.append(tensor_cache[key_id])
                         else:
-                            # Fallback: try matching by cleaned symbolic name
                             try:
                                 name = symbolic_input_tensor.name
                                 clean_name = name.split(":")[0]
@@ -409,7 +413,6 @@ def _define_parameter_sharded_model():
                             elif name and name in tensor_cache:
                                 layer_inputs.append(tensor_cache[name])
                 
-                # --- CRITICAL FIX: Handle Dictionary Inputs for Backbones ---
                 if (
                     (isinstance(layer, Functional) or isinstance(layer, Model))
                     and hasattr(layer, "input_names")
@@ -421,16 +424,6 @@ def _define_parameter_sharded_model():
                     layer_inputs = layer_inputs[0]
 
                 try:
-                    # Defensive: if we failed to reconstruct any inputs for this
-                    # layer, forward the top-level `inputs` so layers don't
-                    # receive an empty list (which causes errors like 'list'
-                    # has no dtype). Use DEBUG level to avoid noisy INFO logs
-                    # during normal runs.
-                    # Only treat as "empty" if we have a container with
-                    # zero length. Avoid using truthiness on tensors/arrays
-                    # (which raises ambiguous truth-value errors for JAX
-                    # arrays). If the reconstructed inputs are None or an
-                    # empty list/tuple/dict, forward the top-level inputs.
                     is_empty_container = (
                         layer_inputs is None
                         or (isinstance(layer_inputs, (list, tuple)) and len(layer_inputs) == 0)
@@ -444,10 +437,6 @@ def _define_parameter_sharded_model():
                         )
                         layer_inputs = inputs
 
-                    # Forward any recorded keyword arguments from the original
-                    # symbolic node (e.g. `reverse=True`) so that layers that
-                    # rely on call-time kwargs receive them during runtime
-                    # reconstruction. Node keeps these in `node.arguments.kwargs`.
                     node_kwargs = {}
                     try:
                         if hasattr(node, "arguments") and getattr(node, "arguments") is not None:
@@ -455,28 +444,15 @@ def _define_parameter_sharded_model():
                     except Exception:
                         node_kwargs = {}
 
-                    # Pass through recorded node kwargs to the layer call.
                     call_kwargs = {"training": training} if training is not None else {}
-                    # Merge node kwargs (do not overwrite explicit training)
                     for k, v in node_kwargs.items():
                         if k != "training":
                             call_kwargs[k] = v
 
                     current_tensor = layer(layer_inputs, **call_kwargs)
                 except Exception:
-                    # Try a sequence of conservative fallbacks to adapt
-                    # the inputs to what the layer implementation expects.
-                    # 1) If we have a list/tuple, try building a dict by
-                    #    matching declared input names.
-                    # 2) If we have a dict, try passing a single tensor
-                    #    (first value) in case the layer expects a single
-                    #    positional tensor.
-                    # 3) If we have a list/tuple, try passing the first
-                    #    element as a single positional tensor.
-
+                    # Fallback logic for input mismatches
                     tried_call = False
-
-                    # (1) list/tuple -> dict by names
                     if isinstance(layer_inputs, (list, tuple)):
                         cleaned_names = None
                         try:
@@ -494,59 +470,31 @@ def _define_parameter_sharded_model():
                         if cleaned_names and len(cleaned_names) == len(layer_inputs):
                             alt_inputs = dict(zip(cleaned_names, layer_inputs))
                             try:
-                                logger.debug(
-                                    "Retrying layer '%s' with dict inputs: %s",
-                                    layer.name,
-                                    list(alt_inputs.keys()),
-                                )
                                 current_tensor = layer(alt_inputs, training=training)
                                 tried_call = True
                             except Exception:
                                 tried_call = False
 
-                    # (2) dict -> single tensor (first value)
                     if not tried_call and isinstance(layer_inputs, dict):
                         first_val = next(iter(layer_inputs.values()), None)
                         if first_val is not None:
                             try:
-                                logger.debug(
-                                    "Retrying layer '%s' with single tensor from dict inputs",
-                                    layer.name,
-                                )
                                 current_tensor = layer(first_val, training=training)
                                 tried_call = True
                             except Exception:
                                 tried_call = False
 
-                    # (3) list/tuple -> single positional tensor (first element)
                     if not tried_call and isinstance(layer_inputs, (list, tuple)) and len(layer_inputs) > 0:
                         try:
-                            logger.debug(
-                                "Retrying layer '%s' with first element of positional inputs",
-                                layer.name,
-                            )
                             current_tensor = layer(layer_inputs[0], training=training)
                             tried_call = True
                         except Exception:
                             tried_call = False
 
                     if not tried_call:
-                        # Nothing worked — re-raise to preserve original traceback
                         raise
 
-                # --- NEW DEBUG: immediate post-call dump for token embeddings ---
-                # Dump the raw return immediately after the layer call so we can
-                # see exactly what the layer returned (type/repr/shape) before any
-                # communication or mapping logic runs.
-                if "token_embedding" in layer.name or "embeddings" in layer.name:
-                    try:
-                        rep = repr(current_tensor)
-                        rep_snip = rep[:1000] + ("...<truncated>" if len(rep) > 1000 else "")
-                        shp = getattr(current_tensor, "shape", None)
-                    except Exception as _e:
-                        pass
-
-                # 4/5. Apply Communication Rules (AllReduce/Gather) and Cache Output
+                # 4/5. Apply Communication Rules
                 layer_path = layer.path
                 output_rule = None
                 for pattern, rule in self.config.output_rules.items():
@@ -555,29 +503,11 @@ def _define_parameter_sharded_model():
                         break
 
                 if output_rule:
-                    # Debug: if this layer is a token embedding or related,
-                    # print the tensor before communication so we can see
-                    # whether gather/all_gather is changing its shape.
-                    if "token_embedding" in layer.name or "embeddings" in layer.name:
-                        try:
-                            pre_shp = getattr(current_tensor, "shape", None)
-                        except Exception:
-                            pre_shp = None
-
                     current_tensor = self._apply_communication(
                         current_tensor, layer.name, output_rule
                     )
 
-                    if "token_embedding" in layer.name or "embeddings" in layer.name:
-                        try:
-                            post_shp = getattr(current_tensor, "shape", None)
-                        except Exception:
-                            post_shp = None
-
-                # Map the runtime outputs back to the symbolic output tensors
-                # for every inbound node. Store by id and by several name
-                # variants (full name, cleaned name, base name) to be tolerant
-                # to id/name mismatches.
+                # Map outputs
                 for node_idx, node in enumerate(layer._inbound_nodes):
                     try:
                         outputs = getattr(node, "output_tensors", None)
@@ -589,15 +519,12 @@ def _define_parameter_sharded_model():
 
                     if isinstance(current_tensor, (list, tuple)):
                         for out_idx, (sym, val) in enumerate(zip(outputs, current_tensor)):
-                            # Primary mapping by id(symbolic_tensor)
                             tensor_cache[id(sym)] = val
-                            # Precise mapping by (layer name, node index, tensor index)
                             try:
                                 layer_key = ("layer_node_output", layer.name, node_idx, out_idx)
                                 tensor_cache[layer_key] = val
                             except Exception:
                                 pass
-                            # Best-effort name mappings for debugging only (may collide)
                             try:
                                 name = getattr(sym, "name", None)
                                 if name:
@@ -623,50 +550,8 @@ def _define_parameter_sharded_model():
                             except Exception:
                                 pass
 
-            # Return final outputs
-            # Print declared output shape/spec for debugging
-            try:
-                declared_shape = None
-                try:
-                    declared_shape = self.original_model.compute_output_shape(
-                        [inp.shape for inp in self.original_model.inputs]
-                    )
-                except Exception:
-                    try:
-                        declared_shape = self.original_model.compute_output_shape(
-                            self.original_model.inputs[0].shape
-                        )
-                    except Exception:
-                        declared_shape = None
-            except Exception:
-                pass
-
-            # Print Keras history for each symbolic output to locate producer layer
-            try:
-                for symbolic_output in self.original_model.outputs:
-                    try:
-                        history = getattr(symbolic_output, "_keras_history", None)
-                        if history:
-                            layer_obj = history[0]
-                            layer_name = getattr(layer_obj, "name", str(layer_obj))
-                            # Print detailed info about the producing layer class/module/file
-                            try:
-                                cls = layer_obj.__class__
-                                mod = getattr(cls, "__module__", "<no module>")
-                                cls_name = getattr(cls, "__name__", str(cls))
-                                src_file = inspect.getsourcefile(cls) or "<source file not found>"
-                            except Exception:
-                                pass
-                        else:
-                            layer_name = "<no keras history>"
-                    except Exception:
-                        layer_name = "<history lookup failed>"
-            except Exception:
-                pass
-
             final_outputs = []
             for symbolic_output in self.original_model.outputs:
-                # Robust lookup: prefer id, then cleaned/full name variants.
                 val = None
                 try:
                     val = tensor_cache.get(id(symbolic_output), None)
@@ -674,7 +559,6 @@ def _define_parameter_sharded_model():
                     val = None
 
                 if val is None:
-                    # Try by name variants
                     try:
                         name = getattr(symbolic_output, "name", None)
                         if name:
@@ -683,7 +567,6 @@ def _define_parameter_sharded_model():
                     except Exception:
                         val = None
 
-                # If still not found, try precise lookup via _keras_history
                 if val is None:
                     try:
                         history = getattr(symbolic_output, "_keras_history", None)
@@ -697,7 +580,6 @@ def _define_parameter_sharded_model():
                         val = None
 
                 if val is None:
-                    # As a last resort, try base name
                     try:
                         name = getattr(symbolic_output, "name", None)
                         if name:
@@ -707,20 +589,9 @@ def _define_parameter_sharded_model():
                         val = None
 
                 if val is None:
-                    # Nothing found — raise with helpful context
                     raise RuntimeError(
                         f"Missing runtime value for model output symbolic tensor: {symbolic_output}."
-                        " Available tensor_cache keys: " + ",".join([str(k) for k in list(tensor_cache.keys())[:20]])
                     )
-
-                # Print shape/type for debugging unexpected output shapes
-                try:
-                    shp = getattr(val, "shape", None)
-                except Exception:
-                    shp = None
-                name = getattr(symbolic_output, 'name', symbolic_output)
-                # Deep introspection for nested structures and abnormal ranks
-                
 
                 final_outputs.append(val)
 
@@ -731,7 +602,6 @@ def _define_parameter_sharded_model():
         def _apply_communication(self, sharded_output, layer_name, rule_str: str):
             """Applies communication directly using the distributed backend."""
             if "sum" in rule_str or "allreduce" in rule_str:
-                logger.debug(f"Applying AllReduce (sum) to {layer_name}")
                 return distribution_lib.all_reduce(
                     sharded_output, op="sum", axis_name="model"
                 )
@@ -746,7 +616,6 @@ def _define_parameter_sharded_model():
                 except (ValueError, IndexError):
                     dim = -1
                 
-                logger.debug(f"Applying AllGather (dim={dim}) to {layer_name}")
                 return distribution_lib.all_gather(
                     sharded_output, axis=dim, axis_name="model"
                 )

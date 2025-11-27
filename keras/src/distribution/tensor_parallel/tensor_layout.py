@@ -20,15 +20,36 @@ def split_tensor_for_parallelism(tensor, index, device_count, dim):
     Returns:
         A tensor slice corresponding to the given `index`.
     """
+    # Resolve negative dimension index
     if dim == -1:
-        split_dim = ops.ndim(tensor) - 1
+        split_dim = len(tensor.shape) - 1
     else:
         split_dim = dim
 
-    splits = ops.array_split(
-        tensor, indices_or_sections=device_count, axis=split_dim
-    )
-    return splits[index]
+    # [OOM FIX] Use direct slicing instead of ops.array_split.
+    # ops.array_split creates ALL splits at once (e.g., 8 copies for 8 GPUs),
+    # which causes a massive memory spike.
+    # Direct slicing only materializes the specific shard we need.
+    
+    shape = tensor.shape
+    total_length = shape[split_dim]
+    shard_size = total_length // device_count
+    
+    start_idx = index * shard_size
+    
+    # Handle remainder for the last shard (mimics numpy.array_split behavior)
+    if index == device_count - 1:
+        end_idx = total_length
+    else:
+        end_idx = (index + 1) * shard_size
+        
+    # Construct the slice tuple: (:, :, start:end, :)
+    slice_indices = [slice(None)] * len(shape)
+    slice_indices[split_dim] = slice(start_idx, end_idx)
+    
+    # Perform the slice. 
+    # If 'tensor' is on CPU (recommended), this returns a CPU tensor/view.
+    return tensor[tuple(slice_indices)]
 
 
 LayoutMap = collections.namedtuple("LayoutMap", ["state_rules", "output_rules"])
