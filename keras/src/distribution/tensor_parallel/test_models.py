@@ -1,12 +1,11 @@
 import os
 
-# --- CRITICAL: Memory Management Settings ---
-# 1. Disable JAX preallocation (grow memory on demand)
+# --- 1. Memory Tuning ---
+# Disable preallocation to allow memory to grow as needed
 os.environ["XLA_PYTHON_CLIENT_PREALLOCATE"] = "false"
 os.environ["XLA_PYTHON_CLIENT_ALLOCATOR"] = "platform"
-# 2. Force JAX backend
 os.environ["KERAS_BACKEND"] = "jax"
-# 3. Ensure CPU host device count
+# Ensure CPU host device count is sufficient for JAX
 os.environ["XLA_FLAGS"] = "--xla_force_host_platform_device_count=8"
 
 import logging
@@ -20,7 +19,8 @@ import keras_hub
 import tensorflow as tf
 import tensorflow_datasets as tfds
 
-# --- Mixed Precision is Mandatory ---
+# --- 2. Mixed Precision is Mandatory ---
+# bfloat16 is crucial for 9B models on T4 GPUs
 keras.config.set_dtype_policy("bfloat16")
 
 tf.config.set_visible_devices([], "GPU")
@@ -33,6 +33,7 @@ from keras.src.distribution.tensor_parallel.tensor_parallel_keras import (
 )
 
 MODEL_PRESET = "gemma2_9b_en"
+# With LoRA + TP on 2xT4s, we can slightly increase batch size
 BATCH_SIZE = 1
 SEQUENCE_LENGTH = 128
 LEARNING_RATE = 5e-5
@@ -61,7 +62,7 @@ def load_data(preset):
     
     logger.info("Tokenizing...")
     tokenizer = keras_hub.models.GemmaTokenizer.from_preset(preset)
-    tokens = tokenizer(text[:20000]) # Reduced for speed
+    tokens = tokenizer(text[:20000]) 
     if isinstance(tokens, dict): tokens = tokens["token_ids"]
     tokens = np.array(tokens)
     
@@ -84,15 +85,24 @@ def run_training():
 
     logger.info("Preparing Tensor Parallel Model...")
     
-    # --- THE FIX IS HERE ---
-    # We do NOT load the model here. We define HOW to load it.
-    # This prevents 'run_training' from holding an 18GB reference.
+    # --- 3. LoRA Factory (The Fix) ---
+    # We define the model creation logic here so the Master Model (18GB)
+    # is loaded, offloaded to disk, and then deleted from RAM immediately.
     def model_factory():
         logger.info(f"🏭 Factory: Loading {MODEL_PRESET} to System RAM (CPU)...")
         with keras.device("cpu"):
-            return keras_hub.models.GemmaCausalLM.from_preset(MODEL_PRESET)
+            model = keras_hub.models.GemmaCausalLM.from_preset(MODEL_PRESET)
+            
+            # --- ENABLE LORA ---
+            # This freezes the main weights and adds tiny trainable adapters.
+            # Trainable Params: 9,000,000,000 -> ~7,000,000
+            # Optimizer Memory: ~72GB -> ~50MB
+            logger.info("✨ Enabling LoRA (Rank=4) to fix Optimizer OOM...")
+            model.backbone.enable_lora(rank=4)
+            
+            return model
 
-    # We pass the FACTORY (callable), not the MODEL
+    # Pass the FACTORY (callable), not the MODEL
     tp_model = TensorParallelKeras(
         model=model_factory, 
         device_count=device_count,
@@ -103,7 +113,7 @@ def run_training():
     
     logger.info("Compiling model...")
     tp_model.compile(
-        optimizer=keras.optimizers.SGD(learning_rate=LEARNING_RATE, momentum=0.0),
+        optimizer=keras.optimizers.AdamW(learning_rate=LEARNING_RATE),
         loss=keras.losses.SparseCategoricalCrossentropy(from_logits=True),
         metrics=["accuracy"]
     )
