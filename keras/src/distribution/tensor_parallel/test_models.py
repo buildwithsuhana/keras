@@ -40,12 +40,14 @@ def run_training():
 
     # --- Step 2: Lazy Initialization (The "Zero Stage") ---
     print("\n--- Phase 1: Lazy Initialization ---")
+    print("\n--- Phase 1: Lazy Initialization ---")
     print("Defining Gemma 9B model structure without allocating weights...")
     
     with lazy_init_scope():
         # Load model structure only (no weights)
+        # CHANGED: "gemma_9b_en" -> "gemma2_9b_en"
         model = keras_nlp.models.GemmaCausalLM.from_preset(
-            "gemma2_9b_en",
+            "gemma2_9b_en",  # <--- CORRECT PRESET NAME
             load_weights=False 
         )
     
