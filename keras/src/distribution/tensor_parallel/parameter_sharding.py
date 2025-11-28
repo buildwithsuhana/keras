@@ -64,14 +64,13 @@ class ParameterShardingStrategy:
     def shard_model_parameters(self, model, config, device_id: Any) -> Tuple["Model", Set[str]]:
         ParameterShardedModel = _define_parameter_sharded_model()
         
-        print(f"🔧 Applying parameter sharding [v13-Aggressive-Traversal]...")
+        print(f"🔧 Applying parameter sharding [v14-Stack-Traversal]...")
         log_memory("Start")
         
         modified_parameters = set()
-        visited_layers = set()
         
-        # Start robust recursion
-        self._recursive_shard_layers(model, config, modified_parameters, visited_layers)
+        # USE ITERATIVE STACK (Like autoconfig)
+        self._iterative_shard_layers(model, config, modified_parameters)
 
         sharded_model = ParameterShardedModel(
             original_model=model,
@@ -84,65 +83,77 @@ class ParameterShardingStrategy:
         print(f"🎯 Sharding Complete. Replaced {len(modified_parameters)} parameters.")
         log_memory("Final")
         
-        if len(modified_parameters) < 10:
-            print("⚠️ WARNING: Extremely low replacement count! Model is likely still on CPU/GPU0.")
-            
         return sharded_model, modified_parameters
 
-    def _recursive_shard_layers(self, current_layer, config, modified_set, visited_layers):
+    def _iterative_shard_layers(self, root_layer, config, modified_set):
         """
-        Recursively walks layers and swaps weights.
+        Iterative traversal matching autoconfig.py logic exactly.
         """
-        # Prevent infinite recursion / cycles
-        if id(current_layer) in visited_layers:
-            return
-        visited_layers.add(id(current_layer))
+        stack = [root_layer]
+        visited = set()
+        
+        print("   [Traversal] Starting graph walk...")
 
-        # 1. Process weights of THIS layer
-        self._shard_and_swap_layer_weights(current_layer, config, modified_set)
-
-        # 2. Find children via standard API (Keras tracking)
-        if hasattr(current_layer, 'layers'):
-            for sub_layer in current_layer.layers:
-                self._recursive_shard_layers(sub_layer, config, modified_set, visited_layers)
-
-        # 3. Aggressive Attribute Scanning (Finds untracked/private sublayers)
-        # [FIX] Removed startswith("_") check to find private layers
-        for attr_name in dir(current_layer):
-            if attr_name.startswith("__"): continue 
-            
-            try:
-                val = getattr(current_layer, attr_name)
-            except:
+        while stack:
+            layer = stack.pop()
+            if id(layer) in visited:
                 continue
-            
-            if isinstance(val, layers.Layer):
-                self._recursive_shard_layers(val, config, modified_set, visited_layers)
-            elif isinstance(val, (list, tuple)):
-                for item in val:
-                    if isinstance(item, layers.Layer):
-                        self._recursive_shard_layers(item, config, modified_set, visited_layers)
+            visited.add(id(layer))
 
-    def _shard_and_swap_layer_weights(self, layer, config, modified_set):
+            # 1. Attempt to shard weights in THIS layer
+            self._shard_layer_weights(layer, config, modified_set)
+
+            # 2. Find children to add to stack
+            children_to_add = []
+            
+            # Standard Keras tracking
+            if hasattr(layer, 'layers') and layer.layers:
+                children_to_add.extend(layer.layers)
+
+            # Explicit Backbone attributes (Gemma/Llama)
+            for specific_attr in ['token_embedding', 'embeddings', 'position_embedding', 'backbone', 'model', 'transformer_layers', 'layers', 'blocks']:
+                if hasattr(layer, specific_attr):
+                    attr_val = getattr(layer, specific_attr)
+                    if isinstance(attr_val, layers.Layer):
+                        children_to_add.append(attr_val)
+                    elif isinstance(attr_val, (list, tuple)):
+                        for item in attr_val:
+                            if isinstance(item, layers.Layer):
+                                children_to_add.append(item)
+
+            # Aggressive Scan (fall back)
+            for attr_name in dir(layer):
+                if attr_name.startswith("__") or attr_name.startswith("_"): continue
+                try:
+                    val = getattr(layer, attr_name)
+                    if isinstance(val, layers.Layer):
+                        children_to_add.append(val)
+                    elif isinstance(val, (list, tuple)):
+                        for item in val:
+                            if isinstance(item, layers.Layer):
+                                children_to_add.append(item)
+                except:
+                    continue
+            
+            # Add to stack (reversed to maintain order)
+            stack.extend(reversed(children_to_add))
+
+    def _shard_layer_weights(self, layer, config, modified_set):
         if not hasattr(layer, "weights"): return
         
         for variable in layer.weights:
-            # Try exact path match first
+            # Check Config
             rule = config.get(variable.path, config.get(variable.name, None))
-            
-            # Fuzzy/Regex match fallback
             if rule is None:
                 for pattern, r in config.items():
                     if isinstance(pattern, str):
                         if re.fullmatch(pattern, variable.path) or re.fullmatch(pattern, variable.name):
-                            rule = r
-                            break
-                        # Allow partial endswith match for robustness (e.g. "kernel" matching "dense/kernel")
+                            rule = r; break
                         if variable.name.endswith(pattern) or variable.path.endswith(pattern):
-                             rule = r
-                             break
+                             rule = r; break
             
             if rule is not None:
+                # We found a rule for this variable!
                 self._apply_swap(layer, variable, rule, modified_set)
 
     def _apply_swap(self, layer, variable, rule, modified_set):
@@ -150,6 +161,7 @@ class ParameterShardingStrategy:
         if param_name in modified_set: return
 
         try:
+            # 1. Interpret Rule
             split_dim = None
             if isinstance(rule, (tuple, list)):
                 for i, axis in enumerate(rule):
@@ -160,54 +172,70 @@ class ParameterShardingStrategy:
 
             if split_dim is None: return
 
-            # Force Freeze Check
+            # 2. Config & Create Shard
             is_trainable = False
             if "lora" in param_name.lower():
                 is_trainable = True
-                print(f"      🔥 Keeping LoRA Trainable: {param_name}")
-
-            # SPMD Creation
+            
             if self.is_spmd:
                 device_buffers = []
                 for dev_idx in range(self.device_count):
-                    shard_np = split_tensor_for_parallelism(
-                        variable, index=dev_idx, device_count=self.device_count, dim=split_dim
-                    )
+                    shard_np = split_tensor_for_parallelism(variable, index=dev_idx, device_count=self.device_count, dim=split_dim)
                     dev_buffer = jax.device_put(shard_np, self.local_devices[dev_idx])
                     device_buffers.append(dev_buffer)
                     del shard_np
                 
                 spec = PartitionSpec(None, 'model') if split_dim == 1 else PartitionSpec('model', None)
                 out_sharding = NamedSharding(self.mesh, spec)
-                dist_array = jax.make_array_from_single_device_arrays(
-                    shape=variable.shape, sharding=out_sharding, arrays=device_buffers
-                )
-                
+                dist_array = jax.make_array_from_single_device_arrays(variable.shape, out_sharding, device_buffers)
                 new_var = ShardedWeight(dist_array, param_name, trainable=is_trainable)
-                try:
-                    jax.block_until_ready(dist_array)
-                    jax.clear_caches()
+                try: jax.block_until_ready(dist_array); jax.clear_caches()
                 except: pass
-
             else:
-                shard_np = split_tensor_for_parallelism(
-                    variable, index=self.rank, device_count=self.device_count, dim=split_dim
-                )
+                shard_np = split_tensor_for_parallelism(variable, index=self.rank, device_count=self.device_count, dim=split_dim)
                 new_var = ShardedWeight(shard_np, param_name, trainable=is_trainable)
                 del shard_np
 
-            # In-Place Attribute Swap
-            # This is the magic that actually replaces the weight in the model
-            found = False
+            # 3. SWAP LOGIC
+            swapped = False
+            
+            # Strategy A: Public Attributes
             for attr_name in dir(layer):
                 if attr_name.startswith("__"): continue
                 try:
                     if id(getattr(layer, attr_name)) == id(variable):
                         setattr(layer, attr_name, new_var)
-                        found = True
+                        swapped = True
+                        # print(f"      [DEBUG] Swapped layer.{attr_name}")
                 except: pass
             
-            if found:
+            # Strategy B: Private Attributes (common in KerasNLP)
+            if not swapped:
+                for attr_name in ['_kernel', '_bias', 'kernel', 'bias', 'embeddings', 'variable']:
+                    if hasattr(layer, attr_name):
+                        try:
+                            if id(getattr(layer, attr_name)) == id(variable):
+                                setattr(layer, attr_name, new_var)
+                                swapped = True
+                                # print(f"      [DEBUG] Swapped layer.{attr_name} (Direct)")
+                        except: pass
+
+            # Strategy C: List Injection (Nuclear Option)
+            # If attribute swap failed, we inject into _trainable_weights list
+            # This ensures Keras sees the new variable during training even if the attribute isn't updated
+            if not swapped:
+                # This is risky but necessary if attributes are hidden
+                if variable in layer._trainable_weights:
+                    idx = layer._trainable_weights.index(variable)
+                    layer._trainable_weights[idx] = new_var._variable
+                    swapped = True
+                    # print(f"      [DEBUG] Swapped via _trainable_weights list")
+                elif variable in layer._non_trainable_weights:
+                    idx = layer._non_trainable_weights.index(variable)
+                    layer._non_trainable_weights[idx] = new_var._variable
+                    swapped = True
+
+            if swapped:
                 modified_set.add(param_name)
                 self.sharded_weights[param_name] = new_var
                 try:
@@ -218,6 +246,8 @@ class ParameterShardingStrategy:
                 
                 if len(modified_set) % 20 == 0:
                     print(f"   [Swap] {len(modified_set)} params replaced...")
+            else:
+                print(f"   ⚠️ [WARN] Could not find attribute for {param_name} in {layer.name}")
 
         except Exception as e:
             print(f"   ❌ Failed to swap {param_name}: {e}")
@@ -248,7 +278,6 @@ def _define_parameter_sharded_model():
         def call(self, inputs, training=None, mask=None):
             d_inputs = self._distribute_inputs(inputs)
             outputs = self.original_model(d_inputs, training=training, mask=mask)
-            
             if hasattr(self.config, "output_rules"):
                 for layer_name, rule in self.config.output_rules.items():
                     if rule == "allreduce sum":
