@@ -27,11 +27,11 @@ class TensorParallelKeras(Model):
             device_ids = [str(d) for d in all_devices]
 
         self.device_count = device_count
-        self.devices = device_ids
         
-        # Normalize device IDs
-        self.devices = [d if "gpu" in d or "cpu" in d or "tpu" in d else f"gpu:{d}" for d in self.devices]
-
+        # --- FIX: Robust Device Normalization ---
+        # Maps 'cuda:0' -> 'gpu:0', '0' -> 'gpu:0', keeps 'cpu:0'
+        self.devices = [self._normalize_device_id(d) for d in device_ids]
+        
         # Get Sharding Config
         self.tensor_parallel_config = get_default_config(model, self.devices)
         self.model_shards = []
@@ -40,18 +40,19 @@ class TensorParallelKeras(Model):
 
         # --- Lazy Sharding Loop ---
         for rank, device_id in enumerate(self.devices):
-            print(f"[{device_id}] ⏳ creating shard {rank+1}/{self.device_count}...")
+            print(f"[{device_id}] ⏳ Creating shard {rank+1}/{self.device_count}...")
             
             # 1. Create Skeleton on Target Device
-            # We clone the structure. Weights are initialized (randomly) on the GPU here.
-            # Since we slice immediately after, this temporary random memory is overwritten.
-            with keras.device(device_id):
-                shard = keras.models.clone_model(model)
-                # Propagate mixed precision policy
-                if hasattr(model, 'dtype_policy'):
-                    shard.dtype_policy = model.dtype_policy
-            
-            # Build if needed to create variables
+            try:
+                with keras.device(device_id):
+                    shard = keras.models.clone_model(model)
+                    if hasattr(model, 'dtype_policy'):
+                        shard.dtype_policy = model.dtype_policy
+            except Exception as e:
+                print(f"❌ Failed to create shard on {device_id}. Error: {e}")
+                raise e
+
+            # Build if needed
             if not shard.built and model.inputs:
                 try:
                     shard.build([x.shape for x in model.inputs])
@@ -59,7 +60,6 @@ class TensorParallelKeras(Model):
                     pass
 
             # 2. Slice & Copy (CPU -> GPU)
-            # This function reads from 'model' (CPU), slices it, and assigns to 'shard' (GPU)
             shard, _ = make_parameter_sharded_model(
                 shard_model=shard,
                 source_model=model,
@@ -73,22 +73,37 @@ class TensorParallelKeras(Model):
             
             # 3. Clean up CPU Intermediates
             gc.collect()
-            print(f"[{device_id}] ✅ Shard created.")
+            print(f"[{device_id}] ✅ Shard ready.")
 
         # --- Cleanup Master ---
         print("🗑️  Freeing Master Model from CPU...")
         self._original_model = None
-        # We cannot 'del' the argument passed in, but we drop our reference.
-        # The caller should also delete their reference if possible.
         gc.collect()
 
         self.built = True
         self.distributed = True
         self.assembled_model = self.build_assembled_model()
 
+    def _normalize_device_id(self, device_id):
+        """Ensures device IDs are in Keras-compatible format (e.g. 'gpu:0')."""
+        d_str = str(device_id).lower()
+        
+        # Pass through already valid formats
+        if d_str.startswith("gpu:") or d_str.startswith("cpu:") or d_str.startswith("tpu:"):
+            return d_str
+        
+        # Fix JAX specific formats
+        if d_str.startswith("cuda:"):
+            return d_str.replace("cuda:", "gpu:")
+            
+        # Handle raw integers
+        if ":" not in d_str:
+            return f"gpu:{d_str}"
+            
+        return d_str
+
     def build_assembled_model(self):
         """Virtual graph combining shards."""
-        # Use first shard for input specs
         ref = self.model_shards[0]
         inputs = {
             i.name.split(':')[0]: keras.Input(shape=i.shape[1:], dtype=i.dtype, name=i.name.split(':')[0])
@@ -97,15 +112,13 @@ class TensorParallelKeras(Model):
         
         shard_outputs = []
         for shard in self.model_shards:
-            # Map global inputs to shard inputs
             shard_in = {
                 k: inputs[k.split(':')[0]] for k in [x.name for x in shard.inputs] 
                 if k.split(':')[0] in inputs
             }
-            if not shard_in: shard_in = inputs # fallback
+            if not shard_in: shard_in = inputs
             shard_outputs.append(shard(shard_in))
         
-        # Combine outputs (Sum logits)
         if len(shard_outputs) > 1:
             out = keras.layers.Add()(shard_outputs)
         else:

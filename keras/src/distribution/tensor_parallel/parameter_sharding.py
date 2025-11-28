@@ -23,28 +23,18 @@ class ParameterShardingStrategy:
     ) -> Tuple["Model", Set[str]]:
         
         modified = set()
-        # Map source vars for fast lookup
         source_map = {v.path if hasattr(v,'path') else v.name: v for v in source_model.variables}
 
         for pattern, action in config.state_rules.items():
             if callable(action):
-                # Find targets in the specific shard
                 targets = self._find_matching_parameters(shard_model, pattern)
-                
                 for name, target_var in targets:
                     if name not in source_map: continue
                     source_var = source_map[name]
-                    
-                    # 1. ACTION: Slice the specific weight
-                    # If source is CPU, this slice is created in RAM
                     sliced_val = action(source_var, self.rank)
-                    
-                    # 2. ASSIGN: Move slice to GPU variable immediately
                     target_var.assign(sliced_val)
-                    
                     modified.add(name)
         
-        # Cleanup temporary slices
         gc.collect()
         return shard_model, modified
 
@@ -56,14 +46,6 @@ class ParameterShardingStrategy:
                 matches.append((name, v))
         return matches
 
-def make_parameter_sharded_model(
-    shard_model: "Model",
-    source_model: "Model",
-    config: Any,
-    rank: int,
-    device_count: int,
-    device_id: Any,
-) -> Tuple["Model", Set[str]]:
-    
+def make_parameter_sharded_model(shard_model, source_model, config, rank, device_count, device_id):
     strategy = ParameterShardingStrategy(device_count, rank)
     return strategy.shard_model_parameters(shard_model, source_model, config, device_id)
