@@ -125,9 +125,13 @@ class TensorParallelKeras(Model):
         except Exception:
             pass
         
-        self.built = True
+        # Mark as distributed and assemble the functional model. Do NOT mark
+        # `built = True` before the assembled model exists — that prevents
+        # Keras from properly building sub-models and metrics during compile.
         self.distributed = True
         self.assembled_model = self.build_assembled_model()
+        # Now the assembled model is created; mark this wrapper as built.
+        self.built = True
 
     def _save_weights_to_disk(self, model):
         for v in model.variables:
