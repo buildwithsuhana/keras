@@ -42,31 +42,30 @@ class TensorParallelKeras(Model):
         for rank, device_id in enumerate(self.devices):
             print(f"[{device_id}] ⏳ Creating shard {rank+1}/{self.device_count}...")
             
-            # 1. Create Skeleton on Target Device
-            try:
-                with keras.device(device_id):
-                    shard = keras.models.clone_model(model)
-                    if hasattr(model, 'dtype_policy'):
-                        shard.dtype_policy = model.dtype_policy
-            except Exception as e:
-                print(f"❌ Failed to create shard on {device_id}. Error: {e}")
-                raise e
+            # --- FIX STARTS HERE ---
+            # 1. Create Skeleton on CPU (Crucial Step)
+            # We explicitly force the clone to happen on CPU to avoid hitting GPU OOM.
+            with keras.device("cpu"):
+                shard = keras.models.clone_model(model)
+                if hasattr(model, 'dtype_policy'):
+                    shard.dtype_policy = model.dtype_policy
 
-            # Build if needed
+            # Build on CPU if needed
             if not shard.built and model.inputs:
                 try:
                     shard.build([x.shape for x in model.inputs])
                 except Exception:
                     pass
+            # --- FIX ENDS HERE ---
 
-            # 2. Slice & Copy (CPU -> GPU)
+            # 2. Slice (CPU) -> Push to GPU
             shard, _ = make_parameter_sharded_model(
                 shard_model=shard,
                 source_model=model,
                 config=self.tensor_parallel_config,
                 rank=rank,
                 device_count=self.device_count,
-                device_id=device_id,
+                device_id=device_id, # This moves the weights to GPU
             )
 
             self.model_shards.append(shard)

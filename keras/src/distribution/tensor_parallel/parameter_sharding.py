@@ -21,6 +21,8 @@ class ParameterShardingStrategy:
         config: Any,
         device_id: Any,
     ) -> Tuple["Model", Set[str]]:
+        import keras
+        from keras import ops
         
         modified = set()
         source_map = {v.path if hasattr(v,'path') else v.name: v for v in source_model.variables}
@@ -31,11 +33,22 @@ class ParameterShardingStrategy:
                 for name, target_var in targets:
                     if name not in source_map: continue
                     source_var = source_map[name]
+                    
+                    # 1. Slice on CPU
+                    # Since source_var is on CPU, this operation happens in RAM
                     sliced_val = action(source_var, self.rank)
+                    
+                    # 2. Explicitly Move Slice to Target GPU
+                    # This is the ONLY time we touch GPU memory for this weight
+                    with keras.device(device_id):
+                        sliced_val = ops.convert_to_tensor(sliced_val)
+                    
+                    # 3. Assign to Variable
                     target_var.assign(sliced_val)
+                    
                     modified.add(name)
         
-        gc.collect()
+        gc.collect() # Clean up the CPU slice immediately
         return shard_model, modified
 
     def _find_matching_parameters(self, model, pattern: str):
