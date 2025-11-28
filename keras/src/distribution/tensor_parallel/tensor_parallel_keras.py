@@ -1,21 +1,9 @@
 import logging
-import re
 import gc
-from typing import Optional, Sequence, Union
-
-import numpy as np
-import tensorflow as tf
 import keras
-from keras import ops
-from keras.src.distribution.tensor_parallel.autoconfig import (
-    get_default_config,
-)
-from keras.src.distribution.tensor_parallel.parameter_sharding import (
-    make_parameter_sharded_model,
-)
-from keras.src.distribution.tensor_parallel.coordinated_optimizer import (
-    TensorParallelOptimizer,
-)
+from keras.src.distribution.tensor_parallel.autoconfig import get_default_config
+from keras.src.distribution.tensor_parallel.parameter_sharding import make_parameter_sharded_model
+from keras.src.distribution.tensor_parallel.coordinated_optimizer import TensorParallelOptimizer
 from keras.src.distribution import list_devices
 from keras.src.models import Model
 
@@ -24,66 +12,54 @@ logger = logging.getLogger(__file__)
 class TensorParallelKeras(Model):
     def __init__(
         self,
-        model,
+        model, # The Master Model (Should be on CPU)
         device_count=None,
         device_ids=None,
         **kwargs,
     ):
         super().__init__(**kwargs)
 
-        # --- 1. Device Configuration ---
-        if device_count is None:
-            device_count, device_ids = self._auto_detect_parallelism()
-        elif device_ids is None:
-            device_ids = self._auto_configure_devices(device_count)
+        # Device Setup
+        if device_count is None or device_ids is None:
+            # Fallback auto-detection
+            all_devices = list_devices()
+            device_count = len(all_devices)
+            device_ids = [str(d) for d in all_devices]
 
         self.device_count = device_count
-        self.devices = list(self.check_device_ids(device_ids))
+        self.devices = device_ids
         
-        # Validation
-        accel_devices = list_devices()
-        if len(accel_devices) < self.device_count:
-            print(f"⚠️  Requested {self.device_count} devices, but only found {len(accel_devices)}. Fallback logic may apply.")
+        # Normalize device IDs
+        self.devices = [d if "gpu" in d or "cpu" in d or "tpu" in d else f"gpu:{d}" for d in self.devices]
 
-        # --- 2. Configuration & Setup ---
-        self.tensor_parallel_config = None
-        self.distributed = True
+        # Get Sharding Config
+        self.tensor_parallel_config = get_default_config(model, self.devices)
         self.model_shards = []
-
-        if self.tensor_parallel_config is None:
-            device_names = [str(d) for d in self.devices]
-            self.tensor_parallel_config = get_default_config(model, device_names)
-
-        print(f"🔧 Initializing Tensor Parallelism for {model.name} on {len(self.devices)} devices...")
-
-        # --- 3. Iterative Shard Creation (Lazy Init) ---
-        # We clone and shard one by one to keep peak memory low.
         
-        for rank, device_id in enumerate(self.devices):
-            print(f"[{device_id}] ⏳ Creating shard {rank+1}/{self.device_count}...")
+        print(f"🚀 Initializing Tensor Parallelism on {self.devices}")
 
-            # A. Create the Shard Structure on the Target Device
-            # This allocates weights on the GPU immediately (randomly initialized), 
-            # avoiding CPU RAM spikes.
+        # --- Lazy Sharding Loop ---
+        for rank, device_id in enumerate(self.devices):
+            print(f"[{device_id}] ⏳ creating shard {rank+1}/{self.device_count}...")
+            
+            # 1. Create Skeleton on Target Device
+            # We clone the structure. Weights are initialized (randomly) on the GPU here.
+            # Since we slice immediately after, this temporary random memory is overwritten.
             with keras.device(device_id):
-                # Clone model structure. 
-                # Note: We use a custom object scope if necessary, empty here.
                 shard = keras.models.clone_model(model)
-                
-                # Ensure the shard respects the mixed precision policy
+                # Propagate mixed precision policy
                 if hasattr(model, 'dtype_policy'):
                     shard.dtype_policy = model.dtype_policy
-
-            # B. Build the shard to initialize variables (if not already built)
+            
+            # Build if needed to create variables
             if not shard.built and model.inputs:
                 try:
-                    input_shapes = [i.shape for i in model.inputs]
-                    shard.build(input_shapes)
+                    shard.build([x.shape for x in model.inputs])
                 except Exception:
-                    pass # Attempt auto-build later if this fails
+                    pass
 
-            # C. Copy & Slice Weights: Source (CPU) -> Shard (GPU)
-            # This function reads from 'model', slices, and assigns to 'shard'
+            # 2. Slice & Copy (CPU -> GPU)
+            # This function reads from 'model' (CPU), slices it, and assigns to 'shard' (GPU)
             shard, _ = make_parameter_sharded_model(
                 shard_model=shard,
                 source_model=model,
@@ -95,104 +71,66 @@ class TensorParallelKeras(Model):
 
             self.model_shards.append(shard)
             
-            # D. CRITICAL: Garbage Collection
-            # Clean up numpy intermediates generated during slicing
-            gc.collect() 
-            print(f"[{device_id}] ✅ Shard ready.")
+            # 3. Clean up CPU Intermediates
+            gc.collect()
+            print(f"[{device_id}] ✅ Shard created.")
 
-        # --- 4. Cleanup Master Model ---
-        # We no longer need the heavy CPU model.
-        print("🗑️  Freeing original master model from CPU memory...")
-        self._original_model = None # Remove reference
-        # Note: We cannot 'del model' here as it is passed by arg, but we drop our ref.
+        # --- Cleanup Master ---
+        print("🗑️  Freeing Master Model from CPU...")
+        self._original_model = None
+        # We cannot 'del' the argument passed in, but we drop our reference.
+        # The caller should also delete their reference if possible.
         gc.collect()
 
         self.built = True
+        self.distributed = True
         self.assembled_model = self.build_assembled_model()
 
-    # --- Standard Methods (Keep existing logic mostly, just updated references) ---
-
     def build_assembled_model(self):
-        """Reconstructs the graph for the forward pass across shards."""
-        # Use the first shard as reference for structure, but it's logically split
-        ref_model = self.model_shards[0]
-        
-        input_layers = {
-            inp.name.split(":")[0]: keras.Input(
-                shape=inp.shape[1:],
-                dtype=inp.dtype,
-                name=inp.name.split(":")[0],
-            )
-            for inp in ref_model.inputs
+        """Virtual graph combining shards."""
+        # Use first shard for input specs
+        ref = self.model_shards[0]
+        inputs = {
+            i.name.split(':')[0]: keras.Input(shape=i.shape[1:], dtype=i.dtype, name=i.name.split(':')[0])
+            for i in ref.inputs
         }
-
-        partial_outputs = []
+        
+        shard_outputs = []
         for shard in self.model_shards:
-            # Simple input mapping: assume all inputs go to all shards
-            # (In sophisticated TP, inputs might be split too, but we replicate inputs for now)
-            shard_inputs = {
-                name: input_layers[name.split(":")[0]] 
-                for name in [i.name for i in shard.inputs] 
-                if name.split(":")[0] in input_layers
+            # Map global inputs to shard inputs
+            shard_in = {
+                k: inputs[k.split(':')[0]] for k in [x.name for x in shard.inputs] 
+                if k.split(':')[0] in inputs
             }
-            if not shard_inputs:
-                shard_inputs = list(input_layers.values()) # Fallback to list
-            
-            partial_outputs.append(shard(shard_inputs))
-
-        # Output Reduction (Row/Col logic)
-        # Simplified reduction for Causal LM (usually just Sum at the end for logits)
-        if len(partial_outputs) > 1:
-            # For CausalLM head, usually we sum the logits if sharded column-wise
-            final_output = keras.layers.Add()(partial_outputs)
+            if not shard_in: shard_in = inputs # fallback
+            shard_outputs.append(shard(shard_in))
+        
+        # Combine outputs (Sum logits)
+        if len(shard_outputs) > 1:
+            out = keras.layers.Add()(shard_outputs)
         else:
-            final_output = partial_outputs[0]
-
-        return keras.Model(inputs=list(input_layers.values()), outputs=final_output)
+            out = shard_outputs[0]
+            
+        return keras.Model(inputs=inputs, outputs=out)
 
     def call(self, inputs, training=None, **kwargs):
         return self.assembled_model(inputs, training=training, **kwargs)
 
-    def compile(self, optimizer=None, loss=None, metrics=None, **kwargs):
-        if len(self.model_shards) > 1 and optimizer is not None:
-            self.coordinated_optimizer = TensorParallelOptimizer(
-                optimizer,
-                self.device_count,
-                tensor_parallel_config=self.tensor_parallel_config,
-            )
-            # Inject shards into optimizer
-            self.coordinated_optimizer._shard_models = self.model_shards
+    def compile(self, optimizer=None, **kwargs):
+        if len(self.model_shards) > 1 and optimizer:
+            # Wrap optimizer
+            opt = TensorParallelOptimizer(optimizer, self.device_count)
+            opt._shard_models = self.model_shards
             
-            # Create variable mapping for the optimizer
-            # This maps master_var_path -> [shard0_var, shard1_var]
+            # Build Var Map
             var_map = {}
             for i, shard in enumerate(self.model_shards):
                 for v in shard.trainable_variables:
-                    # Best effort name matching
                     key = v.path if hasattr(v, "path") else v.name
-                    if key not in var_map:
-                        var_map[key] = [None] * self.device_count
+                    if key not in var_map: var_map[key] = [None]*self.device_count
                     var_map[key][i] = v
-            self.coordinated_optimizer._shard_var_map = var_map
-
-            super().compile(
-                optimizer=self.coordinated_optimizer,
-                loss=loss,
-                metrics=metrics,
-                **kwargs,
-            )
+            opt._shard_var_map = var_map
+            
+            super().compile(optimizer=opt, **kwargs)
         else:
-            super().compile(optimizer, loss, metrics, **kwargs)
-
-    # --- Utils ---
-    def _auto_detect_parallelism(self):
-        accel = list_devices()
-        return len(accel), [str(d) for d in accel]
-
-    def _auto_configure_devices(self, count):
-        accel = list_devices()
-        return [str(d) for d in accel[:count]]
-
-    def check_device_ids(self, device_ids):
-        # normalize
-        return [d if "gpu" in d or "cpu" in d or "tpu" in d else f"gpu:{d}" for d in device_ids]
+            super().compile(optimizer=optimizer, **kwargs)
