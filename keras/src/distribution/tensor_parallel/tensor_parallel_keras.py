@@ -3,10 +3,8 @@ import gc
 import os
 import shutil
 import tempfile
-import ctypes  # Added for memory trimming
 import numpy as np
 import keras
-from keras import ops # Ensure ops is available
 from keras.src.distribution.tensor_parallel.autoconfig import get_default_config
 from keras.src.distribution.tensor_parallel.parameter_sharding import make_parameter_sharded_model
 from keras.src.distribution.tensor_parallel.coordinated_optimizer import TensorParallelOptimizer
@@ -18,7 +16,7 @@ logger = logging.getLogger(__file__)
 class TensorParallelKeras(Model):
     def __init__(
         self,
-        model, 
+        model, # Can be a Model instance OR a Callable (Factory)
         device_count=None,
         device_ids=None,
         **kwargs,
@@ -34,38 +32,36 @@ class TensorParallelKeras(Model):
         self.device_count = device_count
         self.devices = [self._normalize_device_id(d) for d in device_ids]
         
-        # --- 1. MEMORY PRESERVATION ---
-        # FIX: Use CWD to ensure we write to Disk, not RAM (tmpfs)
-        self.temp_dir = os.path.join(os.getcwd(), "tp_offload_weights")
-        if os.path.exists(self.temp_dir):
-            shutil.rmtree(self.temp_dir)
-        os.makedirs(self.temp_dir, exist_ok=True)
+        # --- 1. MEMORY PRESERVATION: Load & Offload ---
+        self.temp_dir = tempfile.mkdtemp(prefix="tp_weights_")
         
+        # Handle Factory vs Instance
         if callable(model) and not isinstance(model, keras.Model):
             print("🏭 Executing Model Factory to load Master Model...")
-            loaded_model = model()
+            loaded_model = model() # Load 18GB
         else:
-            loaded_model = model
+            loaded_model = model # Use existing (Risk of external ref!)
 
+        # Capture Config & Class BEFORE deletion
         self.model_config = loaded_model.get_config()
         self.model_cls = loaded_model.__class__
         
-        # Capture Input Shape
-        self.input_specs = []
-        if hasattr(loaded_model, "inputs") and loaded_model.inputs:
-             for i in loaded_model.inputs:
-                 self.input_specs.append({"shape": i.shape, "dtype": i.dtype, "name": i.name})
-
+        # Capture Sharding Config (requires structure inspection)
         self.tensor_parallel_config = get_default_config(loaded_model, self.devices)
 
+        # Save Weights to Disk
         print(f"💾 Offloading {len(loaded_model.variables)} variables to disk...")
         self._save_weights_to_disk(loaded_model)
         
+        # CRITICAL: Destruction
         print("🗑️  Destroying Master Model from RAM...")
-        del loaded_model
-        if 'model' in locals(): del model
-        self._force_gc() # FIX: Aggressive GC
+        del loaded_model # Delete local reference
+        if 'model' in locals(): del model # Delete argument reference
+        gc.collect() # Force Reclaim 18GB
         
+        # Verify Memory (Optional Check)
+        print("✅ Master Model destruction complete. RAM should be free.")
+
         self.model_shards = []
         print(f"🚀 Initializing Tensor Parallelism on {self.devices}")
 
@@ -73,30 +69,17 @@ class TensorParallelKeras(Model):
         for rank, device_id in enumerate(self.devices):
             print(f"[{device_id}] ⏳ Creating shard {rank+1}/{self.device_count}...")
             
-            # A. Create Skeleton (CPU)
+            # A. Create Skeleton (CPU) -> ~18GB (Allocated here, freed from Master)
+            # Since Master is gone, we have room for 1 Skeleton.
             with keras.device("cpu"):
-                # FIX: Rename in config BEFORE creation to avoid Functional API conflict
-                shard_config = self.model_config.copy()
-                original_name = shard_config.get("name", "model")
-                shard_name = f"shard_{rank}_{original_name}"
-                shard_config["name"] = shard_name
-                
-                try:
-                    shard = self.model_cls.from_config(shard_config)
-                except Exception:
-                    shard = self.model_cls.from_config(self.model_config)
-                
-                # Ensure internal name matches
-                shard._name = shard_name
-                
-                # Robust Build with Dummy Inputs
-                if not shard.built and self.input_specs:
-                    try:
-                        self._build_shard_with_dummy_input(shard)
-                    except Exception as e:
-                        print(f"⚠️ Manual build warning: {e}")
+                shard = self.model_cls.from_config(self.model_config)
+                # Build is tricky without inputs, but usually from_config handles layers.
+                # If we need to build:
+                if hasattr(shard, 'build_from_config'):
+                     shard.build_from_config(self.model_config)
 
-            # B. Stream & Slice
+            # B. Stream Weights (Disk -> CPU Slice -> GPU)
+            # This iteratively replaces the random weights in 'shard' with proper slices
             shard, _ = make_parameter_sharded_model(
                 shard_model=shard,
                 weight_loader=self._weight_loader, 
@@ -106,12 +89,17 @@ class TensorParallelKeras(Model):
                 device_id=device_id,
             )
 
+            # C. Store Shard
             self.model_shards.append(shard)
             
-            # Clear CPU memory after pushing shard to GPU
-            self._force_gc()
+            # D. Cleanup CPU Skeleton
+            # 'shard' variable now holds the model which has mostly been pushed to GPU?
+            # Actually, Keras variables stick to device. 
+            # But the 'shard' object structure remains on CPU.
+            gc.collect()
             print(f"[{device_id}] ✅ Shard ready.")
 
+        # Cleanup Disk
         try:
             shutil.rmtree(self.temp_dir)
         except Exception:
@@ -121,40 +109,12 @@ class TensorParallelKeras(Model):
         self.distributed = True
         self.assembled_model = self.build_assembled_model()
 
-    def _force_gc(self):
-        """Releases memory back to OS aggressively."""
-        gc.collect()
-        try:
-            ctypes.CDLL("libc.so.6").malloc_trim(0)
-        except Exception:
-            pass
-
-    def _build_shard_with_dummy_input(self, shard):
-        dummy_inputs = {}
-        for spec in self.input_specs:
-            shape = list(spec["shape"])
-            shape[0] = 1 
-            shape = [s if s is not None else 1 for s in shape]
-            clean_name = spec["name"].split(":")[0]
-            dtype = spec["dtype"] or "float32"
-            
-            if "int" in str(dtype):
-                data = ops.zeros(shape, dtype=dtype)
-            else:
-                data = ops.zeros(shape, dtype=dtype)
-                
-            dummy_inputs[clean_name] = data
-
-        try:
-            shard(dummy_inputs)
-        except Exception:
-            shard(list(dummy_inputs.values()))
-
     def _save_weights_to_disk(self, model):
         for v in model.variables:
             name = v.path if hasattr(v, 'path') else v.name
             safe_name = name.replace("/", "_").replace(":", "_")
             path = os.path.join(self.temp_dir, safe_name + ".npy")
+            # Save as numpy to avoid keeping tensor graph alive
             np.save(path, v.numpy())
 
     def _weight_loader(self, param_name):
@@ -172,39 +132,24 @@ class TensorParallelKeras(Model):
 
     def build_assembled_model(self):
         ref = self.model_shards[0]
-        
-        # Reconstruct inputs
-        inputs = {}
-        specs = self.input_specs if self.input_specs else []
-        
-        if not specs and hasattr(ref, "inputs"):
-             for i in ref.inputs:
-                 specs.append({"shape": i.shape, "dtype": i.dtype, "name": i.name})
-
-        symbolic_inputs = {}
-        for spec in specs:
-            name = spec["name"].split(':')[0]
-            symbolic_inputs[name] = keras.Input(
-                shape=spec["shape"][1:], 
-                dtype=spec["dtype"], 
-                name=name
-            )
-
+        inputs = {
+            i.name.split(':')[0]: keras.Input(shape=i.shape[1:], dtype=i.dtype, name=i.name.split(':')[0])
+            for i in ref.inputs
+        }
         shard_outputs = []
         for shard in self.model_shards:
-            try:
-                shard_out = shard(symbolic_inputs)
-            except Exception:
-                shard_out = shard(list(symbolic_inputs.values()))
-            
-            shard_outputs.append(shard_out)
+            shard_in = {
+                k: inputs[k.split(':')[0]] for k in [x.name for x in shard.inputs] 
+                if k.split(':')[0] in inputs
+            }
+            if not shard_in: shard_in = inputs
+            shard_outputs.append(shard(shard_in))
         
         if len(shard_outputs) > 1:
             out = keras.layers.Add()(shard_outputs)
         else:
             out = shard_outputs[0]
-            
-        return keras.Model(inputs=symbolic_inputs, outputs=out)
+        return keras.Model(inputs=inputs, outputs=out)
 
     def call(self, inputs, training=None, **kwargs):
         return self.assembled_model(inputs, training=training, **kwargs)
