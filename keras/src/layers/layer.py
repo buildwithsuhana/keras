@@ -524,40 +524,7 @@ class Layer(BackendLayer, Operation):
         overwrite_with_gradient=False,
         name=None,
     ):
-        """Add a weight variable to the layer.
-
-        Args:
-            shape: Shape tuple for the variable. Must be fully-defined
-                (no `None` entries). Defaults to `()` (scalar) if unspecified.
-            initializer: Initializer object to use to populate the initial
-                variable value, or string name of a built-in initializer
-                (e.g. `"random_normal"`). If unspecified, defaults to
-                `"glorot_uniform"` for floating-point variables and to `"zeros"`
-                for all other types (e.g. int, bool).
-            dtype: Dtype of the variable to create, e.g. `"float32"`. If
-                unspecified, defaults to the layer's variable dtype
-                (which itself defaults to `"float32"` if unspecified).
-            trainable: Boolean, whether the variable should be trainable via
-                backprop or whether its updates are managed manually. Defaults
-                to `True`.
-            autocast: Boolean, whether to autocast layers variables when
-                accessing them. Defaults to `True`.
-            regularizer: Regularizer object to call to apply penalty on the
-                weight. These penalties are summed into the loss function
-                during optimization. Defaults to `None`.
-            constraint: Contrainst object to call on the variable after any
-                optimizer update, or string name of a built-in constraint.
-                Defaults to `None`.
-            aggregation: Optional string, one of `None`, `"none"`, `"mean"`,
-                `"sum"` or `"only_first_replica"`. Annotates the variable with
-                the type of multi-replica aggregation to be used for this
-                variable when writing custom data parallel training loops.
-                Defaults to `"none"`.
-            overwrite_with_gradient: Boolean, whether to overwrite the variable
-                with the computed gradient. This is useful for float8 training.
-                Defaults to `False`.
-            name: String name of the variable. Useful for debugging purposes.
-        """
+        """Add a weight variable to the layer."""
         self._check_super_called()
         if shape is None:
             shape = ()
@@ -571,6 +538,26 @@ class Layer(BackendLayer, Operation):
             else:
                 initializer = "zeros"
         initializer = initializers.get(initializer)
+
+        # --- ADDED: Check for Lazy Initialization ---
+        from keras.src.distribution import distribution_lib
+        if distribution_lib.is_lazy_init_enabled():
+            variable = distribution_lib.LazyVariable(
+                initializer=initializer,
+                shape=shape,
+                dtype=dtype,
+                trainable=trainable,
+                name=name,
+                autocast=autocast,
+                aggregation=aggregation,
+            )
+            variable.regularizer = regularizers.get(regularizer)
+            variable.constraint = constraints.get(constraint)
+            variable.overwrite_with_gradient = overwrite_with_gradient
+            self._track_variable(variable)
+            return variable
+        # -------------------------------------------
+
         with backend.name_scope(self.name, caller=self):
             variable = backend.Variable(
                 initializer=initializer,

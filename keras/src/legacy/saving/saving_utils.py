@@ -4,7 +4,6 @@ from absl import logging
 
 from keras.src import backend
 from keras.src import losses
-from keras.src import metrics as metrics_module
 from keras.src import tree
 from keras.src.legacy.saving import serialization
 from keras.src.saving import object_registration
@@ -122,6 +121,8 @@ def model_metadata(model, include_optimizer=True, require_config=True):
 
 
 def compile_args_from_training_config(training_config, custom_objects=None):
+    from keras.src import metrics as metrics_module
+
     """Return model.compile arguments from training config."""
     if custom_objects is None:
         custom_objects = {}
@@ -217,6 +218,8 @@ def _deserialize_nested_config(deserialize_fn, config):
 
 
 def _deserialize_metric(metric_config):
+    from keras.src import metrics as metrics_module
+
     """Deserialize metrics, leaving special strings untouched."""
     if metric_config in ["accuracy", "acc", "crossentropy", "ce"]:
         # Do not deserialize accuracy and cross-entropy strings as we have

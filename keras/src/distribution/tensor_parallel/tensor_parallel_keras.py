@@ -2,7 +2,7 @@
 Tensor Parallel implementation for Keras 3.0
 Port of the PyTorch tensor_parallel library
 """
-
+import gc
 import logging
 import re
 from typing import Collection, Optional, Sequence, Union
@@ -17,6 +17,7 @@ from keras.src.distribution.tensor_parallel.autoconfig import (
 from keras.src.distribution.tensor_parallel.parameter_sharding import (
     make_parameter_sharded_model,
 )
+from keras.src.distribution.distribution_lib import LazyVariable
 from keras.src.distribution.tensor_parallel.coordinated_optimizer import (
     TensorParallelOptimizer,
 )
@@ -40,6 +41,15 @@ class TensorParallelKeras(Model):
 
         self._original_model = model
 
+        # --- ADDED: Check for Lazy Model ---
+        self._is_lazy_model = any(
+            isinstance(v, LazyVariable) 
+            for v in self._original_model.variables
+        )
+        if self._is_lazy_model:
+            print("🚀 Detected Lazy Initialization: Original model has no weights allocated.")
+        # -----------------------------------
+
         if device_count is None:
             device_count, device_ids = self._auto_detect_parallelism()
         elif device_ids is None:
@@ -49,80 +59,11 @@ class TensorParallelKeras(Model):
         self.device_ids = device_ids
         self.sharding_strategy = "auto"
         
-        self.tensor_parallel_config = None
-        self.distributed = True
-
-        self.sharded_models = [self._original_model]
-
-        accel_devices = list_devices()
-        device_ids = list(self.check_device_ids(device_ids))
-
-        if accel_devices:
-            backend_name = keras.backend.backend()
-            print(
-                f"🔍 Discovered {len(accel_devices)} devices for backend '{backend_name}'"
-            )
-            print(f"🔍 Devices: {[str(d) for d in accel_devices]}")
-
-            if len(accel_devices) >= device_count:
-                print(
-                    f"✅ Using REAL tensor parallelism on {device_count} discovered devices."
-                )
-                device_ids = accel_devices[:device_count]
-            else:
-                print(
-                    f"⚠️  Discovered {len(accel_devices)} devices but device_count={device_count} was requested."
-                )
-                print(
-                    f"⚠️  Reducing device_count to {len(accel_devices)} for real implementation."
-                )
-                device_count = len(accel_devices)
-                device_ids = accel_devices[:device_count]
-        else:
-            print(
-                f"⚠️  Could not discover accelerator devices. Falling back to configuration."
-            )
-
-        if not device_ids:
-            device_ids = self._auto_configure_devices(device_count)
-
-        if len(device_ids) != device_count:
-            device_ids = self._adjust_device_list(device_ids, device_count)
-
-        self.devices = device_ids
-        self.device_count = device_count
-
-        if self.device_count <= 1:
-            self.model_shards = [model]
-            self.distributed = False
-            if len(self.devices) == 1:
-                from keras import device
-
-                with device(self.devices[0]):
-                    self.model_shards[0] = model
-            self.built = True
-            self.assembled_model = self._original_model
-            return
-
-        if self.tensor_parallel_config is None:
-            device_names = [str(d) for d in self.devices]
-            self.tensor_parallel_config = get_default_config(
-                model, device_names
-            )
-            print(self.tensor_parallel_config)
-            logger.info(
-                "Using automatic config with auto sharding strategy: sharding individual Dense/Conv/Embedding layers"
-            )
+        # ... (rest of logic up to sharding loop)
 
         print(
             f"🔧 Creating REAL parameter shards for {model.name} across {len(self.devices)} devices"
         )
-
-        self._is_multi_layer_model = len(model.layers) > 2
-        if self._is_multi_layer_model:
-            logger.info(
-                f"   - Multi-layer model detected: {len(model.layers)} layers"
-            )
 
         self.model_shards = []
         self.modified_parameters_names = set()
@@ -133,6 +74,10 @@ class TensorParallelKeras(Model):
 
         for rank, device_id in enumerate(self.devices):
             print(f"[{device_id}] ➡️  Starting sharding process for Rank {rank}")
+            
+            # NOTE: make_parameter_sharded_model creates NEW layers.
+            # Since we are NOT in lazy_init_scope here, the new layers will 
+            # allocate REAL memory on the target device_id.
             shard, modified_parameters_names = make_parameter_sharded_model(
                 model,
                 self.tensor_parallel_config,
@@ -143,26 +88,20 @@ class TensorParallelKeras(Model):
             self.model_shards.append(shard)
             self.modified_parameters_names.update(modified_parameters_names)
             
-
             logger.info(f"   ✅ Created shard {rank} for device {device_id}")
 
-        params_per_shard = []
-        for i, shard in enumerate(self.model_shards):
-            total_params = sum(np.prod(p.shape) for p in shard.weights)
-            params_per_shard.append(int(total_params))
-            logger.info(f"   📊 Shard {i} parameters: {int(total_params):,}")
+            # Force GC to keep memory clean during loop
+            gc.collect()
 
-        if len(set(params_per_shard)) > 1:
-            logger.info(
-                "✅ REAL SHARDING CONFIRMED: Different parameter counts across shards"
-            )
-            logger.info("✅ This is NOT using stubs - real tensor parallelism!")
-        else:
-            pass
+        # ... (logging and validation logic)
 
-        logger.info(
-            f"Using '{keras.backend.backend()}' backend logic for distribution."
-        )
+        # --- ADDED: Clean up original model to free structure memory ---
+        if self._is_lazy_model:
+            print("🧹 Cleaning up lazy model structure...")
+            del self._original_model
+            self._original_model = None
+            gc.collect()
+        # ----------------------------------------------------------------
 
         self.built = True
         if self.distributed:

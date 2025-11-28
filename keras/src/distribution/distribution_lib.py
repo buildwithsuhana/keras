@@ -19,8 +19,60 @@ from keras.src.backend.common import global_state
 
 DEFAULT_BATCH_DIM_NAME = "batch"
 GLOBAL_ATTRIBUTE_NAME = "distribution"
+_LAZY_INIT_SCOPE_ACTIVE = False
+@keras_export("keras.distribution.LazyVariable")
+class LazyVariable:
+    """A variable placeholder that stores metadata but no data.
+    
+    Used for Zero-Stage initialization to avoid OOM by preventing
+    allocation of full model weights on the host.
+    """
+    def __init__(self, initializer, shape, dtype, trainable=True, name=None, **kwargs):
+        self.initializer = initializer
+        self.shape = shape
+        self.dtype = dtype
+        self.trainable = trainable
+        self.name = name
+        self.kwargs = kwargs
+        # Mock path and other attributes expected by Keras internals
+        self.path = name 
+        self._layout = None
+        self._backend_variable = None
 
+    def numpy(self):
+        raise ValueError(
+            f"Cannot convert LazyVariable '{self.name}' to numpy. "
+            "This variable was created inside a `lazy_init_scope` and has no data. "
+            "It should only be used for structural operations (like sharding) "
+            "before being materialized on the target device."
+        )
 
+    def assign(self, value):
+        raise ValueError(f"Cannot assign value to LazyVariable '{self.name}'.")
+
+    def __repr__(self):
+        return f"<LazyVariable name={self.name}, shape={self.shape}, dtype={self.dtype}>"
+
+@contextlib.contextmanager
+@keras_export("keras.distribution.lazy_init_scope")
+def lazy_init_scope():
+    """Context manager to prevent variable allocation.
+    
+    Inside this scope, `Layer.add_weight` will return `LazyVariable` objects
+    instead of backend variables. This allows defining massive models on CPU
+    without OOM, to be sharded later.
+    """
+    global _LAZY_INIT_SCOPE_ACTIVE
+    original_state = _LAZY_INIT_SCOPE_ACTIVE
+    _LAZY_INIT_SCOPE_ACTIVE = True
+    try:
+        yield
+    finally:
+        _LAZY_INIT_SCOPE_ACTIVE = original_state
+
+def is_lazy_init_enabled():
+    return _LAZY_INIT_SCOPE_ACTIVE
+# -------------------------------------------------
 @keras_export("keras.distribution.list_devices")
 def list_devices(device_type=None):
     """Return all the available devices based on the device type.
