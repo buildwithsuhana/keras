@@ -63,7 +63,7 @@ from keras.src.distribution.tensor_parallel.tensor_parallel_keras import (
 )
 
 # --- Constants ---
-BATCH_SIZE = 4
+BATCH_SIZE = 1
 SEQUENCE_LENGTH = 128
 LEARNING_RATE = 5e-5
 EPOCHS = 1
