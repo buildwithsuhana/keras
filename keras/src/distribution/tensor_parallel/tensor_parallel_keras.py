@@ -59,10 +59,12 @@ class TensorParallelKeras(Model):
         temp_dir = None
         weights_path = None
         
-        # Cache metadata & config
+        # [CRITICAL FIX] Cache not just config, but the CLASS itself.
+        # This allows us to call GemmaCausalLM.from_config(...) instead of Model.from_config(...)
         self._input_specs = [{'shape': i.shape, 'dtype': i.dtype, 'name': i.name} for i in model.inputs]
         self._original_name = model.name
-        self._model_config = model.get_config() # Save config to rebuild skeleton
+        self._model_config = model.get_config() 
+        self._original_class = model.__class__ 
         
         if low_memory_mode:
             print("📉 Low Memory Mode: Enabled")
@@ -77,6 +79,7 @@ class TensorParallelKeras(Model):
                 print("   🧹 Aggressively freeing CPU memory...")
                 self._force_release_memory(model)
                 del model
+                self._force_gc()
                 
             except Exception as e:
                 logger.warning(f"Failed to offload model: {e}. Fallback to clone.")
@@ -85,37 +88,29 @@ class TensorParallelKeras(Model):
         # 3. Sharding Loop
         for rank, device_id in enumerate(self.devices):
             print(f"[{device_id}] ➡️  Processing Rank {rank}")
-            self._force_gc() # Pre-emptive GC
+            self._force_gc() 
             
             # A. Create Skeleton & Load Weights (CPU)
             replica_model = None
             if low_memory_mode and weights_path:
-                with keras.saving.custom_object_scope({}): # Add custom objects if needed
+                with keras.saving.custom_object_scope({}): 
                     with keras.device("cpu"):
                         try:
-                            # 1. Rebuild empty shell (Cheap)
-                            # We use the class of the original model if possible, or Functional/Sequential
-                            # But since we have config, from_config is best.
-                            # For KerasNLP models, we might need the specific class.
-                            # We'll try generic reconstruction which works for Functional/Sequential
-                            try:
-                                replica_model = self.__class__.from_config(self._model_config)
-                            except:
-                                # Fallback: Clone the 'model' variable if it wasn't deleted? 
-                                # We deleted it. So we rely on Keras functional reconstruction.
-                                # If 'model' was a custom class, from_config on base Model might fail.
-                                # KerasNLP models usually support from_config.
-                                from keras.src.models import Model as BaseKerasModel
-                                replica_model = BaseKerasModel.from_config(self._model_config)
+                            # [CRITICAL FIX] Use the saved ORIGINAL CLASS to reconstruct
+                            # This ensures arguments like 'backbone' are understood.
+                            replica_model = self._original_class.from_config(self._model_config)
 
-                            # 2. Load Weights (Heavy, peaks at 18GB)
+                            # Load weights into the skeleton
+                            # Note: from_config initializes random weights (18GB).
+                            # load_weights overwrites them. 
+                            # Peak memory is handled by previous cleanup.
                             replica_model.load_weights(weights_path)
                             
                         except Exception as e:
-                            logger.error(f"Error rebuilding replica: {e}")
+                            logger.error(f"Error rebuilding replica with class {self._original_class}: {e}")
                             raise e
             else:
-                # Fallback path (High Memory)
+                # Fallback
                 try:
                     replica_model = keras.models.clone_model(model)
                     replica_model.set_weights(model.get_weights())
@@ -134,7 +129,6 @@ class TensorParallelKeras(Model):
             self.modified_parameters_names.update(modified_names)
             
             # C. Cleanup Replica
-            # Detach anything we can
             self._force_release_memory(replica_model)
             del replica_model 
             self._force_gc()
@@ -150,41 +144,39 @@ class TensorParallelKeras(Model):
         """Destroys model weights and forces OS memory release."""
         if not model: return
         
-        # 1. Iterate all layers (including nested)
-        # _flatten_layers is a robust internal Keras method if available
-        layers = getattr(model, '_flatten_layers', None)
-        if callable(layers):
-            all_layers = layers(include_self=True, recursive=True)
+        # Recursively find all layers
+        layers_to_clear = []
+        if hasattr(model, '_flatten_layers'):
+            layers_to_clear = model._flatten_layers(include_self=True, recursive=True)
         else:
-            # Fallback manual recursion
-            all_layers = []
-            def recurse(m):
-                all_layers.append(m)
+            # Manual recursion for safety
+            def collect(m):
+                layers_to_clear.append(m)
                 if hasattr(m, 'layers'):
-                    for l in m.layers: recurse(l)
-            recurse(model)
+                    for l in m.layers: collect(l)
+                # Check for KerasNLP specifics
+                for attr in ['backbone', 'token_embedding', 'embeddings']:
+                    if hasattr(m, attr):
+                        sub = getattr(m, attr)
+                        if isinstance(sub, (keras.layers.Layer, keras.Model)):
+                            collect(sub)
+            collect(model)
 
-        # 2. Nullify weights
-        for layer in all_layers:
-            # Clear public weight lists
+        # Nullify weights
+        for layer in layers_to_clear:
             if hasattr(layer, '_trainable_weights'): layer._trainable_weights = []
             if hasattr(layer, '_non_trainable_weights'): layer._non_trainable_weights = []
-            # Clear standard attributes
             for attr in ['kernel', 'bias', 'embeddings', 'variable', 'moving_mean', 'moving_variance']:
                 if hasattr(layer, attr):
                     try: setattr(layer, attr, None)
                     except: pass
         
-        # 3. Clear Model cache
         if hasattr(model, '_trainable_variables'): model._trainable_variables = []
-        
-        # 4. FORCE SYSTEM GC
         self._force_gc()
 
     def _force_gc(self):
         gc.collect()
         try:
-            # Linux only: Trim malloc heap to release memory back to OS
             ctypes.CDLL("libc.so.6").malloc_trim(0)
         except:
             pass
