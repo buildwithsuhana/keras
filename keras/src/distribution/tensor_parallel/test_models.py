@@ -2,6 +2,7 @@ import logging
 import os
 import sys
 import time
+import gc  # Added for memory management
 
 import numpy as np
 
@@ -21,7 +22,10 @@ except Exception:
 
 # --- Backend and Device Configuration ---
 os.environ["KERAS_BACKEND"] = "jax"
-os.environ["XLA_FLAGS"] = "--xla_force_host_platform_device_count=12"
+
+# [FIX] Commented out to allow detection of REAL GPUs (T4s, TPUs, etc.)
+# If you want to simulate 8 devices on CPU only, uncomment this.
+# os.environ["XLA_FLAGS"] = "--xla_force_host_platform_device_count=8"
 
 import jax
 import keras_hub
@@ -31,7 +35,11 @@ import tensorflow_datasets as tfds
 
 import keras
 
+# [FIX] Prevent TensorFlow from grabbing all GPU memory (leave it for JAX)
 tf.config.set_visible_devices([], "GPU")
+
+# [FIX] Enable Mixed Precision (Crucial for T4 GPUs to save memory)
+keras.config.set_dtype_policy("mixed_float16")
 
 logging.basicConfig(level=logging.INFO, format="%(levelname)s - %(message)s")
 logger = logging.getLogger(__name__)
@@ -41,21 +49,31 @@ logger = logging.getLogger(__name__)
 try:
     devices = jax.devices()
     logger.info(f"JAX devices found: {[str(d) for d in devices]}")
-    host_devices = [d for d in devices if d.platform == "cpu"]
-    if not host_devices:
-        host_devices = devices
+    
+    # Check for GPUs/TPUs first
+    accel_devices = [d for d in devices if d.platform != "cpu"]
+    
+    if accel_devices:
+        TARGET_DEVICES = accel_devices
+        DEVICES_AVAILABLE = len(TARGET_DEVICES)
+        logger.info(f"🚀 Using Accelerators: {TARGET_DEVICES}")
+    else:
+        # Fallback to CPU
+        TARGET_DEVICES = devices
+        DEVICES_AVAILABLE = len(TARGET_DEVICES)
+        logger.warning("⚠️ No Accelerators found. Falling back to CPU.")
 
-    DEVICES_AVAILABLE = len(host_devices)
-    WORLD_SIZE = 2
+    WORLD_SIZE = 2 # Number of devices you want to shard across
 
     if DEVICES_AVAILABLE < WORLD_SIZE:
         logger.warning(
             f"Requested {WORLD_SIZE} devices, but only {DEVICES_AVAILABLE} available."
         )
-        TARGET_DEVICES = host_devices
         TARGET_WORLD_SIZE = DEVICES_AVAILABLE
+        # Adjust target devices to what we have
+        TARGET_DEVICES = TARGET_DEVICES[:TARGET_WORLD_SIZE]
     else:
-        TARGET_DEVICES = host_devices[:WORLD_SIZE]
+        TARGET_DEVICES = TARGET_DEVICES[:WORLD_SIZE]
         TARGET_WORLD_SIZE = WORLD_SIZE
         logger.info(
             f"Targeting the first {TARGET_WORLD_SIZE} devices for parallelism: "
@@ -80,7 +98,8 @@ STEPS_PER_EPOCH = 10
 VALIDATION_STEPS = 5
 
 MODEL_MAPPING = {
-    "opt_125m_en": keras_hub.models.OPTCausalLM,
+    # "opt_125m_en": keras_hub.models.OPTCausalLM,
+    "gemma2_9b_en": keras_hub.models.GemmaCausalLM, # Uncomment to test Gemma
 }
 
 # ----------------------------------------------------------------------
@@ -97,9 +116,9 @@ def load_shakespeare_dataset(model_preset):
         example["text"].decode("utf-8") for example in ds.as_numpy_iterator()
     )
 
-    tokenizer = keras_hub.models.OPTCausalLM.from_preset(
+    tokenizer = keras_hub.models.GemmaTokenizer.from_preset(
         model_preset
-    ).preprocessor.tokenizer
+    )
     token_ids = tokenizer.tokenize(text)
 
     num_tokens = (len(token_ids) // (SEQUENCE_LENGTH + 1)) * (
@@ -137,7 +156,16 @@ def format_for_causal_lm(data):
 def get_model_from_preset(preset_name, model_class):
     """Creates a CausalLM model from a KerasNLP preset."""
     logger.info(f"Creating {preset_name} model from KerasNLP preset...")
-    model = model_class.from_preset(preset_name, preprocessor=None)
+    
+    # Load model on CPU initially to avoid GPU OOM before sharding
+    with keras.device("cpu"):
+        model = model_class.from_preset(preset_name, preprocessor=None)
+        
+        # [FIX] For large models (like Gemma 9B), Enable LoRA here!
+        # if "gemma" in preset_name:
+        #     logger.info("Enabling LoRA for memory efficiency...")
+        #     model.backbone.enable_lora(rank=4)
+            
     logger.info(f"Model created with {model.count_params():,} parameters.")
     return model
 
@@ -204,6 +232,9 @@ def run_model_verification(preset_name, model_class):
 
     logger.info(f"--- VERIFICATION FOR: {preset_name.upper()} ---")
 
+    # [FIX] Clean memory before starting
+    gc.collect()
+
     # --- Common Setup ---
     train_ds_raw, val_ds_raw = load_shakespeare_dataset(preset_name)
 
@@ -222,8 +253,11 @@ def run_model_verification(preset_name, model_class):
 
     # --- 1. Tensor Parallel Model Training ---
     logger.info("\n--- Training Tensor Parallel (TP) Model ---")
+    
+    # Load template (on CPU)
     tp_model_template = get_model_from_preset(preset_name, model_class)
 
+    # Distribute (Moves shards to GPU)
     tp_model = TensorParallelKeras(
         model=tp_model_template,
         device_count=TARGET_WORLD_SIZE,
@@ -237,6 +271,11 @@ def run_model_verification(preset_name, model_class):
             keras_hub.metrics.Perplexity(from_logits=True, name="perplexity")
         ],
     )
+
+    # [FIX] Release the template memory now that TP model is built
+    # The TP model clones the structure internally, so we don't need this heavy object.
+    del tp_model_template
+    gc.collect()
 
     tp_history = tp_model.fit(
         train_ds,
@@ -254,6 +293,10 @@ def run_model_verification(preset_name, model_class):
     logger.info(f"TP Final Validation Loss: {tp_final_val_loss:.6f}")
 
     plot_training_graphs(tp_history, preset_name)
+
+    # Cleanup
+    del tp_model
+    gc.collect()
 
     logger.info("✅ SUCCESS: TP model training finished without errors.")
     return True
