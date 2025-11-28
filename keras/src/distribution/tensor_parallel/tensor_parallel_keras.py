@@ -157,13 +157,27 @@ class TensorParallelKeras(Model):
             for i in ref.inputs
         }
         shard_outputs = []
-        for shard in self.model_shards:
+        # Wrap each shard invocation in a unique Layer to force unique
+        # operation/namespace during the functional model construction.
+        class _ShardCallLayer(keras.layers.Layer):
+            def __init__(self, shard_model, name=None):
+                super().__init__(name=name)
+                self.shard_model = shard_model
+
+            def call(self, inputs, training=None, **kwargs):
+                return self.shard_model(inputs, training=training, **kwargs)
+
+        for i, shard in enumerate(self.model_shards):
             shard_in = {
-                k: inputs[k.split(':')[0]] for k in [x.name for x in shard.inputs] 
+                k: inputs[k.split(':')[0]] for k in [x.name for x in shard.inputs]
                 if k.split(':')[0] in inputs
             }
-            if not shard_in: shard_in = inputs
-            shard_outputs.append(shard(shard_in))
+            if not shard_in:
+                shard_in = inputs
+
+            wrapper_name = f"shard_wrapper_tp{i}"
+            wrapper = _ShardCallLayer(shard, name=wrapper_name)
+            shard_outputs.append(wrapper(shard_in))
         
         if len(shard_outputs) > 1:
             out = keras.layers.Add()(shard_outputs)
