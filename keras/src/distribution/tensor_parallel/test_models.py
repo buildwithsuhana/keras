@@ -15,11 +15,11 @@ try:
     if _project_root not in sys.path:
         sys.path.insert(0, _project_root)
 except Exception:
-    print("Could not add project root to sys.path.")
+    pass
 
 # --- Backend and Device Configuration ---
 os.environ["KERAS_BACKEND"] = "jax"
-# Prevent JAX from pre-allocating all memory, leaving room for Keras loading
+# Prevent JAX from pre-allocating all memory
 os.environ["XLA_PYTHON_CLIENT_PREALLOCATE"] = "false"
 os.environ["XLA_PYTHON_CLIENT_ALLOCATOR"] = "platform"
 
@@ -29,10 +29,7 @@ import tensorflow as tf
 import tensorflow_datasets as tfds
 import keras
 
-# Hide GPUs from TensorFlow so JAX gets exclusive access
 tf.config.set_visible_devices([], "GPU")
-
-# [CRITICAL] Use mixed_bfloat16 to fit model in memory (18GB vs 36GB)
 keras.config.set_dtype_policy("mixed_bfloat16")
 
 logging.basicConfig(level=logging.INFO, format="%(levelname)s - %(message)s")
@@ -42,17 +39,13 @@ logger = logging.getLogger(__name__)
 try:
     devices = jax.devices()
     accel_devices = [d for d in devices if d.platform != "cpu"]
-    
     if accel_devices:
-        # [FIX] Convert Device objects to standard Keras string format "gpu:0", "gpu:1"
         TARGET_DEVICES = [f"gpu:{d.id}" for d in accel_devices]
         WORLD_SIZE = len(TARGET_DEVICES)
         logger.info(f"🚀 Using Accelerators: {TARGET_DEVICES}")
     else:
         TARGET_DEVICES = ["cpu:0"]
         WORLD_SIZE = 1
-        logger.warning("⚠️ No Accelerators found. Falling back to CPU.")
-
 except Exception as e:
     logger.error(f"Could not initialize JAX. Error: {e}")
     TARGET_DEVICES = []
@@ -63,7 +56,8 @@ from keras.src.distribution.tensor_parallel.tensor_parallel_keras import (
 )
 
 # --- Constants ---
-BATCH_SIZE = 1
+# [CRITICAL] Batch size 1 is mandatory for 9B model on T4
+BATCH_SIZE = 1 
 SEQUENCE_LENGTH = 128
 LEARNING_RATE = 5e-5
 EPOCHS = 1
@@ -77,12 +71,9 @@ MODEL_MAPPING = {
 def load_shakespeare_dataset(model_preset):
     logger.info(f"Loading Tiny Shakespeare for {model_preset}...")
     ds = tfds.load("tiny_shakespeare", split="train", as_supervised=False)
-    
-    # Tiny slice for verification speed
-    text = "".join(example["text"].decode("utf-8") for example in ds.as_numpy_iterator())
-    text = text[:50000]
+    text = "".join(example["text"].decode("utf-8") for example in ds.as_numpy_iterator())[:50000]
 
-    # Load ONLY the preprocessor (lightweight)
+    # Load only preprocessor
     logger.info("   - Loading lightweight preprocessor...")
     if "gemma" in model_preset:
         preprocessor = keras_hub.models.GemmaCausalLMPreprocessor.from_preset(model_preset)
@@ -91,7 +82,6 @@ def load_shakespeare_dataset(model_preset):
 
     tokenizer = preprocessor.tokenizer
     token_ids = tokenizer(text)
-    
     length = SEQUENCE_LENGTH + 1
     num_tokens = (len(token_ids) // length) * length
     token_ids = token_ids[:num_tokens]
@@ -107,7 +97,6 @@ def load_shakespeare_dataset(model_preset):
         }, x[1:]
 
     sequences = sequences.map(split_input_label, num_parallel_calls=tf.data.AUTOTUNE)
-    
     train_ds = sequences.take(50).batch(BATCH_SIZE).repeat()
     val_ds = sequences.skip(50).take(10).batch(BATCH_SIZE).repeat()
     return train_ds, val_ds
@@ -119,19 +108,15 @@ def run_model_verification(preset_name, model_class):
     train_ds, val_ds = load_shakespeare_dataset(preset_name)
 
     logger.info("\n--- Training Tensor Parallel (TP) Model ---")
-    
-    # 1. Load Skeleton on CPU
     logger.info("⏳ Loading model skeleton onto CPU RAM...")
+    
+    # Load on CPU
     with keras.device("cpu"):
-        original_model = model_class.from_preset(
-            preset_name,
-            dtype="bfloat16",
-        )
+        original_model = model_class.from_preset(preset_name, dtype="bfloat16")
         if "gemma" in preset_name:
             logger.info("   - Enabling LoRA for memory efficiency...")
             original_model.backbone.enable_lora(rank=4)
 
-    # 2. Distribute with Disk Offloading
     logger.info("   - Sharding model (Zero Stage Init)...")
     tp_model = TensorParallelKeras(
         model=original_model,
@@ -140,11 +125,10 @@ def run_model_verification(preset_name, model_class):
         low_memory_mode=True 
     )
 
-    # Cleanup CPU model immediately
+    # Force delete reference here too
     del original_model
     gc.collect()
 
-    # 3. Compile & Fit
     logger.info("   - Compiling...")
     tp_model.compile(
         optimizer=keras.optimizers.AdamW(LEARNING_RATE),

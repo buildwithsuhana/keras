@@ -58,7 +58,7 @@ class TensorParallelKeras(Model):
         temp_dir = None
         model_path = None
         
-        # Cache metadata required for reconstruction
+        # Cache metadata
         self._input_specs = [{'shape': i.shape, 'dtype': i.dtype, 'name': i.name} for i in model.inputs]
         self._original_name = model.name
         self._last_layer_name = model.layers[-1].name
@@ -72,11 +72,11 @@ class TensorParallelKeras(Model):
                 model.save(model_path)
                 print(f"   💾 Model offloaded to {model_path}")
                 
-                # CRITICAL FIX: "Hollow out" the original model object.
-                # Just doing 'del model' isn't enough because the caller (test_models.py)
-                # still holds a reference. We must clear the internal weight lists.
+                # CRITICAL: Recursively destroy the original model in memory
                 print("   🧹 Aggressively freeing CPU memory from original model...")
-                self._hollow_out_model(model)
+                self._recursively_hollow_model(model)
+                
+                # Force delete the reference and GC
                 del model
                 gc.collect()
                 
@@ -90,11 +90,15 @@ class TensorParallelKeras(Model):
             gc.collect()
             
             # A. Revive Replica (CPU)
+            replica_model = None
             if low_memory_mode and model_path:
                 with keras.saving.custom_object_scope({}):
-                    # Load strictly on CPU
                     with keras.device("cpu"):
-                        replica_model = keras.models.load_model(model_path, compile=False)
+                        # Load strictly on CPU
+                        try:
+                            replica_model = keras.models.load_model(model_path, compile=False)
+                        except Exception as e:
+                            raise RuntimeError(f"OOM or Error loading replica for Rank {rank}: {e}")
             else:
                 try:
                     replica_model = keras.models.clone_model(model)
@@ -124,30 +128,41 @@ class TensorParallelKeras(Model):
         self.built = True
         self.assembled_model = self.build_assembled_model()
 
-    def _hollow_out_model(self, model):
+    def _recursively_hollow_model(self, layer_or_model):
         """
-        Aggressively clears weights from a model to free RAM, even if references exist.
+        Recursively traverses the model structure to explicitly destroy 
+        variables and weights, freeing memory even if references exist.
         """
-        # 1. Clear layer weights
-        for layer in model.layers:
-            if hasattr(layer, '_trainable_weights'):
-                layer._trainable_weights = []
-            if hasattr(layer, '_non_trainable_weights'):
-                layer._non_trainable_weights = []
-            # Also try to clear backend variables if accessible
-            if hasattr(layer, 'variables'):
-                # We can't easily modify the Variables list in-place safely for all backends,
-                # but clearing the python attributes helps.
-                pass
-                
-        # 2. Clear Model-level containers
-        if hasattr(model, '_trainable_variables'):
-            model._trainable_variables = []
-        if hasattr(model, '_non_trainable_variables'):
-            model._non_trainable_variables = []
-            
-        # 3. Force garbage collection of the arrays
-        gc.collect()
+        # 1. Recurse into sub-modules (e.g. Backbone, TransformerBlock)
+        if hasattr(layer_or_model, 'layers'):
+            for sub_layer in layer_or_model.layers:
+                self._recursively_hollow_model(sub_layer)
+        
+        # Also check for 'backbone' or 'token_embedding' direct attributes
+        # which are common in KerasNLP but might not be in .layers list immediately
+        for attr in ['backbone', 'token_embedding', 'embeddings', 'encoder', 'decoder']:
+            if hasattr(layer_or_model, attr):
+                val = getattr(layer_or_model, attr)
+                if isinstance(val, keras.layers.Layer) or isinstance(val, keras.Model):
+                    self._recursively_hollow_model(val)
+
+        # 2. Destroy Weights on the current object
+        # We iterate known weight attributes and force them to None
+        for attr in ['kernel', 'bias', 'embeddings', 'gamma', 'beta', 'moving_mean', 'moving_variance', 'variable']:
+            if hasattr(layer_or_model, attr):
+                try:
+                    setattr(layer_or_model, attr, None)
+                except: pass
+
+        # 3. Clear storage lists
+        if hasattr(layer_or_model, '_trainable_weights'):
+            layer_or_model._trainable_weights = []
+        if hasattr(layer_or_model, '_non_trainable_weights'):
+            layer_or_model._non_trainable_weights = []
+        if hasattr(layer_or_model, '_trainable_variables'):
+            layer_or_model._trainable_variables = []
+        if hasattr(layer_or_model, '_non_trainable_variables'):
+            layer_or_model._non_trainable_variables = []
 
     @property
     def variables(self):
