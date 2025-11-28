@@ -33,7 +33,7 @@ from keras.src.distribution.tensor_parallel.tensor_parallel_keras import (
 )
 
 MODEL_PRESET = "gemma2_9b_en"
-BATCH_SIZE = 4 
+BATCH_SIZE = 1
 SEQUENCE_LENGTH = 128
 LEARNING_RATE = 5e-5
 EPOCHS = 1
@@ -103,7 +103,7 @@ def run_training():
     
     logger.info("Compiling model...")
     tp_model.compile(
-        optimizer=keras.optimizers.AdamW(learning_rate=LEARNING_RATE),
+        optimizer=keras.optimizers.SGD(learning_rate=LEARNING_RATE, momentum=0.0),
         loss=keras.losses.SparseCategoricalCrossentropy(from_logits=True),
         metrics=["accuracy"]
     )
