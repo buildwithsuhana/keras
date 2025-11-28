@@ -3,8 +3,10 @@ import gc
 import os
 import shutil
 import tempfile
+import ctypes
 import numpy as np
 import keras
+from keras import ops
 from keras.src.distribution.tensor_parallel.autoconfig import get_default_config
 from keras.src.distribution.tensor_parallel.parameter_sharding import make_parameter_sharded_model
 from keras.src.distribution.tensor_parallel.coordinated_optimizer import TensorParallelOptimizer
@@ -125,20 +127,62 @@ class TensorParallelKeras(Model):
         except Exception:
             pass
         
-        # Mark as distributed and assemble the functional model. Do NOT mark
-        # `built = True` before the assembled model exists — that prevents
-        # Keras from properly building sub-models and metrics during compile.
-        self.distributed = True
-        self.assembled_model = self.build_assembled_model()
-        # Now the assembled model is created; mark this wrapper as built.
         self.built = True
+        # Note: We do NOT use assembled_model anymore.
+        # Logic is handled in call()
+
+    # --- SIMPLIFIED CALL METHOD ---
+    def call(self, inputs, training=None, **kwargs):
+        """
+        Runs the forward pass on all shards and sums the results (Logits).
+        This avoids graph name collisions because we don't build a static graph.
+        """
+        results = []
+        for shard in self.model_shards:
+            # Shards might return a dictionary or tensor. 
+            # For CausalLM, it usually returns logits (tensor).
+            out = shard(inputs, training=training, **kwargs)
+            results.append(out)
+        
+        # Sum the outputs (Logits reduction for TP)
+        total = results[0]
+        for i in range(1, len(results)):
+            total = ops.add(total, results[i])
+            
+        return total
+
+    def _force_gc(self):
+        gc.collect()
+        try:
+            ctypes.CDLL("libc.so.6").malloc_trim(0)
+        except Exception:
+            pass
+
+    def _build_shard_with_dummy_input(self, shard):
+        dummy_inputs = {}
+        for spec in self.input_specs:
+            shape = list(spec["shape"])
+            shape[0] = 1 
+            shape = [s if s is not None else 1 for s in shape]
+            clean_name = spec["name"].split(":")[0]
+            dtype = spec["dtype"] or "float32"
+            
+            if "int" in str(dtype):
+                data = ops.zeros(shape, dtype=dtype)
+            else:
+                data = ops.zeros(shape, dtype=dtype)
+            dummy_inputs[clean_name] = data
+
+        try:
+            shard(dummy_inputs)
+        except Exception:
+            shard(list(dummy_inputs.values()))
 
     def _save_weights_to_disk(self, model):
         for v in model.variables:
             name = v.path if hasattr(v, 'path') else v.name
             safe_name = name.replace("/", "_").replace(":", "_")
             path = os.path.join(self.temp_dir, safe_name + ".npy")
-            # Save as numpy to avoid keeping tensor graph alive
             np.save(path, v.numpy())
 
     def _weight_loader(self, param_name):
@@ -153,44 +197,6 @@ class TensorParallelKeras(Model):
         if d_str.startswith("cuda:"): return d_str.replace("cuda:", "gpu:")
         if ":" not in d_str: return f"gpu:{d_str}"
         return d_str
-
-    def build_assembled_model(self):
-        ref = self.model_shards[0]
-        inputs = {
-            i.name.split(':')[0]: keras.Input(shape=i.shape[1:], dtype=i.dtype, name=i.name.split(':')[0])
-            for i in ref.inputs
-        }
-        shard_outputs = []
-        # Wrap each shard invocation in a unique Layer to force unique
-        # operation/namespace during the functional model construction.
-        class _ShardCallLayer(keras.layers.Layer):
-            def __init__(self, shard_model, name=None):
-                super().__init__(name=name)
-                self.shard_model = shard_model
-
-            def call(self, inputs, training=None, **kwargs):
-                return self.shard_model(inputs, training=training, **kwargs)
-
-        for i, shard in enumerate(self.model_shards):
-            shard_in = {
-                k: inputs[k.split(':')[0]] for k in [x.name for x in shard.inputs]
-                if k.split(':')[0] in inputs
-            }
-            if not shard_in:
-                shard_in = inputs
-
-            wrapper_name = f"shard_wrapper_tp{i}"
-            wrapper = _ShardCallLayer(shard, name=wrapper_name)
-            shard_outputs.append(wrapper(shard_in))
-        
-        if len(shard_outputs) > 1:
-            out = keras.layers.Add()(shard_outputs)
-        else:
-            out = shard_outputs[0]
-        return keras.Model(inputs=inputs, outputs=out)
-
-    def call(self, inputs, training=None, **kwargs):
-        return self.assembled_model(inputs, training=training, **kwargs)
 
     def compile(self, optimizer=None, **kwargs):
         if len(self.model_shards) > 1 and optimizer:
