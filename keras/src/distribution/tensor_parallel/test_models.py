@@ -1,15 +1,18 @@
 import os
 
 # --- CRITICAL: Memory Management Settings ---
+# 1. Disable JAX preallocation (grow memory on demand)
 os.environ["XLA_PYTHON_CLIENT_PREALLOCATE"] = "false"
 os.environ["XLA_PYTHON_CLIENT_ALLOCATOR"] = "platform"
+# 2. Force JAX backend
 os.environ["KERAS_BACKEND"] = "jax"
-# Ensure we have enough host device count if testing on CPU backend
+# 3. Ensure CPU host device count
 os.environ["XLA_FLAGS"] = "--xla_force_host_platform_device_count=8"
 
 import logging
 import sys
 import gc
+import shutil
 import numpy as np
 import jax
 import keras
@@ -17,7 +20,7 @@ import keras_hub
 import tensorflow as tf
 import tensorflow_datasets as tfds
 
-# Mixed Precision - Essential
+# --- Mixed Precision is Mandatory ---
 keras.config.set_dtype_policy("bfloat16")
 
 tf.config.set_visible_devices([], "GPU")
@@ -30,7 +33,7 @@ from keras.src.distribution.tensor_parallel.tensor_parallel_keras import (
 )
 
 MODEL_PRESET = "gemma2_9b_en"
-BATCH_SIZE = 1
+BATCH_SIZE = 4 
 SEQUENCE_LENGTH = 128
 LEARNING_RATE = 5e-5
 EPOCHS = 1
@@ -58,7 +61,7 @@ def load_data(preset):
     
     logger.info("Tokenizing...")
     tokenizer = keras_hub.models.GemmaTokenizer.from_preset(preset)
-    tokens = tokenizer(text[:50000])
+    tokens = tokenizer(text[:20000]) # Reduced for speed
     if isinstance(tokens, dict): tokens = tokens["token_ids"]
     tokens = np.array(tokens)
     
@@ -79,22 +82,25 @@ def run_training():
 
     train_ds = load_data(MODEL_PRESET)
 
-    # 1. Load Master on CPU
-    logger.info(f"Loading {MODEL_PRESET} to System RAM (CPU)...")
-    with keras.device("cpu"):
-        master_model = keras_hub.models.GemmaCausalLM.from_preset(MODEL_PRESET)
+    logger.info("Preparing Tensor Parallel Model...")
     
-    logger.info("✅ Master model loaded on CPU.")
-    
-    # 2. Hand over to TP Wrapper (Which will Offload->Shard->Load)
-    logger.info("Starting Tensor Parallel Sharding (with Disk Offloading)...")
+    # --- THE FIX IS HERE ---
+    # We do NOT load the model here. We define HOW to load it.
+    # This prevents 'run_training' from holding an 18GB reference.
+    def model_factory():
+        logger.info(f"🏭 Factory: Loading {MODEL_PRESET} to System RAM (CPU)...")
+        with keras.device("cpu"):
+            return keras_hub.models.GemmaCausalLM.from_preset(MODEL_PRESET)
+
+    # We pass the FACTORY (callable), not the MODEL
     tp_model = TensorParallelKeras(
-        model=master_model,
+        model=model_factory, 
         device_count=device_count,
         device_ids=[str(d) for d in target_devices]
     )
     
-    # 3. Train
+    # At this point, the Master Model is guaranteed to be deleted from RAM.
+    
     logger.info("Compiling model...")
     tp_model.compile(
         optimizer=keras.optimizers.AdamW(learning_rate=LEARNING_RATE),
@@ -105,6 +111,10 @@ def run_training():
     logger.info("Starting Training Loop...")
     tp_model.fit(train_ds, epochs=EPOCHS, steps_per_epoch=STEPS_PER_EPOCH)
     logger.info("🎉 Training Finished Successfully!")
+
+    # Cleanup temp dirs if any remained (optional)
+    if hasattr(tp_model, 'temp_dir') and os.path.exists(tp_model.temp_dir):
+        shutil.rmtree(tp_model.temp_dir)
 
 if __name__ == "__main__":
     run_training()

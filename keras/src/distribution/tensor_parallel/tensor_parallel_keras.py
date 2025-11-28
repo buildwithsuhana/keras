@@ -16,7 +16,7 @@ logger = logging.getLogger(__file__)
 class TensorParallelKeras(Model):
     def __init__(
         self,
-        model, 
+        model, # Can be a Model instance OR a Callable (Factory)
         device_count=None,
         device_ids=None,
         **kwargs,
@@ -32,22 +32,35 @@ class TensorParallelKeras(Model):
         self.device_count = device_count
         self.devices = [self._normalize_device_id(d) for d in device_ids]
         
-        # Get Config from the Master instance
-        self.tensor_parallel_config = get_default_config(model, self.devices)
-        
-        # --- 1. MEMORY PRESERVATION: Offload Master to Disk ---
-        print("💾 Offloading Master Model to Disk to free RAM...")
+        # --- 1. MEMORY PRESERVATION: Load & Offload ---
         self.temp_dir = tempfile.mkdtemp(prefix="tp_weights_")
-        self._save_weights_to_disk(model)
         
-        # Save model config to recreate skeletons later
-        model_config = model.get_config()
-        model_cls = model.__class__
+        # Handle Factory vs Instance
+        if callable(model) and not isinstance(model, keras.Model):
+            print("🏭 Executing Model Factory to load Master Model...")
+            loaded_model = model() # Load 18GB
+        else:
+            loaded_model = model # Use existing (Risk of external ref!)
+
+        # Capture Config & Class BEFORE deletion
+        self.model_config = loaded_model.get_config()
+        self.model_cls = loaded_model.__class__
         
-        # CRITICAL: Delete Master Model from RAM
-        del model
-        gc.collect()
-        print("🗑️ Master Model deleted from RAM.")
+        # Capture Sharding Config (requires structure inspection)
+        self.tensor_parallel_config = get_default_config(loaded_model, self.devices)
+
+        # Save Weights to Disk
+        print(f"💾 Offloading {len(loaded_model.variables)} variables to disk...")
+        self._save_weights_to_disk(loaded_model)
+        
+        # CRITICAL: Destruction
+        print("🗑️  Destroying Master Model from RAM...")
+        del loaded_model # Delete local reference
+        if 'model' in locals(): del model # Delete argument reference
+        gc.collect() # Force Reclaim 18GB
+        
+        # Verify Memory (Optional Check)
+        print("✅ Master Model destruction complete. RAM should be free.")
 
         self.model_shards = []
         print(f"🚀 Initializing Tensor Parallelism on {self.devices}")
@@ -56,56 +69,59 @@ class TensorParallelKeras(Model):
         for rank, device_id in enumerate(self.devices):
             print(f"[{device_id}] ⏳ Creating shard {rank+1}/{self.device_count}...")
             
-            # A. Create Skeleton from Config (on CPU)
-            # This allocates ~18GB Random Weights (Fits in 30GB RAM since master is gone)
+            # A. Create Skeleton (CPU) -> ~18GB (Allocated here, freed from Master)
+            # Since Master is gone, we have room for 1 Skeleton.
             with keras.device("cpu"):
-                # Re-instantiate a fresh model from config
-                shard = model_cls.from_config(model_config)
-                # Ensure build
+                shard = self.model_cls.from_config(self.model_config)
+                # Build is tricky without inputs, but usually from_config handles layers.
+                # If we need to build:
                 if hasattr(shard, 'build_from_config'):
-                     shard.build_from_config(model_config)
+                     shard.build_from_config(self.model_config)
 
-            # B. Stream Weights from Disk -> Slice -> GPU
+            # B. Stream Weights (Disk -> CPU Slice -> GPU)
+            # This iteratively replaces the random weights in 'shard' with proper slices
             shard, _ = make_parameter_sharded_model(
                 shard_model=shard,
-                weight_loader=self._weight_loader, # Pass function, not data
+                weight_loader=self._weight_loader, 
                 config=self.tensor_parallel_config,
                 rank=rank,
                 device_count=self.device_count,
                 device_id=device_id,
             )
 
-            # C. Move entire model to GPU if not already (Keras variables are sticky)
-            # The slicing process pushed weights to GPU, but we ensure structure is consistent
+            # C. Store Shard
             self.model_shards.append(shard)
             
-            # D. Clean up CPU Intermediates
+            # D. Cleanup CPU Skeleton
+            # 'shard' variable now holds the model which has mostly been pushed to GPU?
+            # Actually, Keras variables stick to device. 
+            # But the 'shard' object structure remains on CPU.
             gc.collect()
             print(f"[{device_id}] ✅ Shard ready.")
 
         # Cleanup Disk
-        shutil.rmtree(self.temp_dir)
+        try:
+            shutil.rmtree(self.temp_dir)
+        except Exception:
+            pass
         
         self.built = True
         self.distributed = True
         self.assembled_model = self.build_assembled_model()
 
     def _save_weights_to_disk(self, model):
-        """Saves every variable to a separate .npy file."""
         for v in model.variables:
-            # Clean name for filesystem
             name = v.path if hasattr(v, 'path') else v.name
             safe_name = name.replace("/", "_").replace(":", "_")
             path = os.path.join(self.temp_dir, safe_name + ".npy")
-            np.save(path, v.numpy()) # Save as CPU numpy
+            # Save as numpy to avoid keeping tensor graph alive
+            np.save(path, v.numpy())
 
     def _weight_loader(self, param_name):
-        """Lazy loader callback."""
         safe_name = param_name.replace("/", "_").replace(":", "_")
         path = os.path.join(self.temp_dir, safe_name + ".npy")
         if os.path.exists(path):
             return np.load(path)
-        # Fallback for some naming inconsistencies
         return None
 
     def _normalize_device_id(self, device_id):

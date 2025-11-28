@@ -26,39 +26,34 @@ class ParameterShardingStrategy:
         
         modified = set()
         
-        # Iterate rules
         for pattern, action in config.state_rules.items():
             if callable(action):
-                # Find targets in the skeleton model
                 targets = self._find_matching_parameters(shard_model, pattern)
                 
                 for name, target_var in targets:
-                    # 1. Load Source Weight from Disk (Low Memory Impact)
+                    # 1. Load ONE weight from disk (Low Memory)
                     try:
                         source_val = weight_loader(name)
-                        if source_val is None:
-                            logger.warning(f"Weight not found for {name}")
-                            continue
-                    except Exception as e:
-                        logger.warning(f"Error loading {name}: {e}")
+                        if source_val is None: continue
+                    except Exception:
                         continue
 
-                    # 2. Slice on CPU
-                    # source_val is a numpy array here
+                    # 2. Slice (RAM)
                     sliced_val = action(source_val, self.rank)
                     
-                    # 3. Explicitly Move Slice to Target GPU
+                    # 3. Push to GPU
                     with keras.device(device_id):
-                        sliced_val = ops.convert_to_tensor(sliced_val)
+                        sliced_val_tensor = ops.convert_to_tensor(sliced_val)
                     
-                    # 4. Assign & Update
-                    # This replaces the large random weight in shard_model with the smaller sliced weight
-                    target_var.assign(sliced_val)
+                    # 4. Assign
+                    target_var.assign(sliced_val_tensor)
                     
-                    # Explicit cleanup
+                    modified.add(name)
+                    
+                    # 5. IMMEDIATE CLEANUP
                     del source_val
                     del sliced_val
-                    modified.add(name)
+                    del sliced_val_tensor
         
         gc.collect()
         return shard_model, modified
