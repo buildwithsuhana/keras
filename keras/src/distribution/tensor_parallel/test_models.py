@@ -1,70 +1,55 @@
 import os
-# Limit JAX to 90% of VRAM to prevent fragmentation OOMs
-os.environ["XLA_PYTHON_CLIENT_MEM_FRACTION"] = "0.90"
-
-# --- 1. Memory Tuning ---
-# Disable preallocation to allow memory to grow as needed
-os.environ["XLA_PYTHON_CLIENT_PREALLOCATE"] = "false"
-os.environ["XLA_PYTHON_CLIENT_ALLOCATOR"] = "platform"
-os.environ["KERAS_BACKEND"] = "jax"
-# Ensure CPU host device count is sufficient for JAX
-os.environ["XLA_FLAGS"] = "--xla_force_host_platform_device_count=8"
-
-import logging
-import sys
 import gc
 import shutil
+import logging
 import numpy as np
+
+# --- 1. Aggressive Memory Environment Variables ---
+# We limit JAX to 90% memory to prevent fragmentation, 
+# and force it to act like a CPU allocator (slower but safer for OOM).
+os.environ["XLA_PYTHON_CLIENT_PREALLOCATE"] = "false"
+os.environ["XLA_PYTHON_CLIENT_MEM_FRACTION"] = "0.90" 
+os.environ["XLA_PYTHON_CLIENT_ALLOCATOR"] = "platform"
+os.environ["KERAS_BACKEND"] = "jax"
+os.environ["XLA_FLAGS"] = "--xla_force_host_platform_device_count=8"
+
 import jax
 import keras
 import keras_hub
 import tensorflow as tf
 import tensorflow_datasets as tfds
 
-# --- 2. Mixed Precision is Mandatory ---
-# bfloat16 is crucial for 9B models on T4 GPUs
+# Strict bfloat16 policy
 keras.config.set_dtype_policy("bfloat16")
-
 tf.config.set_visible_devices([], "GPU")
 
 logging.basicConfig(level=logging.INFO, format="%(levelname)s - %(message)s")
 logger = logging.getLogger(__name__)
 
-from keras.src.distribution.tensor_parallel.tensor_parallel_keras import (
-    TensorParallelKeras,
-)
+from keras.src.distribution.tensor_parallel.tensor_parallel_keras import TensorParallelKeras
 
+# --- CONFIGURATION ---
 MODEL_PRESET = "gemma2_9b_en"
-# With LoRA + TP on 2xT4s, we can slightly increase batch size
 BATCH_SIZE = 1
-SEQUENCE_LENGTH = 128
-LEARNING_RATE = 5e-5
+# REDUCED: 128 -> 64 to save Activation Memory
+SEQUENCE_LENGTH = 8
+LEARNING_RATE = 1e-4 # Slightly higher for SGD
 EPOCHS = 1
 STEPS_PER_EPOCH = 5
 
 def get_devices():
-    try:
-        devices = jax.devices()
-        logger.info(f"Available JAX devices: {[str(d) for d in devices]}")
-        accel_devices = [d for d in devices if d.platform != "cpu"]
-        if len(accel_devices) >= 2:
-            return 2, accel_devices[:2]
-        else:
-            logger.warning("Not enough GPUs found. Using CPU devices.")
-            cpu_devices = [d for d in devices if d.platform == "cpu"]
-            return 2, cpu_devices[:2]
-    except Exception as e:
-        logger.error(f"Device detection failed: {e}")
-        return 0, []
+    devices = jax.devices()
+    accel_devices = [d for d in devices if d.platform != "cpu"]
+    return (len(accel_devices), accel_devices) if accel_devices else (0, [])
 
 def load_data(preset):
-    logger.info("Loading Tiny Shakespeare dataset...")
+    # Dummy data loading for speed/testing
+    logger.info("Loading Data...")
     ds = tfds.load("tiny_shakespeare", split="train", as_supervised=False)
     text = "".join(ex["text"].decode("utf-8") for ex in ds.as_numpy_iterator())
     
-    logger.info("Tokenizing...")
     tokenizer = keras_hub.models.GemmaTokenizer.from_preset(preset)
-    tokens = tokenizer(text[:20000]) 
+    tokens = tokenizer(text[:10000]) # Smaller subset
     if isinstance(tokens, dict): tokens = tokens["token_ids"]
     tokens = np.array(tokens)
     
@@ -75,53 +60,47 @@ def load_data(preset):
     def prepare_batch(batch):
         return ({"token_ids": batch[:-1], "padding_mask": tf.ones_like(batch[:-1], dtype=tf.bool)}, batch[1:])
 
-    return dataset.batch(BATCH_SIZE, drop_remainder=True).map(prepare_batch, num_parallel_calls=tf.data.AUTOTUNE)
+    return dataset.batch(BATCH_SIZE, drop_remainder=True)
+
+def model_factory():
+    logger.info(f"🏭 Factory: Loading {MODEL_PRESET}...")
+    with keras.device("cpu"):
+        model = keras_hub.models.GemmaCausalLM.from_preset(MODEL_PRESET)
+        
+        # --- CRITICAL MEMORY SAVER: INT8 WEIGHTS ---
+        logger.info("📉 Quantizing backbone to Int8...")
+        model.backbone.quantize("int8")
+        
+        logger.info("✨ Enabling LoRA (Rank=4)...")
+        model.backbone.enable_lora(rank=4)
+        return model
 
 def run_training():
     device_count, target_devices = get_devices()
     if device_count < 2:
-        logger.error("Aborting: Need at least 2 devices.")
+        logger.error("Need 2 GPUs.")
         return
+
+    # Clear memory before we start
+    gc.collect()
+    jax.clear_caches()
 
     train_ds = load_data(MODEL_PRESET)
 
     logger.info("Preparing Tensor Parallel Model...")
-    
-    # --- 3. LoRA Factory (The Fix) ---
-    # We define the model creation logic here so the Master Model (18GB)
-    # is loaded, offloaded to disk, and then deleted from RAM immediately.
-    # Import RematScope
-    from keras import RematScope
-
-    def model_factory():
-        logger.info(f"🏭 Factory: Loading {MODEL_PRESET}...")
-        
-        # WRAP model creation in RematScope
-        # mode="activations" is usually sufficient and safer/faster than "full"
-        with RematScope(mode="activations"):
-            with keras.device("cpu"):
-                model = keras_hub.models.GemmaCausalLM.from_preset(MODEL_PRESET)
-                
-                logger.info("✨ Enabling LoRA (Rank=4)...")
-                model.backbone.enable_lora(rank=4)
-                return model
-
-    # Pass the FACTORY (callable), not the MODEL
     tp_model = TensorParallelKeras(
         model=model_factory, 
         device_count=device_count,
         device_ids=[str(d) for d in target_devices]
     )
     
-    # At this point, the Master Model is guaranteed to be deleted from RAM.
-    
-    logger.info("Compiling model...")
-    # Use SGD instead of AdamW to save optimizer state memory
-    # Use gradient_accumulation_steps to simulate a batch size of 16 (1 * 16)
+    logger.info("Compiling model with SGD...")
+    # --- CRITICAL: USE SGD ---
+    # AdamW stores 2 extra variables per weight (massive memory usage).
+    # SGD stores 0 extra variables.
     optimizer = keras.optimizers.SGD(
-        learning_rate=LEARNING_RATE, 
-        momentum=0.9,
-        gradient_accumulation_steps=16 
+        learning_rate=LEARNING_RATE,
+        momentum=0.9
     )
 
     tp_model.compile(
@@ -131,10 +110,18 @@ def run_training():
     )
 
     logger.info("Starting Training Loop...")
-    tp_model.fit(train_ds, epochs=EPOCHS, steps_per_epoch=STEPS_PER_EPOCH)
-    logger.info("🎉 Training Finished Successfully!")
+    try:
+        tp_model.fit(train_ds, epochs=EPOCHS, steps_per_epoch=STEPS_PER_EPOCH)
+        logger.info("🎉 Success!")
+    except Exception as e:
+        logger.error(f"Training Failed: {e}")
+        # If it fails, print memory stats (if available)
+        try:
+            logger.info(jax.local_devices()[0].memory_stats())
+        except:
+            pass
+        raise e
 
-    # Cleanup temp dirs if any remained (optional)
     if hasattr(tp_model, 'temp_dir') and os.path.exists(tp_model.temp_dir):
         shutil.rmtree(tp_model.temp_dir)
 
