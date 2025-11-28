@@ -89,6 +89,26 @@ class TensorParallelKeras(Model):
                 device_id=device_id,
             )
 
+            # Ensure unique layer & model names so that when we assemble
+            # multiple shard Models into a single Functional model, there
+            # are no duplicate operation/layer names. Keras requires all
+            # operation names to be unique within a graph.
+            suffix = f"_tp{rank}"
+            try:
+                # Rename model
+                shard._name = shard.name + suffix
+            except Exception:
+                pass
+            # Rename layers
+            for layer in getattr(shard, 'layers', []):
+                try:
+                    # Avoid doubling suffix if already applied
+                    if not layer.name.endswith(suffix):
+                        layer._name = layer.name + suffix
+                except Exception:
+                    # Be conservative: if a layer cannot be renamed, continue
+                    continue
+
             # C. Store Shard
             self.model_shards.append(shard)
             
