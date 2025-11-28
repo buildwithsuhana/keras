@@ -3,8 +3,10 @@ import gc
 import os
 import shutil
 import tempfile
+import ctypes  # Added for memory trimming
 import numpy as np
 import keras
+from keras import ops # Ensure ops is available
 from keras.src.distribution.tensor_parallel.autoconfig import get_default_config
 from keras.src.distribution.tensor_parallel.parameter_sharding import make_parameter_sharded_model
 from keras.src.distribution.tensor_parallel.coordinated_optimizer import TensorParallelOptimizer
@@ -33,7 +35,11 @@ class TensorParallelKeras(Model):
         self.devices = [self._normalize_device_id(d) for d in device_ids]
         
         # --- 1. MEMORY PRESERVATION ---
-        self.temp_dir = tempfile.mkdtemp(prefix="tp_weights_")
+        # FIX: Use CWD to ensure we write to Disk, not RAM (tmpfs)
+        self.temp_dir = os.path.join(os.getcwd(), "tp_offload_weights")
+        if os.path.exists(self.temp_dir):
+            shutil.rmtree(self.temp_dir)
+        os.makedirs(self.temp_dir, exist_ok=True)
         
         if callable(model) and not isinstance(model, keras.Model):
             print("🏭 Executing Model Factory to load Master Model...")
@@ -44,10 +50,11 @@ class TensorParallelKeras(Model):
         self.model_config = loaded_model.get_config()
         self.model_cls = loaded_model.__class__
         
-        # Capture Input Shape for Manual Build (Fix for UserWarning)
-        self.input_shapes = None
+        # Capture Input Shape
+        self.input_specs = []
         if hasattr(loaded_model, "inputs") and loaded_model.inputs:
-             self.input_shapes = [i.shape for i in loaded_model.inputs]
+             for i in loaded_model.inputs:
+                 self.input_specs.append({"shape": i.shape, "dtype": i.dtype, "name": i.name})
 
         self.tensor_parallel_config = get_default_config(loaded_model, self.devices)
 
@@ -68,27 +75,26 @@ class TensorParallelKeras(Model):
             
             # A. Create Skeleton (CPU)
             with keras.device("cpu"):
-                shard = self.model_cls.from_config(self.model_config)
+                # FIX: Rename in config BEFORE creation to avoid Functional API conflict
+                shard_config = self.model_config.copy()
+                original_name = shard_config.get("name", "model")
+                shard_name = f"shard_{rank}_{original_name}"
+                shard_config["name"] = shard_name
                 
-                # --- FIX 1: UNIQUE NAMING ---
-                # Essential for Keras Functional API to accept multiple shards
-                shard._name = f"{shard.name}_shard_{rank}"
+                try:
+                    shard = self.model_cls.from_config(shard_config)
+                except Exception:
+                    shard = self.model_cls.from_config(self.model_config)
                 
-                # --- FIX 2: ROBUST BUILD ---
-                # If build_from_config fails (common in KerasNLP), force manual build
-                if not shard.built and self.input_shapes:
+                # Ensure internal name matches
+                shard._name = shard_name
+                
+                # Robust Build with Dummy Inputs
+                if not shard.built and self.input_specs:
                     try:
-                        shard.build(self.input_shapes)
-                    except Exception:
-                        # Fallback: KerasHub sometimes requires specific input structures (dict)
-                        pass
-                
-                # Attempt standard config build if still needed
-                if not shard.built and hasattr(shard, 'build_from_config'):
-                     try:
-                        shard.build_from_config(self.model_config)
-                     except Exception as e:
-                        print(f"⚠️ build_from_config skipped: {e}")
+                        self._build_shard_with_dummy_input(shard)
+                    except Exception as e:
+                        print(f"⚠️ Manual build warning: {e}")
 
             # B. Stream & Slice
             shard, _ = make_parameter_sharded_model(
@@ -102,7 +108,8 @@ class TensorParallelKeras(Model):
 
             self.model_shards.append(shard)
             
-            gc.collect()
+            # Clear CPU memory after pushing shard to GPU
+            self._force_gc()
             print(f"[{device_id}] ✅ Shard ready.")
 
         try:
@@ -113,6 +120,35 @@ class TensorParallelKeras(Model):
         self.built = True
         self.distributed = True
         self.assembled_model = self.build_assembled_model()
+
+    def _force_gc(self):
+        """Releases memory back to OS aggressively."""
+        gc.collect()
+        try:
+            ctypes.CDLL("libc.so.6").malloc_trim(0)
+        except Exception:
+            pass
+
+    def _build_shard_with_dummy_input(self, shard):
+        dummy_inputs = {}
+        for spec in self.input_specs:
+            shape = list(spec["shape"])
+            shape[0] = 1 
+            shape = [s if s is not None else 1 for s in shape]
+            clean_name = spec["name"].split(":")[0]
+            dtype = spec["dtype"] or "float32"
+            
+            if "int" in str(dtype):
+                data = ops.zeros(shape, dtype=dtype)
+            else:
+                data = ops.zeros(shape, dtype=dtype)
+                
+            dummy_inputs[clean_name] = data
+
+        try:
+            shard(dummy_inputs)
+        except Exception:
+            shard(list(dummy_inputs.values()))
 
     def _save_weights_to_disk(self, model):
         for v in model.variables:
@@ -139,27 +175,27 @@ class TensorParallelKeras(Model):
         
         # Reconstruct inputs
         inputs = {}
-        # Try to detect input names from the reference shard
-        if hasattr(ref, "input_names"):
-             input_names = ref.input_names
-        else:
-             input_names = [i.name.split(':')[0] for i in ref.inputs]
+        specs = self.input_specs if self.input_specs else []
+        
+        if not specs and hasattr(ref, "inputs"):
+             for i in ref.inputs:
+                 specs.append({"shape": i.shape, "dtype": i.dtype, "name": i.name})
 
-        # Create symbolic inputs
-        for idx, i in enumerate(ref.inputs):
-            name = i.name.split(':')[0]
-            inputs[name] = keras.Input(shape=i.shape[1:], dtype=i.dtype, name=name)
+        symbolic_inputs = {}
+        for spec in specs:
+            name = spec["name"].split(':')[0]
+            symbolic_inputs[name] = keras.Input(
+                shape=spec["shape"][1:], 
+                dtype=spec["dtype"], 
+                name=name
+            )
 
         shard_outputs = []
         for shard in self.model_shards:
-            # Map inputs to shard
-            # Handle list vs dict inputs based on model signature
             try:
-                # Try dict input first (Standard for KerasNLP)
-                shard_out = shard(inputs)
+                shard_out = shard(symbolic_inputs)
             except Exception:
-                # Fallback to list input
-                shard_out = shard(list(inputs.values()))
+                shard_out = shard(list(symbolic_inputs.values()))
             
             shard_outputs.append(shard_out)
         
@@ -168,7 +204,7 @@ class TensorParallelKeras(Model):
         else:
             out = shard_outputs[0]
             
-        return keras.Model(inputs=inputs, outputs=out)
+        return keras.Model(inputs=symbolic_inputs, outputs=out)
 
     def call(self, inputs, training=None, **kwargs):
         return self.assembled_model(inputs, training=training, **kwargs)
