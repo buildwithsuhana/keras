@@ -4,6 +4,7 @@ import os
 os.environ["XLA_PYTHON_CLIENT_PREALLOCATE"] = "false"
 os.environ["XLA_PYTHON_CLIENT_ALLOCATOR"] = "platform"
 os.environ["KERAS_BACKEND"] = "jax"
+# Ensure we have enough host device count if testing on CPU backend
 os.environ["XLA_FLAGS"] = "--xla_force_host_platform_device_count=8"
 
 import logging
@@ -16,7 +17,7 @@ import keras_hub
 import tensorflow as tf
 import tensorflow_datasets as tfds
 
-# Mixed Precision
+# Mixed Precision - Essential
 keras.config.set_dtype_policy("bfloat16")
 
 tf.config.set_visible_devices([], "GPU")
@@ -78,19 +79,22 @@ def run_training():
 
     train_ds = load_data(MODEL_PRESET)
 
+    # 1. Load Master on CPU
     logger.info(f"Loading {MODEL_PRESET} to System RAM (CPU)...")
     with keras.device("cpu"):
         master_model = keras_hub.models.GemmaCausalLM.from_preset(MODEL_PRESET)
     
     logger.info("✅ Master model loaded on CPU.")
-    logger.info("Starting Tensor Parallel Sharding...")
     
+    # 2. Hand over to TP Wrapper (Which will Offload->Shard->Load)
+    logger.info("Starting Tensor Parallel Sharding (with Disk Offloading)...")
     tp_model = TensorParallelKeras(
         model=master_model,
         device_count=device_count,
         device_ids=[str(d) for d in target_devices]
     )
     
+    # 3. Train
     logger.info("Compiling model...")
     tp_model.compile(
         optimizer=keras.optimizers.AdamW(learning_rate=LEARNING_RATE),
