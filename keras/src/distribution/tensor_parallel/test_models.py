@@ -223,6 +223,7 @@ def run_model_verification(preset_name, model_class):
     Runs a training execution test for a given model preset using
     tensor parallelism.
     """
+    gc.collect()
     if TARGET_WORLD_SIZE < 2:
         logger.warning(
             f"SKIPPING {preset_name}: Need at least 2 devices for tensor "
@@ -255,14 +256,21 @@ def run_model_verification(preset_name, model_class):
     logger.info("\n--- Training Tensor Parallel (TP) Model ---")
     
     # Load template (on CPU)
-    tp_model_template = get_model_from_preset(preset_name, model_class)
+    tp_model_template = model_class.from_preset(
+        preset_name, 
+        dtype="bfloat16", # <--- CRITICAL FIX
+    )
 
     # Distribute (Moves shards to GPU)
     tp_model = TensorParallelKeras(
         model=tp_model_template,
         device_count=TARGET_WORLD_SIZE,
         device_ids=TARGET_DEVICES,
+        low_memory_mode=True # <--- ENABLES DISK OFFLOADING
     )
+
+    del tp_model_template
+    gc.collect()
 
     tp_model.compile(
         optimizer=keras.optimizers.AdamW(learning_rate=LEARNING_RATE),
