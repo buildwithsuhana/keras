@@ -19,7 +19,7 @@ except Exception:
 
 # --- Backend and Device Configuration ---
 os.environ["KERAS_BACKEND"] = "jax"
-# [CRITICAL] Prevent JAX from grabbing all GPU memory immediately
+# Prevent JAX from pre-allocating all memory, leaving room for Keras loading
 os.environ["XLA_PYTHON_CLIENT_PREALLOCATE"] = "false"
 os.environ["XLA_PYTHON_CLIENT_ALLOCATOR"] = "platform"
 
@@ -29,10 +29,10 @@ import tensorflow as tf
 import tensorflow_datasets as tfds
 import keras
 
-# Hide GPUs from TensorFlow so JAX has exclusive access
+# Hide GPUs from TensorFlow so JAX gets exclusive access
 tf.config.set_visible_devices([], "GPU")
 
-# [CRITICAL] Use mixed_bfloat16 to halve memory usage (18GB vs 36GB)
+# [CRITICAL] Use mixed_bfloat16 to fit model in memory (18GB vs 36GB)
 keras.config.set_dtype_policy("mixed_bfloat16")
 
 logging.basicConfig(level=logging.INFO, format="%(levelname)s - %(message)s")
@@ -42,24 +42,28 @@ logger = logging.getLogger(__name__)
 try:
     devices = jax.devices()
     accel_devices = [d for d in devices if d.platform != "cpu"]
+    
     if accel_devices:
-        TARGET_DEVICES = accel_devices
+        # [FIX] Convert Device objects to standard Keras string format "gpu:0", "gpu:1"
+        TARGET_DEVICES = [f"gpu:{d.id}" for d in accel_devices]
         WORLD_SIZE = len(TARGET_DEVICES)
         logger.info(f"🚀 Using Accelerators: {TARGET_DEVICES}")
     else:
-        TARGET_DEVICES = devices
-        WORLD_SIZE = len(TARGET_DEVICES)
+        TARGET_DEVICES = ["cpu:0"]
+        WORLD_SIZE = 1
         logger.warning("⚠️ No Accelerators found. Falling back to CPU.")
+
 except Exception as e:
     logger.error(f"Could not initialize JAX. Error: {e}")
-    TARGET_WORLD_SIZE = 0
+    TARGET_DEVICES = []
+    WORLD_SIZE = 0
 
 from keras.src.distribution.tensor_parallel.tensor_parallel_keras import (
     TensorParallelKeras,
 )
 
 # --- Constants ---
-BATCH_SIZE = 4  # Small batch size for 9B model
+BATCH_SIZE = 4
 SEQUENCE_LENGTH = 128
 LEARNING_RATE = 5e-5
 EPOCHS = 1
@@ -74,16 +78,15 @@ def load_shakespeare_dataset(model_preset):
     logger.info(f"Loading Tiny Shakespeare for {model_preset}...")
     ds = tfds.load("tiny_shakespeare", split="train", as_supervised=False)
     
-    # Take a subset for quick verification
+    # Tiny slice for verification speed
     text = "".join(example["text"].decode("utf-8") for example in ds.as_numpy_iterator())
     text = text[:50000]
 
-    # [FIX] Load ONLY the preprocessor, not the full model!
+    # Load ONLY the preprocessor (lightweight)
     logger.info("   - Loading lightweight preprocessor...")
     if "gemma" in model_preset:
         preprocessor = keras_hub.models.GemmaCausalLMPreprocessor.from_preset(model_preset)
     else:
-        # Fallback for OPT or others
         preprocessor = keras_hub.models.OPTCausalLMPreprocessor.from_preset(model_preset)
 
     tokenizer = preprocessor.tokenizer
@@ -117,29 +120,24 @@ def run_model_verification(preset_name, model_class):
 
     logger.info("\n--- Training Tensor Parallel (TP) Model ---")
     
-    # [LAZY INIT STRATEGY]
-    # 1. Load on CPU first to avoid GPU OOM during initialization
+    # 1. Load Skeleton on CPU
     logger.info("⏳ Loading model skeleton onto CPU RAM...")
     with keras.device("cpu"):
-        # Note: We don't load weights here if possible, but from_preset does.
-        # So we force it to CPU.
         original_model = model_class.from_preset(
             preset_name,
-            dtype="bfloat16", 
+            dtype="bfloat16",
         )
-        
-        # Enable LoRA to save memory (Required for T4s)
         if "gemma" in preset_name:
             logger.info("   - Enabling LoRA for memory efficiency...")
             original_model.backbone.enable_lora(rank=4)
 
-    # 2. Distribute with Zero-Stage Init (Disk Offloading)
+    # 2. Distribute with Disk Offloading
     logger.info("   - Sharding model (Zero Stage Init)...")
     tp_model = TensorParallelKeras(
         model=original_model,
         device_count=WORLD_SIZE,
         device_ids=TARGET_DEVICES,
-        low_memory_mode=True  # [FIX] Enables disk swapping
+        low_memory_mode=True 
     )
 
     # Cleanup CPU model immediately

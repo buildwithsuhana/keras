@@ -33,13 +33,17 @@ class TensorParallelKeras(Model):
             device_ids = self._auto_configure_devices(device_count)
 
         self.device_count = device_count
+        # Normalize devices
         self.devices = list(self.check_device_ids(device_ids))
+        
+        # Validation
         if len(self.devices) != device_count:
+            # Fallback logic
             self.devices = self._adjust_device_list(self.devices, device_count)
             
         self.distributed = self.device_count > 1
         
-        # 1. Config Generation
+        # Generate Config
         device_names = [str(d) for d in self.devices]
         self.tensor_parallel_config = get_default_config(model, device_names)
 
@@ -52,13 +56,12 @@ class TensorParallelKeras(Model):
             self.assembled_model = model
             return
 
-        print(f"🔧 Sharding {model.name} across {len(self.devices)} devices")
+        print(f"🔧 Sharding {model.name} across {len(self.devices)} devices: {self.devices}")
         
-        # 2. ZERO STAGE INIT (Low Memory Mode)
+        # ZERO STAGE INIT (Low Memory Mode)
         temp_dir = None
         model_path = None
         
-        # Cache metadata
         self._input_specs = [{'shape': i.shape, 'dtype': i.dtype, 'name': i.name} for i in model.inputs]
         self._original_name = model.name
         self._last_layer_name = model.layers[-1].name
@@ -70,18 +73,17 @@ class TensorParallelKeras(Model):
             try:
                 model.save(model_path)
                 print(f"   💾 Model offloaded to {model_path}")
-                del model # CRITICAL: Free RAM
+                del model 
                 gc.collect()
             except Exception as e:
                 logger.warning(f"Failed to offload model: {e}. Using standard clone.")
                 model_path = None
 
-        # 3. Sharding Loop
+        # Sharding Loop
         for rank, device_id in enumerate(self.devices):
             print(f"[{device_id}] ➡️  Processing Rank {rank}")
             gc.collect()
             
-            # A. Revive Replica (CPU)
             if low_memory_mode and model_path:
                 with keras.saving.custom_object_scope({}):
                     with keras.device("cpu"):
@@ -93,7 +95,6 @@ class TensorParallelKeras(Model):
                 except:
                     replica_model = model
 
-            # B. Shard (Move slice to GPU)
             shard, modified_names = make_parameter_sharded_model(
                 replica_model,
                 self.tensor_parallel_config,
@@ -104,11 +105,9 @@ class TensorParallelKeras(Model):
             self.model_shards.append(shard)
             self.modified_parameters_names.update(modified_names)
             
-            # C. Cleanup Replica
             del replica_model 
             gc.collect()
 
-        # 4. Cleanup Disk
         if temp_dir and os.path.exists(temp_dir):
             shutil.rmtree(temp_dir)
 
@@ -144,14 +143,31 @@ class TensorParallelKeras(Model):
         if ids is None: ids = list_devices()
         return tuple(self.canonicalize_device(d) for d in ids)
 
-    def canonicalize_device(self, device_spec: Union[str, int]) -> str:
+    def canonicalize_device(self, device_spec: Union[str, int, any]) -> str:
+        """Robustly convert device specification to canonical string."""
+        # Handle JAX/TF Device objects by stringifying them first
+        if hasattr(device_spec, 'id') and hasattr(device_spec, 'platform'):
+             # Handle JAX Device object directly if passed
+             return f"{device_spec.platform}:{device_spec.id}"
+             
+        s_device = str(device_spec).lower()
+        
+        if "gpu" in s_device or "cuda" in s_device:
+            # Extract index
+            import re
+            match = re.search(r'\d+', s_device)
+            idx = match.group() if match else "0"
+            return f"gpu:{idx}"
+        elif "tpu" in s_device:
+            import re
+            match = re.search(r'\d+', s_device)
+            idx = match.group() if match else "0"
+            return f"tpu:{idx}"
+        
         if isinstance(device_spec, int):
-            return "cpu" if device_spec == -1 else f"gpu:{device_spec}"
-        elif isinstance(device_spec, str):
-            if device_spec == "cpu": return "cpu"
-            if device_spec.startswith("gpu:") or device_spec.startswith("tpu:"): return device_spec
-            if device_spec.startswith("cuda:"): return f"gpu:{device_spec.split(':')[1]}"
-            return device_spec
+            if device_spec == -1: return "cpu"
+            return f"gpu:{device_spec}"
+            
         return "cpu"
 
     def build_assembled_model(self):
@@ -191,7 +207,6 @@ class TensorParallelKeras(Model):
                         per_shard.append(found)
                     var_map[key] = per_shard
             self.coordinated_optimizer._shard_var_map = var_map
-            
             super().compile(optimizer=self.coordinated_optimizer, loss=loss, metrics=metrics, **kwargs)
         else:
             super().compile(optimizer, loss, metrics, **kwargs)
