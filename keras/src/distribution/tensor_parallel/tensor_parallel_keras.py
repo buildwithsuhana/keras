@@ -33,17 +33,13 @@ class TensorParallelKeras(Model):
             device_ids = self._auto_configure_devices(device_count)
 
         self.device_count = device_count
-        # Normalize devices
         self.devices = list(self.check_device_ids(device_ids))
-        
-        # Validation
         if len(self.devices) != device_count:
-            # Fallback logic
             self.devices = self._adjust_device_list(self.devices, device_count)
             
         self.distributed = self.device_count > 1
         
-        # Generate Config
+        # 1. Config Generation
         device_names = [str(d) for d in self.devices]
         self.tensor_parallel_config = get_default_config(model, device_names)
 
@@ -58,10 +54,11 @@ class TensorParallelKeras(Model):
 
         print(f"🔧 Sharding {model.name} across {len(self.devices)} devices: {self.devices}")
         
-        # ZERO STAGE INIT (Low Memory Mode)
+        # 2. ZERO STAGE INIT (Low Memory Mode)
         temp_dir = None
         model_path = None
         
+        # Cache metadata required for reconstruction
         self._input_specs = [{'shape': i.shape, 'dtype': i.dtype, 'name': i.name} for i in model.inputs]
         self._original_name = model.name
         self._last_layer_name = model.layers[-1].name
@@ -71,21 +68,31 @@ class TensorParallelKeras(Model):
             temp_dir = tempfile.mkdtemp()
             model_path = os.path.join(temp_dir, "temp_tp_model.keras")
             try:
+                # Save full model to disk
                 model.save(model_path)
                 print(f"   💾 Model offloaded to {model_path}")
-                del model 
+                
+                # CRITICAL FIX: "Hollow out" the original model object.
+                # Just doing 'del model' isn't enough because the caller (test_models.py)
+                # still holds a reference. We must clear the internal weight lists.
+                print("   🧹 Aggressively freeing CPU memory from original model...")
+                self._hollow_out_model(model)
+                del model
                 gc.collect()
+                
             except Exception as e:
                 logger.warning(f"Failed to offload model: {e}. Using standard clone.")
                 model_path = None
 
-        # Sharding Loop
+        # 3. Sharding Loop
         for rank, device_id in enumerate(self.devices):
             print(f"[{device_id}] ➡️  Processing Rank {rank}")
             gc.collect()
             
+            # A. Revive Replica (CPU)
             if low_memory_mode and model_path:
                 with keras.saving.custom_object_scope({}):
+                    # Load strictly on CPU
                     with keras.device("cpu"):
                         replica_model = keras.models.load_model(model_path, compile=False)
             else:
@@ -95,6 +102,7 @@ class TensorParallelKeras(Model):
                 except:
                     replica_model = model
 
+            # B. Shard (Move slice to GPU)
             shard, modified_names = make_parameter_sharded_model(
                 replica_model,
                 self.tensor_parallel_config,
@@ -105,14 +113,41 @@ class TensorParallelKeras(Model):
             self.model_shards.append(shard)
             self.modified_parameters_names.update(modified_names)
             
+            # C. Cleanup Replica
             del replica_model 
             gc.collect()
 
+        # 4. Cleanup Disk
         if temp_dir and os.path.exists(temp_dir):
             shutil.rmtree(temp_dir)
 
         self.built = True
         self.assembled_model = self.build_assembled_model()
+
+    def _hollow_out_model(self, model):
+        """
+        Aggressively clears weights from a model to free RAM, even if references exist.
+        """
+        # 1. Clear layer weights
+        for layer in model.layers:
+            if hasattr(layer, '_trainable_weights'):
+                layer._trainable_weights = []
+            if hasattr(layer, '_non_trainable_weights'):
+                layer._non_trainable_weights = []
+            # Also try to clear backend variables if accessible
+            if hasattr(layer, 'variables'):
+                # We can't easily modify the Variables list in-place safely for all backends,
+                # but clearing the python attributes helps.
+                pass
+                
+        # 2. Clear Model-level containers
+        if hasattr(model, '_trainable_variables'):
+            model._trainable_variables = []
+        if hasattr(model, '_non_trainable_variables'):
+            model._non_trainable_variables = []
+            
+        # 3. Force garbage collection of the arrays
+        gc.collect()
 
     @property
     def variables(self):
@@ -144,16 +179,10 @@ class TensorParallelKeras(Model):
         return tuple(self.canonicalize_device(d) for d in ids)
 
     def canonicalize_device(self, device_spec: Union[str, int, any]) -> str:
-        """Robustly convert device specification to canonical string."""
-        # Handle JAX/TF Device objects by stringifying them first
         if hasattr(device_spec, 'id') and hasattr(device_spec, 'platform'):
-             # Handle JAX Device object directly if passed
              return f"{device_spec.platform}:{device_spec.id}"
-             
         s_device = str(device_spec).lower()
-        
         if "gpu" in s_device or "cuda" in s_device:
-            # Extract index
             import re
             match = re.search(r'\d+', s_device)
             idx = match.group() if match else "0"
@@ -163,26 +192,21 @@ class TensorParallelKeras(Model):
             match = re.search(r'\d+', s_device)
             idx = match.group() if match else "0"
             return f"tpu:{idx}"
-        
         if isinstance(device_spec, int):
             if device_spec == -1: return "cpu"
             return f"gpu:{device_spec}"
-            
         return "cpu"
 
     def build_assembled_model(self):
         if not self.distributed: return self.model_shards[0]
-        
         input_layers = {}
         for spec in self._input_specs:
             clean = spec['name'].split(":")[0]
             input_layers[clean] = keras.Input(shape=spec['shape'][1:], dtype=spec['dtype'], name=clean)
-            
         partial_outputs = []
         for shard in self.model_shards:
             shard_inputs = dict(input_layers)
             partial_outputs.append(shard(shard_inputs))
-            
         return keras.Model(inputs=list(input_layers.values()), outputs=partial_outputs[0])
 
     def call(self, inputs, training=None, **kwargs):
@@ -194,7 +218,6 @@ class TensorParallelKeras(Model):
                 optimizer, self.device_count, self.tensor_parallel_config
             )
             self.coordinated_optimizer._shard_models = self.model_shards
-            
             var_map = {}
             assembled = getattr(self, "assembled_model", None)
             if assembled:
