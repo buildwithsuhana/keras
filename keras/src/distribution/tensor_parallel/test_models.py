@@ -19,23 +19,21 @@ except Exception:
 
 # --- Backend and Device Configuration ---
 os.environ["KERAS_BACKEND"] = "jax"
-# [CRITICAL] Disable JAX pre-allocation to allow Keras to manage memory
-os.environ["XLA_PYTHON_CLIENT_PREALLOCATE"] = "false" 
+# [CRITICAL] Prevent JAX from grabbing all GPU memory immediately
+os.environ["XLA_PYTHON_CLIENT_PREALLOCATE"] = "false"
 os.environ["XLA_PYTHON_CLIENT_ALLOCATOR"] = "platform"
 
 import jax
 import keras_hub
-import matplotlib.pyplot as plt
 import tensorflow as tf
 import tensorflow_datasets as tfds
-
 import keras
 
-# Hide GPUs from TensorFlow so JAX gets them all
+# Hide GPUs from TensorFlow so JAX has exclusive access
 tf.config.set_visible_devices([], "GPU")
 
-# [CRITICAL] Mixed Precision halves memory usage (18GB vs 36GB for Gemma 9B)
-keras.config.set_dtype_policy("mixed_bfloat16") 
+# [CRITICAL] Use mixed_bfloat16 to halve memory usage (18GB vs 36GB)
+keras.config.set_dtype_policy("mixed_bfloat16")
 
 logging.basicConfig(level=logging.INFO, format="%(levelname)s - %(message)s")
 logger = logging.getLogger(__name__)
@@ -43,8 +41,6 @@ logger = logging.getLogger(__name__)
 # --- JAX Device Detection ---
 try:
     devices = jax.devices()
-    logger.info(f"JAX devices found: {[str(d) for d in devices]}")
-    
     accel_devices = [d for d in devices if d.platform != "cpu"]
     if accel_devices:
         TARGET_DEVICES = accel_devices
@@ -54,7 +50,6 @@ try:
         TARGET_DEVICES = devices
         WORLD_SIZE = len(TARGET_DEVICES)
         logger.warning("⚠️ No Accelerators found. Falling back to CPU.")
-
 except Exception as e:
     logger.error(f"Could not initialize JAX. Error: {e}")
     TARGET_WORLD_SIZE = 0
@@ -64,7 +59,7 @@ from keras.src.distribution.tensor_parallel.tensor_parallel_keras import (
 )
 
 # --- Constants ---
-BATCH_SIZE = 4 # Reduced for 9B model
+BATCH_SIZE = 4  # Small batch size for 9B model
 SEQUENCE_LENGTH = 128
 LEARNING_RATE = 5e-5
 EPOCHS = 1
@@ -72,22 +67,28 @@ STEPS_PER_EPOCH = 5
 VALIDATION_STEPS = 5
 
 MODEL_MAPPING = {
-    # You can swap this back to opt_125m_en for quick tests
-    "gemma2_9b_en": keras_hub.models.GemmaCausalLM, 
+    "gemma2_9b_en": keras_hub.models.GemmaCausalLM,
 }
 
 def load_shakespeare_dataset(model_preset):
     logger.info(f"Loading Tiny Shakespeare for {model_preset}...")
     ds = tfds.load("tiny_shakespeare", split="train", as_supervised=False)
     
-    # Slice data for speed
+    # Take a subset for quick verification
     text = "".join(example["text"].decode("utf-8") for example in ds.as_numpy_iterator())
-    text = text[:50000] 
+    text = text[:50000]
 
-    preprocessor = keras_hub.models.GemmaCausalLM.from_preset(model_preset).preprocessor
+    # [FIX] Load ONLY the preprocessor, not the full model!
+    logger.info("   - Loading lightweight preprocessor...")
+    if "gemma" in model_preset:
+        preprocessor = keras_hub.models.GemmaCausalLMPreprocessor.from_preset(model_preset)
+    else:
+        # Fallback for OPT or others
+        preprocessor = keras_hub.models.OPTCausalLMPreprocessor.from_preset(model_preset)
+
     tokenizer = preprocessor.tokenizer
-    
     token_ids = tokenizer(text)
+    
     length = SEQUENCE_LENGTH + 1
     num_tokens = (len(token_ids) // length) * length
     token_ids = token_ids[:num_tokens]
@@ -96,7 +97,6 @@ def load_shakespeare_dataset(model_preset):
         np.array(token_ids).reshape(-1, length)
     )
     
-    # Drop last token for inputs, shift for labels
     def split_input_label(x):
         return {
             "token_ids": x[:-1],
@@ -105,46 +105,48 @@ def load_shakespeare_dataset(model_preset):
 
     sequences = sequences.map(split_input_label, num_parallel_calls=tf.data.AUTOTUNE)
     
-    num_seq = 100 # Artificial limit for speed
-    train_ds = sequences.take(int(0.8 * num_seq)).batch(BATCH_SIZE).repeat()
-    val_ds = sequences.skip(int(0.8 * num_seq)).take(int(0.2 * num_seq)).batch(BATCH_SIZE).repeat()
+    train_ds = sequences.take(50).batch(BATCH_SIZE).repeat()
+    val_ds = sequences.skip(50).take(10).batch(BATCH_SIZE).repeat()
     return train_ds, val_ds
 
 def run_model_verification(preset_name, model_class):
     gc.collect()
-    
     logger.info(f"--- VERIFICATION FOR: {preset_name.upper()} ---")
+    
     train_ds, val_ds = load_shakespeare_dataset(preset_name)
 
     logger.info("\n--- Training Tensor Parallel (TP) Model ---")
     
     # [LAZY INIT STRATEGY]
-    # 1. Load on CPU first. Keras Hub loads weights immediately, so we MUST 
-    #    force this to CPU to avoid "Resource Exhausted" on GPU.
-    logger.info("⏳ Lazy Init: Loading model skeleton onto CPU RAM...")
+    # 1. Load on CPU first to avoid GPU OOM during initialization
+    logger.info("⏳ Loading model skeleton onto CPU RAM...")
     with keras.device("cpu"):
-        tp_model_template = model_class.from_preset(
+        # Note: We don't load weights here if possible, but from_preset does.
+        # So we force it to CPU.
+        original_model = model_class.from_preset(
             preset_name,
-            dtype="bfloat16", # Keep 16-bit to fit in CPU RAM (18GB vs 36GB)
+            dtype="bfloat16", 
         )
         
-        # 2. Enable LoRA (Required for 9B on T4s)
-        # This freezes the main weights so we only train adapters
+        # Enable LoRA to save memory (Required for T4s)
         if "gemma" in preset_name:
             logger.info("   - Enabling LoRA for memory efficiency...")
-            tp_model_template.backbone.enable_lora(rank=4)
+            original_model.backbone.enable_lora(rank=4)
 
-    # 3. Apply Tensor Parallelism with Low Memory Mode
-    # This will: Save CPU model to disk -> Delete from RAM -> Load Shard 0 to GPU -> Load Shard 1 to GPU
-    logger.info("   - Distributing model (Zero Stage Init)...")
+    # 2. Distribute with Zero-Stage Init (Disk Offloading)
+    logger.info("   - Sharding model (Zero Stage Init)...")
     tp_model = TensorParallelKeras(
-        model=tp_model_template,
+        model=original_model,
         device_count=WORLD_SIZE,
         device_ids=TARGET_DEVICES,
-        low_memory_mode=True # <--- Enables Disk Swapping
+        low_memory_mode=True  # [FIX] Enables disk swapping
     )
 
-    # 4. Compile & Fit
+    # Cleanup CPU model immediately
+    del original_model
+    gc.collect()
+
+    # 3. Compile & Fit
     logger.info("   - Compiling...")
     tp_model.compile(
         optimizer=keras.optimizers.AdamW(LEARNING_RATE),
@@ -162,10 +164,7 @@ def run_model_verification(preset_name, model_class):
     )
     
     logger.info("✅ SUCCESS: TP training complete.")
-    
-    # Cleanup
     del tp_model
-    del tp_model_template
     gc.collect()
     return True
 

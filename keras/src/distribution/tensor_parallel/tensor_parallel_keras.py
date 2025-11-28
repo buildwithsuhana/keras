@@ -1,10 +1,9 @@
 import logging
-import re
 import gc
 import os
 import shutil
 import tempfile
-from typing import Collection, Optional, Sequence, Union
+from typing import Optional, Sequence, Union
 
 import numpy as np
 import keras
@@ -23,7 +22,7 @@ class TensorParallelKeras(Model):
         model,
         device_count=None,
         device_ids=None,
-        low_memory_mode=True, # Default to True for large models
+        low_memory_mode=True, 
         **kwargs,
     ):
         super().__init__(**kwargs)
@@ -40,8 +39,7 @@ class TensorParallelKeras(Model):
             
         self.distributed = self.device_count > 1
         
-        # 1. Config Generation (Before modifying model)
-        self.tensor_parallel_config = None
+        # 1. Config Generation
         device_names = [str(d) for d in self.devices]
         self.tensor_parallel_config = get_default_config(model, device_names)
 
@@ -54,18 +52,16 @@ class TensorParallelKeras(Model):
             self.assembled_model = model
             return
 
-        print(f"🔧 Creating Shards for {model.name} across {len(self.devices)} devices")
+        print(f"🔧 Sharding {model.name} across {len(self.devices)} devices")
         
         # 2. ZERO STAGE INIT (Low Memory Mode)
-        # Strategy: Save Original to Disk -> Delete Original -> Load Replica 1 -> Shard -> Delete -> Load Replica 2...
         temp_dir = None
         model_path = None
         
-        # Cache metadata before deletion
+        # Cache metadata
         self._input_specs = [{'shape': i.shape, 'dtype': i.dtype, 'name': i.name} for i in model.inputs]
         self._original_name = model.name
         self._last_layer_name = model.layers[-1].name
-        self._last_layer_config = model.layers[-1].get_config()
 
         if low_memory_mode:
             print("📉 Low Memory Mode: Enabled (Offloading to disk)")
@@ -74,7 +70,7 @@ class TensorParallelKeras(Model):
             try:
                 model.save(model_path)
                 print(f"   💾 Model offloaded to {model_path}")
-                del model # CRITICAL: Free 18GB/36GB from RAM
+                del model # CRITICAL: Free RAM
                 gc.collect()
             except Exception as e:
                 logger.warning(f"Failed to offload model: {e}. Using standard clone.")
@@ -83,16 +79,14 @@ class TensorParallelKeras(Model):
         # 3. Sharding Loop
         for rank, device_id in enumerate(self.devices):
             print(f"[{device_id}] ➡️  Processing Rank {rank}")
-            gc.collect() # Ensure previous shard debris is gone
+            gc.collect()
             
             # A. Revive Replica (CPU)
             if low_memory_mode and model_path:
                 with keras.saving.custom_object_scope({}):
-                    # Load strictly on CPU
                     with keras.device("cpu"):
                         replica_model = keras.models.load_model(model_path, compile=False)
             else:
-                # Fallback for small models
                 try:
                     replica_model = keras.models.clone_model(model)
                     replica_model.set_weights(model.get_weights())
@@ -100,7 +94,6 @@ class TensorParallelKeras(Model):
                     replica_model = model
 
             # B. Shard (Move slice to GPU)
-            # parameter_sharding.py handles the slicing and placement
             shard, modified_names = make_parameter_sharded_model(
                 replica_model,
                 self.tensor_parallel_config,
@@ -112,8 +105,6 @@ class TensorParallelKeras(Model):
             self.modified_parameters_names.update(modified_names)
             
             # C. Cleanup Replica
-            # The 'shard' wrapper retains the model, but we want to ensure 
-            # no OTHER references exist so python can free the CPU weights.
             del replica_model 
             gc.collect()
 
@@ -123,9 +114,6 @@ class TensorParallelKeras(Model):
 
         self.built = True
         self.assembled_model = self.build_assembled_model()
-
-    # ... [Include all other standard methods: variables, compile, call, etc.] ...
-    # (Copy properties and helper methods from previous correct file versions)
 
     @property
     def variables(self):
@@ -169,7 +157,6 @@ class TensorParallelKeras(Model):
     def build_assembled_model(self):
         if not self.distributed: return self.model_shards[0]
         
-        # Reconstruct inputs from metadata
         input_layers = {}
         for spec in self._input_specs:
             clean = spec['name'].split(":")[0]
@@ -180,10 +167,7 @@ class TensorParallelKeras(Model):
             shard_inputs = dict(input_layers)
             partial_outputs.append(shard(shard_inputs))
             
-        # Naive aggregation (TP usually ends with AllReduce inside the shard, so outputs are same)
-        final_output = partial_outputs[0]
-        
-        return keras.Model(inputs=list(input_layers.values()), outputs=final_output)
+        return keras.Model(inputs=list(input_layers.values()), outputs=partial_outputs[0])
 
     def call(self, inputs, training=None, **kwargs):
         return self.assembled_model(inputs, training=training, **kwargs)
@@ -195,7 +179,6 @@ class TensorParallelKeras(Model):
             )
             self.coordinated_optimizer._shard_models = self.model_shards
             
-            # Var Mapping Logic
             var_map = {}
             assembled = getattr(self, "assembled_model", None)
             if assembled:

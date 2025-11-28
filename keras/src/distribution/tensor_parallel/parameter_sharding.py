@@ -5,7 +5,6 @@ from typing import Any, Tuple, Set, TYPE_CHECKING
 import keras
 from keras import Variable, device
 from keras.src.models import Model
-from keras.src.backend import distribution_lib
 
 logger = logging.getLogger(__name__)
 
@@ -15,13 +14,12 @@ class ParameterShardingStrategy:
         self.rank = rank
 
     def shard_model_parameters(self, replica_model, config, device_id):
-        # Define wrapper class locally
         ParameterShardedModel = _define_parameter_sharded_model()
         
         modified = set()
         print(f"   🔧 Sharding parameters for Rank {self.rank} on {device_id}...")
 
-        # Apply rules
+        # Iterate config rules
         for pattern, action in config.state_rules.items():
             if callable(action):
                 matches = self._find_matches(replica_model, pattern)
@@ -29,7 +27,7 @@ class ParameterShardingStrategy:
                     # 1. Get CPU Value
                     val = param.value
                     
-                    # 2. Slice on CPU
+                    # 2. Slice (on CPU)
                     try:
                         sharded_val = action(val, self.rank)
                     except Exception as e:
@@ -66,6 +64,7 @@ class ParameterShardingStrategy:
                 name = obj.name
                 full = f"{prefix}.{name}" if prefix else name
                 
+                # Check attributes
                 for attr in dir(obj):
                     if attr.startswith("_"): continue
                     try:
@@ -88,6 +87,8 @@ class ParameterShardingStrategy:
         return matches
 
 def _define_parameter_sharded_model():
+    from keras.src.backend import distribution_lib
+    
     class ParameterShardedModel(Model):
         def __init__(self, model_shard, config, device_id):
             super().__init__(name=model_shard.name)
@@ -105,16 +106,18 @@ def _define_parameter_sharded_model():
         def non_trainable_weights(self): return self.model_shard.non_trainable_weights
 
         def call(self, inputs, training=None, mask=None):
-            # Forward call to underlying shard
-            # Communication logic (AllReduce) happens here or via rules
             out = self.model_shard(inputs, training=training, mask=mask)
             
-            # Apply Output Rules (AllReduce/Gather)
-            # Find rule for last layer or specific layers if needed
-            # For this demo, assuming implicit or handled by layer logic
-            # If explicit rule needed:
-            # rule = self.config.output_rules.get(...)
-            # if rule: out = apply_comm(out, rule)
+            # Basic communication rule application if needed
+            # (Assume most layers handle it internally or via config rules)
+            layer_name = self.model_shard.layers[-1].name
+            rule = self.config.output_rules.get(layer_name)
+            if rule:
+                rule_str = rule.get(0, "")
+                if "sum" in rule_str or "allreduce" in rule_str:
+                    out = distribution_lib.all_reduce(out, op="sum", axis_name="model")
+                elif "gather" in rule_str:
+                    out = distribution_lib.all_gather(out, axis=-1, axis_name="model")
             
             return out
             
