@@ -2,6 +2,7 @@ import logging
 import os
 import sys
 import time
+import gc
 
 import numpy as np
 
@@ -14,14 +15,13 @@ try:
     if _project_root not in sys.path:
         sys.path.insert(0, _project_root)
 except Exception:
-    print(
-        "Could not add project root to sys.path. "
-        "Please run from the 'keras' directory or install as a package."
-    )
+    print("Could not add project root to sys.path.")
 
 # --- Backend and Device Configuration ---
 os.environ["KERAS_BACKEND"] = "jax"
-os.environ["XLA_FLAGS"] = "--xla_force_host_platform_device_count=12"
+# Ensure we have enough host device count if testing on CPU backend, 
+# otherwise JAX defaults to 1.
+os.environ["XLA_FLAGS"] = "--xla_force_host_platform_device_count=8"
 
 import jax
 import keras_hub
@@ -31,11 +31,15 @@ import tensorflow_datasets as tfds
 
 import keras
 
+# --- CRITICAL: MIXED PRECISION TO PREVENT OOM ---
+# Gemma 9B in float32 is ~36GB. In bfloat16 it is ~18GB.
+# This must be set before loading the model.
+keras.config.set_dtype_policy("bfloat16")
+
 tf.config.set_visible_devices([], "GPU")
 
 logging.basicConfig(level=logging.INFO, format="%(levelname)s - %(message)s")
 logger = logging.getLogger(__name__)
-
 
 # --- JAX Device Detection ---
 try:
@@ -45,257 +49,144 @@ try:
     if not host_devices:
         host_devices = devices
 
+    # We want to use 2 devices for Tensor Parallelism
+    TARGET_WORLD_SIZE = 2
     DEVICES_AVAILABLE = len(host_devices)
-    WORLD_SIZE = 2
 
-    if DEVICES_AVAILABLE < WORLD_SIZE:
+    if DEVICES_AVAILABLE < TARGET_WORLD_SIZE:
         logger.warning(
-            f"Requested {WORLD_SIZE} devices, but only {DEVICES_AVAILABLE} available."
+            f"Requested {TARGET_WORLD_SIZE} devices, but only {DEVICES_AVAILABLE} available."
         )
         TARGET_DEVICES = host_devices
         TARGET_WORLD_SIZE = DEVICES_AVAILABLE
     else:
-        TARGET_DEVICES = host_devices[:WORLD_SIZE]
-        TARGET_WORLD_SIZE = WORLD_SIZE
+        TARGET_DEVICES = host_devices[:TARGET_WORLD_SIZE]
         logger.info(
-            f"Targeting the first {TARGET_WORLD_SIZE} devices for parallelism: "
-            f"{[str(d) for d in TARGET_DEVICES]}"
+            f"Targeting devices for parallelism: {[str(d) for d in TARGET_DEVICES]}"
         )
 
 except Exception as e:
-    logger.error(f"Could not initialize JAX or find devices. Error: {e}")
+    logger.error(f"Could not initialize JAX. Error: {e}")
     TARGET_WORLD_SIZE = 0
-
 
 from keras.src.distribution.tensor_parallel.tensor_parallel_keras import (
     TensorParallelKeras,
 )
 
 # --- Constants ---
-BATCH_SIZE = 16
-SEQUENCE_LENGTH = 128
-LEARNING_RATE = 1e-4
-EPOCHS = 2
-STEPS_PER_EPOCH = 10
-VALIDATION_STEPS = 5
+BATCH_SIZE = 1  # Reduced batch size for 9B model
+SEQUENCE_LENGTH = 32 # Reduced seq len for quick verification
+LEARNING_RATE = 5e-5
+EPOCHS = 1
+STEPS_PER_EPOCH = 5
+VALIDATION_STEPS = 2
 
-MODEL_MAPPING = {
-    "opt_125m_en": keras_hub.models.OPTCausalLM,
-}
+# Using Gemma 2 9B
+MODEL_PRESET = "gemma2_9b_en" 
 
 # ----------------------------------------------------------------------
 # --- Dataset and Model Helpers ---
 # ----------------------------------------------------------------------
 
-def load_shakespeare_dataset(model_preset):
-    """Loads and preprocesses the Tiny Shakespeare dataset."""
-    logger.info(
-        f"Loading and preprocessing Tiny Shakespeare dataset for {model_preset}..."
-    )
+def load_dataset(model_preset):
+    """Loads dataset and tokenizes using the Gemma tokenizer."""
+    logger.info(f"Loading Tiny Shakespeare for {model_preset}...")
+    
+    # Load raw text
     ds = tfds.load("tiny_shakespeare", split="train", as_supervised=False)
-    text = "".join(
-        example["text"].decode("utf-8") for example in ds.as_numpy_iterator()
-    )
+    text = "".join(example["text"].decode("utf-8") for example in ds.as_numpy_iterator())
+    
+    # Load Tokenizer associated with the preset
+    tokenizer = keras_hub.models.GemmaTokenizer.from_preset(model_preset)
+    
+    # Tokenize (returns a tensor of IDs)
+    # Note: Shorten text for quick tokenization in this demo
+    short_text = text[:100000] 
+    token_ids = tokenizer(short_text)
+    
+    # If output is a dict (some versions), extract ids
+    if isinstance(token_ids, dict):
+        token_ids = token_ids["token_ids"]
+        
+    token_ids = np.array(token_ids)
 
-    tokenizer = keras_hub.models.OPTCausalLM.from_preset(
-        model_preset
-    ).preprocessor.tokenizer
-    token_ids = tokenizer.tokenize(text)
-
-    num_tokens = (len(token_ids) // (SEQUENCE_LENGTH + 1)) * (
-        SEQUENCE_LENGTH + 1
-    )
-    sequences = np.array(token_ids[:num_tokens]).reshape(
-        -1, SEQUENCE_LENGTH + 1
-    )
-
+    # Create sequences
+    num_tokens = (len(token_ids) // (SEQUENCE_LENGTH + 1)) * (SEQUENCE_LENGTH + 1)
+    sequences = token_ids[:num_tokens].reshape(-1, SEQUENCE_LENGTH + 1)
+    
+    # Create TF Dataset
     all_data = tf.data.Dataset.from_tensor_slices(sequences)
-
+    
     num_sequences = sequences.shape[0]
     num_train_samples = int(0.9 * num_sequences)
-
+    
     train_ds = all_data.take(num_train_samples)
     val_ds = all_data.skip(num_train_samples)
-
-    logger.info(
-        f"Dataset ready with {num_train_samples} training and "
-        f"{num_sequences - num_train_samples} validation sequences."
-    )
+    
+    logger.info(f"Dataset ready: {num_train_samples} train sequences.")
     return train_ds, val_ds
 
-
 def format_for_causal_lm(data):
-    """Formats data for KerasNLP's CausalLM, creating features and labels."""
-    features = {
-        "token_ids": data[:, :-1],
-        "padding_mask": tf.ones_like(data[:, :-1], dtype=tf.bool),
-    }
-    labels = data[:, 1:]
-    return features, labels
-
-
-def get_model_from_preset(preset_name, model_class):
-    """Creates a CausalLM model from a KerasNLP preset."""
-    logger.info(f"Creating {preset_name} model from KerasNLP preset...")
-    model = model_class.from_preset(preset_name, preprocessor=None)
-    logger.info(f"Model created with {model.count_params():,} parameters.")
-    return model
-
-
-# ----------------------------------------------------------------------
-# --- Plotting Function (MODIFIED) ---
-# ----------------------------------------------------------------------
-
-def plot_training_graphs(tp_history, preset_name):
-    """Plots and saves the loss and perplexity graphs for the TP run."""
-    fig, (ax1, ax2) = plt.subplots(2, 1, figsize=(12, 10))
-    fig.suptitle(f"{preset_name} - Tensor Parallel Training Metrics", fontsize=16)
-
-    # Plotting Loss
-    ax1.plot(
-        tp_history.history["val_loss"],
-        label="Tensor Parallel - Validation Loss",
-        color="green",
-        linestyle="-",
-        marker="o",
+    """Formats data for CausalLM."""
+    # Inputs: tokens [0:-1], Labels: tokens [1:]
+    return (
+        {
+            "token_ids": data[:-1],
+            "padding_mask": tf.ones_like(data[:-1], dtype=tf.bool),
+        },
+        data[1:]
     )
-    ax1.set_title("Validation Loss")
-    ax1.set_ylabel("Loss")
-    ax1.set_xlabel("Epoch")
-    ax1.legend()
-    ax1.grid(True)
 
-    # Plotting Perplexity
-    ax2.plot(
-        tp_history.history["val_perplexity"],
-        label="Tensor Parallel - Validation Perplexity",
-        color="purple",
-        linestyle="-",
-        marker="o",
-    )
-    ax2.set_title("Validation Perplexity")
-    ax2.set_ylabel("Perplexity")
-    ax2.set_xlabel("Epoch")
-    ax2.legend()
-    ax2.grid(True)
-
-    output_filename = f"{preset_name}_tp_training.png"
-    plt.tight_layout(rect=[0, 0.03, 1, 0.95])
-    plt.savefig(output_filename)
-    logger.info(f"\nTraining graph saved to {output_filename}")
-    plt.close()
-
-
-# ----------------------------------------------------------------------
-# --- Main Verification Function (MODIFIED) ---
-# ----------------------------------------------------------------------
-
-def run_model_verification(preset_name, model_class):
-    """
-    Runs a training execution test for a given model preset using
-    tensor parallelism.
-    """
+def run_verification():
     if TARGET_WORLD_SIZE < 2:
-        logger.warning(
-            f"SKIPPING {preset_name}: Need at least 2 devices for tensor "
-            f"parallelism, found {TARGET_WORLD_SIZE}"
-        )
-        return "SKIPPED"
+        logger.error("Need at least 2 devices for TP verification.")
+        return
 
-    logger.info(f"--- VERIFICATION FOR: {preset_name.upper()} ---")
-
-    # --- Common Setup ---
-    train_ds_raw, val_ds_raw = load_shakespeare_dataset(preset_name)
-
+    # 1. Load Data
+    train_ds_raw, val_ds_raw = load_dataset(MODEL_PRESET)
+    
     train_ds = (
         train_ds_raw.batch(BATCH_SIZE, drop_remainder=True)
         .map(format_for_causal_lm, num_parallel_calls=tf.data.AUTOTUNE)
-        .prefetch(tf.data.AUTOTUNE)
         .repeat()
     )
     val_ds = (
         val_ds_raw.batch(BATCH_SIZE, drop_remainder=True)
         .map(format_for_causal_lm, num_parallel_calls=tf.data.AUTOTUNE)
-        .prefetch(tf.data.AUTOTUNE)
-        .repeat()
     )
 
-    # --- 1. Tensor Parallel Model Training ---
-    logger.info("\n--- Training Tensor Parallel (TP) Model ---")
-    tp_model_template = get_model_from_preset(preset_name, model_class)
-
+    # 2. Load Master Model (CPU)
+    # Using low_cpu_mem_usage logic implicit in Keras 3 with bfloat16
+    logger.info(f"Loading master model: {MODEL_PRESET}...")
+    master_model = keras_hub.models.GemmaCausalLM.from_preset(MODEL_PRESET)
+    
+    # 3. Create Tensor Parallel Model
+    # The updated TensorParallelKeras will ingest the master, shard it, and delete the master from CPU.
+    logger.info("Initializing Tensor Parallel Wrapper...")
     tp_model = TensorParallelKeras(
-        model=tp_model_template,
+        model=master_model,
         device_count=TARGET_WORLD_SIZE,
         device_ids=TARGET_DEVICES,
     )
 
+    # 4. Compile & Fit
+    logger.info("Compiling...")
     tp_model.compile(
         optimizer=keras.optimizers.AdamW(learning_rate=LEARNING_RATE),
         loss=keras.losses.SparseCategoricalCrossentropy(from_logits=True),
-        metrics=[
-            keras_hub.metrics.Perplexity(from_logits=True, name="perplexity")
-        ],
+        metrics=["accuracy"], # Perplexity can be heavy, check simple accuracy first
     )
 
-    tp_history = tp_model.fit(
+    logger.info("Starting Training...")
+    tp_model.fit(
         train_ds,
         validation_data=val_ds,
         epochs=EPOCHS,
         steps_per_epoch=STEPS_PER_EPOCH,
         validation_steps=VALIDATION_STEPS,
-        verbose=1,
     )
-    tp_final_val_loss = tp_history.history["val_loss"][-1]
-    logger.info("TP model training completed successfully.")
-
-    # --- 2. Verification ---
-    logger.info("\n--- ⚖️ Verification Results ---")
-    logger.info(f"TP Final Validation Loss: {tp_final_val_loss:.6f}")
-
-    plot_training_graphs(tp_history, preset_name)
-
-    logger.info("✅ SUCCESS: TP model training finished without errors.")
-    return True
-
-
-# ----------------------------------------------------------------------
-# --- Main Execution ---
-# ----------------------------------------------------------------------
+    
+    logger.info("✅ Verification Complete.")
 
 if __name__ == "__main__":
-    if TARGET_WORLD_SIZE == 0:
-        logger.critical("No JAX devices found. Aborting verification suite.")
-        sys.exit(1)
-
-    logger.info("\n" + "=" * 70)
-    logger.info("      TENSOR PARALLELISM EXECUTION SUITE")
-    logger.info("=" * 70)
-
-    results = {}
-    total_start_time = time.time()
-
-    for preset, model_class in MODEL_MAPPING.items():
-        try:
-            result = run_model_verification(preset, model_class)
-            if result == "SKIPPED":
-                results[preset] = "⚪ SKIPPED"
-            else:
-                results[preset] = "✅ PASS" if result else "❌ FAIL"
-        except Exception as e:
-            logger.error(
-                f"Test for {preset} failed with an exception: {e}",
-                exc_info=True,
-            )
-            results[preset] = "💥 ERROR"
-        logger.info("-" * 70)
-
-    logger.info("\n" + "=" * 70)
-    logger.info("🎉 EXECUTION SUITE COMPLETED!")
-    logger.info(
-        f"   Total execution time: {time.time() - total_start_time:.2f}s"
-    )
-    logger.info("\n   --- SUMMARY ---")
-    for preset, status in results.items():
-        print(f"   - {preset:<18}: {status}")
-    logger.info("=" * 70)
+    run_verification()
