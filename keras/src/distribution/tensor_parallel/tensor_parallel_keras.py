@@ -64,7 +64,7 @@ class TensorParallelKeras(Model):
         print("🗑️  Destroying Master Model from RAM...")
         del loaded_model
         if 'model' in locals(): del model
-        gc.collect()
+        self._force_gc() # FIX: Aggressive GC
         
         self.model_shards = []
         print(f"🚀 Initializing Tensor Parallelism on {self.devices}")
