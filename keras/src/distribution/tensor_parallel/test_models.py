@@ -1,4 +1,6 @@
 import os
+# Limit JAX to 90% of VRAM to prevent fragmentation OOMs
+os.environ["XLA_PYTHON_CLIENT_MEM_FRACTION"] = "0.90"
 
 # --- 1. Memory Tuning ---
 # Disable preallocation to allow memory to grow as needed
@@ -88,19 +90,22 @@ def run_training():
     # --- 3. LoRA Factory (The Fix) ---
     # We define the model creation logic here so the Master Model (18GB)
     # is loaded, offloaded to disk, and then deleted from RAM immediately.
+    from keras.src.layers.preprocessing.image_preprocessing import transform
+    # Import RematScope
+    from keras import RematScope
+
     def model_factory():
-        logger.info(f"🏭 Factory: Loading {MODEL_PRESET} to System RAM (CPU)...")
-        with keras.device("cpu"):
-            model = keras_hub.models.GemmaCausalLM.from_preset(MODEL_PRESET)
-            
-            # --- ENABLE LORA ---
-            # This freezes the main weights and adds tiny trainable adapters.
-            # Trainable Params: 9,000,000,000 -> ~7,000,000
-            # Optimizer Memory: ~72GB -> ~50MB
-            logger.info("✨ Enabling LoRA (Rank=4) to fix Optimizer OOM...")
-            model.backbone.enable_lora(rank=4)
-            
-            return model
+        logger.info(f"🏭 Factory: Loading {MODEL_PRESET}...")
+        
+        # WRAP model creation in RematScope
+        # mode="activations" is usually sufficient and safer/faster than "full"
+        with RematScope(mode="activations"):
+            with keras.device("cpu"):
+                model = keras_hub.models.GemmaCausalLM.from_preset(MODEL_PRESET)
+                
+                logger.info("✨ Enabling LoRA (Rank=4)...")
+                model.backbone.enable_lora(rank=4)
+                return model
 
     # Pass the FACTORY (callable), not the MODEL
     tp_model = TensorParallelKeras(
@@ -112,8 +117,16 @@ def run_training():
     # At this point, the Master Model is guaranteed to be deleted from RAM.
     
     logger.info("Compiling model...")
+    # Use SGD instead of AdamW to save optimizer state memory
+    # Use gradient_accumulation_steps to simulate a batch size of 16 (1 * 16)
+    optimizer = keras.optimizers.SGD(
+        learning_rate=LEARNING_RATE, 
+        momentum=0.9,
+        gradient_accumulation_steps=16 
+    )
+
     tp_model.compile(
-        optimizer=keras.optimizers.AdamW(learning_rate=LEARNING_RATE),
+        optimizer=optimizer,
         loss=keras.losses.SparseCategoricalCrossentropy(from_logits=True),
         metrics=["accuracy"]
     )
