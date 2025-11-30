@@ -32,7 +32,7 @@ from keras.src.distribution.tensor_parallel.tensor_parallel_keras import TensorP
 MODEL_PRESET = "gemma2_9b_en"
 BATCH_SIZE = 1
 # REDUCED: 128 -> 64 to save Activation Memory
-SEQUENCE_LENGTH = 8
+SEQUENCE_LENGTH = 128
 LEARNING_RATE = 1e-4 # Slightly higher for SGD
 EPOCHS = 1
 STEPS_PER_EPOCH = 5
