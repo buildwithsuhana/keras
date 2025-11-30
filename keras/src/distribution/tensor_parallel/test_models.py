@@ -43,7 +43,6 @@ def get_devices():
     return (len(accel_devices), accel_devices) if accel_devices else (0, [])
 
 def load_data(preset):
-    # Dummy data loading for speed/testing
     logger.info("Loading Data...")
     ds = tfds.load("tiny_shakespeare", split="train", as_supervised=False)
     text = "".join(ex["text"].decode("utf-8") for ex in ds.as_numpy_iterator())
