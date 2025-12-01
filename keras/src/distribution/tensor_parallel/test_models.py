@@ -148,7 +148,8 @@ def run_training():
     tp_model.compile(
         optimizer=optimizer,
         loss=keras.losses.SparseCategoricalCrossentropy(from_logits=True),
-        metrics=["accuracy"]
+        metrics=["accuracy"],
+        jit_compile=False
     )
 
     logger.info("Starting Training Loop...")
