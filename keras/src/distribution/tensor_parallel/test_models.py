@@ -143,7 +143,7 @@ def run_training():
     logger.info("✅ Model built successfully.")
 
     logger.info("Compiling model with SGD...")
-    optimizer = keras.optimizers.SGD(learning_rate=LEARNING_RATE, momentum=0.9)
+    optimizer = keras.optimizers.SGD(learning_rate=LEARNING_RATE, momentum=0.0)
 
     tp_model.compile(
         optimizer=optimizer,
