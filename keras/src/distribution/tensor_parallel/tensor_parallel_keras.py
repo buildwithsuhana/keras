@@ -134,17 +134,26 @@ class TensorParallelKeras(Model):
     # --- SIMPLIFIED CALL METHOD ---
     def call(self, inputs, training=None, **kwargs):
         """
-        Runs the forward pass on all shards and sums the results (Logits).
-        This avoids graph name collisions because we don't build a static graph.
+        Runs the forward pass on each shard ON ITS OWN DEVICE, 
+        then sums the results (Logits) on the default device.
         """
         results = []
-        for shard in self.model_shards:
-            # Shards might return a dictionary or tensor. 
-            # For CausalLM, it usually returns logits (tensor).
-            out = shard(inputs, training=training, **kwargs)
-            results.append(out)
         
-        # Sum the outputs (Logits reduction for TP)
+        # We assume self.devices matches the order of self.model_shards
+        for i, shard in enumerate(self.model_shards):
+            # CRITICAL FIX: Force execution on the specific shard's device
+            target_device = self.devices[i]
+            with keras.device(target_device):
+                # JAX will auto-copy 'inputs' to 'target_device' (cheap)
+                # The shard weights are already there (zero cost)
+                # Computation happens on 'target_device'
+                out = shard(inputs, training=training, **kwargs)
+                results.append(out)
+        
+        # Sum the outputs.
+        # 'results' contains tensors on different devices (TPU:0, TPU:1, etc.)
+        # The addition will happen on the device of the first operand (TPU:0)
+        # causing the other partial logits to be copied to TPU:0 (cheap).
         total = results[0]
         for i in range(1, len(results)):
             total = ops.add(total, results[i])
