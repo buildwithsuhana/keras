@@ -1,6 +1,7 @@
 import logging
 import gc
 import os
+import re
 import shutil
 import tempfile
 import ctypes
@@ -91,33 +92,23 @@ class TensorParallelKeras(Model):
                 device_id=device_id,
             )
 
-            # Ensure unique layer & model names so that when we assemble
-            # multiple shard Models into a single Functional model, there
-            # are no duplicate operation/layer names. Keras requires all
-            # operation names to be unique within a graph.
+            # Ensure unique layer & model names
             suffix = f"_tp{rank}"
             try:
-                # Rename model
                 shard._name = shard.name + suffix
             except Exception:
                 pass
-            # Rename layers
             for layer in getattr(shard, 'layers', []):
                 try:
-                    # Avoid doubling suffix if already applied
                     if not layer.name.endswith(suffix):
                         layer._name = layer.name + suffix
                 except Exception:
-                    # Be conservative: if a layer cannot be renamed, continue
                     continue
 
             # C. Store Shard
             self.model_shards.append(shard)
             
             # D. Cleanup CPU Skeleton
-            # 'shard' variable now holds the model which has mostly been pushed to GPU?
-            # Actually, Keras variables stick to device. 
-            # But the 'shard' object structure remains on CPU.
             gc.collect()
             print(f"[{device_id}] ✅ Shard ready.")
 
@@ -128,32 +119,23 @@ class TensorParallelKeras(Model):
             pass
         
         self.built = True
-        # Note: We do NOT use assembled_model anymore.
-        # Logic is handled in call()
 
-    # --- SIMPLIFIED CALL METHOD ---
+    # --- CORRECTED CALL METHOD ---
     def call(self, inputs, training=None, **kwargs):
         """
-        Runs the forward pass on each shard ON ITS OWN DEVICE, 
-        then sums the results (Logits) on the default device.
+        Runs the forward pass on all shards explicitly ON THEIR DEVICES 
+        and sums the results (Logits).
         """
         results = []
-        
-        # We assume self.devices matches the order of self.model_shards
         for i, shard in enumerate(self.model_shards):
-            # CRITICAL FIX: Force execution on the specific shard's device
+            # FIX 1: Explicitly force execution on the correct device
+            # This prevents JAX from trying to pull all weights to TPU:0
             target_device = self.devices[i]
             with keras.device(target_device):
-                # JAX will auto-copy 'inputs' to 'target_device' (cheap)
-                # The shard weights are already there (zero cost)
-                # Computation happens on 'target_device'
                 out = shard(inputs, training=training, **kwargs)
                 results.append(out)
         
-        # Sum the outputs.
-        # 'results' contains tensors on different devices (TPU:0, TPU:1, etc.)
-        # The addition will happen on the device of the first operand (TPU:0)
-        # causing the other partial logits to be copied to TPU:0 (cheap).
+        # Sum the outputs (Logits reduction for TP)
         total = results[0]
         for i in range(1, len(results)):
             total = ops.add(total, results[i])
@@ -203,6 +185,26 @@ class TensorParallelKeras(Model):
 
     def _normalize_device_id(self, device_id):
         d_str = str(device_id).lower()
+        
+        # FIX 2: Better TPU Detection
+        # If it's a TPU string (e.g. 'tpu_0(process=0...)'), format it correctly
+        if "tpu" in d_str and "gpu" not in d_str:
+            # If already correct format 'tpu:0', return it
+            if d_str.startswith("tpu:"): 
+                return d_str
+            
+            # Extract ID from verbose JAX string (e.g. 'tpu_0')
+            match = re.search(r"tpu_(\d+)", d_str)
+            if match:
+                return f"tpu:{match.group(1)}"
+            
+            # Fallback: Prefix with tpu: if just an ID or weird string
+            if ":" not in d_str: 
+                return f"tpu:{d_str}"
+            
+            return d_str
+
+        # Standard GPU handling
         if d_str.startswith("cuda:"): return d_str.replace("cuda:", "gpu:")
         if ":" not in d_str: return f"gpu:{d_str}"
         return d_str

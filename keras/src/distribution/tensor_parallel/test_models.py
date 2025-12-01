@@ -9,6 +9,7 @@ os.environ["XLA_PYTHON_CLIENT_PREALLOCATE"] = "false"
 os.environ["XLA_PYTHON_CLIENT_MEM_FRACTION"] = "0.90" 
 os.environ["XLA_PYTHON_CLIENT_ALLOCATOR"] = "platform"
 os.environ["KERAS_BACKEND"] = "jax"
+# Ensure we see all TPUs
 os.environ["XLA_FLAGS"] = "--xla_force_host_platform_device_count=8"
 
 import jax
@@ -19,7 +20,7 @@ import keras_hub
 import tensorflow as tf
 import tensorflow_datasets as tfds
 
-# Strict bfloat16 policy
+# Strict bfloat16 policy for TPU efficiency
 keras.config.set_dtype_policy("bfloat16")
 tf.config.set_visible_devices([], "GPU")
 
@@ -72,6 +73,7 @@ STEPS_PER_EPOCH = 5
 
 def get_devices():
     devices = jax.devices()
+    # Filter for TPUs/GPUs only
     accel_devices = [d for d in devices if d.platform != "cpu"]
     return (len(accel_devices), accel_devices) if accel_devices else (0, [])
 
@@ -106,6 +108,7 @@ def load_data(preset):
 
 def model_factory():
     logger.info(f"🏭 Factory: Loading {MODEL_PRESET}...")
+    # Load initial model on CPU to avoid OOM before sharding
     with keras.device("cpu"):
         model = keras_hub.models.GemmaCausalLM.from_preset(MODEL_PRESET)
         return model
@@ -131,15 +134,13 @@ def run_training():
     )
 
     logger.info("🔧 Manually building model to ensure variable initialization...")
-    try:
-        dummy_inputs = {
-            "token_ids": np.zeros((BATCH_SIZE, SEQUENCE_LENGTH), dtype="int32"),
-            "padding_mask": np.ones((BATCH_SIZE, SEQUENCE_LENGTH), dtype="int32"),
-        }
-        tp_model(dummy_inputs)
-        logger.info("✅ Model built successfully.")
-    except Exception as e:
-        logger.warning(f"Build pass warning (ignore if training starts): {e}")
+    # CHANGE: Removed try/except block. If this fails, we want to crash NOW.
+    dummy_inputs = {
+        "token_ids": np.zeros((BATCH_SIZE, SEQUENCE_LENGTH), dtype="int32"),
+        "padding_mask": np.ones((BATCH_SIZE, SEQUENCE_LENGTH), dtype="int32"),
+    }
+    tp_model(dummy_inputs)
+    logger.info("✅ Model built successfully.")
 
     logger.info("Compiling model with SGD...")
     optimizer = keras.optimizers.SGD(learning_rate=LEARNING_RATE, momentum=0.9)
@@ -157,13 +158,15 @@ def run_training():
     except Exception as e:
         logger.error(f"Training Failed: {e}")
         try:
+            # Attempt to print memory stats for debugging
             logger.info(jax.local_devices()[0].memory_stats())
         except:
             pass
         raise e
-
-    if hasattr(tp_model, 'temp_dir') and os.path.exists(tp_model.temp_dir):
-        shutil.rmtree(tp_model.temp_dir)
+    finally:
+        # Cleanup temp weights
+        if hasattr(tp_model, 'temp_dir') and os.path.exists(tp_model.temp_dir):
+            shutil.rmtree(tp_model.temp_dir)
 
 if __name__ == "__main__":
     run_training()
