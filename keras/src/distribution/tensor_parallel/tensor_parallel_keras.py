@@ -138,11 +138,21 @@ class TensorParallelKeras(Model):
         return total
 
     def _save_weights_to_disk(self, model):
+        """Saves weights to disk, ensuring they are compatible (casting bfloat16 to float32)."""
         for v in model.variables:
             name = v.path if hasattr(v, 'path') else v.name
             safe_name = name.replace("/", "_").replace(":", "_")
             path = os.path.join(self.temp_dir, safe_name + ".npy")
-            np.save(path, v.numpy())
+            
+            val = v.numpy()
+            
+            # Check for bfloat16 or similar problematic types and cast to float32
+            # |V2 is essentially void/raw 2 bytes, which is how numpy sees bf16 without ml_dtypes
+            if (hasattr(val, 'dtype') and (val.dtype.name == 'bfloat16' or str(val.dtype) == 'bfloat16')) or \
+               (val.dtype.char == 'V' and val.itemsize == 2):
+                val = val.astype('float32')
+                
+            np.save(path, val)
 
     def _weight_loader(self, param_name):
         safe_name = param_name.replace("/", "_").replace(":", "_")
