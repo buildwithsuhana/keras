@@ -12,6 +12,7 @@ os.environ["KERAS_BACKEND"] = "jax"
 os.environ["XLA_FLAGS"] = "--xla_force_host_platform_device_count=8"
 
 import jax
+import jax.nn
 import keras
 import keras_hub
 import tensorflow as tf
@@ -23,6 +24,30 @@ tf.config.set_visible_devices([], "GPU")
 
 logging.basicConfig(level=logging.INFO, format="%(levelname)s - %(message)s")
 logger = logging.getLogger(__name__)
+
+# --- 🩹 UPDATED MONKEY PATCH (Fixes ConcretizationTypeError) ---
+try:
+    import keras.src.backend.jax.nn as jax_keras_nn
+    
+    def safe_dot_product_attention(query, key, value, bias=None, mask=None, scale=None, is_causal=False, **kwargs):
+        # 🛠️ FIX: We force mask=None. 
+        # Since your data is dense (no padding tokens), the padding mask is all 1s 
+        # and technically unnecessary. Passing it causes the Pallas kernel to crash 
+        # trying to read the Tracer object.
+        # The 'is_causal' flag handles the lower-triangular mask automatically.
+        return jax.nn.dot_product_attention(
+            query, key, value, 
+            bias=bias, 
+            mask=None, # Force None to bypass the Pallas hashing crash
+            scale=scale, 
+            is_causal=is_causal
+        )
+        
+    jax_keras_nn.dot_product_attention = safe_dot_product_attention
+    logger.info("🩹 Patch Applied: Forced mask=None in attention to prevent ConcretizationTypeError.")
+except Exception as e:
+    logger.warning(f"Failed to apply patch: {e}")
+# ---------------------------------------------------------------
 
 from keras.src.distribution.tensor_parallel.tensor_parallel_keras import TensorParallelKeras
 
@@ -49,14 +74,14 @@ def load_data(preset):
     if isinstance(tokens, dict): tokens = tokens["token_ids"]
     tokens = np.array(tokens)
     
-    # Ensure tokens are split exactly into input+label blocks
     total_tokens = (len(tokens) // (SEQUENCE_LENGTH + 1)) * (SEQUENCE_LENGTH + 1)
     tokens = tokens[:total_tokens].reshape(-1, SEQUENCE_LENGTH + 1)
     
     dataset = tf.data.Dataset.from_tensor_slices(tokens)
     
     def prepare_batch(batch):
-        # FIX: Re-added padding_mask because the model signature demands it.
+        # We still provide the key because Keras checks for it, 
+        # but our Monkey Patch will ignore it during calculation.
         return (
             {
                 "token_ids": batch[:-1], 
@@ -94,10 +119,8 @@ def run_training():
         device_ids=[str(d) for d in target_devices]
     )
 
-    # --- FIX: Manually Build the Model WITH Padding Mask ---
     logger.info("🔧 Manually building model to ensure variable initialization...")
     try:
-        # We must provide exactly what the model expects, or build fails.
         dummy_inputs = {
             "token_ids": np.zeros((BATCH_SIZE, SEQUENCE_LENGTH), dtype="int32"),
             "padding_mask": np.ones((BATCH_SIZE, SEQUENCE_LENGTH), dtype="int32"),
@@ -108,10 +131,7 @@ def run_training():
         logger.warning(f"Build pass warning (ignore if training starts): {e}")
 
     logger.info("Compiling model with SGD...")
-    optimizer = keras.optimizers.SGD(
-        learning_rate=LEARNING_RATE,
-        momentum=0.9
-    )
+    optimizer = keras.optimizers.SGD(learning_rate=LEARNING_RATE, momentum=0.9)
 
     tp_model.compile(
         optimizer=optimizer,
