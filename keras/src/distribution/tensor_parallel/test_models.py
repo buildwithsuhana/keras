@@ -5,13 +5,14 @@ import logging
 import time
 import numpy as np
 
-# --- 1. Aggressive Memory Environment Variables ---
-os.environ["XLA_PYTHON_CLIENT_PREALLOCATE"] = "false"
-os.environ["XLA_PYTHON_CLIENT_MEM_FRACTION"] = "0.90" 
-os.environ["XLA_PYTHON_CLIENT_ALLOCATOR"] = "platform"
+# --- 1. Environment Setup ---
+# CRITICAL: Do NOT set "XLA_FLAGS" for host device count if you are on GPU.
+# It forces JAX to use CPU!
 os.environ["KERAS_BACKEND"] = "jax"
-# Ensure we see all TPUs
-os.environ["XLA_FLAGS"] = "--xla_force_host_platform_device_count=8"
+
+# Optional: Aggressive memory freeing
+os.environ["XLA_PYTHON_CLIENT_PREALLOCATE"] = "false"
+os.environ["XLA_PYTHON_CLIENT_ALLOCATOR"] = "platform"
 
 import jax
 import jax.nn
@@ -21,8 +22,10 @@ import keras_hub
 import tensorflow as tf
 import tensorflow_datasets as tfds
 
-# Strict bfloat16 policy for TPU efficiency
+# Strict bfloat16 policy for efficiency
 keras.config.set_dtype_policy("bfloat16")
+
+# Hide GPUs from TensorFlow so JAX gets exclusive access
 tf.config.set_visible_devices([], "GPU")
 
 logging.basicConfig(level=logging.INFO, format="%(asctime)s - %(levelname)s - %(message)s")
@@ -50,7 +53,7 @@ try:
         )
         
     jax_keras_nn.dot_product_attention = safe_dot_product_attention
-    logger.info("🩹 Patch Applied: Enabled Manual GQA + Disabled Pallas Attention.")
+    logger.info("🩹 Patch Applied: Enabled Manual GQA.")
 except Exception as e:
     logger.warning(f"Failed to apply patch: {e}")
 # ---------------------------------------------------------------
@@ -67,19 +70,19 @@ STEPS_PER_EPOCH = 5
 
 # --- 🕵️ DEBUGGER HELPERS ---
 def print_memory_stats(stage_name):
-    """Prints the memory usage of TPU:0 to detect leaks/OOMs."""
+    """Prints the memory usage to detect leaks/OOMs."""
     try:
-        # We focus on device 0 because that's where the crash happens
+        # Check the first device (usually gpu:0 or tpu:0)
         device = jax.local_devices()[0]
         stats = device.memory_stats()
         gb_in_use = stats.get('bytes_in_use', 0) / 1e9
         gb_limit = stats.get('bytes_limit', 0) / 1e9
         utilization = (gb_in_use / gb_limit) * 100 if gb_limit > 0 else 0
         
-        logger.info(f"📊 MEMORY [TPU:0] @ {stage_name}")
+        logger.info(f"📊 MEMORY [{device.platform}:{device.id}] @ {stage_name}")
         logger.info(f"   ↳ Used: {gb_in_use:.2f} GB / {gb_limit:.2f} GB ({utilization:.1f}%)")
-    except Exception as e:
-        logger.warning(f"   ↳ Could not fetch memory stats: {e}")
+    except Exception:
+        pass
 
 def inspect_model_shards(tp_model, target_devices):
     """Verifies that shards are actually living on different devices."""
@@ -88,29 +91,28 @@ def inspect_model_shards(tp_model, target_devices):
     for i, shard in enumerate(tp_model.model_shards):
         expected_device = target_devices[i]
         
-        # Check the device of the first trainable variable
         if not shard.trainable_variables:
             logger.warning(f"   ⚠️ Shard {i} has no trainable variables!")
             continue
             
         first_var = shard.trainable_variables[0]
         
-        # FIX: Robustly get device for Keras 3 + JAX
+        # Robustly get device info
         try:
-            # Method 1: Check if it's a JAX Array in .value
+            # Check where the underlying JAX array lives
             if hasattr(first_var, 'value') and hasattr(first_var.value, 'devices'):
-                # jax.Array returns a set of devices
                 devs = list(first_var.value.devices())
                 actual_device = str(devs[0]) if devs else "Unknown"
-            # Method 2: Standard .device property
             elif hasattr(first_var, 'device'):
                 actual_device = str(first_var.device)
             else:
-                actual_device = "Unknown (No device attr)"
+                actual_device = "Unknown"
         except Exception as e:
             actual_device = f"Error: {e}"
 
-        status = "✅ OK" if str(expected_device) in actual_device else "❌ WRONG DEVICE"
+        # Loose matching because 'gpu:0' != 'cuda:0' strictly
+        match = str(expected_device).lower().replace("cuda", "gpu") in actual_device.lower().replace("cuda", "gpu")
+        status = "✅ OK" if match else "❌ WRONG DEVICE"
         logger.info(f"   Shard {i} | Expect: {expected_device} | Actual: {actual_device} | {status}")
 
 def inspect_optimizer_state(tp_model):
@@ -118,16 +120,14 @@ def inspect_optimizer_state(tp_model):
     logger.info("🕵️ INSPECTING OPTIMIZER STATE...")
     
     if not hasattr(tp_model.optimizer, 'variables'):
-        logger.warning("   ⚠️ Optimizer has no variables yet (Build not called?)")
         return
 
     vars = tp_model.optimizer.variables
     if not vars:
-        logger.info("   Optimizer has 0 variables (might be SGD with no momentum).")
+        logger.info("   Optimizer has 0 variables.")
         return
 
-    # Check the first few variables
-    on_tpu0 = 0
+    on_device0 = 0
     on_cpu = 0
     for v in vars:
         try:
@@ -137,19 +137,21 @@ def inspect_optimizer_state(tp_model):
             elif hasattr(v, 'device'):
                 d = str(v.device).lower()
             
-            if "tpu:0" in d: on_tpu0 += 1
+            if "gpu:0" in d or "tpu:0" in d: on_device0 += 1
             if "cpu" in d: on_cpu += 1
         except:
             pass
         
     logger.info(f"   Optimizer Variables Total: {len(vars)}")
-    logger.info(f"   ↳ On TPU:0 : {on_tpu0} (⚠️ High number = OOM Risk)")
-    logger.info(f"   ↳ On CPU   : {on_cpu} (✅ Preferred for Coordinator)")
+    logger.info(f"   ↳ On Device:0 : {on_device0} (⚠️ Should be low)")
+    logger.info(f"   ↳ On CPU      : {on_cpu} (✅ Preferred for Coordinator)")
 
 # ---------------------------------------------------------------
 
 def get_devices():
     devices = jax.devices()
+    logger.info(f"JAX Devices: {devices}")
+    # Filter for TPUs or GPUs
     accel_devices = [d for d in devices if d.platform != "cpu"]
     return (len(accel_devices), accel_devices) if accel_devices else (0, [])
 
@@ -190,7 +192,7 @@ def run_training():
     print_memory_stats("STARTUP")
     
     device_count, target_devices = get_devices()
-    logger.info(f"Devices detected: {device_count}")
+    logger.info(f"Accelerator Devices detected: {device_count}")
     
     if device_count < 2:
         logger.error("Need at least 2 accelerators for Tensor Parallelism.")
@@ -202,14 +204,17 @@ def run_training():
     train_ds = load_data(MODEL_PRESET)
 
     logger.info("Preparing Tensor Parallel Model...")
+    # Clean string conversion for devices
+    device_ids = [f"{d.platform}:{d.id}" for d in target_devices]
+    
     tp_model = TensorParallelKeras(
         model=model_factory, 
         device_count=device_count,
-        device_ids=[str(d) for d in target_devices]
+        device_ids=device_ids
     )
-    print_memory_stats("AFTER TP INIT (Model Loaded)")
+    print_memory_stats("AFTER TP INIT")
 
-    logger.info("🔧 Manually building model to ensure variable initialization...")
+    logger.info("🔧 Manually building model...")
     dummy_inputs = {
         "token_ids": np.zeros((BATCH_SIZE, SEQUENCE_LENGTH), dtype="int32"),
         "padding_mask": np.ones((BATCH_SIZE, SEQUENCE_LENGTH), dtype="int32"),
@@ -217,11 +222,9 @@ def run_training():
     tp_model(dummy_inputs)
     print_memory_stats("AFTER BUILD")
     
-    # DEBUG: Check where shards ended up
     inspect_model_shards(tp_model, target_devices)
 
     logger.info("Compiling model with SGD...")
-    # Use simple SGD first to minimize optimizer state memory usage
     optimizer = keras.optimizers.SGD(learning_rate=LEARNING_RATE, momentum=0.0)
 
     tp_model.compile(
@@ -231,10 +234,8 @@ def run_training():
         jit_compile=False
     )
     
-    # Force optimizer build to check where variables go
     try:
         tp_model.optimizer.build(tp_model.trainable_variables)
-        print_memory_stats("AFTER OPTIMIZER BUILD")
         inspect_optimizer_state(tp_model)
     except Exception as e:
         logger.warning(f"Could not manually build optimizer: {e}")
@@ -246,11 +247,6 @@ def run_training():
     except Exception as e:
         logger.error(f"❌ Training Failed: {e}")
         print_memory_stats("CRASH STATE")
-        
-        # Additional Debugging info on crash
-        logger.info("🔍 DIAGNOSTICS:")
-        logger.info("1. Check 'AFTER OPTIMIZER BUILD' stats above. If TPU:0 usage spiked, the optimizer state is not sharded.")
-        logger.info("2. If 'INSPECTING SHARD PLACEMENT' showed 'WRONG DEVICE', your sharding logic is broken.")
         raise e
     finally:
         if hasattr(tp_model, 'temp_dir') and os.path.exists(tp_model.temp_dir):
