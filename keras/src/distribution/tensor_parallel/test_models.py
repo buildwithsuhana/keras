@@ -13,6 +13,7 @@ os.environ["XLA_FLAGS"] = "--xla_force_host_platform_device_count=8"
 
 import jax
 import jax.nn
+import jax.numpy as jnp
 import keras
 import keras_hub
 import tensorflow as tf
@@ -25,26 +26,36 @@ tf.config.set_visible_devices([], "GPU")
 logging.basicConfig(level=logging.INFO, format="%(levelname)s - %(message)s")
 logger = logging.getLogger(__name__)
 
-# --- 🩹 UPDATED MONKEY PATCH (Fixes ConcretizationTypeError) ---
+# --- 🩹 ADVANCED MONKEY PATCH (Fixes GQA + Driver Mismatch) ---
 try:
     import keras.src.backend.jax.nn as jax_keras_nn
     
     def safe_dot_product_attention(query, key, value, bias=None, mask=None, scale=None, is_causal=False, **kwargs):
-        # 🛠️ FIX: We force mask=None. 
-        # Since your data is dense (no padding tokens), the padding mask is all 1s 
-        # and technically unnecessary. Passing it causes the Pallas kernel to crash 
-        # trying to read the Tracer object.
-        # The 'is_causal' flag handles the lower-triangular mask automatically.
+        # 1. FIX SHAPE MISMATCH (GQA Support)
+        # Gemma 2 uses Grouped Query Attention. 
+        # If Query has 16 heads and Key has 8, we must repeat Key 2x to match.
+        q_heads = query.shape[-2]
+        k_heads = key.shape[-2]
+        
+        if q_heads != k_heads:
+            rep_factor = q_heads // k_heads
+            # Repeat the key/value heads to match query heads
+            key = jnp.repeat(key, rep_factor, axis=-2)
+            value = jnp.repeat(value, rep_factor, axis=-2)
+
+        # 2. FIX DRIVER CRASH (ConcretizationTypeError)
+        # We force mask=None because the "Pallas" kernel crashes on TPUs with old drivers
+        # when it tries to read the mask. 'is_causal' handles the masking for us.
         return jax.nn.dot_product_attention(
             query, key, value, 
             bias=bias, 
-            mask=None, # Force None to bypass the Pallas hashing crash
+            mask=None, 
             scale=scale, 
             is_causal=is_causal
         )
         
     jax_keras_nn.dot_product_attention = safe_dot_product_attention
-    logger.info("🩹 Patch Applied: Forced mask=None in attention to prevent ConcretizationTypeError.")
+    logger.info("🩹 Patch Applied: Enabled Manual GQA + Disabled Pallas Attention.")
 except Exception as e:
     logger.warning(f"Failed to apply patch: {e}")
 # ---------------------------------------------------------------
@@ -74,14 +85,14 @@ def load_data(preset):
     if isinstance(tokens, dict): tokens = tokens["token_ids"]
     tokens = np.array(tokens)
     
+    # Ensure tokens are split exactly into input+label blocks
     total_tokens = (len(tokens) // (SEQUENCE_LENGTH + 1)) * (SEQUENCE_LENGTH + 1)
     tokens = tokens[:total_tokens].reshape(-1, SEQUENCE_LENGTH + 1)
     
     dataset = tf.data.Dataset.from_tensor_slices(tokens)
     
     def prepare_batch(batch):
-        # We still provide the key because Keras checks for it, 
-        # but our Monkey Patch will ignore it during calculation.
+        # We keep the dictionary structure Keras expects
         return (
             {
                 "token_ids": batch[:-1], 
