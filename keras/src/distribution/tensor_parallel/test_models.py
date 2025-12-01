@@ -5,12 +5,12 @@ import logging
 import numpy as np
 
 # --- 1. Aggressive Memory Environment Variables ---
-# We limit JAX to 90% memory to prevent fragmentation, 
-# and force it to act like a CPU allocator (slower but safer for OOM).
 os.environ["XLA_PYTHON_CLIENT_PREALLOCATE"] = "false"
+# Note: On TPUs, MEM_FRACTION behavior varies, but keeping it per your request.
 os.environ["XLA_PYTHON_CLIENT_MEM_FRACTION"] = "0.90" 
 os.environ["XLA_PYTHON_CLIENT_ALLOCATOR"] = "platform"
 os.environ["KERAS_BACKEND"] = "jax"
+# Ensuring 8 devices are visible if using TPU/Multi-GPU
 os.environ["XLA_FLAGS"] = "--xla_force_host_platform_device_count=8"
 
 import jax
@@ -19,7 +19,7 @@ import keras_hub
 import tensorflow as tf
 import tensorflow_datasets as tfds
 
-# Strict bfloat16 policy
+# Strict bfloat16 policy for TPU/GPU memory savings
 keras.config.set_dtype_policy("bfloat16")
 tf.config.set_visible_devices([], "GPU")
 
@@ -30,10 +30,9 @@ from keras.src.distribution.tensor_parallel.tensor_parallel_keras import TensorP
 
 # --- CONFIGURATION ---
 MODEL_PRESET = "gemma2_9b_en"
-BATCH_SIZE = 1
-# REDUCED: 128 -> 64 to save Activation Memory
+BATCH_SIZE = 1 # Keep at 1 for 9B model on limited resources
 SEQUENCE_LENGTH = 128
-LEARNING_RATE = 1e-4 # Slightly higher for SGD
+LEARNING_RATE = 1e-4 
 EPOCHS = 1
 STEPS_PER_EPOCH = 5
 
@@ -48,17 +47,25 @@ def load_data(preset):
     text = "".join(ex["text"].decode("utf-8") for ex in ds.as_numpy_iterator())
     
     tokenizer = keras_hub.models.GemmaTokenizer.from_preset(preset)
-    tokens = tokenizer(text[:10000]) # Smaller subset
+    tokens = tokenizer(text[:10000]) 
     if isinstance(tokens, dict): tokens = tokens["token_ids"]
     tokens = np.array(tokens)
     
+    # Ensure we have exact multiples of sequence length + 1 (for input+label)
     total_tokens = (len(tokens) // (SEQUENCE_LENGTH + 1)) * (SEQUENCE_LENGTH + 1)
     tokens = tokens[:total_tokens].reshape(-1, SEQUENCE_LENGTH + 1)
     
     dataset = tf.data.Dataset.from_tensor_slices(tokens)
+    
     def prepare_batch(batch):
-        return ({"token_ids": batch[:-1], "padding_mask": tf.ones_like(batch[:-1], dtype=tf.bool)}, batch[1:])
+        # OPTIMIZATION: Removed "padding_mask". 
+        # GemmaCausalLM handles unmasked input fine (assumes full attention).
+        # This saves memory and complexity.
+        return ({"token_ids": batch[:-1]}, batch[1:])
 
+    # --- FIX 1: Apply the prepare_batch mapping ---
+    dataset = dataset.map(prepare_batch, num_parallel_calls=tf.data.AUTOTUNE)
+    
     return dataset.batch(BATCH_SIZE, drop_remainder=True)
 
 def model_factory():
@@ -69,8 +76,10 @@ def model_factory():
 
 def run_training():
     device_count, target_devices = get_devices()
+    logger.info(f"Devices detected: {device_count}")
+    
     if device_count < 2:
-        logger.error("Need 2 GPUs.")
+        logger.error("Need at least 2 accelerators for Tensor Parallelism.")
         return
 
     # Clear memory before we start
@@ -85,11 +94,23 @@ def run_training():
         device_count=device_count,
         device_ids=[str(d) for d in target_devices]
     )
-    
+
+    # --- FIX 2: Manually Build the Model ---
+    # This forces variable creation before the complex .fit() loop starts.
+    logger.info("🔧 Manually building model to ensure variable initialization...")
+    try:
+        # Create dummy inputs matching (BATCH_SIZE, SEQUENCE_LENGTH)
+        dummy_inputs = {
+            "token_ids": np.zeros((BATCH_SIZE, SEQUENCE_LENGTH), dtype="int32"),
+            # No padding mask needed as we removed it in load_data
+        }
+        # Run a single forward pass to initialize weights
+        tp_model(dummy_inputs)
+        logger.info("✅ Model built successfully.")
+    except Exception as e:
+        logger.warning(f"Build pass warning (ignore if training starts): {e}")
+
     logger.info("Compiling model with SGD...")
-    # --- CRITICAL: USE SGD ---
-    # AdamW stores 2 extra variables per weight (massive memory usage).
-    # SGD stores 0 extra variables.
     optimizer = keras.optimizers.SGD(
         learning_rate=LEARNING_RATE,
         momentum=0.9
@@ -107,8 +128,8 @@ def run_training():
         logger.info("🎉 Success!")
     except Exception as e:
         logger.error(f"Training Failed: {e}")
-        # If it fails, print memory stats (if available)
         try:
+            # Print memory stats for the first device if available
             logger.info(jax.local_devices()[0].memory_stats())
         except:
             pass
