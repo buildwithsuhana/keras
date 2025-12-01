@@ -1,3 +1,4 @@
+import re
 from keras.src import layers
 from keras.src.distribution.tensor_parallel.tensor_layout import (
     split_tensor_for_parallelism,
@@ -58,51 +59,85 @@ def _apply_layer_sharding_rules(layer, full_name, device_count, state_rules, out
     """
     Helper function that applies rules to a single layer instance.
     """
-    if isinstance(layer, layers.Dense):
-        mlp_type = analyze_dense_layer(layer)
-
-        if mlp_type == 'up_projection':
-            state_rules[f"{full_name}.kernel"] = _split_rule(device_count, dim=1)
-            if layer.use_bias:
-                state_rules[f"{full_name}.bias"] = _split_rule(device_count, dim=0)
-            output_rules[f"{full_name}"] = {0: "gather"}
-
-        elif mlp_type == 'down_projection':
+    # Helper to check names case-insensitively
+    lname = layer.name.lower() if layer.name else ""
+    
+    # --- 1. DENSE / EINSUM DENSE LAYERS ---
+    if isinstance(layer, (layers.Dense, layers.EinsumDense)):
+        # Identify Layer Type by Name (Gemma / Llama / Standard Transformers)
+        is_down_proj = any(x in lname for x in ["down_proj", "output", "o_proj", "ffw_linear"])
+        is_up_proj = any(x in lname for x in ["up_proj", "gate", "ffw_gating"])
+        is_qkv = any(x in lname for x in ["query", "key", "value", "q_proj", "k_proj", "v_proj"])
+        
+        # --- Strategy A: Down Projections (Row Parallel) ---
+        # Split Input (dim 0) -> Sum Reduction on Output
+        if is_down_proj:
             state_rules[f"{full_name}.kernel"] = _split_rule(device_count, dim=0)
             output_rules[f"{full_name}"] = {0: "allreduce"}
-
-        else:
+            
+        # --- Strategy B: Up Projections & QKV (Column Parallel) ---
+        # Split Output (dim 1) -> No Reduction needed yet
+        elif is_up_proj or is_qkv:
             state_rules[f"{full_name}.kernel"] = _split_rule(device_count, dim=1)
-            if layer.use_bias:
+            if hasattr(layer, "bias") and layer.bias is not None:
                 state_rules[f"{full_name}.bias"] = _split_rule(device_count, dim=0)
             output_rules[f"{full_name}"] = {0: "gather -1"}
-
-    elif isinstance(layer, layers.EinsumDense):
-        if "attention_output" in full_name:
-            state_rules[f"{full_name}.kernel"] = _split_rule(device_count, dim=0)
-            output_rules[f"{full_name}"] = {0: "allreduce"}
+            
+        # --- Strategy C: Fallback (Heuristic based on Shape) ---
+        # Only for standard Dense layers where name matching failed
+        elif isinstance(layer, layers.Dense):
+            mlp_type = analyze_dense_layer(layer)
+            if mlp_type == 'up_projection':
+                state_rules[f"{full_name}.kernel"] = _split_rule(device_count, dim=1)
+                if layer.use_bias:
+                    state_rules[f"{full_name}.bias"] = _split_rule(device_count, dim=0)
+                output_rules[f"{full_name}"] = {0: "gather"}
+            elif mlp_type == 'down_projection':
+                state_rules[f"{full_name}.kernel"] = _split_rule(device_count, dim=0)
+                output_rules[f"{full_name}"] = {0: "allreduce"}
+            else:
+                state_rules[f"{full_name}.kernel"] = _split_rule(device_count, dim=1)
+                if layer.use_bias:
+                    state_rules[f"{full_name}.bias"] = _split_rule(device_count, dim=0)
+                output_rules[f"{full_name}"] = {0: "gather -1"}
+        
+        # --- Strategy D: Fallback for EinsumDense (Default to Column) ---
         else:
             state_rules[f"{full_name}.kernel"] = _split_rule(device_count, dim=1)
             if hasattr(layer, 'bias') and layer.bias is not None:
                 state_rules[f"{full_name}.bias"] = _split_rule(device_count, dim=0)
             output_rules[f"{full_name}"] = {0: "gather -1"}
 
+    # --- 2. EMBEDDING LAYERS ---
     elif isinstance(layer, (layers.Embedding,)) or "Embedding" in layer.__class__.__name__:
+        # Vocabulary Parallelism (Split dim 1 of weights, which is typically vocab_size if transposed, 
+        # but in Keras Embedding it is (vocab_size, dim), so we usually split dim 0 for Row Parallel 
+        # or dim 1 for Column Parallel depending on usage. 
+        # For simple data parallelism safe-guarding, we split dim 1 (embedding dim) so we don't need allreduce on lookups).
+        
         if hasattr(layer, 'weights'):
             for weight in layer.weights:
+                # Match "embeddings", "token_embedding", "position_embedding"
                 if "embedding" in weight.name or "weight" in weight.name:
-                    key_found = False
-                    for attr_candidate in ['embeddings', 'position_embeddings', 'weight']:
-                        if getattr(layer, attr_candidate, None) is weight:
-                            state_rules[f"{full_name}.{attr_candidate}"] = _split_rule(device_count, dim=1)
-                            key_found = True
+                    # Construct rule key
+                    # We try to match the attribute name on the layer object
+                    attr_name = None
+                    for candidate in ['embeddings', 'token_embedding', 'position_embedding', 'weight']:
+                        if getattr(layer, candidate, None) is weight:
+                            attr_name = candidate
                             break
                     
-                    if not key_found:
-                        clean_name = weight.name.split('/')[-1].split(':')[0]
-                        state_rules[f"{full_name}.{clean_name}"] = _split_rule(device_count, dim=1)
+                    if not attr_name:
+                        # Fallback: parse from variable name (e.g. 'token_embedding/embeddings:0')
+                        attr_name = weight.name.split('/')[-1].split(':')[0]
 
-            output_rules[f"{full_name}"] = {0: "no_comm"}
+                    # Split Embedding Dimension (Column Parallel)
+                    # This means each device holds partial embedding vector for ALL tokens.
+                    # Output of lookup will be partial vectors -> Gather needed.
+                    state_rules[f"{full_name}.{attr_name}"] = _split_rule(device_count, dim=1)
+
+            # Mark output as needing gathering (concatenation along last dim)
+            output_rules[f"{full_name}"] = {0: "gather -1"}
 
 
 def get_default_config(module, device_ids):
@@ -116,6 +151,8 @@ def get_default_config(module, device_ids):
     
     processed_layers = set()
     
+    # Traverse the model to find layers
+    # We use a stack to avoid recursion depth issues
     stack = [(module, "")]
 
     while stack:
@@ -125,44 +162,44 @@ def get_default_config(module, device_ids):
             continue
         processed_layers.add(id(current_layer))
 
+        # Handle Naming: Use 'name' but ensure unique paths
         name = current_layer.name
         full_name = f"{prefix}.{name}" if prefix else name
+        
+        # Fix for path inconsistency: 
+        # Sometimes prefix ends with the same string as name (e.g. gemma_backbone.gemma_backbone)
+        # We clean this up to match variable paths more closely
+        parts = full_name.split('.')
+        clean_parts = []
+        for p in parts:
+            if not clean_parts or clean_parts[-1] != p:
+                clean_parts.append(p)
+        full_name = ".".join(clean_parts)
 
+        # Apply Rules
         _apply_layer_sharding_rules(
             current_layer, full_name, device_count, state_rules, output_rules
         )
 
         children_to_add = []
 
+        # 1. Standard Layers traversal
         if hasattr(current_layer, 'layers') and current_layer.layers:
             for sub_layer in current_layer.layers:
                 children_to_add.append((sub_layer, full_name))
 
-        for specific_attr in ['token_embedding', 'embeddings', 'position_embedding']:
+        # 2. Special Attributes traversal (Backbones often store layers in attrs)
+        for specific_attr in ['token_embedding', 'embeddings', 'position_embedding', 'backbone', 'transformer_layers']:
             if hasattr(current_layer, specific_attr):
                 attr_val = getattr(current_layer, specific_attr)
                 if isinstance(attr_val, layers.Layer):
                     children_to_add.append((attr_val, full_name))
+                elif isinstance(attr_val, (list, tuple)):
+                    for i, item in enumerate(attr_val):
+                        if isinstance(item, layers.Layer):
+                            # Ensure list items get unique names in path
+                            children_to_add.append((item, f"{full_name}"))
 
-        for attr_name in dir(current_layer):
-            if attr_name.startswith('__') and attr_name.endswith('__'):
-                continue
-            
-            if attr_name in ['trainable_variables', 'non_trainable_variables', 'weights']:
-                continue
-
-            attr_value = getattr(current_layer, attr_name, None)
-
-            if attr_value is None:
-                continue
-
-            if isinstance(attr_value, layers.Layer) and attr_value is not current_layer:
-                children_to_add.append((attr_value, full_name))
-            elif isinstance(attr_value, (list, tuple)):
-                for item in attr_value:
-                    if isinstance(item, layers.Layer):
-                        children_to_add.append((item, full_name))
-        
         stack.extend(reversed(children_to_add))
 
     return LayoutMap(
