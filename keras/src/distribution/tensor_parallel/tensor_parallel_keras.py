@@ -92,6 +92,23 @@ class TensorParallelKeras(Model):
                 device_id=device_id,
             )
 
+            # --- C. MIGRATE VARIABLES TO DEVICE (Fixes TFRT_CPU_0 error) ---
+            # Unsharded variables (biases, layernorms) are still on CPU because of step A.
+            # We must explicitly push them to the TPU to avoid hybrid execution crashes.
+            try:
+                import jax
+                # 1. Identify target JAX device object
+                target_idx = int(device_id.split(":")[-1])
+                target_device = next(d for d in jax.devices() if d.id == target_idx)
+                
+                # 2. Move every variable in this shard to that device
+                for v in shard.variables:
+                    # jax.device_put is efficient: it's a no-op if already on device
+                    v.assign(jax.device_put(v.value, target_device))
+            except Exception as e:
+                print(f"⚠️ Migration warning: {e}")
+            # ---------------------------------------------------------------
+
             # Ensure unique layer & model names
             suffix = f"_tp{rank}"
             try:
@@ -105,10 +122,10 @@ class TensorParallelKeras(Model):
                 except Exception:
                     continue
 
-            # C. Store Shard
+            # D. Store Shard
             self.model_shards.append(shard)
             
-            # D. Cleanup CPU Skeleton
+            # E. Cleanup CPU Skeleton
             gc.collect()
             print(f"[{device_id}] ✅ Shard ready.")
 
