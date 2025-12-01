@@ -2,14 +2,10 @@ import re
 from typing import Any
 
 import numpy as np
-from keras.src import saving
-
+import keras
 from keras.src import ops
 from keras.src import optimizers
-import keras
-
 from keras.src.backend import distribution_lib
-
 
 class CoordinatedOptimizer:
     """Manages an optimizer's state for distributed training."""
@@ -54,7 +50,6 @@ class CoordinatedOptimizer:
                 continue
 
             state_suffix = path_parts[1]
-
             found_param = None
             slot_name = None
             
@@ -96,6 +91,8 @@ class CoordinatedOptimizer:
         self, state_variable: Any, dim: int
     ) -> list[np.ndarray]:
         """Splits a single state variable numpy array into chunks."""
+        # Forces conversion to NumPy (CPU), ensuring the Coordinator holds the state
+        # in system RAM, avoiding TPU OOM.
         state_array = ops.convert_to_numpy(state_variable)
         if (
             state_array.ndim > dim
@@ -162,9 +159,8 @@ class CoordinatedOptimizer:
         for shard_idx in range(self.device_count):
             local_states = self._get_local_optimizer_states(shard_idx)
             
-            # FIX: Robustly get the optimizer from the shard
+            # Robustly get the optimizer from the shard
             shard_opt = shard_models[shard_idx].optimizer
-            # If the shard optimizer is wrapped (e.g. LossScale), peel it
             if hasattr(shard_opt, "inner_optimizer"): 
                 shard_opt = shard_opt.inner_optimizer
             elif hasattr(shard_opt, "base_optimizer"):
@@ -275,6 +271,7 @@ class CoordinatedOptimizer:
                     if g_and_v[i][0] is not None
                 ]
                 if grads_to_reduce:
+                    # Sync gradients across devices
                     synced_grad = self._allreduce_gradients(grads_to_reduce)[0] 
                     for shard_idx in range(self.device_count):
                         if gradients_and_vars[shard_idx][i][0] is not None:
@@ -286,27 +283,18 @@ class CoordinatedOptimizer:
 
     def _allreduce_gradients(self, gradients: list[Any]) -> list[Any]:
         """Performs a mean all-reduce operation on a list of gradients.
-
-        This method uses the on-device communication primitive from the backend
-        (e.g., JAX's lax.pmean) when multiple devices are detected, resolving
-        the critical performance issue related to CPU transfers.
+        
+        Since this code runs on the Coordinator (Host), we treat the gradients
+        (which physically reside on different devices) as a list of tensors.
+        We simply stack and mean them. JAX handles the cross-device data movement.
         """
         if not gradients:
             return []
 
-        if distribution_lib.get_device_count() > 1:
-            local_grad = gradients[0]
-            # Use JAX pmean if available for efficient TPU reduction
-            try:
-                import jax
-                synced_tensor = jax.lax.pmean(local_grad, axis_name="model")
-            except:
-                 synced_tensor = distribution_lib.all_reduce(
-                    local_grad, op="mean", axis_name="model"
-                )
-
-            return [synced_tensor for _ in range(self.device_count)]
-
+        # FIX: Removed the incorrect use of jax.lax.pmean/distribution_lib.all_reduce.
+        # Those are for SPMD (Single Program Multiple Data) contexts.
+        # Here we are in a central coordinator context, so we use explicit stack+mean.
+        
         if len(gradients) == 1:
             mean_grad = ops.convert_to_tensor(gradients[0])
         else:
@@ -367,7 +355,6 @@ class TensorParallelOptimizer(optimizers.Optimizer):
             tensor_parallel_config=tensor_parallel_config,
         )
 
-    # UNCOMMENTED AND FIXED
     def apply_gradients(self, grads_and_vars: list, **kwargs):
         """Applies gradients to the model variables."""
         is_sharded_grads = (

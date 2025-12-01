@@ -88,14 +88,28 @@ def inspect_model_shards(tp_model, target_devices):
     for i, shard in enumerate(tp_model.model_shards):
         expected_device = target_devices[i]
         
-        # Check the device of the first trainable variable (usually embedding or kernel)
+        # Check the device of the first trainable variable
         if not shard.trainable_variables:
             logger.warning(f"   ⚠️ Shard {i} has no trainable variables!")
             continue
             
         first_var = shard.trainable_variables[0]
-        actual_device = str(first_var.device)
         
+        # FIX: Robustly get device for Keras 3 + JAX
+        try:
+            # Method 1: Check if it's a JAX Array in .value
+            if hasattr(first_var, 'value') and hasattr(first_var.value, 'devices'):
+                # jax.Array returns a set of devices
+                devs = list(first_var.value.devices())
+                actual_device = str(devs[0]) if devs else "Unknown"
+            # Method 2: Standard .device property
+            elif hasattr(first_var, 'device'):
+                actual_device = str(first_var.device)
+            else:
+                actual_device = "Unknown (No device attr)"
+        except Exception as e:
+            actual_device = f"Error: {e}"
+
         status = "✅ OK" if str(expected_device) in actual_device else "❌ WRONG DEVICE"
         logger.info(f"   Shard {i} | Expect: {expected_device} | Actual: {actual_device} | {status}")
 
@@ -116,9 +130,17 @@ def inspect_optimizer_state(tp_model):
     on_tpu0 = 0
     on_cpu = 0
     for v in vars:
-        d = str(v.device).lower()
-        if "tpu:0" in d: on_tpu0 += 1
-        if "cpu" in d: on_cpu += 1
+        try:
+            d = "unknown"
+            if hasattr(v, 'value') and hasattr(v.value, 'devices'):
+                d = str(list(v.value.devices())[0]).lower()
+            elif hasattr(v, 'device'):
+                d = str(v.device).lower()
+            
+            if "tpu:0" in d: on_tpu0 += 1
+            if "cpu" in d: on_cpu += 1
+        except:
+            pass
         
     logger.info(f"   Optimizer Variables Total: {len(vars)}")
     logger.info(f"   ↳ On TPU:0 : {on_tpu0} (⚠️ High number = OOM Risk)")
