@@ -151,6 +151,11 @@ def run_training():
         metrics=["accuracy"],
         jit_compile=False
     )
+    logger.info("🕵️ Verifying Shard Placement...")
+    for i, shard in enumerate(tp_model.model_shards):
+        # Check the device of the first weight in each shard
+        first_weight = shard.trainable_variables[0]
+        logger.info(f"Shard {i} | Device: {first_weight.device} | Shape: {first_weight.shape}")
 
     logger.info("Starting Training Loop...")
     try:
