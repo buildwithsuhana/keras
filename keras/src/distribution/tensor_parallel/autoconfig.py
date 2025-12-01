@@ -65,18 +65,17 @@ def _apply_layer_sharding_rules(layer, full_name, device_count, state_rules, out
     # --- 1. DENSE / EINSUM DENSE LAYERS ---
     if isinstance(layer, (layers.Dense, layers.EinsumDense)):
         # Identify Layer Type by Name (Gemma / Llama / Standard Transformers)
+        # Note: "gating_ffw_2" contains "gate", so it matches is_up_proj
         is_down_proj = any(x in lname for x in ["down_proj", "output", "o_proj", "ffw_linear"])
         is_up_proj = any(x in lname for x in ["up_proj", "gate", "ffw_gating"])
         is_qkv = any(x in lname for x in ["query", "key", "value", "q_proj", "k_proj", "v_proj"])
         
         # --- Strategy A: Down Projections (Row Parallel) ---
-        # Split Input (dim 0) -> Sum Reduction on Output
         if is_down_proj:
             state_rules[f"{full_name}.kernel"] = _split_rule(device_count, dim=0)
             output_rules[f"{full_name}"] = {0: "allreduce"}
             
         # --- Strategy B: Up Projections & QKV (Column Parallel) ---
-        # Split Output (dim 1) -> No Reduction needed yet
         elif is_up_proj or is_qkv:
             state_rules[f"{full_name}.kernel"] = _split_rule(device_count, dim=1)
             if hasattr(layer, "bias") and layer.bias is not None:
@@ -84,7 +83,6 @@ def _apply_layer_sharding_rules(layer, full_name, device_count, state_rules, out
             output_rules[f"{full_name}"] = {0: "gather -1"}
             
         # --- Strategy C: Fallback (Heuristic based on Shape) ---
-        # Only for standard Dense layers where name matching failed
         elif isinstance(layer, layers.Dense):
             mlp_type = analyze_dense_layer(layer)
             if mlp_type == 'up_projection':
@@ -110,17 +108,9 @@ def _apply_layer_sharding_rules(layer, full_name, device_count, state_rules, out
 
     # --- 2. EMBEDDING LAYERS ---
     elif isinstance(layer, (layers.Embedding,)) or "Embedding" in layer.__class__.__name__:
-        # Vocabulary Parallelism (Split dim 1 of weights, which is typically vocab_size if transposed, 
-        # but in Keras Embedding it is (vocab_size, dim), so we usually split dim 0 for Row Parallel 
-        # or dim 1 for Column Parallel depending on usage. 
-        # For simple data parallelism safe-guarding, we split dim 1 (embedding dim) so we don't need allreduce on lookups).
-        
         if hasattr(layer, 'weights'):
             for weight in layer.weights:
-                # Match "embeddings", "token_embedding", "position_embedding"
                 if "embedding" in weight.name or "weight" in weight.name:
-                    # Construct rule key
-                    # We try to match the attribute name on the layer object
                     attr_name = None
                     for candidate in ['embeddings', 'token_embedding', 'position_embedding', 'weight']:
                         if getattr(layer, candidate, None) is weight:
@@ -128,22 +118,19 @@ def _apply_layer_sharding_rules(layer, full_name, device_count, state_rules, out
                             break
                     
                     if not attr_name:
-                        # Fallback: parse from variable name (e.g. 'token_embedding/embeddings:0')
                         attr_name = weight.name.split('/')[-1].split(':')[0]
 
-                    # Split Embedding Dimension (Column Parallel)
-                    # This means each device holds partial embedding vector for ALL tokens.
-                    # Output of lookup will be partial vectors -> Gather needed.
                     state_rules[f"{full_name}.{attr_name}"] = _split_rule(device_count, dim=1)
 
-            # Mark output as needing gathering (concatenation along last dim)
             output_rules[f"{full_name}"] = {0: "gather -1"}
 
 
 def get_default_config(module, device_ids):
     """
     Generates a default tensor parallelism configuration for a model using
-    iterative graph traversal (stack-based).
+    iterative graph traversal.
+    
+    FIXED: Handles root model naming correctly so paths align with Keras variable.path.
     """
     device_count = len(device_ids)
     state_rules = {}
@@ -151,9 +138,9 @@ def get_default_config(module, device_ids):
     
     processed_layers = set()
     
-    # Traverse the model to find layers
-    # We use a stack to avoid recursion depth issues
-    stack = [(module, "")]
+    # We use a tuple (layer, prefix)
+    # Start with None as prefix to indicate the root layer
+    stack = [(module, None)]
 
     while stack:
         current_layer, prefix = stack.pop()
@@ -162,13 +149,16 @@ def get_default_config(module, device_ids):
             continue
         processed_layers.add(id(current_layer))
 
-        # Handle Naming: Use 'name' but ensure unique paths
         name = current_layer.name
-        full_name = f"{prefix}.{name}" if prefix else name
         
-        # Fix for path inconsistency: 
-        # Sometimes prefix ends with the same string as name (e.g. gemma_backbone.gemma_backbone)
-        # We clean this up to match variable paths more closely
+        # Logic Change: If prefix is None (Root), we use empty string for prefix
+        # This ensures the first children don't get the root model name prefixed.
+        if prefix is None:
+            full_name = "" 
+        else:
+            full_name = f"{prefix}.{name}" if prefix else name
+        
+        # Clean up repeated parts (e.g. gemma_backbone.gemma_backbone)
         parts = full_name.split('.')
         clean_parts = []
         for p in parts:
@@ -188,7 +178,7 @@ def get_default_config(module, device_ids):
             for sub_layer in current_layer.layers:
                 children_to_add.append((sub_layer, full_name))
 
-        # 2. Special Attributes traversal (Backbones often store layers in attrs)
+        # 2. Special Attributes traversal
         for specific_attr in ['token_embedding', 'embeddings', 'position_embedding', 'backbone', 'transformer_layers']:
             if hasattr(current_layer, specific_attr):
                 attr_val = getattr(current_layer, specific_attr)
@@ -197,7 +187,6 @@ def get_default_config(module, device_ids):
                 elif isinstance(attr_val, (list, tuple)):
                     for i, item in enumerate(attr_val):
                         if isinstance(item, layers.Layer):
-                            # Ensure list items get unique names in path
                             children_to_add.append((item, f"{full_name}"))
 
         stack.extend(reversed(children_to_add))
