@@ -65,13 +65,6 @@ def model_factory():
     logger.info(f"🏭 Factory: Loading {MODEL_PRESET}...")
     with keras.device("cpu"):
         model = keras_hub.models.GemmaCausalLM.from_preset(MODEL_PRESET)
-        
-        # --- CRITICAL MEMORY SAVER: INT8 WEIGHTS ---
-        logger.info("📉 Quantizing backbone to Int8...")
-        model.backbone.quantize("int8")
-        
-        logger.info("✨ Enabling LoRA (Rank=4)...")
-        model.backbone.enable_lora(rank=4)
         return model
 
 def run_training():
