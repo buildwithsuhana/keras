@@ -65,7 +65,6 @@ def _apply_layer_sharding_rules(layer, full_name, device_count, state_rules, out
     # --- 1. DENSE / EINSUM DENSE LAYERS ---
     if isinstance(layer, (layers.Dense, layers.EinsumDense)):
         # Identify Layer Type by Name (Gemma / Llama / Standard Transformers)
-        # Note: "gating_ffw_2" contains "gate", so it matches is_up_proj
         is_down_proj = any(x in lname for x in ["down_proj", "output", "o_proj", "ffw_linear"])
         is_up_proj = any(x in lname for x in ["up_proj", "gate", "ffw_gating"])
         is_qkv = any(x in lname for x in ["query", "key", "value", "q_proj", "k_proj", "v_proj"])
@@ -127,10 +126,8 @@ def _apply_layer_sharding_rules(layer, full_name, device_count, state_rules, out
 
 def get_default_config(module, device_ids):
     """
-    Generates a default tensor parallelism configuration for a model using
-    iterative graph traversal.
-    
-    FIXED: Handles root model naming correctly so paths align with Keras variable.path.
+    Generates a default tensor parallelism configuration for a model.
+    Fixes path generation to match Keras variable names robustly.
     """
     device_count = len(device_ids)
     state_rules = {}
@@ -138,7 +135,6 @@ def get_default_config(module, device_ids):
     
     processed_layers = set()
     
-    # We use a tuple (layer, prefix)
     # Start with None as prefix to indicate the root layer
     stack = [(module, None)]
 
@@ -151,14 +147,20 @@ def get_default_config(module, device_ids):
 
         name = current_layer.name
         
-        # Logic Change: If prefix is None (Root), we use empty string for prefix
-        # This ensures the first children don't get the root model name prefixed.
+        # LOGIC CHANGE: 
+        # 1. If prefix is None (Root), start with empty string.
+        # 2. If layer is a Backbone, DO NOT append its name. 
+        #    This allows the regex to match 'decoder_block_0' directly, which works
+        #    whether the variable path is 'backbone/decoder_block_0' or just 'decoder_block_0'.
+        
         if prefix is None:
-            full_name = "" 
+            full_name = ""
+        elif "Backbone" in current_layer.__class__.__name__:
+            full_name = prefix  # Skip appending backbone name
         else:
             full_name = f"{prefix}.{name}" if prefix else name
         
-        # Clean up repeated parts (e.g. gemma_backbone.gemma_backbone)
+        # Clean up repeated parts (e.g. gemma.gemma) just in case
         parts = full_name.split('.')
         clean_parts = []
         for p in parts:
