@@ -221,5 +221,16 @@ class TensorParallelKeras(Model):
                     var_map[key][i] = v
             opt._shard_var_map = var_map
             super().compile(optimizer=opt, **kwargs)
+            for i, shard in enumerate(self.model_shards):
+                # Use a fresh optimizer instance for each shard
+                # (clone from the global config)
+                if isinstance(optimizer, str):
+                    shard_opt = keras.optimizers.get(optimizer)
+                else:
+                    shard_opt = optimizer.from_config(optimizer.get_config())
+                
+                # Force compilation on the specific device
+                with keras.device(self.devices[i]):
+                    shard.compile(optimizer=shard_opt, **kwargs)
         else:
             super().compile(optimizer=optimizer, **kwargs)

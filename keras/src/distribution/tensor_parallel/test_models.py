@@ -2,6 +2,7 @@ import os
 import gc
 import shutil
 import logging
+import time
 import numpy as np
 
 # --- 1. Aggressive Memory Environment Variables ---
@@ -24,7 +25,7 @@ import tensorflow_datasets as tfds
 keras.config.set_dtype_policy("bfloat16")
 tf.config.set_visible_devices([], "GPU")
 
-logging.basicConfig(level=logging.INFO, format="%(levelname)s - %(message)s")
+logging.basicConfig(level=logging.INFO, format="%(asctime)s - %(levelname)s - %(message)s")
 logger = logging.getLogger(__name__)
 
 # --- 🩹 ADVANCED MONKEY PATCH (Fixes GQA + Driver Mismatch) ---
@@ -32,21 +33,14 @@ try:
     import keras.src.backend.jax.nn as jax_keras_nn
     
     def safe_dot_product_attention(query, key, value, bias=None, mask=None, scale=None, is_causal=False, **kwargs):
-        # 1. FIX SHAPE MISMATCH (GQA Support)
-        # Gemma 2 uses Grouped Query Attention. 
-        # If Query has 16 heads and Key has 8, we must repeat Key 2x to match.
         q_heads = query.shape[-2]
         k_heads = key.shape[-2]
         
         if q_heads != k_heads:
             rep_factor = q_heads // k_heads
-            # Repeat the key/value heads to match query heads
             key = jnp.repeat(key, rep_factor, axis=-2)
             value = jnp.repeat(value, rep_factor, axis=-2)
 
-        # 2. FIX DRIVER CRASH (ConcretizationTypeError)
-        # We force mask=None because the "Pallas" kernel crashes on TPUs with old drivers
-        # when it tries to read the mask. 'is_causal' handles the masking for us.
         return jax.nn.dot_product_attention(
             query, key, value, 
             bias=bias, 
@@ -71,9 +65,69 @@ LEARNING_RATE = 1e-4
 EPOCHS = 1
 STEPS_PER_EPOCH = 5
 
+# --- 🕵️ DEBUGGER HELPERS ---
+def print_memory_stats(stage_name):
+    """Prints the memory usage of TPU:0 to detect leaks/OOMs."""
+    try:
+        # We focus on device 0 because that's where the crash happens
+        device = jax.local_devices()[0]
+        stats = device.memory_stats()
+        gb_in_use = stats.get('bytes_in_use', 0) / 1e9
+        gb_limit = stats.get('bytes_limit', 0) / 1e9
+        utilization = (gb_in_use / gb_limit) * 100 if gb_limit > 0 else 0
+        
+        logger.info(f"📊 MEMORY [TPU:0] @ {stage_name}")
+        logger.info(f"   ↳ Used: {gb_in_use:.2f} GB / {gb_limit:.2f} GB ({utilization:.1f}%)")
+    except Exception as e:
+        logger.warning(f"   ↳ Could not fetch memory stats: {e}")
+
+def inspect_model_shards(tp_model, target_devices):
+    """Verifies that shards are actually living on different devices."""
+    logger.info("🕵️ INSPECTING SHARD PLACEMENT...")
+    
+    for i, shard in enumerate(tp_model.model_shards):
+        expected_device = target_devices[i]
+        
+        # Check the device of the first trainable variable (usually embedding or kernel)
+        if not shard.trainable_variables:
+            logger.warning(f"   ⚠️ Shard {i} has no trainable variables!")
+            continue
+            
+        first_var = shard.trainable_variables[0]
+        actual_device = str(first_var.device)
+        
+        status = "✅ OK" if str(expected_device) in actual_device else "❌ WRONG DEVICE"
+        logger.info(f"   Shard {i} | Expect: {expected_device} | Actual: {actual_device} | {status}")
+
+def inspect_optimizer_state(tp_model):
+    """Checks where the optimizer variables are being allocated."""
+    logger.info("🕵️ INSPECTING OPTIMIZER STATE...")
+    
+    if not hasattr(tp_model.optimizer, 'variables'):
+        logger.warning("   ⚠️ Optimizer has no variables yet (Build not called?)")
+        return
+
+    vars = tp_model.optimizer.variables
+    if not vars:
+        logger.info("   Optimizer has 0 variables (might be SGD with no momentum).")
+        return
+
+    # Check the first few variables
+    on_tpu0 = 0
+    on_cpu = 0
+    for v in vars:
+        d = str(v.device).lower()
+        if "tpu:0" in d: on_tpu0 += 1
+        if "cpu" in d: on_cpu += 1
+        
+    logger.info(f"   Optimizer Variables Total: {len(vars)}")
+    logger.info(f"   ↳ On TPU:0 : {on_tpu0} (⚠️ High number = OOM Risk)")
+    logger.info(f"   ↳ On CPU   : {on_cpu} (✅ Preferred for Coordinator)")
+
+# ---------------------------------------------------------------
+
 def get_devices():
     devices = jax.devices()
-    # Filter for TPUs/GPUs only
     accel_devices = [d for d in devices if d.platform != "cpu"]
     return (len(accel_devices), accel_devices) if accel_devices else (0, [])
 
@@ -87,14 +141,12 @@ def load_data(preset):
     if isinstance(tokens, dict): tokens = tokens["token_ids"]
     tokens = np.array(tokens)
     
-    # Ensure tokens are split exactly into input+label blocks
     total_tokens = (len(tokens) // (SEQUENCE_LENGTH + 1)) * (SEQUENCE_LENGTH + 1)
     tokens = tokens[:total_tokens].reshape(-1, SEQUENCE_LENGTH + 1)
     
     dataset = tf.data.Dataset.from_tensor_slices(tokens)
     
     def prepare_batch(batch):
-        # We keep the dictionary structure Keras expects
         return (
             {
                 "token_ids": batch[:-1], 
@@ -108,12 +160,13 @@ def load_data(preset):
 
 def model_factory():
     logger.info(f"🏭 Factory: Loading {MODEL_PRESET}...")
-    # Load initial model on CPU to avoid OOM before sharding
     with keras.device("cpu"):
         model = keras_hub.models.GemmaCausalLM.from_preset(MODEL_PRESET)
         return model
 
 def run_training():
+    print_memory_stats("STARTUP")
+    
     device_count, target_devices = get_devices()
     logger.info(f"Devices detected: {device_count}")
     
@@ -132,17 +185,21 @@ def run_training():
         device_count=device_count,
         device_ids=[str(d) for d in target_devices]
     )
+    print_memory_stats("AFTER TP INIT (Model Loaded)")
 
     logger.info("🔧 Manually building model to ensure variable initialization...")
-    # CHANGE: Removed try/except block. If this fails, we want to crash NOW.
     dummy_inputs = {
         "token_ids": np.zeros((BATCH_SIZE, SEQUENCE_LENGTH), dtype="int32"),
         "padding_mask": np.ones((BATCH_SIZE, SEQUENCE_LENGTH), dtype="int32"),
     }
     tp_model(dummy_inputs)
-    logger.info("✅ Model built successfully.")
+    print_memory_stats("AFTER BUILD")
+    
+    # DEBUG: Check where shards ended up
+    inspect_model_shards(tp_model, target_devices)
 
     logger.info("Compiling model with SGD...")
+    # Use simple SGD first to minimize optimizer state memory usage
     optimizer = keras.optimizers.SGD(learning_rate=LEARNING_RATE, momentum=0.0)
 
     tp_model.compile(
@@ -151,26 +208,29 @@ def run_training():
         metrics=["accuracy"],
         jit_compile=False
     )
-    logger.info("🕵️ Verifying Shard Placement...")
-    for i, shard in enumerate(tp_model.model_shards):
-        # Check the device of the first weight in each shard
-        first_weight = shard.trainable_variables[0]
-        logger.info(f"Shard {i} | Device: {first_weight.device} | Shape: {first_weight.shape}")
+    
+    # Force optimizer build to check where variables go
+    try:
+        tp_model.optimizer.build(tp_model.trainable_variables)
+        print_memory_stats("AFTER OPTIMIZER BUILD")
+        inspect_optimizer_state(tp_model)
+    except Exception as e:
+        logger.warning(f"Could not manually build optimizer: {e}")
 
     logger.info("Starting Training Loop...")
     try:
         tp_model.fit(train_ds, epochs=EPOCHS, steps_per_epoch=STEPS_PER_EPOCH)
         logger.info("🎉 Success!")
     except Exception as e:
-        logger.error(f"Training Failed: {e}")
-        try:
-            # Attempt to print memory stats for debugging
-            logger.info(jax.local_devices()[0].memory_stats())
-        except:
-            pass
+        logger.error(f"❌ Training Failed: {e}")
+        print_memory_stats("CRASH STATE")
+        
+        # Additional Debugging info on crash
+        logger.info("🔍 DIAGNOSTICS:")
+        logger.info("1. Check 'AFTER OPTIMIZER BUILD' stats above. If TPU:0 usage spiked, the optimizer state is not sharded.")
+        logger.info("2. If 'INSPECTING SHARD PLACEMENT' showed 'WRONG DEVICE', your sharding logic is broken.")
         raise e
     finally:
-        # Cleanup temp weights
         if hasattr(tp_model, 'temp_dir') and os.path.exists(tp_model.temp_dir):
             shutil.rmtree(tp_model.temp_dir)
 
