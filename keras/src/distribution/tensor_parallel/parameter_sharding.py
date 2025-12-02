@@ -19,10 +19,8 @@ class ParameterShardingStrategy:
     def _map_variables_to_owners(self, model):
         """
         Maps variable IDs to (layer, attribute_name).
-        Uses DUCK TYPING to avoid instance check failures between 'keras' and 'keras.src'.
-        Explicitly ignores Classes to prevent 'property object is not iterable' errors.
         """
-        print("\n🔍 [DEBUG] Starting Variable Owner Mapping (Duck Typing + Type Filter)...")
+        # print("\n🔍 [DEBUG] Starting Variable Owner Mapping...")
         var_to_owner = {}
         
         # Traverse all layers
@@ -35,82 +33,48 @@ class ParameterShardingStrategy:
                 continue
             visited.add(id(layer))
 
-            # 1. Scan attributes to find variables and sub-layers
-            layer_vars = {} # id -> list of names
+            layer_vars = {} 
             
             for attr_name in dir(layer):
                 if attr_name.startswith("__"): continue
-                
-                try:
-                    attr_val = getattr(layer, attr_name, None)
-                except Exception:
-                    continue
-                
+                try: attr_val = getattr(layer, attr_name, None)
+                except Exception: continue
                 if attr_val is None: continue
+                if isinstance(attr_val, type): continue
 
-                # SKIP CLASSES: hasattr on a class triggers properties, causing false positives
-                if isinstance(attr_val, type):
-                    continue
-
-                # --- CHECK IF ATTRIBUTE IS A VARIABLE (Duck Typing) ---
-                # Check for 'assign', 'value', 'dtype' methods/properties
                 is_var = hasattr(attr_val, 'assign') and hasattr(attr_val, 'value') and hasattr(attr_val, 'dtype')
-                
-                # --- CHECK IF ATTRIBUTE IS A LAYER (Duck Typing) ---
-                # Check for 'weights', 'add_weight'
-                # Must not be a variable, and must NOT be a class
-                is_layer = (hasattr(attr_val, 'weights') and 
-                            hasattr(attr_val, 'add_weight') and 
-                            not is_var)
+                is_layer = (hasattr(attr_val, 'weights') and hasattr(attr_val, 'add_weight') and not is_var)
 
                 if is_var:
                     layer_vars.setdefault(id(attr_val), []).append(attr_name)
-                
                 elif is_layer:
                     stack.append(attr_val)
-                
                 elif isinstance(attr_val, (list, tuple)):
                     for item in attr_val:
                         if item is None or isinstance(item, type): continue
-                        
-                        # Check items in list
                         if hasattr(item, 'weights') and hasattr(item, 'add_weight'):
                             stack.append(item)
 
-            # 2. Resolve best attribute name for variables found on this layer
             for vid, names in layer_vars.items():
-                # Default to first found
                 best_name = names[0]
                 for name in names:
-                    # Prefer attributes starting with '_' (e.g. _kernel) as they are the backing storage
                     if name.startswith("_") and not best_name.startswith("_"):
                         best_name = name
-                
                 var_to_owner[vid] = (layer, best_name)
 
-            # 3. Standard Sub-layer traversal
             if hasattr(layer, 'layers'):
                 try:
-                    # Ensure it is actually iterable (defensive check against properties on classes)
                     sublayers = layer.layers
                     if sublayers and hasattr(sublayers, '__iter__'):
                         stack.extend(sublayers)
-                except Exception:
-                    pass
+                except Exception: pass
 
-        print(f"✅ [DEBUG] Mapped {len(var_to_owner)} variables to their owner layers.\n")
+        # print(f"✅ [DEBUG] Mapped {len(var_to_owner)} variables.\n")
         return var_to_owner
 
     def _replace_variable(self, layer, attr_name, old_var, new_val_tensor):
-        """
-        Replaces 'old_var' with a new Variable containing 'new_val_tensor'.
-        """
         print(f"      🛠️  [Resizing] Replacing '{attr_name}' on layer '{layer.name}'...")
-        
-        # We must instantiate the new variable using the SAME class as the old one
-        # to ensure compatibility (e.g. if it's a specific BackendVariable subclass)
         VarClass = old_var.__class__
-        
         try:
             new_var = VarClass(
                 initializer=new_val_tensor,
@@ -120,7 +84,6 @@ class ParameterShardingStrategy:
                 name=old_var.name
             )
         except Exception:
-            # Fallback to standard Keras Variable if specific class fails constructor
             new_var = keras.Variable(
                 initializer=new_val_tensor,
                 shape=new_val_tensor.shape,
@@ -129,76 +92,80 @@ class ParameterShardingStrategy:
                 name=old_var.name
             )
         
-        # Force set the attribute (bypassing @property setters and Keras tracking)
-        try:
-            object.__setattr__(layer, attr_name, new_var)
-        except Exception as e:
-            print(f"      ⚠️ Failed to set attribute via object.__setattr__: {e}")
-            # Last ditch effort: regular setattr
-            setattr(layer, attr_name, new_var)
+        try: object.__setattr__(layer, attr_name, new_var)
+        except Exception: setattr(layer, attr_name, new_var)
         
-        # Update Keras internal tracking lists
         for lst_name in ['_trainable_weights', '_non_trainable_weights', '_weights', 'weights', 'variables']:
             if hasattr(layer, lst_name):
                 lst = getattr(layer, lst_name)
                 if isinstance(lst, list):
                     for i, v in enumerate(lst):
-                        if v is old_var:
-                            lst[i] = new_var
-                            
+                        if v is old_var: lst[i] = new_var
         return new_var
-    
+
     def _find_layer_by_path(self, model, var_path):
         """
-        Traverses the model using the variable path to find the owner layer and attribute name.
-        Example Path: decoder_block_0/attention/key/kernel
+        Debug-enabled traversal to find a layer by its path string.
         """
+        print(f"      🔎 [PathLookup] Starting lookup for: {var_path}")
         if ":" in var_path: var_path = var_path.split(":")[0]
         parts = var_path.split("/")
-        
-        # The last part is usually the attribute name (e.g., 'kernel', 'bias')
-        # However, sometimes Keras naming adds intermediate scopes.
-        # We try to consume parts until we find a match.
         
         attr_name = parts[-1]
         layer_path = parts[:-1]
         
         current = model
-        
-        # Helper to find a child layer by name in 'layers' list or attributes
+        print(f"      🔎 [PathLookup] Root Node: {current.name if hasattr(current, 'name') else current}")
+
         def find_child(parent, name):
-            # 1. Check direct attributes (fast path for named attributes)
+            # 1. Check direct attributes
             if hasattr(parent, name):
                 val = getattr(parent, name)
-                if hasattr(val, 'weights'): return val # Is a layer
+                if hasattr(val, 'weights'): 
+                    print(f"        -> Found '{name}' as attribute.")
+                    return val
             
             # 2. Check layers list
             if hasattr(parent, 'layers'):
                 for layer in parent.layers:
                     if layer.name == name:
+                        print(f"        -> Found '{name}' in .layers list.")
                         return layer
             return None
 
         for part in layer_path:
-            # If the part matches the current layer name (redundancy), skip
+            print(f"      🔎 [PathLookup] Looking for '{part}' in '{current.name if hasattr(current, 'name') else 'Object'}'...")
+            
             if hasattr(current, 'name') and current.name == part:
+                print(f"        -> Skipping redundant path part '{part}' (matches current name).")
                 continue
                 
             next_node = find_child(current, part)
             if next_node:
                 current = next_node
             else:
-                # If path doesn't match strict hierarchy, we might need to skip 'backbone' or similar invisible wrappers
-                # But for now, if we fail to traverse, we fail.
-                pass
+                print(f"        ❌ Failed to find '{part}' in children/attributes.")
+                # Diagnostic: Print what IS available
+                try:
+                    sublayers = [l.name for l in getattr(current, 'layers', [])]
+                    print(f"        -> Available .layers names: {sublayers[:10]}...")
+                except: pass
+                try:
+                    attrs = [a for a in dir(current) if not a.startswith('_')]
+                    print(f"        -> Available attributes: {attrs[:10]}...")
+                except: pass
+                return None, None
                 
-        # Check if the final node has the attribute
-        # We also check for underscored version (common in Keras 3: .kernel -> ._kernel)
+        # Check attribute
+        print(f"      🔎 [PathLookup] Final check for attribute '{attr_name}' on '{current.name}'")
         if hasattr(current, attr_name):
+            print(f"        -> Found '{attr_name}'.")
             return current, attr_name
         elif hasattr(current, "_" + attr_name):
+            print(f"        -> Found '_{attr_name}'.")
             return current, "_" + attr_name
             
+        print(f"        ❌ Attribute not found.")
         return None, None
 
     def shard_model_parameters(
@@ -227,14 +194,11 @@ class ParameterShardingStrategy:
                         print(f"   ⚠️ Error loading {name}: {e}")
                         continue
 
-                    # 1. Slice on CPU
                     sliced_val = action(source_val, self.rank)
                     
-                    # 2. Move to Device
                     with keras.device(device_id):
                         sliced_val_tensor = ops.convert_to_tensor(sliced_val, dtype=target_var.dtype)
                     
-                    # 3. Assign or Resize
                     if target_var.shape == sliced_val_tensor.shape:
                         target_var.assign(sliced_val_tensor)
                     else:
