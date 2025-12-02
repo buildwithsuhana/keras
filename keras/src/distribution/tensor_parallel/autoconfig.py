@@ -17,7 +17,6 @@ def analyze_dense_layer(layer):
     """
     Classifies a Dense layer based on its input/output dimensions.
     """
-    # Use string check to avoid local vs installed Keras class mismatch
     if "Dense" not in layer.__class__.__name__:
         return 'dense'
 
@@ -59,32 +58,26 @@ def analyze_dense_layer(layer):
 def _apply_layer_sharding_rules(layer, full_name, device_count, state_rules, output_rules):
     """
     Helper function that applies rules to a single layer instance.
-    Uses string checks for class names to ensure compatibility with KerasHub.
     """
     lname = layer.name.lower() if layer.name else ""
     cls_name = layer.__class__.__name__
     
-    # Generate Rule Keys
-    # We strip leading dots if they exist to ensure clean matching
+    # Strip leading dots to ensure clean matching
     clean_name = full_name.lstrip(".")
     rule_key_kernel = f"{clean_name}.kernel"
     rule_key_bias = f"{clean_name}.bias"
 
     # --- 1. DENSE / EINSUM DENSE LAYERS ---
-    # Matches 'Dense', 'EinsumDense', 'QuantizedDense', etc.
     if "Dense" in cls_name:
-        # Identify Layer Type by Name (Gemma / Llama / Standard Transformers)
         is_down_proj = any(x in lname for x in ["down_proj", "output", "o_proj", "ffw_linear"])
         is_up_proj = any(x in lname for x in ["up_proj", "gate", "ffw_gating"])
         is_qkv = any(x in lname for x in ["query", "key", "value", "q_proj", "k_proj", "v_proj"])
         
-        # Strategy A: Down Projections (Row Parallel)
         if is_down_proj:
             print(f"   [Rule] '{clean_name}' -> Down Projection (Row Parallel)")
             state_rules[rule_key_kernel] = _split_rule(device_count, dim=0)
             output_rules[clean_name] = {0: "allreduce"}
             
-        # Strategy B: Up Projections & QKV (Column Parallel)
         elif is_up_proj or is_qkv:
             print(f"   [Rule] '{clean_name}' -> Up Projection/QKV (Column Parallel)")
             state_rules[rule_key_kernel] = _split_rule(device_count, dim=1)
@@ -92,8 +85,6 @@ def _apply_layer_sharding_rules(layer, full_name, device_count, state_rules, out
                 state_rules[rule_key_bias] = _split_rule(device_count, dim=0)
             output_rules[clean_name] = {0: "gather -1"}
             
-        # Strategy C: Fallback (Heuristic based on Shape)
-        # Skip EinsumDense in heuristic as it might not have standard shapes
         elif "EinsumDense" not in cls_name:
             mlp_type = analyze_dense_layer(layer)
             print(f"   [Rule] '{clean_name}' -> Dense Heuristic: {mlp_type}")
@@ -110,8 +101,6 @@ def _apply_layer_sharding_rules(layer, full_name, device_count, state_rules, out
                 if layer.use_bias:
                     state_rules[rule_key_bias] = _split_rule(device_count, dim=0)
                 output_rules[clean_name] = {0: "gather -1"}
-        
-        # Strategy D: Fallback for EinsumDense (Default to Column)
         else:
             print(f"   [Rule] '{clean_name}' -> EinsumDense Fallback (Column Parallel)")
             state_rules[rule_key_kernel] = _split_rule(device_count, dim=1)
@@ -143,6 +132,7 @@ def _apply_layer_sharding_rules(layer, full_name, device_count, state_rules, out
 def get_default_config(module, device_ids):
     """
     Generates a default tensor parallelism configuration for a model.
+    Robustly handles Backbone naming and hidden layers.
     """
     print(f"\n🔍 [AutoConfig] Starting generation for model: {module.name}")
     device_count = len(device_ids)
@@ -151,7 +141,7 @@ def get_default_config(module, device_ids):
     
     processed_layers = set()
     
-    # Use None to indicate the root level, so we don't prefix the root model name
+    # Traverse the model
     stack = [(module, None)]
 
     while stack:
@@ -163,15 +153,17 @@ def get_default_config(module, device_ids):
 
         name = current_layer.name
         
-        # 1. Naming Logic
-        # If prefix is None, we are at root -> name is empty string (don't use model name)
-        # If prefix is string, append current name.
+        # --- Naming Logic Fix ---
         if prefix is None:
             full_name = ""
+        # CRITICAL FIX: Do NOT append Backbone name.
+        # This allows 'decoder_block_0' to be at the root of the path, matching Keras variable paths.
+        elif "Backbone" in current_layer.__class__.__name__:
+            full_name = prefix
         else:
             full_name = f"{prefix}.{name}" if prefix else name
         
-        # 2. Cleanup repeated parts (e.g. gemma.gemma -> gemma)
+        # Cleanup
         parts = full_name.split('.')
         clean_parts = []
         for p in parts:
@@ -179,22 +171,18 @@ def get_default_config(module, device_ids):
                 clean_parts.append(p)
         full_name = ".".join(clean_parts)
 
-        # 3. Apply Rules
+        # Apply Rules
         _apply_layer_sharding_rules(
             current_layer, full_name, device_count, state_rules, output_rules
         )
 
         children_to_add = []
 
-        # 4. ROBUST TRAVERSAL (From tp_2)
-        # Iterate over ALL attributes to find hidden layers (like 'transformer_layers')
-        # This fixes the issue where only embeddings were found.
+        # --- Robust Attribute Traversal ---
         for attr_name in dir(current_layer):
-            # Skip private/internal attributes
             if attr_name.startswith('__') or attr_name.startswith('_'):
                 continue
             
-            # Skip weight lists to avoid re-processing variables as layers
             if attr_name in ['trainable_variables', 'non_trainable_variables', 'weights', 'variables']:
                 continue
 
@@ -206,21 +194,18 @@ def get_default_config(module, device_ids):
             if attr_value is None:
                 continue
 
-            # Check if attribute is a Layer (using loose string check for safety)
             if hasattr(attr_value, "name") and "Layer" in attr_value.__class__.__bases__[0].__name__:
                 if attr_value is not current_layer:
                     children_to_add.append((attr_value, full_name))
             
-            # Check if attribute is a List/Tuple of Layers
             elif isinstance(attr_value, (list, tuple)):
                 for item in attr_value:
                     if hasattr(item, "name") and "Layer" in item.__class__.__bases__[0].__name__:
                         children_to_add.append((item, full_name))
         
-        # Also check standard .layers list just in case
+        # Standard .layers check
         if hasattr(current_layer, 'layers') and current_layer.layers:
             for sub_layer in current_layer.layers:
-                # Avoid duplicates if they were already found via attributes
                 is_duplicate = False
                 for existing_child, _ in children_to_add:
                     if existing_child is sub_layer:
