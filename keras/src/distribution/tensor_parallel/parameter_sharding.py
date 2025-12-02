@@ -19,12 +19,9 @@ class ParameterShardingStrategy:
     def _map_variables_to_owners(self, model):
         """
         Maps variable IDs to (layer, attribute_name).
-        Prioritizes backing attributes (e.g. '_kernel') over properties (e.g. 'kernel').
+        Uses DUCK TYPING to avoid instance check failures between 'keras' and 'keras.src'.
         """
-        # Local import to avoid circular dependency
-        from keras.src.layers.layer import Layer
-        
-        print("\n🔍 [DEBUG] Starting Variable Owner Mapping...")
+        print("\n🔍 [DEBUG] Starting Variable Owner Mapping (Duck Typing Mode)...")
         var_to_owner = {}
         
         # Traverse all layers
@@ -47,16 +44,27 @@ class ParameterShardingStrategy:
                     attr_val = getattr(layer, attr_name, None)
                 except Exception:
                     continue
+                
+                if attr_val is None: continue
 
-                if isinstance(attr_val, keras.Variable):
+                # --- CHECK IF ATTRIBUTE IS A VARIABLE (Duck Typing) ---
+                # Check for 'assign', 'value', 'dtype' methods/properties
+                is_var = hasattr(attr_val, 'assign') and hasattr(attr_val, 'value') and hasattr(attr_val, 'dtype')
+                
+                # --- CHECK IF ATTRIBUTE IS A LAYER (Duck Typing) ---
+                # Check for 'weights', 'add_weight'
+                is_layer = hasattr(attr_val, 'weights') and hasattr(attr_val, 'add_weight') and not is_var
+
+                if is_var:
                     layer_vars.setdefault(id(attr_val), []).append(attr_name)
                 
-                # Robustly check for nested layers
-                elif isinstance(attr_val, Layer):
+                elif is_layer:
                     stack.append(attr_val)
+                
                 elif isinstance(attr_val, (list, tuple)):
                     for item in attr_val:
-                        if isinstance(item, Layer):
+                        # Check items in list
+                        if hasattr(item, 'weights') and hasattr(item, 'add_weight'):
                             stack.append(item)
 
             # 2. Resolve best attribute name for variables found on this layer
@@ -64,13 +72,11 @@ class ParameterShardingStrategy:
                 # Default to first found
                 best_name = names[0]
                 for name in names:
-                    # HEURISTIC: Prefer attributes starting with '_' (e.g. _kernel) 
-                    # as these are usually the writable storage backing a property.
+                    # Prefer attributes starting with '_' (e.g. _kernel) as they are the backing storage
                     if name.startswith("_") and not best_name.startswith("_"):
                         best_name = name
                 
                 var_to_owner[vid] = (layer, best_name)
-                # print(f"   -> Mapped var {vid} to {layer.name}.{best_name} (Candidates: {names})")
 
             # 3. Standard Sub-layer traversal
             if hasattr(layer, 'layers'):
@@ -82,22 +88,35 @@ class ParameterShardingStrategy:
     def _replace_variable(self, layer, attr_name, old_var, new_val_tensor):
         """
         Replaces 'old_var' with a new Variable containing 'new_val_tensor'.
-        Uses object.__setattr__ to bypass built-layer locks and property setters.
         """
         print(f"      🛠️  [Resizing] Replacing '{attr_name}' on layer '{layer.name}'...")
         
-        new_var = keras.Variable(
-            initializer=new_val_tensor,
-            shape=new_val_tensor.shape,
-            dtype=old_var.dtype,
-            trainable=old_var.trainable,
-            name=old_var.name
-        )
+        # We must instantiate the new variable using the SAME class as the old one
+        # to ensure compatibility (e.g. if it's a specific BackendVariable subclass)
+        VarClass = old_var.__class__
+        
+        try:
+            new_var = VarClass(
+                initializer=new_val_tensor,
+                shape=new_val_tensor.shape,
+                dtype=old_var.dtype,
+                trainable=old_var.trainable,
+                name=old_var.name
+            )
+        except Exception:
+            # Fallback to standard Keras Variable if specific class fails
+            new_var = keras.Variable(
+                initializer=new_val_tensor,
+                shape=new_val_tensor.shape,
+                dtype=old_var.dtype,
+                trainable=old_var.trainable,
+                name=old_var.name
+            )
         
         # Force set the attribute (bypassing @property setters and Keras tracking)
         object.__setattr__(layer, attr_name, new_var)
         
-        # Update Keras internal tracking lists to point to the new variable
+        # Update Keras internal tracking lists
         for lst_name in ['_trainable_weights', '_non_trainable_weights', '_weights', 'weights', 'variables']:
             if hasattr(layer, lst_name):
                 lst = getattr(layer, lst_name)
@@ -117,7 +136,6 @@ class ParameterShardingStrategy:
     ) -> Tuple["Model", Set[str]]:
         
         modified = set()
-        # Pre-map all variables to their owners
         var_to_owner = self._map_variables_to_owners(shard_model)
         
         for pattern, action in config.state_rules.items():
@@ -135,32 +153,26 @@ class ParameterShardingStrategy:
                         print(f"   ⚠️ Error loading {name}: {e}")
                         continue
 
-                    # 1. Slice on CPU (NumPy)
+                    # 1. Slice on CPU
                     sliced_val = action(source_val, self.rank)
-                    print(f"   -> Sliced {source_val.shape} -> {sliced_val.shape} (Rank {self.rank})")
-
+                    
                     # 2. Move to Device
                     with keras.device(device_id):
                         sliced_val_tensor = ops.convert_to_tensor(sliced_val, dtype=target_var.dtype)
                     
                     # 3. Assign or Resize
                     if target_var.shape == sliced_val_tensor.shape:
-                        print(f"   -> Shapes match {target_var.shape}. Assigning directly.")
                         target_var.assign(sliced_val_tensor)
                     else:
-                        print(f"   -> Shape Mismatch! Target: {target_var.shape} vs Sliced: {sliced_val_tensor.shape}")
-                        
                         if id(target_var) in var_to_owner:
                             layer, attr_name = var_to_owner[id(target_var)]
                             self._replace_variable(layer, attr_name, target_var, sliced_val_tensor)
                         else:
-                            # If mapping fails, we can't resize.
                             print(f"   ❌ CRITICAL WARNING: Could not find owner layer for {name}. Cannot resize variable!")
                             print(f"   ❌ Attempting direct assign (This will likely fail with ValueError)...")
                             target_var.assign(sliced_val_tensor)
                     
                     modified.add(name)
-                    # Immediate cleanup to save RAM
                     del source_val, sliced_val, sliced_val_tensor
                     gc.collect()
         
