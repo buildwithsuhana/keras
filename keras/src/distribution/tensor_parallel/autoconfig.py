@@ -69,40 +69,47 @@ def _apply_layer_sharding_rules(layer, full_name, device_count, state_rules, out
         is_up_proj = any(x in lname for x in ["up_proj", "gate", "ffw_gating"])
         is_qkv = any(x in lname for x in ["query", "key", "value", "q_proj", "k_proj", "v_proj"])
         
+        rule_key_kernel = f"{full_name}.kernel"
+        rule_key_bias = f"{full_name}.bias"
+
         # --- Strategy A: Down Projections (Row Parallel) ---
         if is_down_proj:
-            state_rules[f"{full_name}.kernel"] = _split_rule(device_count, dim=0)
+            print(f"   [Rule] '{full_name}' -> Down Projection (Row Parallel)")
+            state_rules[rule_key_kernel] = _split_rule(device_count, dim=0)
             output_rules[f"{full_name}"] = {0: "allreduce"}
             
         # --- Strategy B: Up Projections & QKV (Column Parallel) ---
         elif is_up_proj or is_qkv:
-            state_rules[f"{full_name}.kernel"] = _split_rule(device_count, dim=1)
+            print(f"   [Rule] '{full_name}' -> Up Projection/QKV (Column Parallel)")
+            state_rules[rule_key_kernel] = _split_rule(device_count, dim=1)
             if hasattr(layer, "bias") and layer.bias is not None:
-                state_rules[f"{full_name}.bias"] = _split_rule(device_count, dim=0)
+                state_rules[rule_key_bias] = _split_rule(device_count, dim=0)
             output_rules[f"{full_name}"] = {0: "gather -1"}
             
         # --- Strategy C: Fallback (Heuristic based on Shape) ---
         elif isinstance(layer, layers.Dense):
             mlp_type = analyze_dense_layer(layer)
+            print(f"   [Rule] '{full_name}' -> Dense Heuristic: {mlp_type}")
             if mlp_type == 'up_projection':
-                state_rules[f"{full_name}.kernel"] = _split_rule(device_count, dim=1)
+                state_rules[rule_key_kernel] = _split_rule(device_count, dim=1)
                 if layer.use_bias:
-                    state_rules[f"{full_name}.bias"] = _split_rule(device_count, dim=0)
+                    state_rules[rule_key_bias] = _split_rule(device_count, dim=0)
                 output_rules[f"{full_name}"] = {0: "gather"}
             elif mlp_type == 'down_projection':
-                state_rules[f"{full_name}.kernel"] = _split_rule(device_count, dim=0)
+                state_rules[rule_key_kernel] = _split_rule(device_count, dim=0)
                 output_rules[f"{full_name}"] = {0: "allreduce"}
             else:
-                state_rules[f"{full_name}.kernel"] = _split_rule(device_count, dim=1)
+                state_rules[rule_key_kernel] = _split_rule(device_count, dim=1)
                 if layer.use_bias:
-                    state_rules[f"{full_name}.bias"] = _split_rule(device_count, dim=0)
+                    state_rules[rule_key_bias] = _split_rule(device_count, dim=0)
                 output_rules[f"{full_name}"] = {0: "gather -1"}
         
         # --- Strategy D: Fallback for EinsumDense (Default to Column) ---
         else:
-            state_rules[f"{full_name}.kernel"] = _split_rule(device_count, dim=1)
+            print(f"   [Rule] '{full_name}' -> EinsumDense Fallback (Column Parallel)")
+            state_rules[rule_key_kernel] = _split_rule(device_count, dim=1)
             if hasattr(layer, 'bias') and layer.bias is not None:
-                state_rules[f"{full_name}.bias"] = _split_rule(device_count, dim=0)
+                state_rules[rule_key_bias] = _split_rule(device_count, dim=0)
             output_rules[f"{full_name}"] = {0: "gather -1"}
 
     # --- 2. EMBEDDING LAYERS ---
@@ -119,7 +126,9 @@ def _apply_layer_sharding_rules(layer, full_name, device_count, state_rules, out
                     if not attr_name:
                         attr_name = weight.name.split('/')[-1].split(':')[0]
 
-                    state_rules[f"{full_name}.{attr_name}"] = _split_rule(device_count, dim=1)
+                    rule_key = f"{full_name}.{attr_name}"
+                    print(f"   [Rule] '{full_name}' -> Embedding ({attr_name}) (Column Parallel)")
+                    state_rules[rule_key] = _split_rule(device_count, dim=1)
 
             output_rules[f"{full_name}"] = {0: "gather -1"}
 
@@ -129,6 +138,7 @@ def get_default_config(module, device_ids):
     Generates a default tensor parallelism configuration for a model.
     Fixes path generation to match Keras variable names robustly.
     """
+    print(f"\n🔍 [AutoConfig] Starting generation for model: {module.name}")
     device_count = len(device_ids)
     state_rules = {}
     output_rules = {}
@@ -147,12 +157,7 @@ def get_default_config(module, device_ids):
 
         name = current_layer.name
         
-        # LOGIC CHANGE: 
-        # 1. If prefix is None (Root), start with empty string.
-        # 2. If layer is a Backbone, DO NOT append its name. 
-        #    This allows the regex to match 'decoder_block_0' directly, which works
-        #    whether the variable path is 'backbone/decoder_block_0' or just 'decoder_block_0'.
-        
+        # Determine Full Name
         if prefix is None:
             full_name = ""
         elif "Backbone" in current_layer.__class__.__name__:
@@ -193,6 +198,7 @@ def get_default_config(module, device_ids):
 
         stack.extend(reversed(children_to_add))
 
+    print(f"✅ [AutoConfig] Generated {len(state_rules)} sharding rules.\n")
     return LayoutMap(
         state_rules=state_rules,
         output_rules=output_rules
