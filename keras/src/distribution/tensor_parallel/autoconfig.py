@@ -158,7 +158,9 @@ def get_default_config(module, device_ids):
             full_name = ""
         # CRITICAL FIX: Do NOT append Backbone name.
         # This allows 'decoder_block_0' to be at the root of the path, matching Keras variable paths.
-        elif "Backbone" in current_layer.__class__.__name__:
+        # CRITICAL FIX: Check class name properly
+        elif "backbone" in current_layer.__class__.__name__.lower():
+            full_name = prefix
             full_name = prefix
         else:
             full_name = f"{prefix}.{name}" if prefix else name
