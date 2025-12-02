@@ -18,8 +18,8 @@ class ParameterShardingStrategy:
 
     def _map_variables_to_owners(self, model):
         """
-        Creates a mapping from variable object ID to (layer, attribute_name).
-        This allows us to replace the variable on the layer if we need to resize it.
+        Robustly maps variable object IDs to (layer, attribute_name).
+        Uses dir() traversal to find variables hidden in lists or non-standard attributes.
         """
         var_to_owner = {}
         
@@ -33,35 +33,45 @@ class ParameterShardingStrategy:
                 continue
             visited.add(id(layer))
 
-            # Inspect all attributes of the layer to find variables
-            # We look at __dict__ to find the actual name the user/keras uses
-            if hasattr(layer, '__dict__'):
-                for attr_name, attr_val in layer.__dict__.items():
-                    if isinstance(attr_val, keras.Variable):
-                        var_to_owner[id(attr_val)] = (layer, attr_name)
-            
-            # Recurse to sub-layers
+            # 1. Scan all attributes (including hidden ones)
+            for attr_name in dir(layer):
+                if attr_name.startswith("__"): continue
+                
+                try:
+                    attr_val = getattr(layer, attr_name, None)
+                except Exception:
+                    continue
+
+                # Case A: Attribute is a Variable
+                if isinstance(attr_val, keras.Variable):
+                    var_to_owner[id(attr_val)] = (layer, attr_name)
+                
+                # Case B: Attribute is a Layer -> Add to stack
+                elif hasattr(attr_val, "weights") and "Layer" in attr_val.__class__.__bases__[0].__name__:
+                    stack.append(attr_val)
+                
+                # Case C: Attribute is a List/Tuple of Layers or Variables
+                elif isinstance(attr_val, (list, tuple)):
+                    for i, item in enumerate(attr_val):
+                        if isinstance(item, keras.Variable):
+                            # We can't easily replace inside a tuple/list via setattr
+                            # but we track it. For lists, we might support it later if needed.
+                            pass 
+                        elif hasattr(item, "weights"):
+                            stack.append(item)
+
+            # 2. Standard Sub-layer traversal
             if hasattr(layer, 'layers'):
                 stack.extend(layer.layers)
-            
-            # Handle Functional API / Specific submodules
-            if hasattr(layer, '__dict__'):
-                for attr_val in layer.__dict__.values():
-                    if isinstance(attr_val, keras.layers.Layer):
-                        stack.append(attr_val)
-                    elif isinstance(attr_val, (list, tuple)):
-                        for item in attr_val:
-                            if isinstance(item, keras.layers.Layer):
-                                stack.append(item)
 
         return var_to_owner
 
     def _replace_variable(self, layer, attr_name, old_var, new_val_tensor):
         """
-        Replaces 'old_var' with a new Variable containing 'new_val_tensor' 
-        on 'layer' at 'attr_name'. Updates internal weights lists.
+        Replaces 'old_var' with a new Variable containing 'new_val_tensor'.
+        Bypasses Keras state locking using object.__setattr__.
         """
-        # 1. Create new variable with correct shape/dtype/trainable
+        # 1. Create new variable with correct shape
         new_var = keras.Variable(
             initializer=new_val_tensor,
             shape=new_val_tensor.shape,
@@ -70,13 +80,10 @@ class ParameterShardingStrategy:
             name=old_var.name
         )
         
-        # 2. Replace attribute on the layer (e.g. layer.kernel = new_var)
-        # CRITICAL: Use object.__setattr__ to bypass Keras's "built layer" lock check.
-        # Standard setattr(layer, name, val) triggers the tracker which forbids adding/changing state.
+        # 2. Hard Replace on Layer
         object.__setattr__(layer, attr_name, new_var)
         
-        # 3. Update Keras internal tracking lists (_trainable_weights, etc.)
-        # This ensures model.variables returns the NEW variable.
+        # 3. Update Keras internal tracking lists
         for lst_name in ['_trainable_weights', '_non_trainable_weights', '_weights', 'weights', 'variables']:
             if hasattr(layer, lst_name):
                 lst = getattr(layer, lst_name)
@@ -103,47 +110,38 @@ class ParameterShardingStrategy:
                 targets = self._find_matching_parameters(shard_model, pattern)
                 
                 for name, target_var in targets:
-                    # 1. Load ONE weight from disk
                     try:
                         source_val = weight_loader(name)
                         if source_val is None: continue
                     except Exception:
                         continue
 
-                    # 2. Slice (RAM)
+                    # Slice on CPU/RAM
                     sliced_val = action(source_val, self.rank)
                     
-                    # 3. Create Tensor on Device (Cast to variable dtype, e.g., bfloat16)
+                    # Move to TPU
                     with keras.device(device_id):
                         sliced_val_tensor = ops.convert_to_tensor(sliced_val, dtype=target_var.dtype)
                     
-                    # 4. Assign or Resize
+                    # Assign or Resize
                     if target_var.shape == sliced_val_tensor.shape:
                         target_var.assign(sliced_val_tensor)
                     else:
-                        # SHAPE MISMATCH: We must replace the variable
                         if id(target_var) in var_to_owner:
                             layer, attr_name = var_to_owner[id(target_var)]
-                            # Perform replacement
                             self._replace_variable(layer, attr_name, target_var, sliced_val_tensor)
                         else:
-                            # Fallback
-                            print(f"⚠️ Warning: Could not find owner for {name} to resize. Attempting direct assign.")
+                            print(f"⚠️ Warning: Could not find owner for {name}. Attempting direct assign (Might Fail).")
                             target_var.assign(sliced_val_tensor)
                     
                     modified.add(name)
-                    
-                    # 5. Cleanup
-                    del source_val
-                    del sliced_val
-                    del sliced_val_tensor
+                    del source_val, sliced_val, sliced_val_tensor
         
         gc.collect()
         return shard_model, modified
 
     def _find_matching_parameters(self, model, pattern: str):
         matches = []
-        # Note: We must iterate model.variables dynamically because we might have replaced some!
         for v in model.variables:
             name = v.path if hasattr(v, 'path') else v.name
             if re.search(pattern, name):

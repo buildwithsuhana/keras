@@ -5,23 +5,15 @@ from keras.src.distribution.tensor_parallel.tensor_layout import LayoutMap
 
 def _split_tensor_cpu(x, index, device_count, dim):
     """
-    Splits the tensor using standard NumPy on CPU.
-    This prevents JAX from trying to load the full (multi-GB) tensor onto 
-    the GPU just to slice it, which causes OOM.
+    Splits the tensor using standard NumPy on CPU to avoid GPU OOM.
     """
-    # np.array_split returns a list of arrays. We return the specific shard.
     splits = np.array_split(x, device_count, axis=dim)
     return splits[index]
 
 def _split_rule(device_count, dim):
-    """Creates a sharding rule for a specific dimension."""
     return lambda x, index: _split_tensor_cpu(x, index, device_count, dim=dim)
 
-
 def analyze_dense_layer(layer):
-    """
-    Classifies a Dense layer based on its input/output dimensions.
-    """
     if "Dense" not in layer.__class__.__name__:
         return 'dense'
 
@@ -61,13 +53,9 @@ def analyze_dense_layer(layer):
 
 
 def _apply_layer_sharding_rules(layer, full_name, device_count, state_rules, output_rules):
-    """
-    Helper function that applies rules to a single layer instance.
-    """
     lname = layer.name.lower() if layer.name else ""
     cls_name = layer.__class__.__name__
     
-    # Generate Rule Keys
     clean_name = full_name.lstrip(".")
     rule_key_kernel = f"{clean_name}.kernel"
     rule_key_bias = f"{clean_name}.bias"
@@ -85,7 +73,14 @@ def _apply_layer_sharding_rules(layer, full_name, device_count, state_rules, out
             
         elif is_up_proj or is_qkv:
             print(f"   [Rule] '{clean_name}' -> Up Projection/QKV (Column Parallel)")
-            state_rules[rule_key_kernel] = _split_rule(device_count, dim=1)
+            
+            # --- FIX: Handle 3D Kernels (Heads, Input, HeadDim) ---
+            split_dim = 1
+            if hasattr(layer, 'kernel') and layer.kernel is not None:
+                if len(layer.kernel.shape) == 3:
+                    split_dim = 0  # Split the 'Heads' dimension
+            
+            state_rules[rule_key_kernel] = _split_rule(device_count, dim=split_dim)
             if hasattr(layer, "bias") and layer.bias is not None:
                 state_rules[rule_key_bias] = _split_rule(device_count, dim=0)
             output_rules[clean_name] = {0: "gather -1"}
@@ -135,9 +130,6 @@ def _apply_layer_sharding_rules(layer, full_name, device_count, state_rules, out
 
 
 def get_default_config(module, device_ids):
-    """
-    Generates a default tensor parallelism configuration for a model.
-    """
     print(f"\n🔍 [AutoConfig] Starting generation for model: {module.name}")
     device_count = len(device_ids)
     state_rules = {}
@@ -155,7 +147,6 @@ def get_default_config(module, device_ids):
 
         name = current_layer.name
         
-        # --- Naming Logic (Skip Backbone Prefix) ---
         if prefix is None:
             full_name = ""
         elif "backbone" in current_layer.__class__.__name__.lower():
@@ -163,7 +154,6 @@ def get_default_config(module, device_ids):
         else:
             full_name = f"{prefix}.{name}" if prefix else name
         
-        # Cleanup
         parts = full_name.split('.')
         clean_parts = []
         for p in parts:
@@ -171,14 +161,12 @@ def get_default_config(module, device_ids):
                 clean_parts.append(p)
         full_name = ".".join(clean_parts)
 
-        # Apply Rules
         _apply_layer_sharding_rules(
             current_layer, full_name, device_count, state_rules, output_rules
         )
 
         children_to_add = []
 
-        # Robust Traversal
         for attr_name in dir(current_layer):
             if attr_name.startswith('__') or attr_name.startswith('_'):
                 continue
