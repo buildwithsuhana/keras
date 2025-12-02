@@ -19,7 +19,7 @@ class ParameterShardingStrategy:
     def _map_variables_to_owners(self, model):
         """
         Robustly maps variable object IDs to (layer, attribute_name).
-        Uses dir() traversal to find variables hidden in lists or non-standard attributes.
+        Prioritizes real attributes over properties to ensure setability.
         """
         var_to_owner = {}
         
@@ -44,8 +44,29 @@ class ParameterShardingStrategy:
 
                 # Case A: Attribute is a Variable
                 if isinstance(attr_val, keras.Variable):
-                    var_to_owner[id(attr_val)] = (layer, attr_name)
-                
+                    # Determine if this attribute name corresponds to a property on the class
+                    # (properties are often read-only, so we prefer the backing attribute e.g. _kernel vs kernel)
+                    is_property = isinstance(getattr(type(layer), attr_name, None), property)
+                    
+                    var_id = id(attr_val)
+                    
+                    if var_id not in var_to_owner:
+                        var_to_owner[var_id] = (layer, attr_name)
+                    else:
+                        # Conflict resolution: Prefer non-properties (backing storage)
+                        curr_layer, curr_name = var_to_owner[var_id]
+                        curr_is_property = isinstance(getattr(type(curr_layer), curr_name, None), property)
+                        
+                        if curr_is_property and not is_property:
+                            # Replace property reference with backing attribute reference
+                            var_to_owner[var_id] = (layer, attr_name)
+                        elif is_property and not curr_is_property:
+                            # Keep existing backing attribute
+                            pass
+                        elif attr_name.startswith("_") and not curr_name.startswith("_"):
+                            # Tie-breaker: prefer underscored names as they are usually storage
+                            var_to_owner[var_id] = (layer, attr_name)
+
                 # Case B: Attribute is a Layer -> Add to stack
                 elif hasattr(attr_val, "weights") and "Layer" in attr_val.__class__.__bases__[0].__name__:
                     stack.append(attr_val)
@@ -81,6 +102,9 @@ class ParameterShardingStrategy:
         )
         
         # 2. Hard Replace on Layer
+        # We use object.__setattr__ to bypass:
+        # a) Keras 'built' layer locking
+        # b) Potential read-only properties (though our mapping logic avoids selecting those now)
         object.__setattr__(layer, attr_name, new_var)
         
         # 3. Update Keras internal tracking lists
@@ -129,6 +153,7 @@ class ParameterShardingStrategy:
                     else:
                         if id(target_var) in var_to_owner:
                             layer, attr_name = var_to_owner[id(target_var)]
+                            # print(f"Resizing {attr_name} on {layer.name}...")
                             self._replace_variable(layer, attr_name, target_var, sliced_val_tensor)
                         else:
                             print(f"⚠️ Warning: Could not find owner for {name}. Attempting direct assign (Might Fail).")
