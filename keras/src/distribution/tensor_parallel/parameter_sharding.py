@@ -35,25 +35,24 @@ class ParameterShardingStrategy:
 
             # Inspect all attributes of the layer to find variables
             # We look at __dict__ to find the actual name the user/keras uses
-            for attr_name, attr_val in layer.__dict__.items():
-                if isinstance(attr_val, keras.Variable):
-                    var_to_owner[id(attr_val)] = (layer, attr_name)
-            
-            # Also check if variables are in standard Keras lists but maybe not named attributes?
-            # Usually Keras variables are attached as attributes (e.g. self.kernel)
+            if hasattr(layer, '__dict__'):
+                for attr_name, attr_val in layer.__dict__.items():
+                    if isinstance(attr_val, keras.Variable):
+                        var_to_owner[id(attr_val)] = (layer, attr_name)
             
             # Recurse to sub-layers
             if hasattr(layer, 'layers'):
                 stack.extend(layer.layers)
             
             # Handle Functional API / Specific submodules
-            for attr_val in layer.__dict__.values():
-                if isinstance(attr_val, keras.layers.Layer):
-                    stack.append(attr_val)
-                elif isinstance(attr_val, (list, tuple)):
-                    for item in attr_val:
-                        if isinstance(item, keras.layers.Layer):
-                            stack.append(item)
+            if hasattr(layer, '__dict__'):
+                for attr_val in layer.__dict__.values():
+                    if isinstance(attr_val, keras.layers.Layer):
+                        stack.append(attr_val)
+                    elif isinstance(attr_val, (list, tuple)):
+                        for item in attr_val:
+                            if isinstance(item, keras.layers.Layer):
+                                stack.append(item)
 
         return var_to_owner
 
@@ -72,7 +71,9 @@ class ParameterShardingStrategy:
         )
         
         # 2. Replace attribute on the layer (e.g. layer.kernel = new_var)
-        setattr(layer, attr_name, new_var)
+        # CRITICAL: Use object.__setattr__ to bypass Keras's "built layer" lock check.
+        # Standard setattr(layer, name, val) triggers the tracker which forbids adding/changing state.
+        object.__setattr__(layer, attr_name, new_var)
         
         # 3. Update Keras internal tracking lists (_trainable_weights, etc.)
         # This ensures model.variables returns the NEW variable.
@@ -126,7 +127,7 @@ class ParameterShardingStrategy:
                             # Perform replacement
                             self._replace_variable(layer, attr_name, target_var, sliced_val_tensor)
                         else:
-                            # Fallback: Try assign (will fail, but logs might help debug why owner wasn't found)
+                            # Fallback
                             print(f"⚠️ Warning: Could not find owner for {name} to resize. Attempting direct assign.")
                             target_var.assign(sliced_val_tensor)
                     
@@ -143,7 +144,6 @@ class ParameterShardingStrategy:
     def _find_matching_parameters(self, model, pattern: str):
         matches = []
         # Note: We must iterate model.variables dynamically because we might have replaced some!
-        # But for 'targets' in one loop, we use the current snapshot.
         for v in model.variables:
             name = v.path if hasattr(v, 'path') else v.name
             if re.search(pattern, name):
