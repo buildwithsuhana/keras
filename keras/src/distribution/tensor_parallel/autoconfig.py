@@ -1,16 +1,21 @@
 import re
+import numpy as np
 from keras.src import layers
-from keras.src.distribution.tensor_parallel.tensor_layout import (
-    split_tensor_for_parallelism,
-    LayoutMap
-)
+from keras.src.distribution.tensor_parallel.tensor_layout import LayoutMap
 
-_split_fn_internal = split_tensor_for_parallelism
-
+def _split_tensor_cpu(x, index, device_count, dim):
+    """
+    Splits the tensor using standard NumPy on CPU.
+    This prevents JAX from trying to load the full (multi-GB) tensor onto 
+    the GPU just to slice it, which causes OOM.
+    """
+    # np.array_split returns a list of arrays. We return the specific shard.
+    splits = np.array_split(x, device_count, axis=dim)
+    return splits[index]
 
 def _split_rule(device_count, dim):
     """Creates a sharding rule for a specific dimension."""
-    return lambda x, index: _split_fn_internal(x, index, device_count, dim=dim)
+    return lambda x, index: _split_tensor_cpu(x, index, device_count, dim=dim)
 
 
 def analyze_dense_layer(layer):
@@ -62,7 +67,7 @@ def _apply_layer_sharding_rules(layer, full_name, device_count, state_rules, out
     lname = layer.name.lower() if layer.name else ""
     cls_name = layer.__class__.__name__
     
-    # Strip leading dots to ensure clean matching
+    # Generate Rule Keys
     clean_name = full_name.lstrip(".")
     rule_key_kernel = f"{clean_name}.kernel"
     rule_key_bias = f"{clean_name}.bias"
@@ -132,7 +137,6 @@ def _apply_layer_sharding_rules(layer, full_name, device_count, state_rules, out
 def get_default_config(module, device_ids):
     """
     Generates a default tensor parallelism configuration for a model.
-    Robustly handles Backbone naming and hidden layers.
     """
     print(f"\n🔍 [AutoConfig] Starting generation for model: {module.name}")
     device_count = len(device_ids)
@@ -140,8 +144,6 @@ def get_default_config(module, device_ids):
     output_rules = {}
     
     processed_layers = set()
-    
-    # Traverse the model
     stack = [(module, None)]
 
     while stack:
@@ -153,14 +155,10 @@ def get_default_config(module, device_ids):
 
         name = current_layer.name
         
-        # --- Naming Logic Fix ---
+        # --- Naming Logic (Skip Backbone Prefix) ---
         if prefix is None:
             full_name = ""
-        # CRITICAL FIX: Do NOT append Backbone name.
-        # This allows 'decoder_block_0' to be at the root of the path, matching Keras variable paths.
-        # CRITICAL FIX: Check class name properly
         elif "backbone" in current_layer.__class__.__name__.lower():
-            full_name = prefix
             full_name = prefix
         else:
             full_name = f"{prefix}.{name}" if prefix else name
@@ -180,11 +178,10 @@ def get_default_config(module, device_ids):
 
         children_to_add = []
 
-        # --- Robust Attribute Traversal ---
+        # Robust Traversal
         for attr_name in dir(current_layer):
             if attr_name.startswith('__') or attr_name.startswith('_'):
                 continue
-            
             if attr_name in ['trainable_variables', 'non_trainable_variables', 'weights', 'variables']:
                 continue
 
@@ -205,7 +202,6 @@ def get_default_config(module, device_ids):
                     if hasattr(item, "name") and "Layer" in item.__class__.__bases__[0].__name__:
                         children_to_add.append((item, full_name))
         
-        # Standard .layers check
         if hasattr(current_layer, 'layers') and current_layer.layers:
             for sub_layer in current_layer.layers:
                 is_duplicate = False
