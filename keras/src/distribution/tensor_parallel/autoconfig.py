@@ -5,6 +5,7 @@ from keras.src.distribution.tensor_parallel.tensor_layout import LayoutMap
 
 def _split_tensor_cpu(x, index, device_count, dim):
     """Splits the tensor using standard NumPy on CPU to avoid GPU OOM."""
+    # print(f"   [CPU Split] Splitting tensor shape {x.shape} on dim {dim}...")
     # np.array_split returns a list of arrays. We return the specific shard.
     splits = np.array_split(x, device_count, axis=dim)
     return splits[index]
@@ -50,6 +51,7 @@ def _apply_layer_sharding_rules(layer, full_name, device_count, state_rules, out
         is_qkv = any(x in lname for x in ["query", "key", "value", "q_proj", "k_proj", "v_proj"])
         
         if is_down_proj:
+            print(f"   [Rule] '{clean_name}' -> Down Projection (Row Parallel)")
             state_rules[rule_key_kernel] = _split_rule(device_count, dim=0)
             output_rules[clean_name] = {0: "allreduce"}
         elif is_up_proj or is_qkv:
@@ -58,12 +60,16 @@ def _apply_layer_sharding_rules(layer, full_name, device_count, state_rules, out
             if hasattr(layer, 'kernel') and layer.kernel is not None:
                 if len(layer.kernel.shape) == 3:
                     split_dim = 0
+                    print(f"      -> Detected 3D Kernel (Attention Heads). Splitting Dim 0.")
+            
+            print(f"   [Rule] '{clean_name}' -> Up Projection/QKV (Split Dim {split_dim})")
             state_rules[rule_key_kernel] = _split_rule(device_count, dim=split_dim)
             if hasattr(layer, "bias") and layer.bias is not None:
                 state_rules[rule_key_bias] = _split_rule(device_count, dim=0)
             output_rules[clean_name] = {0: "gather -1"}
         elif "EinsumDense" not in cls_name:
             mlp_type = analyze_dense_layer(layer)
+            print(f"   [Rule] '{clean_name}' -> Dense Heuristic: {mlp_type}")
             if mlp_type == 'up_projection':
                 state_rules[rule_key_kernel] = _split_rule(device_count, dim=1)
                 if layer.use_bias:
@@ -78,6 +84,7 @@ def _apply_layer_sharding_rules(layer, full_name, device_count, state_rules, out
                     state_rules[rule_key_bias] = _split_rule(device_count, dim=0)
                 output_rules[clean_name] = {0: "gather -1"}
         else:
+            print(f"   [Rule] '{clean_name}' -> EinsumDense Fallback (Column Parallel)")
             state_rules[rule_key_kernel] = _split_rule(device_count, dim=1)
             if hasattr(layer, 'bias') and layer.bias is not None:
                 state_rules[rule_key_bias] = _split_rule(device_count, dim=0)
@@ -94,6 +101,8 @@ def _apply_layer_sharding_rules(layer, full_name, device_count, state_rules, out
                             break
                     if not attr_name:
                         attr_name = weight.name.split('/')[-1].split(':')[0]
+                    
+                    print(f"   [Rule] '{clean_name}' -> Embedding ({attr_name}) (Column Parallel)")
                     state_rules[f"{clean_name}.{attr_name}"] = _split_rule(device_count, dim=1)
             output_rules[clean_name] = {0: "gather -1"}
 

@@ -21,6 +21,10 @@ class ParameterShardingStrategy:
         Maps variable IDs to (layer, attribute_name).
         Prioritizes backing attributes (e.g. '_kernel') over properties (e.g. 'kernel').
         """
+        # Local import to avoid circular dependency
+        from keras.src.layers.layer import Layer
+        
+        print("\n🔍 [DEBUG] Starting Variable Owner Mapping...")
         var_to_owner = {}
         
         # Traverse all layers
@@ -47,12 +51,12 @@ class ParameterShardingStrategy:
                 if isinstance(attr_val, keras.Variable):
                     layer_vars.setdefault(id(attr_val), []).append(attr_name)
                 
-                # Check for nested layers (attributes or lists)
-                elif hasattr(attr_val, "weights") and "Layer" in attr_val.__class__.__bases__[0].__name__:
+                # Robustly check for nested layers
+                elif isinstance(attr_val, Layer):
                     stack.append(attr_val)
                 elif isinstance(attr_val, (list, tuple)):
                     for item in attr_val:
-                        if hasattr(item, "weights") and "Layer" in item.__class__.__bases__[0].__name__:
+                        if isinstance(item, Layer):
                             stack.append(item)
 
             # 2. Resolve best attribute name for variables found on this layer
@@ -66,11 +70,13 @@ class ParameterShardingStrategy:
                         best_name = name
                 
                 var_to_owner[vid] = (layer, best_name)
+                # print(f"   -> Mapped var {vid} to {layer.name}.{best_name} (Candidates: {names})")
 
             # 3. Standard Sub-layer traversal
             if hasattr(layer, 'layers'):
                 stack.extend(layer.layers)
 
+        print(f"✅ [DEBUG] Mapped {len(var_to_owner)} variables to their owner layers.\n")
         return var_to_owner
 
     def _replace_variable(self, layer, attr_name, old_var, new_val_tensor):
@@ -78,6 +84,8 @@ class ParameterShardingStrategy:
         Replaces 'old_var' with a new Variable containing 'new_val_tensor'.
         Uses object.__setattr__ to bypass built-layer locks and property setters.
         """
+        print(f"      🛠️  [Resizing] Replacing '{attr_name}' on layer '{layer.name}'...")
+        
         new_var = keras.Variable(
             initializer=new_val_tensor,
             shape=new_val_tensor.shape,
@@ -117,29 +125,38 @@ class ParameterShardingStrategy:
                 targets = self._find_matching_parameters(shard_model, pattern)
                 
                 for name, target_var in targets:
+                    print(f"⚡ [Sharding] Processing: {name}")
                     try:
                         source_val = weight_loader(name)
-                        if source_val is None: continue
-                    except Exception:
+                        if source_val is None: 
+                            print(f"   ⚠️ Source value not found for {name}, skipping.")
+                            continue
+                    except Exception as e:
+                        print(f"   ⚠️ Error loading {name}: {e}")
                         continue
 
-                    # 1. Slice on CPU (NumPy) - action() should call _split_tensor_cpu
+                    # 1. Slice on CPU (NumPy)
                     sliced_val = action(source_val, self.rank)
-                    
+                    print(f"   -> Sliced {source_val.shape} -> {sliced_val.shape} (Rank {self.rank})")
+
                     # 2. Move to Device
                     with keras.device(device_id):
                         sliced_val_tensor = ops.convert_to_tensor(sliced_val, dtype=target_var.dtype)
                     
                     # 3. Assign or Resize
                     if target_var.shape == sliced_val_tensor.shape:
+                        print(f"   -> Shapes match {target_var.shape}. Assigning directly.")
                         target_var.assign(sliced_val_tensor)
                     else:
+                        print(f"   -> Shape Mismatch! Target: {target_var.shape} vs Sliced: {sliced_val_tensor.shape}")
+                        
                         if id(target_var) in var_to_owner:
                             layer, attr_name = var_to_owner[id(target_var)]
                             self._replace_variable(layer, attr_name, target_var, sliced_val_tensor)
                         else:
-                            # If mapping fails, we can't resize. Fallback to assign (will likely fail).
-                            print(f"⚠️ Warning: Could not find owner for {name}. Attempting direct assign.")
+                            # If mapping fails, we can't resize.
+                            print(f"   ❌ CRITICAL WARNING: Could not find owner layer for {name}. Cannot resize variable!")
+                            print(f"   ❌ Attempting direct assign (This will likely fail with ValueError)...")
                             target_var.assign(sliced_val_tensor)
                     
                     modified.add(name)
