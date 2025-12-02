@@ -20,8 +20,9 @@ class ParameterShardingStrategy:
         """
         Maps variable IDs to (layer, attribute_name).
         Uses DUCK TYPING to avoid instance check failures between 'keras' and 'keras.src'.
+        Explicitly ignores Classes to prevent 'property object is not iterable' errors.
         """
-        print("\n🔍 [DEBUG] Starting Variable Owner Mapping (Duck Typing Mode)...")
+        print("\n🔍 [DEBUG] Starting Variable Owner Mapping (Duck Typing + Type Filter)...")
         var_to_owner = {}
         
         # Traverse all layers
@@ -47,13 +48,20 @@ class ParameterShardingStrategy:
                 
                 if attr_val is None: continue
 
+                # SKIP CLASSES: hasattr on a class triggers properties, causing false positives
+                if isinstance(attr_val, type):
+                    continue
+
                 # --- CHECK IF ATTRIBUTE IS A VARIABLE (Duck Typing) ---
                 # Check for 'assign', 'value', 'dtype' methods/properties
                 is_var = hasattr(attr_val, 'assign') and hasattr(attr_val, 'value') and hasattr(attr_val, 'dtype')
                 
                 # --- CHECK IF ATTRIBUTE IS A LAYER (Duck Typing) ---
                 # Check for 'weights', 'add_weight'
-                is_layer = hasattr(attr_val, 'weights') and hasattr(attr_val, 'add_weight') and not is_var
+                # Must not be a variable, and must NOT be a class
+                is_layer = (hasattr(attr_val, 'weights') and 
+                            hasattr(attr_val, 'add_weight') and 
+                            not is_var)
 
                 if is_var:
                     layer_vars.setdefault(id(attr_val), []).append(attr_name)
@@ -63,6 +71,8 @@ class ParameterShardingStrategy:
                 
                 elif isinstance(attr_val, (list, tuple)):
                     for item in attr_val:
+                        if item is None or isinstance(item, type): continue
+                        
                         # Check items in list
                         if hasattr(item, 'weights') and hasattr(item, 'add_weight'):
                             stack.append(item)
@@ -80,7 +90,13 @@ class ParameterShardingStrategy:
 
             # 3. Standard Sub-layer traversal
             if hasattr(layer, 'layers'):
-                stack.extend(layer.layers)
+                try:
+                    # Ensure it is actually iterable (defensive check against properties on classes)
+                    sublayers = layer.layers
+                    if sublayers and hasattr(sublayers, '__iter__'):
+                        stack.extend(sublayers)
+                except Exception:
+                    pass
 
         print(f"✅ [DEBUG] Mapped {len(var_to_owner)} variables to their owner layers.\n")
         return var_to_owner
@@ -104,7 +120,7 @@ class ParameterShardingStrategy:
                 name=old_var.name
             )
         except Exception:
-            # Fallback to standard Keras Variable if specific class fails
+            # Fallback to standard Keras Variable if specific class fails constructor
             new_var = keras.Variable(
                 initializer=new_val_tensor,
                 shape=new_val_tensor.shape,
@@ -114,7 +130,12 @@ class ParameterShardingStrategy:
             )
         
         # Force set the attribute (bypassing @property setters and Keras tracking)
-        object.__setattr__(layer, attr_name, new_var)
+        try:
+            object.__setattr__(layer, attr_name, new_var)
+        except Exception as e:
+            print(f"      ⚠️ Failed to set attribute via object.__setattr__: {e}")
+            # Last ditch effort: regular setattr
+            setattr(layer, attr_name, new_var)
         
         # Update Keras internal tracking lists
         for lst_name in ['_trainable_weights', '_non_trainable_weights', '_weights', 'weights', 'variables']:
