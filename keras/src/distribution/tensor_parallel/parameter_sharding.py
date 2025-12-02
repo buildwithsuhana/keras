@@ -20,7 +20,6 @@ class ParameterShardingStrategy:
         """
         Maps variable IDs to (layer, attribute_name).
         """
-        # print("\n🔍 [DEBUG] Starting Variable Owner Mapping...")
         var_to_owner = {}
         
         # Traverse all layers
@@ -69,7 +68,6 @@ class ParameterShardingStrategy:
                         stack.extend(sublayers)
                 except Exception: pass
 
-        # print(f"✅ [DEBUG] Mapped {len(var_to_owner)} variables.\n")
         return var_to_owner
 
     def _replace_variable(self, layer, attr_name, old_var, new_val_tensor):
@@ -105,7 +103,8 @@ class ParameterShardingStrategy:
 
     def _find_layer_by_path(self, model, var_path):
         """
-        Debug-enabled traversal to find a layer by its path string.
+        Traverses the model using the variable path to find the owner layer.
+        Smartly dives into 'backbone' or 'model' wrappers if direct child lookup fails.
         """
         print(f"      🔎 [PathLookup] Starting lookup for: {var_path}")
         if ":" in var_path: var_path = var_path.split(":")[0]
@@ -122,50 +121,50 @@ class ParameterShardingStrategy:
             if hasattr(parent, name):
                 val = getattr(parent, name)
                 if hasattr(val, 'weights'): 
-                    print(f"        -> Found '{name}' as attribute.")
                     return val
-            
             # 2. Check layers list
             if hasattr(parent, 'layers'):
                 for layer in parent.layers:
                     if layer.name == name:
-                        print(f"        -> Found '{name}' in .layers list.")
                         return layer
             return None
 
         for part in layer_path:
-            print(f"      🔎 [PathLookup] Looking for '{part}' in '{current.name if hasattr(current, 'name') else 'Object'}'...")
-            
+            # 1. Try finding in current node
             if hasattr(current, 'name') and current.name == part:
-                print(f"        -> Skipping redundant path part '{part}' (matches current name).")
-                continue
+                continue # Redundant path part
                 
             next_node = find_child(current, part)
+            
             if next_node:
                 current = next_node
             else:
-                print(f"        ❌ Failed to find '{part}' in children/attributes.")
-                # Diagnostic: Print what IS available
-                try:
-                    sublayers = [l.name for l in getattr(current, 'layers', [])]
-                    print(f"        -> Available .layers names: {sublayers[:10]}...")
-                except: pass
-                try:
-                    attrs = [a for a in dir(current) if not a.startswith('_')]
-                    print(f"        -> Available attributes: {attrs[:10]}...")
-                except: pass
-                return None, None
+                # 2. Heuristic: Check for implicit wrappers (e.g. backbone)
+                print(f"        ⚠️ '{part}' not found in '{current.name}'. Checking sub-modules...")
+                found_in_wrapper = False
+                # Common wrappers in KerasNLP/CV
+                for wrapper in ['backbone', 'model', 'encoder', 'decoder', 'transformer', 'preprocessor']:
+                    if hasattr(current, wrapper):
+                        sub_module = getattr(current, wrapper)
+                        # Check if the part exists inside this wrapper
+                        candidate = find_child(sub_module, part)
+                        if candidate:
+                            print(f"        -> Found '{part}' inside '{wrapper}'. Diving in.")
+                            current = candidate
+                            found_in_wrapper = True
+                            break
                 
+                if not found_in_wrapper:
+                    print(f"        ❌ Failed to resolve path part '{part}'.")
+                    return None, None
+
         # Check attribute
-        print(f"      🔎 [PathLookup] Final check for attribute '{attr_name}' on '{current.name}'")
         if hasattr(current, attr_name):
-            print(f"        -> Found '{attr_name}'.")
             return current, attr_name
         elif hasattr(current, "_" + attr_name):
-            print(f"        -> Found '_{attr_name}'.")
             return current, "_" + attr_name
             
-        print(f"        ❌ Attribute not found.")
+        print(f"        ❌ Attribute '{attr_name}' not found on final layer '{current.name}'.")
         return None, None
 
     def shard_model_parameters(
