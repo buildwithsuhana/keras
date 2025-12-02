@@ -17,7 +17,8 @@ def analyze_dense_layer(layer):
     """
     Classifies a Dense layer based on its input/output dimensions.
     """
-    if not isinstance(layer, layers.Dense):
+    # Check class name string to avoid instance mismatch
+    if "Dense" not in layer.__class__.__name__:
         return 'dense'
 
     input_dim = None
@@ -58,12 +59,14 @@ def analyze_dense_layer(layer):
 def _apply_layer_sharding_rules(layer, full_name, device_count, state_rules, output_rules):
     """
     Helper function that applies rules to a single layer instance.
+    Uses string checks for class names to avoid "local vs installed" Keras mismatches.
     """
     # Helper to check names case-insensitively
     lname = layer.name.lower() if layer.name else ""
+    cls_name = layer.__class__.__name__
     
     # --- 1. DENSE / EINSUM DENSE LAYERS ---
-    if isinstance(layer, (layers.Dense, layers.EinsumDense)):
+    if "Dense" in cls_name:
         # Identify Layer Type by Name (Gemma / Llama / Standard Transformers)
         is_down_proj = any(x in lname for x in ["down_proj", "output", "o_proj", "ffw_linear"])
         is_up_proj = any(x in lname for x in ["up_proj", "gate", "ffw_gating"])
@@ -87,7 +90,7 @@ def _apply_layer_sharding_rules(layer, full_name, device_count, state_rules, out
             output_rules[f"{full_name}"] = {0: "gather -1"}
             
         # --- Strategy C: Fallback (Heuristic based on Shape) ---
-        elif isinstance(layer, layers.Dense):
+        elif "EinsumDense" not in cls_name: # Standard Dense Fallback
             mlp_type = analyze_dense_layer(layer)
             print(f"   [Rule] '{full_name}' -> Dense Heuristic: {mlp_type}")
             if mlp_type == 'up_projection':
@@ -113,7 +116,7 @@ def _apply_layer_sharding_rules(layer, full_name, device_count, state_rules, out
             output_rules[f"{full_name}"] = {0: "gather -1"}
 
     # --- 2. EMBEDDING LAYERS ---
-    elif isinstance(layer, (layers.Embedding,)) or "Embedding" in layer.__class__.__name__:
+    elif "Embedding" in cls_name:
         if hasattr(layer, 'weights'):
             for weight in layer.weights:
                 if "embedding" in weight.name or "weight" in weight.name:
@@ -136,7 +139,6 @@ def _apply_layer_sharding_rules(layer, full_name, device_count, state_rules, out
 def get_default_config(module, device_ids):
     """
     Generates a default tensor parallelism configuration for a model.
-    Fixes path generation to match Keras variable names robustly.
     """
     print(f"\n🔍 [AutoConfig] Starting generation for model: {module.name}")
     device_count = len(device_ids)
@@ -165,7 +167,7 @@ def get_default_config(module, device_ids):
         else:
             full_name = f"{prefix}.{name}" if prefix else name
         
-        # Clean up repeated parts (e.g. gemma.gemma) just in case
+        # Clean up repeated parts
         parts = full_name.split('.')
         clean_parts = []
         for p in parts:
