@@ -147,6 +147,59 @@ class ParameterShardingStrategy:
                             lst[i] = new_var
                             
         return new_var
+    
+    def _find_layer_by_path(self, model, var_path):
+        """
+        Traverses the model using the variable path to find the owner layer and attribute name.
+        Example Path: decoder_block_0/attention/key/kernel
+        """
+        if ":" in var_path: var_path = var_path.split(":")[0]
+        parts = var_path.split("/")
+        
+        # The last part is usually the attribute name (e.g., 'kernel', 'bias')
+        # However, sometimes Keras naming adds intermediate scopes.
+        # We try to consume parts until we find a match.
+        
+        attr_name = parts[-1]
+        layer_path = parts[:-1]
+        
+        current = model
+        
+        # Helper to find a child layer by name in 'layers' list or attributes
+        def find_child(parent, name):
+            # 1. Check direct attributes (fast path for named attributes)
+            if hasattr(parent, name):
+                val = getattr(parent, name)
+                if hasattr(val, 'weights'): return val # Is a layer
+            
+            # 2. Check layers list
+            if hasattr(parent, 'layers'):
+                for layer in parent.layers:
+                    if layer.name == name:
+                        return layer
+            return None
+
+        for part in layer_path:
+            # If the part matches the current layer name (redundancy), skip
+            if hasattr(current, 'name') and current.name == part:
+                continue
+                
+            next_node = find_child(current, part)
+            if next_node:
+                current = next_node
+            else:
+                # If path doesn't match strict hierarchy, we might need to skip 'backbone' or similar invisible wrappers
+                # But for now, if we fail to traverse, we fail.
+                pass
+                
+        # Check if the final node has the attribute
+        # We also check for underscored version (common in Keras 3: .kernel -> ._kernel)
+        if hasattr(current, attr_name):
+            return current, attr_name
+        elif hasattr(current, "_" + attr_name):
+            return current, "_" + attr_name
+            
+        return None, None
 
     def shard_model_parameters(
         self,
@@ -185,8 +238,20 @@ class ParameterShardingStrategy:
                     if target_var.shape == sliced_val_tensor.shape:
                         target_var.assign(sliced_val_tensor)
                     else:
+                        layer = None
+                        attr_name = None
+                        
+                        # Strategy A: Use ID Mapping
                         if id(target_var) in var_to_owner:
                             layer, attr_name = var_to_owner[id(target_var)]
+                        
+                        # Strategy B: Path-based Fallback
+                        if layer is None:
+                            var_path = target_var.path if hasattr(target_var, 'path') else target_var.name
+                            print(f"   ⚠️ [Fallback] ID mapping failed. Attempting path lookup for: {var_path}")
+                            layer, attr_name = self._find_layer_by_path(shard_model, var_path)
+
+                        if layer and attr_name:
                             self._replace_variable(layer, attr_name, target_var, sliced_val_tensor)
                         else:
                             print(f"   ❌ CRITICAL WARNING: Could not find owner layer for {name}. Cannot resize variable!")
