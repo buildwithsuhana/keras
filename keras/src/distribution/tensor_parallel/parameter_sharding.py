@@ -19,6 +19,7 @@ class ParameterShardingStrategy:
     def _map_variables_to_owners(self, model):
         """
         Maps variable IDs to (layer, attribute_name).
+        Traverses attributes, lists, and DICTS to find all layers and variables.
         """
         var_to_owner = {}
         
@@ -34,26 +35,42 @@ class ParameterShardingStrategy:
 
             layer_vars = {} 
             
+            # Scan all attributes of the object
             for attr_name in dir(layer):
                 if attr_name.startswith("__"): continue
-                try: attr_val = getattr(layer, attr_name, None)
-                except Exception: continue
+                
+                try:
+                    attr_val = getattr(layer, attr_name, None)
+                except Exception:
+                    continue
+                
                 if attr_val is None: continue
                 if isinstance(attr_val, type): continue
 
+                # Duck typing checks
                 is_var = hasattr(attr_val, 'assign') and hasattr(attr_val, 'value') and hasattr(attr_val, 'dtype')
                 is_layer = (hasattr(attr_val, 'weights') and hasattr(attr_val, 'add_weight') and not is_var)
 
                 if is_var:
                     layer_vars.setdefault(id(attr_val), []).append(attr_name)
+                
                 elif is_layer:
                     stack.append(attr_val)
+                
                 elif isinstance(attr_val, (list, tuple)):
                     for item in attr_val:
                         if item is None or isinstance(item, type): continue
                         if hasattr(item, 'weights') and hasattr(item, 'add_weight'):
                             stack.append(item)
+                            
+                # --- ADDED: Dictionary Support ---
+                elif isinstance(attr_val, dict):
+                    for key, item in attr_val.items():
+                        if item is None or isinstance(item, type): continue
+                        if hasattr(item, 'weights') and hasattr(item, 'add_weight'):
+                            stack.append(item)
 
+            # Resolve best name for variables
             for vid, names in layer_vars.items():
                 best_name = names[0]
                 for name in names:
@@ -61,6 +78,7 @@ class ParameterShardingStrategy:
                         best_name = name
                 var_to_owner[vid] = (layer, best_name)
 
+            # Standard Sub-layer traversal
             if hasattr(layer, 'layers'):
                 try:
                     sublayers = layer.layers
@@ -93,6 +111,7 @@ class ParameterShardingStrategy:
         try: object.__setattr__(layer, attr_name, new_var)
         except Exception: setattr(layer, attr_name, new_var)
         
+        # Update Keras internal tracking lists
         for lst_name in ['_trainable_weights', '_non_trainable_weights', '_weights', 'weights', 'variables']:
             if hasattr(layer, lst_name):
                 lst = getattr(layer, lst_name)
@@ -104,7 +123,6 @@ class ParameterShardingStrategy:
     def _find_layer_by_path(self, model, var_path):
         """
         Traverses the model using the variable path to find the owner layer.
-        Smartly dives into 'backbone' or 'model' wrappers if direct child lookup fails.
         """
         print(f"      🔎 [PathLookup] Starting lookup for: {var_path}")
         if ":" in var_path: var_path = var_path.split(":")[0]
@@ -114,15 +132,18 @@ class ParameterShardingStrategy:
         layer_path = parts[:-1]
         
         current = model
-        print(f"      🔎 [PathLookup] Root Node: {current.name if hasattr(current, 'name') else current}")
-
+        
         def find_child(parent, name):
-            # 1. Check direct attributes
-            if hasattr(parent, name):
-                val = getattr(parent, name)
-                if hasattr(val, 'weights'): 
+            # 1. Check direct attributes by checking .name property of attribute value
+            # This handles cases where self.key_dense = Dense(name='key')
+            for attr in dir(parent):
+                if attr.startswith("__"): continue
+                try: val = getattr(parent, attr)
+                except: continue
+                if hasattr(val, 'name') and val.name == name and hasattr(val, 'weights'):
                     return val
-            # 2. Check layers list
+            
+            # 2. Check layers list explicitly
             if hasattr(parent, 'layers'):
                 for layer in parent.layers:
                     if layer.name == name:
@@ -132,21 +153,19 @@ class ParameterShardingStrategy:
         for part in layer_path:
             # 1. Try finding in current node
             if hasattr(current, 'name') and current.name == part:
-                continue # Redundant path part
+                continue 
                 
             next_node = find_child(current, part)
             
             if next_node:
                 current = next_node
             else:
-                # 2. Heuristic: Check for implicit wrappers (e.g. backbone)
+                # 2. Heuristic: Check for implicit wrappers
                 print(f"        ⚠️ '{part}' not found in '{current.name}'. Checking sub-modules...")
                 found_in_wrapper = False
-                # Common wrappers in KerasNLP/CV
                 for wrapper in ['backbone', 'model', 'encoder', 'decoder', 'transformer', 'preprocessor']:
                     if hasattr(current, wrapper):
                         sub_module = getattr(current, wrapper)
-                        # Check if the part exists inside this wrapper
                         candidate = find_child(sub_module, part)
                         if candidate:
                             print(f"        -> Found '{part}' inside '{wrapper}'. Diving in.")
@@ -156,6 +175,15 @@ class ParameterShardingStrategy:
                 
                 if not found_in_wrapper:
                     print(f"        ❌ Failed to resolve path part '{part}'.")
+                    # Diagnostic: Print available layers/attributes to help debug
+                    try:
+                        layers = [l.name for l in getattr(current, 'layers', [])]
+                        print(f"           Available layers: {layers[:10]}")
+                    except: pass
+                    try:
+                        attrs = [a for a in dir(current) if not a.startswith('_') and hasattr(getattr(current, a), 'name')]
+                        print(f"           Available named attributes: {attrs[:10]}")
+                    except: pass
                     return None, None
 
         # Check attribute
