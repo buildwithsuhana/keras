@@ -45,13 +45,15 @@ def _apply_layer_sharding_rules(layer, full_name, device_count, state_rules, out
     rule_key_kernel = f"{clean_name}.kernel"
     rule_key_bias = f"{clean_name}.bias"
 
+    print(f"🔍 [AutoConfig] Analyzing: '{clean_name}' ({cls_name})")
+
     if "Dense" in cls_name:
         is_down_proj = any(x in lname for x in ["down_proj", "output", "o_proj", "ffw_linear"])
         is_up_proj = any(x in lname for x in ["up_proj", "gate", "ffw_gating"])
         is_qkv = any(x in lname for x in ["query", "key", "value", "q_proj", "k_proj", "v_proj"])
         
         if is_down_proj:
-            print(f"   [Rule] '{clean_name}' -> Down Projection (Row Parallel)")
+            print(f"   ➕ [Add Rule] '{clean_name}' -> Down Projection (Row Parallel)")
             state_rules[rule_key_kernel] = _split_rule(device_count, dim=0)
             output_rules[clean_name] = {0: "allreduce"}
         elif is_up_proj or is_qkv:
@@ -62,14 +64,14 @@ def _apply_layer_sharding_rules(layer, full_name, device_count, state_rules, out
                     split_dim = 0
                     print(f"      -> Detected 3D Kernel (Attention Heads). Splitting Dim 0.")
             
-            print(f"   [Rule] '{clean_name}' -> Up Projection/QKV (Split Dim {split_dim})")
+            print(f"   ➕ [Add Rule] '{clean_name}' -> Up Projection/QKV (Split Dim {split_dim})")
             state_rules[rule_key_kernel] = _split_rule(device_count, dim=split_dim)
             if hasattr(layer, "bias") and layer.bias is not None:
                 state_rules[rule_key_bias] = _split_rule(device_count, dim=0)
             output_rules[clean_name] = {0: "gather -1"}
         elif "EinsumDense" not in cls_name:
             mlp_type = analyze_dense_layer(layer)
-            print(f"   [Rule] '{clean_name}' -> Dense Heuristic: {mlp_type}")
+            print(f"   ➕ [Add Rule] '{clean_name}' -> Dense Heuristic: {mlp_type}")
             if mlp_type == 'up_projection':
                 state_rules[rule_key_kernel] = _split_rule(device_count, dim=1)
                 if layer.use_bias:
@@ -84,7 +86,7 @@ def _apply_layer_sharding_rules(layer, full_name, device_count, state_rules, out
                     state_rules[rule_key_bias] = _split_rule(device_count, dim=0)
                 output_rules[clean_name] = {0: "gather -1"}
         else:
-            print(f"   [Rule] '{clean_name}' -> EinsumDense Fallback (Column Parallel)")
+            print(f"   ➕ [Add Rule] '{clean_name}' -> EinsumDense Fallback (Column Parallel)")
             state_rules[rule_key_kernel] = _split_rule(device_count, dim=1)
             if hasattr(layer, 'bias') and layer.bias is not None:
                 state_rules[rule_key_bias] = _split_rule(device_count, dim=0)
@@ -102,12 +104,25 @@ def _apply_layer_sharding_rules(layer, full_name, device_count, state_rules, out
                     if not attr_name:
                         attr_name = weight.name.split('/')[-1].split(':')[0]
                     
-                    print(f"   [Rule] '{clean_name}' -> Embedding ({attr_name}) (Column Parallel)")
+                    print(f"   ➕ [Add Rule] '{clean_name}' -> Embedding ({attr_name}) (Column Parallel)")
                     state_rules[f"{clean_name}.{attr_name}"] = _split_rule(device_count, dim=1)
             output_rules[clean_name] = {0: "gather -1"}
 
+    # --- ADDED: Normalization Rules ---
+    elif "Normalization" in cls_name:
+        # RMSNorm uses 'scale', LayerNorm uses 'gamma'/'beta'
+        found_norm_weight = False
+        for attr in ["scale", "gamma", "beta"]:
+            if hasattr(layer, attr) and getattr(layer, attr) is not None:
+                print(f"   ➕ [Add Rule] '{clean_name}' -> Normalization ({attr}) (Split Dim 0)")
+                state_rules[f"{clean_name}.{attr}"] = _split_rule(device_count, dim=0)
+                found_norm_weight = True
+        
+        if not found_norm_weight:
+             print(f"   ⚠️ [Warning] Normalization layer '{clean_name}' found but no known weights (scale/gamma/beta) detected.")
+
 def get_default_config(module, device_ids):
-    print(f"\n🔍 [AutoConfig] Starting generation for model: {module.name}")
+    print(f"\n🚀 [AutoConfig] Starting generation for model: {module.name}")
     device_count = len(device_ids)
     state_rules = {}
     output_rules = {}

@@ -157,7 +157,8 @@ class TensorParallelKeras(Model):
     def _weight_loader(self, param_name):
         safe_name = param_name.replace("/", "_").replace(":", "_")
         path = os.path.join(self.temp_dir, safe_name + ".npy")
-        if os.path.exists(path): return np.load(path)
+        # Loads metadata only; data is read from disk on-demand during slicing
+        if os.path.exists(path): return np.load(path, mmap_mode='r')
         return None
 
     def _normalize_device_id(self, device_id):
