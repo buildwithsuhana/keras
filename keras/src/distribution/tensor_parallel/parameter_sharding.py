@@ -63,7 +63,7 @@ class ParameterShardingStrategy:
                         if hasattr(item, 'weights') and hasattr(item, 'add_weight'):
                             stack.append(item)
                             
-                # --- ADDED: Dictionary Support ---
+                # Dictionary Support
                 elif isinstance(attr_val, dict):
                     for key, item in attr_val.items():
                         if item is None or isinstance(item, type): continue
@@ -108,8 +108,12 @@ class ParameterShardingStrategy:
                 name=old_var.name
             )
         
-        try: object.__setattr__(layer, attr_name, new_var)
-        except Exception: setattr(layer, attr_name, new_var)
+        # Bypass property setters and tracking locks
+        try: 
+            object.__setattr__(layer, attr_name, new_var)
+        except Exception as e: 
+            print(f"      ⚠️ object.__setattr__ failed: {e}. Trying setattr...")
+            setattr(layer, attr_name, new_var)
         
         # Update Keras internal tracking lists
         for lst_name in ['_trainable_weights', '_non_trainable_weights', '_weights', 'weights', 'variables']:
@@ -135,7 +139,6 @@ class ParameterShardingStrategy:
         
         def find_child(parent, name):
             # 1. Check direct attributes by checking .name property of attribute value
-            # This handles cases where self.key_dense = Dense(name='key')
             for attr in dir(parent):
                 if attr.startswith("__"): continue
                 try: val = getattr(parent, attr)
@@ -175,22 +178,15 @@ class ParameterShardingStrategy:
                 
                 if not found_in_wrapper:
                     print(f"        ❌ Failed to resolve path part '{part}'.")
-                    # Diagnostic: Print available layers/attributes to help debug
-                    try:
-                        layers = [l.name for l in getattr(current, 'layers', [])]
-                        print(f"           Available layers: {layers[:10]}")
-                    except: pass
-                    try:
-                        attrs = [a for a in dir(current) if not a.startswith('_') and hasattr(getattr(current, a), 'name')]
-                        print(f"           Available named attributes: {attrs[:10]}")
-                    except: pass
                     return None, None
 
-        # Check attribute
+        # Check attribute - PREFER PRIVATE STORAGE (_attr) over properties (attr)
+        if hasattr(current, "_" + attr_name):
+            print(f"        -> Found '_{attr_name}' (preferred over '{attr_name}').")
+            return current, "_" + attr_name
+            
         if hasattr(current, attr_name):
             return current, attr_name
-        elif hasattr(current, "_" + attr_name):
-            return current, "_" + attr_name
             
         print(f"        ❌ Attribute '{attr_name}' not found on final layer '{current.name}'.")
         return None, None
