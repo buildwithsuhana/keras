@@ -42,14 +42,34 @@ def _apply_layer_sharding_rules(layer, full_name, device_count, state_rules, out
     clean_name = full_name.lstrip(".")
     rule_key_kernel = f"{clean_name}.kernel"
     rule_key_bias = f"{clean_name}.bias"
+    rule_key_scale = f"{clean_name}.scale"  # For RMSNorm
+    rule_key_gamma = f"{clean_name}.gamma"  # For LayerNorm
+    rule_key_beta = f"{clean_name}.beta"    # For LayerNorm
 
     print(f"🔍 [AutoConfig] Analyzing: '{clean_name}' ({cls_name})")
+
+    # --- NEW: Shard Normalization Layers ---
+    if "Normalization" in cls_name:
+        # Shard the scale/gamma/beta weights to match the sharded input (H/N)
+        # This prevents the broadcasting error (1792 vs 3584)
+        print(f"   ➕ [Add Rule] '{clean_name}' -> Normalization (Split Dim 0)")
+        
+        # Helper to safely add rule if variable exists
+        def add_if_exists(attr, key):
+            if hasattr(layer, attr) and getattr(layer, attr) is not None:
+                state_rules[key] = _split_rule(device_count, dim=0)
+
+        add_if_exists("scale", rule_key_scale)
+        add_if_exists("gamma", rule_key_gamma)
+        add_if_exists("beta", rule_key_beta)
+        return # Done with this layer
 
     if "Dense" in cls_name:
         is_down_proj = any(x in lname for x in ["down_proj", "output", "o_proj", "ffw_linear"])
         is_up_proj = any(x in lname for x in ["up_proj", "gate", "ffw_gating"])
         is_qkv = any(x in lname for x in ["query", "key", "value", "q_proj", "k_proj", "v_proj"])
         
+        # ... (Rest of your Dense logic remains the same) ...
         # Check for 3D kernel (EinsumDense with Heads) 
         is_3d_kernel = False
         if hasattr(layer, 'kernel') and layer.kernel is not None:
@@ -57,36 +77,20 @@ def _apply_layer_sharding_rules(layer, full_name, device_count, state_rules, out
                 is_3d_kernel = True
 
         if is_down_proj:
-            # Row Parallel: Split Input (Dim 0 or 1), AllReduce Output
-            # 2D Kernel: (Input, Output) -> Split Input (Dim 0)
-            # 3D Kernel (Gemma Attn Output): (Heads, HeadDim, Output) -> Split Heads (Dim 0)
-            # Note: Gemma's einsum for output is usually 'bt n d, n h -> bt h' (kernel is n,h)
-            # Wait, Gemma EinsumDense output kernel is typically (Heads, Dim, Hidden)? 
-            # Actually, standard RowParallel splits the "Input" dimension of the matrix mult.
-            
-            split_dim = 0 # Usually input/heads dimension for DownProj
-            
+            split_dim = 0 
             print(f"   ➕ [Add Rule] '{clean_name}' -> Down Projection (Split Dim {split_dim}) + AllReduce")
             state_rules[rule_key_kernel] = _split_rule(device_count, dim=split_dim)
             output_rules[clean_name] = {0: "allreduce"}
             
         elif is_up_proj or is_qkv:
-            # Column Parallel: Split Output (Dim 1 or 2), No Comm
-            # 2D Kernel: (Input, Output) -> Split Output (Dim 1)
-            # 3D Kernel: (Input, Heads, HeadDim) or (Heads, Input, HeadDim)?
-            # For Gemma QKV: Input is Dim 0. Output (Heads) is Dim 1 or 0?
-            # Standard code usually detects shape.
-            # If 3D (Heads, Input, Dim) -> Split Heads (Dim 0).
-            
             split_dim = 1
             if is_3d_kernel:
-                split_dim = 0 # Assuming Dim 0 is Heads
+                split_dim = 0 
             
             print(f"   ➕ [Add Rule] '{clean_name}' -> Up Projection/QKV (Split Dim {split_dim})")
             state_rules[rule_key_kernel] = _split_rule(device_count, dim=split_dim)
             if hasattr(layer, "bias") and layer.bias is not None:
                 state_rules[rule_key_bias] = _split_rule(device_count, dim=0)
-            # No Output Rule (Identity) -> Output remains sharded
             
         elif "EinsumDense" not in cls_name:
             # Heuristic fallback
@@ -128,8 +132,6 @@ def _apply_layer_sharding_rules(layer, full_name, device_count, state_rules, out
             # 2. Gather Output (Restore Full Hidden Dim)
             print(f"   ➕ [Output Rule] '{clean_name}' -> Gather (Restore Full H)")
             output_rules[clean_name] = {0: "gather -1"}
-
-    # No specific rules for Normalization -> Replicated (Full Weights)
 
 def get_default_config(module, device_ids):
     print(f"\n🚀 [AutoConfig] Starting generation for model: {module.name}")
