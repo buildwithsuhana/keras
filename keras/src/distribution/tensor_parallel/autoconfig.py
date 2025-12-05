@@ -42,77 +42,83 @@ def _apply_layer_sharding_rules(layer, full_name, device_count, state_rules, out
     clean_name = full_name.lstrip(".")
     rule_key_kernel = f"{clean_name}.kernel"
     rule_key_bias = f"{clean_name}.bias"
-    rule_key_scale = f"{clean_name}.scale"  # For RMSNorm
-    rule_key_gamma = f"{clean_name}.gamma"  # For LayerNorm
-    rule_key_beta = f"{clean_name}.beta"    # For LayerNorm
+    
+    # Normalization Rules keys
+    rule_key_scale = f"{clean_name}.scale"
+    rule_key_gamma = f"{clean_name}.gamma"
+    rule_key_beta = f"{clean_name}.beta"
 
     print(f"🔍 [AutoConfig] Analyzing: '{clean_name}' ({cls_name})")
 
-    # --- NEW: Shard Normalization Layers ---
+    # 1. Shard Normalization (Fixes the first RMSNorm crash)
     if "Normalization" in cls_name:
-        # Shard the scale/gamma/beta weights to match the sharded input (H/N)
-        # This prevents the broadcasting error (1792 vs 3584)
         print(f"   ➕ [Add Rule] '{clean_name}' -> Normalization (Split Dim 0)")
-        
-        # Helper to safely add rule if variable exists
         def add_if_exists(attr, key):
             if hasattr(layer, attr) and getattr(layer, attr) is not None:
                 state_rules[key] = _split_rule(device_count, dim=0)
-
         add_if_exists("scale", rule_key_scale)
         add_if_exists("gamma", rule_key_gamma)
         add_if_exists("beta", rule_key_beta)
-        return # Done with this layer
+        return
 
+    # 2. Shard Dense / EinsumDense Layers
     if "Dense" in cls_name:
         is_down_proj = any(x in lname for x in ["down_proj", "output", "o_proj", "ffw_linear"])
         is_up_proj = any(x in lname for x in ["up_proj", "gate", "ffw_gating"])
         is_qkv = any(x in lname for x in ["query", "key", "value", "q_proj", "k_proj", "v_proj"])
         
-        # ... (Rest of your Dense logic remains the same) ...
-        # Check for 3D kernel (EinsumDense with Heads) 
         is_3d_kernel = False
         if hasattr(layer, 'kernel') and layer.kernel is not None:
             if len(layer.kernel.shape) == 3:
                 is_3d_kernel = True
 
         if is_down_proj:
-            split_dim = 0 
-            print(f"   ➕ [Add Rule] '{clean_name}' -> Down Projection (Split Dim {split_dim}) + AllReduce")
+            # DOWN PROJECTION:
+            # Input is full heads (4096) or whatever QKV produced. 
+            # We must split OUTPUT (Dim 1) to return to 1792 (sharded hidden)
+            # This ensures residual connection x (1792) + f(x) (1792) works.
+            
+            # Standard Dense: (In, Out) -> Split Dim 1
+            # Einsum 3D: (Heads, Dim, Out)? Usually 2D for O_Proj (N*H, D)
+            split_dim = 1 
+            if is_3d_kernel: 
+                # If kernel is (Heads, Dim, Out), Out is dim 2.
+                # But typically O_Proj is 2D. Let's assume Dim 1 for safety or check shape.
+                split_dim = 2 if layer.kernel.shape[2] > layer.kernel.shape[0] else 1
+
+            print(f"   ➕ [Add Rule] '{clean_name}' -> Down Projection (Split Output Dim {split_dim})")
             state_rules[rule_key_kernel] = _split_rule(device_count, dim=split_dim)
-            output_rules[clean_name] = {0: "allreduce"}
+            
+            # We do NOT want AllReduce here because we are keeping the shards separate
+            # output_rules[clean_name] = {0: "allreduce"} 
             
         elif is_up_proj or is_qkv:
-            split_dim = 1
-            if is_3d_kernel:
-                split_dim = 0 
+            # UP PROJECTION / QKV:
+            # Input is sharded (1792). We must split INPUT (Dim 0).
             
-            print(f"   ➕ [Add Rule] '{clean_name}' -> Up Projection/QKV (Split Dim {split_dim})")
+            split_dim = 0
+            
+            print(f"   ➕ [Add Rule] '{clean_name}' -> Up Projection/QKV (Split Input Dim {split_dim})")
             state_rules[rule_key_kernel] = _split_rule(device_count, dim=split_dim)
-            if hasattr(layer, "bias") and layer.bias is not None:
-                state_rules[rule_key_bias] = _split_rule(device_count, dim=0)
             
-        elif "EinsumDense" not in cls_name:
-            # Heuristic fallback
-            mlp_type = analyze_dense_layer(layer)
-            print(f"   ➕ [Add Rule] '{clean_name}' -> Dense Heuristic: {mlp_type}")
-            if mlp_type == 'up_projection':
-                state_rules[rule_key_kernel] = _split_rule(device_count, dim=1)
-                if layer.use_bias:
-                    state_rules[rule_key_bias] = _split_rule(device_count, dim=0)
-            elif mlp_type == 'down_projection':
-                state_rules[rule_key_kernel] = _split_rule(device_count, dim=0)
-                output_rules[clean_name] = {0: "allreduce"}
-            else:
-                state_rules[rule_key_kernel] = _split_rule(device_count, dim=1)
-                if layer.use_bias:
-                    state_rules[rule_key_bias] = _split_rule(device_count, dim=0)
+            # Biases in QKV usually match the Output dimension (Heads).
+            # If we split Input (Dim 0), the Output (Dim 1) is FULL.
+            # So Bias should NOT be sharded (Replicated).
+            # However, if memory is tight, we might have issues. 
+            # But mathematically, if we calculate full heads, we need full bias.
+            if hasattr(layer, "bias") and layer.bias is not None:
+                # Keep bias replicated (no rule needed usually implies replicated)
+                # Or explicitly:
+                pass 
+            
         else:
-            print(f"   ➕ [Add Rule] '{clean_name}' -> EinsumDense Fallback (Column Parallel)")
+            # Fallback for generic Dense
+            print(f"   ➕ [Add Rule] '{clean_name}' -> Dense Fallback (Split Dim 1)")
             state_rules[rule_key_kernel] = _split_rule(device_count, dim=1)
             if hasattr(layer, 'bias') and layer.bias is not None:
                 state_rules[rule_key_bias] = _split_rule(device_count, dim=0)
 
+    # 3. Embedding
     elif "Embedding" in cls_name:
         if hasattr(layer, 'weights'):
             for weight in layer.weights:
@@ -125,13 +131,13 @@ def _apply_layer_sharding_rules(layer, full_name, device_count, state_rules, out
                     if not attr_name:
                         attr_name = weight.name.split('/')[-1].split(':')[0]
                     
-                    # 1. Shard Weights (Column Parallel) 
+                    # Split Weights (Column Parallel) -> Outputs 1792
                     print(f"   ➕ [Add Rule] '{clean_name}' -> Embedding ({attr_name}) (Column Parallel)")
                     state_rules[f"{clean_name}.{attr_name}"] = _split_rule(device_count, dim=1)
             
-            # 2. Gather Output (Restore Full Hidden Dim)
-            print(f"   ➕ [Output Rule] '{clean_name}' -> Gather (Restore Full H)")
-            output_rules[clean_name] = {0: "gather -1"}
+            # Disable Gather to keep it sharded
+            print(f"   ➕ [Output Rule] '{clean_name}' -> No Comm (Keep Sharded)")
+            output_rules[clean_name] = {0: "no_comm"}
 
 def get_default_config(module, device_ids):
     print(f"\n🚀 [AutoConfig] Starting generation for model: {module.name}")
