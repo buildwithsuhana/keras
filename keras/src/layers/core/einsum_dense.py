@@ -256,14 +256,16 @@ class EinsumDense(Layer):
 
     def call(self, inputs, training=None):
         # --- DEBUG LOGGING START ---
-        print(f"\n🔍 [DEBUG EinsumDense] Layer: {self.name}")
+        print(f"🔍 [DEBUG EinsumDense ID] Layer: {self.name} | ID: {id(self)}")
         print(f"   Equation: {self.equation}")
         print(f"   Inputs Shape: {getattr(inputs, 'shape', 'Unknown')}")
         
         kernel_shape = "Unknown"
         if hasattr(self, "_kernel"):
-            kernel_shape = self._kernel.shape
-        # Use property to see effective kernel (in case of unpacking)
+             print(f"   Internal _kernel ID: {id(self._kernel)} | Shape: {self._kernel.shape}")
+        else:
+             print("   Internal _kernel: MISSING")
+             
         try:
             eff_kernel = self.kernel
             print(f"   Effective Kernel Shape: {eff_kernel.shape}")
@@ -277,7 +279,8 @@ class EinsumDense(Layer):
         if self.activation is not None:
             x = self.activation(x)
         return x
-
+    
+    # ... (Rest of the methods remain unchanged from your previous upload, omitted for brevity but must be included in the real file) ...
     def enable_lora(
         self,
         rank,

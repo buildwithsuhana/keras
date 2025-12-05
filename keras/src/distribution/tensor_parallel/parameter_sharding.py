@@ -89,7 +89,7 @@ class ParameterShardingStrategy:
         return var_to_owner
 
     def _replace_variable(self, layer, attr_name, old_var, new_val_tensor):
-        print(f"      🛠️  [Resizing] Replacing '{attr_name}' on layer '{layer.name}'...")
+        print(f"      🛠️  [Resizing] Replacing '{attr_name}' on layer '{layer.name}' (ID: {id(layer)})...")
         VarClass = old_var.__class__
         try:
             new_var = VarClass(
@@ -116,7 +116,8 @@ class ParameterShardingStrategy:
             setattr(layer, attr_name, new_var)
         
         # Update Keras internal tracking lists
-        for lst_name in ['_trainable_weights', '_non_trainable_weights', '_weights', 'weights', 'variables']:
+        # Added 'trainable_weights' and 'non_trainable_weights' explicitly just in case
+        for lst_name in ['_trainable_weights', '_non_trainable_weights', '_weights', 'weights', 'variables', 'trainable_weights', 'non_trainable_weights']:
             if hasattr(layer, lst_name):
                 lst = getattr(layer, lst_name)
                 if isinstance(lst, list):

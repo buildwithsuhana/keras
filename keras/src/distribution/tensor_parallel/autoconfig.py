@@ -50,7 +50,7 @@ def _apply_layer_sharding_rules(layer, full_name, device_count, state_rules, out
 
     print(f"🔍 [AutoConfig] Analyzing: '{clean_name}' ({cls_name})")
 
-    # 1. Shard Normalization (Fixes the first RMSNorm crash)
+    # 1. Shard Normalization (Crucial for input shape consistency)
     if "Normalization" in cls_name:
         print(f"   ➕ [Add Rule] '{clean_name}' -> Normalization (Split Dim 0)")
         def add_if_exists(attr, key):
@@ -73,50 +73,47 @@ def _apply_layer_sharding_rules(layer, full_name, device_count, state_rules, out
                 is_3d_kernel = True
 
         if is_down_proj:
-            # DOWN PROJECTION:
-            # Input is full heads (4096) or whatever QKV produced. 
-            # We must split OUTPUT (Dim 1) to return to 1792 (sharded hidden)
-            # This ensures residual connection x (1792) + f(x) (1792) works.
+            # Down Projection (Output Processing)
+            # Input is Full Heads/Features -> We want Sharded Output (1792)
             
-            # Standard Dense: (In, Out) -> Split Dim 1
-            # Einsum 3D: (Heads, Dim, Out)? Usually 2D for O_Proj (N*H, D)
-            split_dim = 1 
-            if is_3d_kernel: 
-                # If kernel is (Heads, Dim, Out), Out is dim 2.
-                # But typically O_Proj is 2D. Let's assume Dim 1 for safety or check shape.
-                split_dim = 2 if layer.kernel.shape[2] > layer.kernel.shape[0] else 1
+            if is_3d_kernel:
+                # Kernel: (Heads, HeadDim, Output) or (Heads, Output, HeadDim)?
+                # Usually EinsumDense output is last dim.
+                split_dim = len(layer.kernel.shape) - 1 
+            else:
+                # Kernel: (Input, Output) -> Split Output (Dim 1)
+                split_dim = 1
 
             print(f"   ➕ [Add Rule] '{clean_name}' -> Down Projection (Split Output Dim {split_dim})")
             state_rules[rule_key_kernel] = _split_rule(device_count, dim=split_dim)
             
-            # We do NOT want AllReduce here because we are keeping the shards separate
+            # Disable AllReduce to keep shards independent
             # output_rules[clean_name] = {0: "allreduce"} 
             
         elif is_up_proj or is_qkv:
-            # UP PROJECTION / QKV:
-            # Input is sharded (1792). We must split INPUT (Dim 0).
+            # Up Projection / QKV (Input Processing)
+            # Input is Sharded (1792) -> We must split the Input Dimension of the kernel.
             
-            split_dim = 0
+            if is_3d_kernel:
+                # Kernel: (Heads, Input, HeadDim) -> Input is Dim 1
+                split_dim = 1
+            else:
+                # Kernel: (Input, Output) -> Input is Dim 0
+                split_dim = 0
             
             print(f"   ➕ [Add Rule] '{clean_name}' -> Up Projection/QKV (Split Input Dim {split_dim})")
             state_rules[rule_key_kernel] = _split_rule(device_count, dim=split_dim)
             
-            # Biases in QKV usually match the Output dimension (Heads).
-            # If we split Input (Dim 0), the Output (Dim 1) is FULL.
-            # So Bias should NOT be sharded (Replicated).
-            # However, if memory is tight, we might have issues. 
-            # But mathematically, if we calculate full heads, we need full bias.
+            # Bias usually matches Output/Heads. Since we split Input, 
+            # Output is Full. So Bias should NOT be sharded (Replicated).
             if hasattr(layer, "bias") and layer.bias is not None:
-                # Keep bias replicated (no rule needed usually implies replicated)
-                # Or explicitly:
-                pass 
+                pass # Default is replicated, which is correct here.
             
         else:
-            # Fallback for generic Dense
-            print(f"   ➕ [Add Rule] '{clean_name}' -> Dense Fallback (Split Dim 1)")
-            state_rules[rule_key_kernel] = _split_rule(device_count, dim=1)
-            if hasattr(layer, 'bias') and layer.bias is not None:
-                state_rules[rule_key_bias] = _split_rule(device_count, dim=0)
+            # Fallback for generic Dense (treat as Up/Expansion)
+            print(f"   ➕ [Add Rule] '{clean_name}' -> Dense Fallback (Split Input)")
+            split_dim = 0
+            state_rules[rule_key_kernel] = _split_rule(device_count, dim=split_dim)
 
     # 3. Embedding
     elif "Embedding" in cls_name:
