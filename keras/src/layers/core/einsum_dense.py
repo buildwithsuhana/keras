@@ -255,24 +255,6 @@ class EinsumDense(Layer):
         return self.full_output_shape
 
     def call(self, inputs, training=None):
-        # --- DEBUG LOGGING START ---
-        print(f"🔍 [DEBUG EinsumDense ID] Layer: {self.name} | ID: {id(self)}")
-        print(f"   Equation: {self.equation}")
-        print(f"   Inputs Shape: {getattr(inputs, 'shape', 'Unknown')}")
-        
-        kernel_shape = "Unknown"
-        if hasattr(self, "_kernel"):
-             print(f"   Internal _kernel ID: {id(self._kernel)} | Shape: {self._kernel.shape}")
-        else:
-             print("   Internal _kernel: MISSING")
-             
-        try:
-            eff_kernel = self.kernel
-            print(f"   Effective Kernel Shape: {eff_kernel.shape}")
-        except Exception as e:
-            print(f"   Error accessing kernel: {e}")
-        # --- DEBUG LOGGING END ---
-
         x = ops.einsum(self.equation, inputs, self.kernel)
         if self.bias is not None:
             x = ops.add(x, self.bias)
