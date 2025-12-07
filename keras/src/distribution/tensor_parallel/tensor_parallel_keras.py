@@ -12,6 +12,7 @@ from keras.src.distribution.tensor_parallel.parameter_sharding import make_param
 from keras.src.distribution.tensor_parallel.coordinated_optimizer import TensorParallelOptimizer
 from keras.src.distribution import list_devices
 from keras.src.models import Model
+import ctypes
 
 logger = logging.getLogger(__file__)
 
@@ -24,6 +25,11 @@ class TensorParallelKeras(Model):
         **kwargs,
     ):
         super().__init__(**kwargs)
+
+        def flush_memory():
+            gc.collect()
+            try: ctypes.CDLL("libc.so.6").malloc_trim(0)
+            except: pass
 
         # Device Setup
         if device_count is None or device_ids is None:
@@ -52,7 +58,7 @@ class TensorParallelKeras(Model):
         print("🗑️  Destroying Master Model...")
         del loaded_model
         if 'model' in locals(): del model
-        gc.collect()
+        flush_memory()
 
         self.model_shards = []
         print(f"🚀 Initializing TP on {self.devices}")
@@ -117,7 +123,7 @@ class TensorParallelKeras(Model):
                 except: continue
 
             self.model_shards.append(shard)
-            gc.collect()
+            flush_memory()
             print(f"[{device_id}] ✅ Shard ready.")
 
         try: shutil.rmtree(self.temp_dir)
