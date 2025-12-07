@@ -23,7 +23,6 @@ class ParameterShardingStrategy:
         """
         var_to_owner = {}
         
-        # Traverse all layers
         stack = [model]
         visited = set()
         
