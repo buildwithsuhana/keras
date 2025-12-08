@@ -133,7 +133,6 @@ class TensorParallelKeras(Model):
             total = ops.add(total, results[i])
         return total
     
-    # --- CUSTOM TRAIN STEP ---
     def train_step(self, state, data):
         # In JAX backend, train_step receives (state, data).
         # We ignore 'state' because our real variables are distributed in self.model_shards
@@ -144,15 +143,21 @@ class TensorParallelKeras(Model):
         all_shard_grads_vars = []
         total_loss = 0.0
         import tensorflow as tf
+        
         # 1. Forward & Backward on Shards
         for i, shard in enumerate(self.model_shards):
             with keras.device(self.devices[i]):
                 with tf.GradientTape() as tape:
                     # Forward pass
                     y_pred = shard(x, training=True)
-                    # Compute loss
-                    loss = self.compiled_loss(y, y_pred, sample_weight=sample_weight)
-                
+                    
+                    # Compute loss using the correct method
+                    # Option A: Use compute_loss (Recommended - handles all losses)
+                    loss = self.compute_loss(x, y, y_pred, sample_weight)
+                    
+                    # Option B: Use _compile_loss directly (Only uses the loss function passed to compile)
+                    # loss = self._compile_loss(y, y_pred, sample_weight)
+
                 # Compute gradients
                 trainable_vars = shard.trainable_variables
                 grads = tape.gradient(loss, trainable_vars)
