@@ -17,7 +17,11 @@ class ParameterShardingStrategy:
         self.rank = rank
 
     def _map_variables_to_owners(self, model):
+        """
+        Maps variable IDs to (layer, attribute_name).
+        """
         var_to_owner = {}
+        
         stack = [model]
         visited = set()
         
@@ -27,12 +31,15 @@ class ParameterShardingStrategy:
             visited.add(id(layer))
 
             layer_vars = {} 
+            
+            # Scan attributes
             for attr_name in dir(layer):
                 if attr_name.startswith("__"): continue
                 try: attr_val = getattr(layer, attr_name, None)
                 except Exception: continue
                 if attr_val is None: continue
 
+                # Duck typing checks
                 is_var = hasattr(attr_val, 'assign') and hasattr(attr_val, 'value')
                 is_layer = (hasattr(attr_val, 'weights') and hasattr(attr_val, 'add_weight') and not is_var)
 
@@ -43,12 +50,17 @@ class ParameterShardingStrategy:
                 elif isinstance(attr_val, (list, tuple)):
                     for item in attr_val:
                         if hasattr(item, 'weights'): stack.append(item)
+                elif isinstance(attr_val, dict):
+                    for key, item in attr_val.items():
+                        if hasattr(item, 'weights'): stack.append(item)
 
+            # Resolve best name for variables
             for vid, names in layer_vars.items():
-                # Heuristic: prefer names that don't start with underscore if available, else take first
                 best_name = names[0]
+                # CRITICAL FIX: Prefer private attributes (e.g. '_kernel') over public properties ('kernel')
+                # This avoids triggering read-only property errors or Keras tracking locks.
                 for name in names:
-                    if not name.startswith("_"):
+                    if name.startswith("_"):
                         best_name = name
                         break
                 var_to_owner[vid] = (layer, best_name)
@@ -56,17 +68,13 @@ class ParameterShardingStrategy:
             if hasattr(layer, 'layers'):
                 try: stack.extend(layer.layers)
                 except Exception: pass
+
         return var_to_owner
 
     def _replace_variable(self, layer, attr_name, old_var, new_val_tensor):
         print(f"      🛠️  [Re-creating] '{attr_name}' on '{layer.name}' -> {new_val_tensor.device}")
         
-        # 1. Create NEW variable. This ensures it adopts the device of 'new_val_tensor' (The GPU)
-        # explicitly, because we are using the 'initializer' which is the tensor itself.
         try:
-            # We use a lambda initializer to bypass some internal Keras checks that might complain
-            # about device mismatch if we passed the tensor directly as a value.
-            # But passing tensor as initializer usually works to force device.
             new_var = keras.Variable(
                 initializer=new_val_tensor,
                 shape=new_val_tensor.shape,
@@ -77,54 +85,61 @@ class ParameterShardingStrategy:
         except Exception as e:
             print(f"      ⚠️ Var creation failed: {e}")
             return old_var
-
-        # 2. Force overwrite the attribute on the layer
+        
+        # 1. Force overwrite the attribute on the layer using object.__setattr__
+        # This bypasses Layer.__setattr__ which contains the 'already built' check.
         try: 
             object.__setattr__(layer, attr_name, new_var)
-        except Exception: 
-            setattr(layer, attr_name, new_var)
+        except Exception as e:
+            print(f"      ⚠️ object.__setattr__ failed: {e}. Trying fallback...")
+            # If the attribute lookup failed (maybe it really wants the _ version and we missed it)
+            if not attr_name.startswith("_"):
+                try:
+                    object.__setattr__(layer, "_" + attr_name, new_var)
+                    print(f"      ✅ Fallback to '_{attr_name}' succeeded.")
+                except:
+                    setattr(layer, attr_name, new_var)
+            else:
+                setattr(layer, attr_name, new_var)
         
-        # 3. Update Keras internal tracking lists to point to the new GPU variable
+        # 2. Update Keras internal tracking lists
+        # We must update these lists so Keras sees the new variable for gradients/saving
         for lst_name in ['_trainable_weights', '_non_trainable_weights', '_weights', 'weights', 'variables']:
             if hasattr(layer, lst_name):
                 lst = getattr(layer, lst_name)
                 if isinstance(lst, list):
                     for i, v in enumerate(lst):
-                        if v is old_var: 
-                            lst[i] = new_var
+                        if v is old_var: lst[i] = new_var
 
         return new_var
 
     def _find_layer_by_path(self, model, var_path):
+        """Traverses the model using the variable path to find the owner layer."""
         if ":" in var_path: var_path = var_path.split(":")[0]
         parts = var_path.split("/")
         attr_name = parts[-1]
         
         current = model
         
-        # Helper to find attribute or layer
         def find_child(parent, name):
-            # Check attributes first
             for attr in dir(parent):
                 if attr.startswith("__"): continue
                 try: val = getattr(parent, attr)
                 except: continue
                 if hasattr(val, 'name') and val.name == name: return val
-            # Check layers list
             if hasattr(parent, 'layers'):
                 for layer in parent.layers:
                     if layer.name == name: return layer
             return None
 
-        # Navigate path
         for part in parts[:-1]:
             if hasattr(current, 'name') and current.name == part: continue 
             next_node = find_child(current, part)
             if next_node: 
                 current = next_node
             else:
-                # Fallback: check inside common wrappers
                 found = False
+                # Heuristic: Check inside common wrappers
                 for wrapper in ['backbone', 'model', 'encoder', 'decoder', 'transformer']:
                     if hasattr(current, wrapper):
                         candidate = find_child(getattr(current, wrapper), part)
@@ -134,6 +149,7 @@ class ParameterShardingStrategy:
                             break
                 if not found: return None, None
 
+        # Prefer private attribute if it exists
         if hasattr(current, "_" + attr_name): return current, "_" + attr_name
         if hasattr(current, attr_name): return current, attr_name
         return None, None
@@ -142,19 +158,17 @@ class ParameterShardingStrategy:
         modified = set()
         var_to_owner = self._map_variables_to_owners(shard_model)
         
-        # Resolve JAX Target Device
+        # JAX Device Resolution
         jax_target = None
         if keras.config.backend() == "jax":
-            import jax
             try:
-                # Parse "cuda:0" -> jax device object
-                d_str = str(device_id)
+                import jax
+                d_str = str(device_id).lower()
                 idx = int(d_str.split(":")[-1]) if ":" in d_str else 0
-                
-                # Try finding specific backend first
                 try: jax_target = jax.devices('gpu')[idx]
-                except: jax_target = jax.devices()[idx]
-                
+                except: 
+                    try: jax_target = jax.devices('cuda')[idx]
+                    except: jax_target = jax.devices()[idx]
                 print(f"      🎯 JAX Target: {jax_target}")
             except: pass
 
@@ -170,33 +184,34 @@ class ParameterShardingStrategy:
 
                     sliced_val = action(source_val, self.rank)
                     
-                    # --- FORCE PLACEMENT ---
+                    # --- 1. FORCE PLACEMENT ---
                     if jax_target is not None:
                         import jax
-                        # Push to GPU immediately
+                        # Push to GPU immediately to avoid CPU OOM
                         sliced_val_tensor = jax.device_put(sliced_val, jax_target)
                         sliced_val_tensor = sliced_val_tensor.astype(target_var.dtype)
                     else:
                         with keras.device(device_id):
                             sliced_val_tensor = ops.convert_to_tensor(sliced_val, dtype=target_var.dtype)
 
-                    # --- ALWAYS REPLACE VARIABLE ---
-                    # We do NOT use assign() because it might respect the old CPU placement.
-                    # We find the owner layer and swap the variable object entirely.
-                    
+                    # --- 2. REPLACE VARIABLE ---
                     layer, attr_name = None, None
+                    
+                    # Try ID mapping first
                     if id(target_var) in var_to_owner:
                         layer, attr_name = var_to_owner[id(target_var)]
                     
+                    # Fallback to path lookup
                     if layer is None:
-                        # Fallback to path lookup
                         var_path = target_var.path if hasattr(target_var, 'path') else target_var.name
                         layer, attr_name = self._find_layer_by_path(shard_model, var_path)
 
                     if layer and attr_name:
                         self._replace_variable(layer, attr_name, target_var, sliced_val_tensor)
                     else:
-                        print(f"   ❌ CRITICAL: Could not find owner for {name}. Forced assign (May OOM).")
+                        print(f"   ❌ CRITICAL: Could not find owner for {name}. Assigning (Risk of CPU OOM).")
+                        # If we can't replace the object, we have to assign. 
+                        # This might bring data back to CPU if the var was created there.
                         target_var.assign(sliced_val_tensor)
                     
                     modified.add(name)
