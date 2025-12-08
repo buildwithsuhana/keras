@@ -216,7 +216,10 @@ class TensorParallelKeras(Model):
     def compile(self, optimizer=None, **kwargs):
         if len(self.model_shards) > 1 and optimizer:
             opt = TensorParallelOptimizer(optimizer, self.device_count)
-            opt._shard_models = self.model_shards
+            
+            # FIX: Use __dict__ to assign these properties prevents Keras/JAX 
+            # from tracking the shards via the optimizer.
+            opt.__dict__["_shard_models"] = self.model_shards
             
             var_map = {}
             for i, shard in enumerate(self.model_shards):
@@ -224,7 +227,8 @@ class TensorParallelKeras(Model):
                     key = v.path if hasattr(v, "path") else v.name
                     if key not in var_map: var_map[key] = [None]*self.device_count
                     var_map[key][i] = v
-            opt._shard_var_map = var_map
+            
+            opt.__dict__["_shard_var_map"] = var_map
             
             super().compile(optimizer=opt, **kwargs)
             
