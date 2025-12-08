@@ -145,20 +145,16 @@ class TensorParallelKeras(Model):
 
         # 2. Forward & Backward Pass per Shard
         for i, shard in enumerate(self.model_shards):
-            # Ensure we are operating on the correct device for this shard
             with keras.device(self.devices[i]):
                 
-                # Define a pure function for JAX differentiation
+                # Define pure function for JAX
                 def compute_loss(trainable_vars, non_trainable_vars, x_in, y_target):
-                    # stateless_call allows passing explicit variables (JAX requirement)
                     y_pred, non_trainable_updates = shard.stateless_call(
                         trainable_vars, 
                         non_trainable_vars, 
                         x_in, 
                         training=True
                     )
-                    
-                    # Compute loss (this handles regularization losses automatically)
                     loss = self.compute_loss(
                         x=x_in, 
                         y=y_target, 
@@ -167,32 +163,35 @@ class TensorParallelKeras(Model):
                     )
                     return loss, non_trainable_updates
 
-                # Create the gradient function
                 grad_fn = jax.value_and_grad(compute_loss, has_aux=True)
                 
-                # Execute on device (Compute gradients)
+                # --- FIX START ---
+                # Extract the pure JAX arrays (.value) from the Variables
+                trainable_values = [v.value for v in shard.trainable_variables]
+                non_trainable_values = [v.value for v in shard.non_trainable_variables]
+
+                # Pass VALUES to the gradient function, not the Variable objects
                 (loss_val, _), grads = grad_fn(
-                    shard.trainable_variables, 
-                    shard.non_trainable_variables, 
+                    trainable_values, 
+                    non_trainable_values, 
                     x, 
                     y
                 )
+                # --- FIX END ---
                 
-                # Accumulate (gradient, variable) pairs for this shard
+                # Pair the computed gradient arrays back with the Variable objects for the optimizer
                 all_shard_grads_vars.append(list(zip(grads, shard.trainable_variables)))
                 
                 if i == 0:
                     total_loss = loss_val
 
-        # 3. Apply Gradients (Coordinator handles synchronization)
+        # 3. Apply Gradients
         self.optimizer.apply_gradients(all_shard_grads_vars, shard_models=self.model_shards)
         
         # 4. Update Metrics
         for metric in self.metrics:
             if metric.name == "loss":
                 metric.update_state(total_loss)
-            else:
-                pass # Add custom metric logic here if needed
         
         return {m.name: m.result() for m in self.metrics}
 
