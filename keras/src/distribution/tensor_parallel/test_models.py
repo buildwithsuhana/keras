@@ -77,22 +77,33 @@ def model_factory():
 
 def print_memory(tag):
     try:
-        d = jax.local_devices()[0]
-        stats = d.memory_stats()
-        used = stats['bytes_in_use'] / 1e9
-        limit = stats['bytes_limit'] / 1e9
-        logger.info(f"📊 MEMORY [TPU:0] @ {tag}: {used:.2f} / {limit:.2f} GB")
+        # Try to print for all local devices
+        for d in jax.local_devices():
+            if d.platform == "cpu": continue
+            stats = d.memory_stats()
+            used = stats['bytes_in_use'] / 1e9
+            limit = stats['bytes_limit'] / 1e9
+            logger.info(f"📊 MEMORY [{d}] @ {tag}: {used:.2f} / {limit:.2f} GB")
     except: pass
 
 def inspect_shards(tp_model, devices):
     logger.info("🕵️ INSPECTING SHARD PLACEMENT...")
     for i, shard in enumerate(tp_model.model_shards):
+        # We expect the shard to be on the device requested
         expect = str(devices[i])
-        var = shard.trainable_variables[0]
-        try: actual = str(list(var.value.devices())[0]) if hasattr(var, 'value') else str(var.device)
-        except: actual = "Unknown"
         
-        status = "✅ OK" if expect in actual or expect.split(':')[0] in actual else "❌ WRONG DEVICE"
+        # Check the first weight (usually embedding or dense kernel)
+        var = shard.trainable_variables[0]
+        try: 
+            # For JAX, value.devices() gives the placement
+            actual = str(list(var.value.devices())[0]) if hasattr(var, 'value') else str(var.device)
+        except: 
+            actual = "Unknown"
+        
+        # We check if the expected device string is roughly inside the actual string
+        # e.g. Expect 'cuda:0' in Actual 'cuda:0' or 'gpu:0'
+        is_match = expect in actual or actual in expect
+        status = "✅ OK" if is_match else "❌ WRONG DEVICE"
         logger.info(f"   Shard {i} | Expect: {expect} | Actual: {actual} | {status}")
 
 def run_training():
@@ -106,8 +117,9 @@ def run_training():
     train_ds = load_data(MODEL_PRESET)
     
     logger.info("Init TP Model...")
-    # Clean device strings for Keras
-    dev_ids = [f"{d.platform}:{d.id}" for d in devices]
+    dev_ids = [str(d) for d in devices]
+    logger.info(f"Using devices: {dev_ids}")
+    
     tp_model = TensorParallelKeras(model=model_factory, device_count=count, device_ids=dev_ids)
     print_memory("AFTER INIT")
 

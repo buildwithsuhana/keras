@@ -86,6 +86,7 @@ class TensorParallelKeras(Model):
             # 3. Smart Migration (Unsharded variables -> TPU)
             try:
                 import jax
+                # Handle both 'cuda:0' and 'gpu:0' formats
                 target_idx = int(device_id.split(":")[-1])
                 target_device = next(d for d in jax.devices() if d.id == target_idx)
                 
@@ -153,7 +154,6 @@ class TensorParallelKeras(Model):
             val = v.numpy()
             
             # Check for bfloat16 or similar problematic types and cast to float32
-            # |V2 is essentially void/raw 2 bytes, which is how numpy sees bf16 without ml_dtypes
             if (hasattr(val, 'dtype') and (val.dtype.name == 'bfloat16' or str(val.dtype) == 'bfloat16')) or \
                (val.dtype.char == 'V' and val.itemsize == 2):
                 val = val.astype('float32')
@@ -163,7 +163,6 @@ class TensorParallelKeras(Model):
     def _weight_loader(self, param_name):
         safe_name = param_name.replace("/", "_").replace(":", "_")
         path = os.path.join(self.temp_dir, safe_name + ".npy")
-        # Loads metadata only; data is read from disk on-demand during slicing
         if os.path.exists(path): return np.load(path, mmap_mode='r')
         return None
 
@@ -175,8 +174,15 @@ class TensorParallelKeras(Model):
             if match: return f"tpu:{match.group(1)}"
             if ":" not in d_str: return f"tpu:{d_str}"
             return d_str
-        if d_str.startswith("cuda:"): return d_str.replace("cuda:", "gpu:")
-        if ":" not in d_str: return f"gpu:{d_str}"
+        
+        # FIX: Do not force replace 'cuda' with 'gpu'. JAX might expect 'cuda'.
+        # if d_str.startswith("cuda:"): return d_str.replace("cuda:", "gpu:")
+        
+        if ":" not in d_str: 
+            # If it's just a number like "0", we can assume gpu or cuda based on environment?
+            # Safer to assume gpu:x for now if no prefix is given.
+            return f"gpu:{d_str}"
+            
         return d_str
 
     def compile(self, optimizer=None, **kwargs):
