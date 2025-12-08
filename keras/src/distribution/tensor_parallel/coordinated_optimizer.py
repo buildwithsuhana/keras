@@ -143,19 +143,16 @@ class TensorParallelOptimizer(optimizers.Optimizer):
         else:
             self.base_optimizer.apply_gradients(grads_and_vars)
 
-    # --- ADDED THIS METHOD ---
+    # --- FIX 1: Implement update_step for Keras 3 compatibility ---
     def update_step(self, gradient, variable, learning_rate):
-        """Delegates the update step to the base optimizer.
-        
-        This is required by Keras 3.0+ Optimizer base class even if 
-        apply_gradients is overridden.
-        """
         return self.base_optimizer.update_step(gradient, variable, learning_rate)
 
     def build(self, variables: list):
         if self.built: return
         self.coordinated_optimizer.enable_optimizer_state_sharding(variables)
-        super().build(variables)
+        # --- FIX 2: Do NOT call super().build(variables) ---
+        # This prevents the master optimizer from initializing variables on CPU.
+        self.built = True
 
     def get_config(self):
         return {

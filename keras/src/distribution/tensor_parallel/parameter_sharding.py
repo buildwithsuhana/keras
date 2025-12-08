@@ -43,12 +43,10 @@ class ParameterShardingStrategy:
                 elif isinstance(attr_val, (list, tuple)):
                     for item in attr_val:
                         if hasattr(item, 'weights'): stack.append(item)
-                elif isinstance(attr_val, dict):
-                    for key, item in attr_val.items():
-                        if hasattr(item, 'weights'): stack.append(item)
 
             for vid, names in layer_vars.items():
                 best_name = names[0]
+                # Prefer private names (e.g. _kernel) to bypass property locks
                 for name in names:
                     if name.startswith("_"):
                         best_name = name
@@ -63,12 +61,9 @@ class ParameterShardingStrategy:
     def _replace_variable(self, layer, attr_name, old_var, new_val_tensor, device_id=None):
         print(f"      🛠️  [Swapping] '{attr_name}' on '{layer.name}' -> {new_val_tensor.device}")
         
-        # Enforce Keras Device Scope if provided
         try:
-            if device_id:
-                ctx = keras.device(device_id)
-                ctx.__enter__()
-
+            # We assume new_val_tensor is already on the correct device (GPU)
+            # Using it as initializer forces the Variable to adopt that device.
             new_var = keras.Variable(
                 initializer=new_val_tensor,
                 shape=new_val_tensor.shape,
@@ -76,21 +71,17 @@ class ParameterShardingStrategy:
                 trainable=old_var.trainable,
                 name=old_var.name
             )
-            
-            if device_id:
-                ctx.__exit__(None, None, None)
-                
         except Exception as e:
             print(f"      ⚠️ Var creation failed: {e}")
-            if device_id: ctx.__exit__(None, None, None)
             return old_var
         
+        # Force set the attribute, bypassing "built" checks
         success = False
         try:
             object.__setattr__(layer, attr_name, new_var)
             success = True
         except Exception: pass
-            
+
         if not success and not attr_name.startswith("_"):
             try:
                 object.__setattr__(layer, "_" + attr_name, new_var)
@@ -98,8 +89,9 @@ class ParameterShardingStrategy:
             except Exception: pass
         
         if not success:
-            print(f"      ⚠️ FAILED to swap attribute '{attr_name}'.")
+            print(f"      ⚠️ FAILED to swap attribute '{attr_name}'. Memory leak risk!")
 
+        # Update internal Keras lists so the new variable is actually used
         for lst_name in ['_trainable_weights', '_non_trainable_weights', '_weights', 'weights', 'variables']:
             if hasattr(layer, lst_name):
                 lst = getattr(layer, lst_name)
@@ -156,9 +148,8 @@ class ParameterShardingStrategy:
                 d_str = str(device_id)
                 idx = int(d_str.split(":")[-1]) if ":" in d_str else 0
                 try: jax_target = jax.devices('gpu')[idx]
-                except: 
-                    try: jax_target = jax.devices('cuda')[idx]
-                    except: jax_target = jax.devices()[idx]
+                except: jax_target = jax.devices()[idx]
+                print(f"      🎯 JAX Target: {jax_target}")
             except: pass
 
         for pattern, action in config.state_rules.items():
@@ -175,6 +166,7 @@ class ParameterShardingStrategy:
                     
                     if jax_target is not None:
                         import jax
+                        # Push to GPU immediately
                         sliced_val_tensor = jax.device_put(sliced_val, jax_target)
                         sliced_val_tensor = sliced_val_tensor.astype(target_var.dtype)
                     else:
@@ -192,7 +184,7 @@ class ParameterShardingStrategy:
                     if layer and attr_name:
                         self._replace_variable(layer, attr_name, target_var, sliced_val_tensor, device_id=device_id)
                     else:
-                        print(f"   ❌ CRITICAL: Could not find owner for {name}. Assigning.")
+                        # Fallback assign
                         target_var.assign(sliced_val_tensor)
                     
                     modified.add(name)
