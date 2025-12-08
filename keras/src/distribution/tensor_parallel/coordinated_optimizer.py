@@ -24,8 +24,6 @@ class CoordinatedOptimizer:
 
     def _initialize_sharded_states(self):
         # BYPASS: Do not initialize master state on CPU to avoid OOM.
-        # The shards will initialize their own optimizer variables locally 
-        # when apply_gradients is called on them.
         return
 
     def apply_gradients(
@@ -36,7 +34,6 @@ class CoordinatedOptimizer:
         synchronized_gradients = self._synchronize_gradients(gradients_and_vars)
 
         # 2. Apply Locally on each Shard
-        # We skip the "Coordinator" update and go directly to shards
         for shard_idx in range(self.device_count):
             shard_opt = shard_models[shard_idx].optimizer
             if hasattr(shard_opt, "inner_optimizer"): 
@@ -44,8 +41,6 @@ class CoordinatedOptimizer:
             elif hasattr(shard_opt, "base_optimizer"):
                 shard_opt = shard_opt.base_optimizer
 
-            # Apply gradients directly to the shard's optimizer
-            # This triggers local variable creation on the GPU
             shard_grads_and_vars = synchronized_gradients[shard_idx]
             shard_opt.apply_gradients(shard_grads_and_vars)
 
@@ -79,8 +74,7 @@ class CoordinatedOptimizer:
                     if g_and_v[i][0] is not None
                 ]
                 if grads_to_reduce:
-                    # Sync gradients across devices using stack + mean
-                    # Since we are in JAX, this works if they are compatible arrays
+                    # Sync gradients across devices (All-Reduce)
                     stacked_grads = ops.stack(
                         [ops.convert_to_tensor(g) for g in grads_to_reduce], axis=0
                     )
@@ -99,7 +93,6 @@ class CoordinatedOptimizer:
 
     def enable_optimizer_state_sharding(self, variables: list):
         self.shard_optimizer_states = True
-        # Skip initialization to save memory
         pass
 
 
@@ -121,7 +114,7 @@ class TensorParallelOptimizer(optimizers.Optimizer):
         try:
             lr_value = float(ops.convert_to_numpy(learning_rate))
         except:
-            lr_value = 0.001 # Fallback
+            lr_value = 0.001
 
         super().__init__(
             learning_rate=lr_value,
@@ -150,10 +143,17 @@ class TensorParallelOptimizer(optimizers.Optimizer):
         else:
             self.base_optimizer.apply_gradients(grads_and_vars)
 
+    # --- ADDED THIS METHOD ---
+    def update_step(self, gradient, variable, learning_rate):
+        """Delegates the update step to the base optimizer.
+        
+        This is required by Keras 3.0+ Optimizer base class even if 
+        apply_gradients is overridden.
+        """
+        return self.base_optimizer.update_step(gradient, variable, learning_rate)
+
     def build(self, variables: list):
         if self.built: return
-        # BYPASS: Do NOT build base_optimizer on CPU. 
-        # This prevents 36GB+ allocation on CPU.
         self.coordinated_optimizer.enable_optimizer_state_sharding(variables)
         super().build(variables)
 

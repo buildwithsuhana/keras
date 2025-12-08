@@ -17,11 +17,7 @@ class ParameterShardingStrategy:
         self.rank = rank
 
     def _map_variables_to_owners(self, model):
-        """
-        Maps variable IDs to (layer, attribute_name).
-        """
         var_to_owner = {}
-        
         stack = [model]
         visited = set()
         
@@ -31,15 +27,12 @@ class ParameterShardingStrategy:
             visited.add(id(layer))
 
             layer_vars = {} 
-            
-            # Scan attributes
             for attr_name in dir(layer):
                 if attr_name.startswith("__"): continue
                 try: attr_val = getattr(layer, attr_name, None)
                 except Exception: continue
                 if attr_val is None: continue
 
-                # Duck typing checks
                 is_var = hasattr(attr_val, 'assign') and hasattr(attr_val, 'value')
                 is_layer = (hasattr(attr_val, 'weights') and hasattr(attr_val, 'add_weight') and not is_var)
 
@@ -54,11 +47,8 @@ class ParameterShardingStrategy:
                     for key, item in attr_val.items():
                         if hasattr(item, 'weights'): stack.append(item)
 
-            # Resolve best name for variables
             for vid, names in layer_vars.items():
                 best_name = names[0]
-                # CRITICAL FIX: Prefer private attributes (e.g. '_kernel') over public properties ('kernel')
-                # This avoids triggering read-only property errors or Keras tracking locks.
                 for name in names:
                     if name.startswith("_"):
                         best_name = name
@@ -68,13 +58,17 @@ class ParameterShardingStrategy:
             if hasattr(layer, 'layers'):
                 try: stack.extend(layer.layers)
                 except Exception: pass
-
         return var_to_owner
 
-    def _replace_variable(self, layer, attr_name, old_var, new_val_tensor):
-        print(f"      🛠️  [Re-creating] '{attr_name}' on '{layer.name}' -> {new_val_tensor.device}")
+    def _replace_variable(self, layer, attr_name, old_var, new_val_tensor, device_id=None):
+        print(f"      🛠️  [Swapping] '{attr_name}' on '{layer.name}' -> {new_val_tensor.device}")
         
+        # Enforce Keras Device Scope if provided
         try:
+            if device_id:
+                ctx = keras.device(device_id)
+                ctx.__enter__()
+
             new_var = keras.Variable(
                 initializer=new_val_tensor,
                 shape=new_val_tensor.shape,
@@ -82,28 +76,30 @@ class ParameterShardingStrategy:
                 trainable=old_var.trainable,
                 name=old_var.name
             )
+            
+            if device_id:
+                ctx.__exit__(None, None, None)
+                
         except Exception as e:
             print(f"      ⚠️ Var creation failed: {e}")
+            if device_id: ctx.__exit__(None, None, None)
             return old_var
         
-        # 1. Force overwrite the attribute on the layer using object.__setattr__
-        # This bypasses Layer.__setattr__ which contains the 'already built' check.
-        try: 
+        success = False
+        try:
             object.__setattr__(layer, attr_name, new_var)
-        except Exception as e:
-            print(f"      ⚠️ object.__setattr__ failed: {e}. Trying fallback...")
-            # If the attribute lookup failed (maybe it really wants the _ version and we missed it)
-            if not attr_name.startswith("_"):
-                try:
-                    object.__setattr__(layer, "_" + attr_name, new_var)
-                    print(f"      ✅ Fallback to '_{attr_name}' succeeded.")
-                except:
-                    setattr(layer, attr_name, new_var)
-            else:
-                setattr(layer, attr_name, new_var)
+            success = True
+        except Exception: pass
+            
+        if not success and not attr_name.startswith("_"):
+            try:
+                object.__setattr__(layer, "_" + attr_name, new_var)
+                success = True
+            except Exception: pass
         
-        # 2. Update Keras internal tracking lists
-        # We must update these lists so Keras sees the new variable for gradients/saving
+        if not success:
+            print(f"      ⚠️ FAILED to swap attribute '{attr_name}'.")
+
         for lst_name in ['_trainable_weights', '_non_trainable_weights', '_weights', 'weights', 'variables']:
             if hasattr(layer, lst_name):
                 lst = getattr(layer, lst_name)
@@ -114,11 +110,9 @@ class ParameterShardingStrategy:
         return new_var
 
     def _find_layer_by_path(self, model, var_path):
-        """Traverses the model using the variable path to find the owner layer."""
         if ":" in var_path: var_path = var_path.split(":")[0]
         parts = var_path.split("/")
         attr_name = parts[-1]
-        
         current = model
         
         def find_child(parent, name):
@@ -135,12 +129,10 @@ class ParameterShardingStrategy:
         for part in parts[:-1]:
             if hasattr(current, 'name') and current.name == part: continue 
             next_node = find_child(current, part)
-            if next_node: 
-                current = next_node
+            if next_node: current = next_node
             else:
                 found = False
-                # Heuristic: Check inside common wrappers
-                for wrapper in ['backbone', 'model', 'encoder', 'decoder', 'transformer']:
+                for wrapper in ['backbone', 'model', 'encoder', 'decoder', 'transformer', 'preprocessor']:
                     if hasattr(current, wrapper):
                         candidate = find_child(getattr(current, wrapper), part)
                         if candidate: 
@@ -149,7 +141,6 @@ class ParameterShardingStrategy:
                             break
                 if not found: return None, None
 
-        # Prefer private attribute if it exists
         if hasattr(current, "_" + attr_name): return current, "_" + attr_name
         if hasattr(current, attr_name): return current, attr_name
         return None, None
@@ -158,18 +149,16 @@ class ParameterShardingStrategy:
         modified = set()
         var_to_owner = self._map_variables_to_owners(shard_model)
         
-        # JAX Device Resolution
         jax_target = None
         if keras.config.backend() == "jax":
+            import jax
             try:
-                import jax
-                d_str = str(device_id).lower()
+                d_str = str(device_id)
                 idx = int(d_str.split(":")[-1]) if ":" in d_str else 0
                 try: jax_target = jax.devices('gpu')[idx]
                 except: 
                     try: jax_target = jax.devices('cuda')[idx]
                     except: jax_target = jax.devices()[idx]
-                print(f"      🎯 JAX Target: {jax_target}")
             except: pass
 
         for pattern, action in config.state_rules.items():
@@ -184,34 +173,26 @@ class ParameterShardingStrategy:
 
                     sliced_val = action(source_val, self.rank)
                     
-                    # --- 1. FORCE PLACEMENT ---
                     if jax_target is not None:
                         import jax
-                        # Push to GPU immediately to avoid CPU OOM
                         sliced_val_tensor = jax.device_put(sliced_val, jax_target)
                         sliced_val_tensor = sliced_val_tensor.astype(target_var.dtype)
                     else:
                         with keras.device(device_id):
                             sliced_val_tensor = ops.convert_to_tensor(sliced_val, dtype=target_var.dtype)
 
-                    # --- 2. REPLACE VARIABLE ---
                     layer, attr_name = None, None
-                    
-                    # Try ID mapping first
                     if id(target_var) in var_to_owner:
                         layer, attr_name = var_to_owner[id(target_var)]
                     
-                    # Fallback to path lookup
                     if layer is None:
                         var_path = target_var.path if hasattr(target_var, 'path') else target_var.name
                         layer, attr_name = self._find_layer_by_path(shard_model, var_path)
 
                     if layer and attr_name:
-                        self._replace_variable(layer, attr_name, target_var, sliced_val_tensor)
+                        self._replace_variable(layer, attr_name, target_var, sliced_val_tensor, device_id=device_id)
                     else:
-                        print(f"   ❌ CRITICAL: Could not find owner for {name}. Assigning (Risk of CPU OOM).")
-                        # If we can't replace the object, we have to assign. 
-                        # This might bring data back to CPU if the var was created there.
+                        print(f"   ❌ CRITICAL: Could not find owner for {name}. Assigning.")
                         target_var.assign(sliced_val_tensor)
                     
                     modified.add(name)
