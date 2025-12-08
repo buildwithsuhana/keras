@@ -121,6 +121,10 @@ class TensorParallelKeras(Model):
         if ":" not in d_str: return f"gpu:{d_str}"
         return d_str
 
+    # --- FIX 1: Prevent JAXTrainer from wiping variables ---
+    def _purge_model_variables(self, *args, **kwargs):
+        pass
+
     def call(self, inputs, training=None, **kwargs):
         results = []
         for i, shard in enumerate(self.model_shards):
@@ -166,8 +170,8 @@ class TensorParallelKeras(Model):
 
                 grad_fn = jax.value_and_grad(compute_loss, has_aux=True)
                 
-                # --- FIX START ---
                 # Extract the pure JAX arrays (.value) from the Variables
+                # Since we disabled purging, .value is safe to access here
                 trainable_values = [v.value for v in shard.trainable_variables]
                 non_trainable_values = [v.value for v in shard.non_trainable_variables]
 
@@ -178,7 +182,6 @@ class TensorParallelKeras(Model):
                     x, 
                     y
                 )
-                # --- FIX END ---
                 
                 # Pair the computed gradient arrays back with the Variable objects for the optimizer
                 all_shard_grads_vars.append(list(zip(grads, shard.trainable_variables)))
@@ -194,7 +197,20 @@ class TensorParallelKeras(Model):
             if metric.name == "loss":
                 metric.update_state(total_loss)
         
-        return {m.name: m.result() for m in self.metrics}
+        # --- FIX 2: Return updated state for JAXTrainer compatibility ---
+        # JAXTrainer expects (logs, state). state must match the structure of input state.
+        # Since variables were updated in-place (in eager mode), we read fresh values.
+        new_trainable = [v.value for v in self.trainable_variables]
+        new_non_trainable = [v.value for v in self.non_trainable_variables]
+        new_optimizer = [v.value for v in self.optimizer.variables]
+        new_metrics = [v.value for v in self.metrics_variables]
+        
+        return {m.name: m.result() for m in self.metrics}, (
+            new_trainable, 
+            new_non_trainable, 
+            new_optimizer, 
+            new_metrics
+        )
 
     def _save_weights_to_disk(self, model):
         for v in model.variables:
