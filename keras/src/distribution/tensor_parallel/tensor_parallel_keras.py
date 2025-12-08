@@ -134,54 +134,67 @@ class TensorParallelKeras(Model):
         return total
     
     def train_step(self, state, data):
-        # In JAX backend, train_step receives (state, data).
-        # We ignore 'state' because our real variables are distributed in self.model_shards
-        # and we are running in eager mode (side-effects allowed).
-        
+        import jax
+        from keras.src.trainers.data_adapters import data_adapter_utils
+
+        # 1. Unpack Data
         x, y, sample_weight = data_adapter_utils.unpack_x_y_sample_weight(data)
         
         all_shard_grads_vars = []
         total_loss = 0.0
-        import tensorflow as tf
-        
-        # 1. Forward & Backward on Shards
-        for i, shard in enumerate(self.model_shards):
-            with keras.device(self.devices[i]):
-                with tf.GradientTape() as tape:
-                    # Forward pass
-                    y_pred = shard(x, training=True)
-                    
-                    # Compute loss using the correct method
-                    # Option A: Use compute_loss (Recommended - handles all losses)
-                    loss = self.compute_loss(x, y, y_pred, sample_weight)
-                    
-                    # Option B: Use _compile_loss directly (Only uses the loss function passed to compile)
-                    # loss = self._compile_loss(y, y_pred, sample_weight)
 
-                # Compute gradients
-                trainable_vars = shard.trainable_variables
-                grads = tape.gradient(loss, trainable_vars)
+        # 2. Forward & Backward Pass per Shard
+        for i, shard in enumerate(self.model_shards):
+            # Ensure we are operating on the correct device for this shard
+            with keras.device(self.devices[i]):
                 
-                # Store (grad, var) pairs for this shard
-                all_shard_grads_vars.append(list(zip(grads, trainable_vars)))
+                # Define a pure function for JAX differentiation
+                def compute_loss(trainable_vars, non_trainable_vars, x_in, y_target):
+                    # stateless_call allows passing explicit variables (JAX requirement)
+                    y_pred, non_trainable_updates = shard.stateless_call(
+                        trainable_vars, 
+                        non_trainable_vars, 
+                        x_in, 
+                        training=True
+                    )
+                    
+                    # Compute loss (this handles regularization losses automatically)
+                    loss = self.compute_loss(
+                        x=x_in, 
+                        y=y_target, 
+                        y_pred=y_pred, 
+                        sample_weight=sample_weight
+                    )
+                    return loss, non_trainable_updates
+
+                # Create the gradient function
+                grad_fn = jax.value_and_grad(compute_loss, has_aux=True)
+                
+                # Execute on device (Compute gradients)
+                (loss_val, _), grads = grad_fn(
+                    shard.trainable_variables, 
+                    shard.non_trainable_variables, 
+                    x, 
+                    y
+                )
+                
+                # Accumulate (gradient, variable) pairs for this shard
+                all_shard_grads_vars.append(list(zip(grads, shard.trainable_variables)))
                 
                 if i == 0:
-                    total_loss = loss
+                    total_loss = loss_val
 
-        # 2. Apply Gradients (via Coordinator -> Shards)
+        # 3. Apply Gradients (Coordinator handles synchronization)
         self.optimizer.apply_gradients(all_shard_grads_vars, shard_models=self.model_shards)
         
-        # 3. Update Metrics
-        # Manually update loss metric
+        # 4. Update Metrics
         for metric in self.metrics:
             if metric.name == "loss":
                 metric.update_state(total_loss)
-            # Add other metrics here if needed (requires synchronization)
+            else:
+                pass # Add custom metric logic here if needed
         
-        logs = {m.name: m.result() for m in self.metrics}
-        
-        # Return logs and the UNCHANGED state (since the coordinator has no state)
-        return logs, state
+        return {m.name: m.result() for m in self.metrics}
 
     def _save_weights_to_disk(self, model):
         for v in model.variables:

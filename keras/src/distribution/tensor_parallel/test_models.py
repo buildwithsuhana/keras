@@ -127,7 +127,8 @@ def run_training():
         optimizer=keras.optimizers.SGD(LEARNING_RATE),
         loss=keras.losses.SparseCategoricalCrossentropy(from_logits=True),
         metrics=["accuracy"],
-        run_eagerly=True  # <--- CRITICAL FOR JAX SIDE EFFECTS
+        run_eagerly=True,
+        jit_compile=False # <--- CRITICAL FOR JAX SIDE EFFECTS
     )
 
     logger.info("Training...")
