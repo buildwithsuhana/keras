@@ -12,6 +12,7 @@ from keras.src.distribution.tensor_parallel.parameter_sharding import make_param
 from keras.src.distribution.tensor_parallel.coordinated_optimizer import TensorParallelOptimizer
 from keras.src.distribution import list_devices
 from keras.src.models import Model
+from keras.src.trainers.data_adapters import data_adapter_utils
 import ctypes
 
 logger = logging.getLogger(__file__)
@@ -132,43 +133,50 @@ class TensorParallelKeras(Model):
             total = ops.add(total, results[i])
         return total
     
-    # --- CUSTOM TRAIN STEP TO BYPASS DEFAULT OPTIMIZER LOGIC ---
-    def train_step(self, data):
-        x, y = data
+    # --- CUSTOM TRAIN STEP ---
+    def train_step(self, state, data):
+        # In JAX backend, train_step receives (state, data).
+        # We ignore 'state' because our real variables are distributed in self.model_shards
+        # and we are running in eager mode (side-effects allowed).
         
-        # 1. Forward & Backward on Shards
-        # In a real TP implementation, this would involve complex synchronization.
-        # For this prototype, we compute gradients naively on each shard and let 
-        # the TensorParallelOptimizer sync them.
+        x, y, sample_weight = data_adapter_utils.unpack_x_y_sample_weight(data)
         
-        gradients_and_vars = []
+        all_shard_grads_vars = []
         total_loss = 0.0
         
+        # 1. Forward & Backward on Shards
         for i, shard in enumerate(self.model_shards):
             with keras.device(self.devices[i]):
                 with keras.GradientTape() as tape:
                     # Forward pass
                     y_pred = shard(x, training=True)
                     # Compute loss
-                    loss = self.compiled_loss(y, y_pred)
+                    loss = self.compiled_loss(y, y_pred, sample_weight=sample_weight)
                 
                 # Compute gradients
                 trainable_vars = shard.trainable_variables
                 grads = tape.gradient(loss, trainable_vars)
                 
-                # Pair grads with vars
-                gradients_and_vars.append(list(zip(grads, trainable_vars)))
-                total_loss += loss
+                # Store (grad, var) pairs for this shard
+                all_shard_grads_vars.append(list(zip(grads, trainable_vars)))
+                
+                if i == 0:
+                    total_loss = loss
 
-        # 2. Apply Gradients (delegates to CoordinatedOptimizer)
-        # We pass shard_models so it can find the local optimizers
-        self.optimizer.apply_gradients(gradients_and_vars, shard_models=self.model_shards)
+        # 2. Apply Gradients (via Coordinator -> Shards)
+        self.optimizer.apply_gradients(all_shard_grads_vars, shard_models=self.model_shards)
         
         # 3. Update Metrics
-        # This is simplified; assumes loss is comparable
-        self.compiled_metrics.update_state(y, y_pred) # Updates using last shard's pred
+        # Manually update loss metric
+        for metric in self.metrics:
+            if metric.name == "loss":
+                metric.update_state(total_loss)
+            # Add other metrics here if needed (requires synchronization)
         
-        return {m.name: m.result() for m in self.metrics}
+        logs = {m.name: m.result() for m in self.metrics}
+        
+        # Return logs and the UNCHANGED state (since the coordinator has no state)
+        return logs, state
 
     def _save_weights_to_disk(self, model):
         for v in model.variables:

@@ -6,7 +6,6 @@ import time
 import numpy as np
 
 # --- Environment ---
-# Clear XLA flags to prevent CPU emulation/conflicts
 if "XLA_FLAGS" in os.environ: del os.environ["XLA_FLAGS"]
 os.environ["KERAS_BACKEND"] = "jax"
 os.environ["XLA_PYTHON_CLIENT_PREALLOCATE"] = "false"
@@ -89,19 +88,13 @@ def print_memory(tag):
 def inspect_shards(tp_model, devices):
     logger.info("🕵️ INSPECTING SHARD PLACEMENT...")
     for i, shard in enumerate(tp_model.model_shards):
-        # We expect the shard to be on the device requested
         expect = str(devices[i])
-        
-        # Check the first weight (usually embedding or dense kernel)
         var = shard.trainable_variables[0]
         try: 
-            # For JAX, value.devices() gives the placement
             actual = str(list(var.value.devices())[0]) if hasattr(var, 'value') else str(var.device)
         except: 
             actual = "Unknown"
         
-        # We check if the expected device string is roughly inside the actual string
-        # e.g. Expect 'cuda:0' in Actual 'cuda:0' or 'gpu:0'
         is_match = expect in actual or actual in expect
         status = "✅ OK" if is_match else "❌ WRONG DEVICE"
         logger.info(f"   Shard {i} | Expect: {expect} | Actual: {actual} | {status}")
@@ -117,7 +110,6 @@ def run_training():
     train_ds = load_data(MODEL_PRESET)
     
     logger.info("Init TP Model...")
-    # FIX: Use exact string representation from JAX (e.g. 'cuda:0')
     dev_ids = [str(d) for d in devices]
     logger.info(f"Using devices: {dev_ids}")
     
@@ -134,7 +126,8 @@ def run_training():
     tp_model.compile(
         optimizer=keras.optimizers.SGD(LEARNING_RATE),
         loss=keras.losses.SparseCategoricalCrossentropy(from_logits=True),
-        metrics=["accuracy"]
+        metrics=["accuracy"],
+        run_eagerly=True  # <--- CRITICAL FOR JAX SIDE EFFECTS
     )
 
     logger.info("Training...")
