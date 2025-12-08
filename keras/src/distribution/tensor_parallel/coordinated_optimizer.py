@@ -23,17 +23,14 @@ class CoordinatedOptimizer:
         self.sharded_states = {}
 
     def _initialize_sharded_states(self):
-        # BYPASS: Do not initialize master state on CPU to avoid OOM.
+        # BYPASS: CPU State allocation
         return
 
     def apply_gradients(
         self, gradients_and_vars: list[list[tuple]], shard_models: list
     ):
-        """Coordinates gradient synchronization and application."""
-        # 1. Sync Gradients (All-Reduce)
         synchronized_gradients = self._synchronize_gradients(gradients_and_vars)
 
-        # 2. Apply Locally on each Shard
         for shard_idx in range(self.device_count):
             shard_opt = shard_models[shard_idx].optimizer
             if hasattr(shard_opt, "inner_optimizer"): 
@@ -47,7 +44,6 @@ class CoordinatedOptimizer:
     def _synchronize_gradients(
         self, gradients_and_vars: list[list[tuple]]
     ) -> list[list[tuple]]:
-        """Synchronizes gradients across shards based on tensor parallel rules."""
         if not self.tensor_parallel_config:
             return gradients_and_vars
 
@@ -74,7 +70,6 @@ class CoordinatedOptimizer:
                     if g_and_v[i][0] is not None
                 ]
                 if grads_to_reduce:
-                    # Sync gradients across devices (All-Reduce)
                     stacked_grads = ops.stack(
                         [ops.convert_to_tensor(g) for g in grads_to_reduce], axis=0
                     )
@@ -97,8 +92,6 @@ class CoordinatedOptimizer:
 
 
 class TensorParallelOptimizer(optimizers.Optimizer):
-    """A Keras Optimizer wrapper for tensor-parallel distributed training."""
-
     def __init__(
         self,
         base_optimizer: optimizers.Optimizer,
@@ -143,15 +136,12 @@ class TensorParallelOptimizer(optimizers.Optimizer):
         else:
             self.base_optimizer.apply_gradients(grads_and_vars)
 
-    # --- FIX 1: Implement update_step for Keras 3 compatibility ---
     def update_step(self, gradient, variable, learning_rate):
         return self.base_optimizer.update_step(gradient, variable, learning_rate)
 
     def build(self, variables: list):
         if self.built: return
         self.coordinated_optimizer.enable_optimizer_state_sharding(variables)
-        # --- FIX 2: Do NOT call super().build(variables) ---
-        # This prevents the master optimizer from initializing variables on CPU.
         self.built = True
 
     def get_config(self):

@@ -55,7 +55,7 @@ class TensorParallelKeras(Model):
         self.model_shards = []
         print(f"🚀 Initializing TP on {self.devices}")
 
-        # Helper to map vars for migration
+        # Helper for migration
         from keras.src.distribution.tensor_parallel.parameter_sharding import ParameterShardingStrategy
         strat_helper = ParameterShardingStrategy(1, 0)
 
@@ -76,7 +76,7 @@ class TensorParallelKeras(Model):
                 device_id=device_id,
             )
 
-            # --- MIGRATION OF REMAINING VARS ---
+            # Migration of unsharded variables
             try:
                 import jax
                 d_str = str(device_id)
@@ -84,7 +84,6 @@ class TensorParallelKeras(Model):
                 try: target_device = jax.devices('gpu')[idx]
                 except: target_device = jax.devices()[idx]
                 
-                # Re-map owners for migration
                 var_to_owner = strat_helper._map_variables_to_owners(shard)
                 
                 migrated_count = 0
@@ -92,16 +91,12 @@ class TensorParallelKeras(Model):
                     v_name = v.path if hasattr(v, 'path') else v.name
                     if v_name in modified_vars: continue 
 
-                    # Move to GPU
                     val_gpu = jax.device_put(v.value, target_device)
                     
-                    # REPLACE VARIABLE (Don't just assign)
                     if id(v) in var_to_owner:
                         layer, attr_name = var_to_owner[id(v)]
                         strat_helper._replace_variable(layer, attr_name, v, val_gpu)
                         migrated_count += 1
-                
-                # print(f"   ↳ Migrated {migrated_count} small variables.")
             except Exception as e:
                 print(f"⚠️ Migration Error: {e}")
 
@@ -112,6 +107,17 @@ class TensorParallelKeras(Model):
         try: shutil.rmtree(self.temp_dir)
         except: pass
         self.built = True
+
+    def _normalize_device_id(self, device_id):
+        d_str = str(device_id).lower()
+        if "tpu" in d_str and "gpu" not in d_str:
+            if d_str.startswith("tpu:"): return d_str
+            match = re.search(r"tpu_(\d+)", d_str)
+            if match: return f"tpu:{match.group(1)}"
+            if ":" not in d_str: return f"tpu:{d_str}"
+            return d_str
+        if ":" not in d_str: return f"gpu:{d_str}"
+        return d_str
 
     def call(self, inputs, training=None, **kwargs):
         results = []
@@ -125,6 +131,44 @@ class TensorParallelKeras(Model):
         for i in range(1, len(results)):
             total = ops.add(total, results[i])
         return total
+    
+    # --- CUSTOM TRAIN STEP TO BYPASS DEFAULT OPTIMIZER LOGIC ---
+    def train_step(self, data):
+        x, y = data
+        
+        # 1. Forward & Backward on Shards
+        # In a real TP implementation, this would involve complex synchronization.
+        # For this prototype, we compute gradients naively on each shard and let 
+        # the TensorParallelOptimizer sync them.
+        
+        gradients_and_vars = []
+        total_loss = 0.0
+        
+        for i, shard in enumerate(self.model_shards):
+            with keras.device(self.devices[i]):
+                with keras.GradientTape() as tape:
+                    # Forward pass
+                    y_pred = shard(x, training=True)
+                    # Compute loss
+                    loss = self.compiled_loss(y, y_pred)
+                
+                # Compute gradients
+                trainable_vars = shard.trainable_variables
+                grads = tape.gradient(loss, trainable_vars)
+                
+                # Pair grads with vars
+                gradients_and_vars.append(list(zip(grads, trainable_vars)))
+                total_loss += loss
+
+        # 2. Apply Gradients (delegates to CoordinatedOptimizer)
+        # We pass shard_models so it can find the local optimizers
+        self.optimizer.apply_gradients(gradients_and_vars, shard_models=self.model_shards)
+        
+        # 3. Update Metrics
+        # This is simplified; assumes loss is comparable
+        self.compiled_metrics.update_state(y, y_pred) # Updates using last shard's pred
+        
+        return {m.name: m.result() for m in self.metrics}
 
     def _save_weights_to_disk(self, model):
         for v in model.variables:
@@ -142,18 +186,6 @@ class TensorParallelKeras(Model):
         path = os.path.join(self.temp_dir, safe_name + ".npy")
         if os.path.exists(path): return np.load(path, mmap_mode='r')
         return None
-
-    def _normalize_device_id(self, device_id):
-        d_str = str(device_id).lower()
-        if "tpu" in d_str and "gpu" not in d_str:
-            if d_str.startswith("tpu:"): return d_str
-            match = re.search(r"tpu_(\d+)", d_str)
-            if match: return f"tpu:{match.group(1)}"
-            if ":" not in d_str: return f"tpu:{d_str}"
-            return d_str
-        # Keep cuda/gpu as is
-        if ":" not in d_str: return f"gpu:{d_str}"
-        return d_str
 
     def compile(self, optimizer=None, **kwargs):
         if len(self.model_shards) > 1 and optimizer:
