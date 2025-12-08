@@ -1,15 +1,10 @@
+import functools
+
 from keras.src import layers
+from keras.src.distribution.tensor_parallel.tensor_layout import LayoutMap
 from keras.src.distribution.tensor_parallel.tensor_layout import (
     split_tensor_for_parallelism,
-    LayoutMap
 )
-
-_split_fn_internal = split_tensor_for_parallelism
-
-
-def _split_rule(device_count, dim):
-    """Creates a sharding rule for a specific dimension."""
-    return lambda x, index: _split_fn_internal(x, index, device_count, dim=dim)
 
 
 def analyze_dense_layer(layer):
@@ -22,7 +17,12 @@ def analyze_dense_layer(layer):
     input_dim = None
     output_dim = None
 
-    if hasattr(layer, 'kernel') and layer.kernel is not None:
+    if hasattr(layer, '_kernel') and layer._kernel is not None:
+        kernel_shape = layer._kernel.shape
+        if len(kernel_shape) == 2:
+            input_dim = kernel_shape[0]
+            output_dim = kernel_shape[1]
+    elif hasattr(layer, 'kernel') and layer.kernel is not None:
         kernel_shape = layer.kernel.shape
         if len(kernel_shape) == 2:
             input_dim = kernel_shape[0]
@@ -58,33 +58,38 @@ def _apply_layer_sharding_rules(layer, full_name, device_count, state_rules, out
     """
     Helper function that applies rules to a single layer instance.
     """
+    def split_rule(dim):
+        return functools.partial(
+            split_tensor_for_parallelism, device_count=device_count, dim=dim
+        )
+
     if isinstance(layer, layers.Dense):
         mlp_type = analyze_dense_layer(layer)
 
         if mlp_type == 'up_projection':
-            state_rules[f"{full_name}.kernel"] = _split_rule(device_count, dim=1)
+            state_rules[f"{full_name}.kernel"] = split_rule(dim=1)
             if layer.use_bias:
-                state_rules[f"{full_name}.bias"] = _split_rule(device_count, dim=0)
+                state_rules[f"{full_name}.bias"] = split_rule(dim=0)
             output_rules[f"{full_name}"] = {0: "gather"}
 
         elif mlp_type == 'down_projection':
-            state_rules[f"{full_name}.kernel"] = _split_rule(device_count, dim=0)
+            state_rules[f"{full_name}.kernel"] = split_rule(dim=0)
             output_rules[f"{full_name}"] = {0: "allreduce"}
 
         else:
-            state_rules[f"{full_name}.kernel"] = _split_rule(device_count, dim=1)
+            state_rules[f"{full_name}.kernel"] = split_rule(dim=1)
             if layer.use_bias:
-                state_rules[f"{full_name}.bias"] = _split_rule(device_count, dim=0)
+                state_rules[f"{full_name}.bias"] = split_rule(dim=0)
             output_rules[f"{full_name}"] = {0: "gather -1"}
 
     elif isinstance(layer, layers.EinsumDense):
         if "attention_output" in full_name:
-            state_rules[f"{full_name}.kernel"] = _split_rule(device_count, dim=0)
+            state_rules[f"{full_name}.kernel"] = split_rule(dim=0)
             output_rules[f"{full_name}"] = {0: "allreduce"}
         else:
-            state_rules[f"{full_name}.kernel"] = _split_rule(device_count, dim=1)
+            state_rules[f"{full_name}.kernel"] = split_rule(dim=1)
             if hasattr(layer, 'bias') and layer.bias is not None:
-                state_rules[f"{full_name}.bias"] = _split_rule(device_count, dim=0)
+                state_rules[f"{full_name}.bias"] = split_rule(dim=0)
             output_rules[f"{full_name}"] = {0: "gather -1"}
 
     elif isinstance(layer, (layers.Embedding,)) or "Embedding" in layer.__class__.__name__:
@@ -94,18 +99,18 @@ def _apply_layer_sharding_rules(layer, full_name, device_count, state_rules, out
                     key_found = False
                     for attr_candidate in ['embeddings', 'position_embeddings', 'weight']:
                         if getattr(layer, attr_candidate, None) is weight:
-                            state_rules[f"{full_name}.{attr_candidate}"] = _split_rule(device_count, dim=1)
+                            state_rules[f"{full_name}.{attr_candidate}"] = split_rule(dim=1)
                             key_found = True
                             break
                     
                     if not key_found:
-                        clean_name = weight.name.split('/')[-1].split(':')[0]
-                        state_rules[f"{full_name}.{clean_name}"] = _split_rule(device_count, dim=1)
+                        clean_name = weight.name.split('/')[-1]
+                        state_rules[f"{full_name}.{clean_name}"] = split_rule(dim=1)
 
             output_rules[f"{full_name}"] = {0: "no_comm"}
 
 
-def get_default_config(module, device_ids):
+def get_default_config(model, device_ids):
     """
     Generates a default tensor parallelism configuration for a model using
     iterative graph traversal (stack-based).
@@ -116,7 +121,7 @@ def get_default_config(module, device_ids):
     
     processed_layers = set()
     
-    stack = [(module, "")]
+    stack = [(model, "")]
 
     while stack:
         current_layer, prefix = stack.pop()
