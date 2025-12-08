@@ -117,6 +117,7 @@ def run_training():
     train_ds = load_data(MODEL_PRESET)
     
     logger.info("Init TP Model...")
+    # FIX: Use exact string representation from JAX (e.g. 'cuda:0')
     dev_ids = [str(d) for d in devices]
     logger.info(f"Using devices: {dev_ids}")
     

@@ -179,8 +179,6 @@ class TensorParallelKeras(Model):
         # if d_str.startswith("cuda:"): return d_str.replace("cuda:", "gpu:")
         
         if ":" not in d_str: 
-            # If it's just a number like "0", we can assume gpu or cuda based on environment?
-            # Safer to assume gpu:x for now if no prefix is given.
             return f"gpu:{d_str}"
             
         return d_str
