@@ -53,7 +53,8 @@ class TensorParallelKeras(Model):
         if 'model' in locals(): del model
         flush_memory()
 
-        self.model_shards = []
+        # Bypass Keras tracking to prevent JAXTrainer from purging variables
+        self.__dict__["model_shards"] = []
         print(f"🚀 Initializing TP on {self.devices}")
 
         # Helper for migration
