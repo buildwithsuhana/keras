@@ -115,7 +115,6 @@ class ParameterShardingStrategy:
             setattr(layer, attr_name, new_var)
         
         # Update Keras internal tracking lists
-        # Added 'trainable_weights' and 'non_trainable_weights' explicitly just in case
         for lst_name in ['_trainable_weights', '_non_trainable_weights', '_weights', 'weights', 'variables', 'trainable_weights', 'non_trainable_weights']:
             if hasattr(layer, lst_name):
                 lst = getattr(layer, lst_name)
@@ -138,7 +137,6 @@ class ParameterShardingStrategy:
         current = model
         
         def find_child(parent, name):
-            # 1. Check direct attributes by checking .name property of attribute value
             for attr in dir(parent):
                 if attr.startswith("__"): continue
                 try: val = getattr(parent, attr)
@@ -146,7 +144,6 @@ class ParameterShardingStrategy:
                 if hasattr(val, 'name') and val.name == name and hasattr(val, 'weights'):
                     return val
             
-            # 2. Check layers list explicitly
             if hasattr(parent, 'layers'):
                 for layer in parent.layers:
                     if layer.name == name:
@@ -154,7 +151,6 @@ class ParameterShardingStrategy:
             return None
 
         for part in layer_path:
-            # 1. Try finding in current node
             if hasattr(current, 'name') and current.name == part:
                 continue 
                 
@@ -163,7 +159,6 @@ class ParameterShardingStrategy:
             if next_node:
                 current = next_node
             else:
-                # 2. Heuristic: Check for implicit wrappers
                 print(f"        ⚠️ '{part}' not found in '{current.name}'. Checking sub-modules...")
                 found_in_wrapper = False
                 for wrapper in ['backbone', 'model', 'encoder', 'decoder', 'transformer', 'preprocessor']:
@@ -180,7 +175,6 @@ class ParameterShardingStrategy:
                     print(f"        ❌ Failed to resolve path part '{part}'.")
                     return None, None
 
-        # Check attribute - PREFER PRIVATE STORAGE (_attr) over properties (attr)
         if hasattr(current, "_" + attr_name):
             print(f"        -> Found '_{attr_name}' (preferred over '{attr_name}').")
             return current, "_" + attr_name
@@ -202,6 +196,12 @@ class ParameterShardingStrategy:
         modified = set()
         var_to_owner = self._map_variables_to_owners(shard_model)
         
+        # Try importing JAX for explicit placement
+        try: 
+            import jax
+        except ImportError: 
+            jax = None
+
         for pattern, action in config.state_rules.items():
             if callable(action):
                 targets = self._find_matching_parameters(shard_model, pattern)
@@ -219,8 +219,33 @@ class ParameterShardingStrategy:
 
                     sliced_val = action(source_val, self.rank)
                     
-                    with keras.device(device_id):
-                        sliced_val_tensor = ops.convert_to_tensor(sliced_val, dtype=target_var.dtype)
+                    # FORCE GPU PLACEMENT
+                    if jax is not None and keras.config.backend() == "jax":
+                        try:
+                            # Parse device string explicitly 'cuda:0' -> jax.devices()[0]
+                            d_str = str(device_id)
+                            if ":" in d_str:
+                                backend_type, idx = d_str.split(":")
+                                search_backend = 'gpu' if backend_type == 'cuda' else backend_type
+                                try:
+                                    target_device_obj = jax.devices(search_backend)[int(idx)]
+                                except RuntimeError:
+                                    # Fallback to default search if specific backend fails
+                                    target_device_obj = jax.devices()[int(idx)]
+                            else:
+                                target_device_obj = jax.devices()[0]
+
+                            # Move numpy array -> JAX array on GPU immediately
+                            sliced_val_tensor = jax.device_put(sliced_val, target_device_obj)
+                            # Ensure compatible dtype
+                            sliced_val_tensor = sliced_val_tensor.astype(target_var.dtype)
+                        except Exception as e:
+                            print(f"   ⚠️ JAX placement failed: {e}. Falling back to default.")
+                            with keras.device(device_id):
+                                sliced_val_tensor = ops.convert_to_tensor(sliced_val, dtype=target_var.dtype)
+                    else:
+                        with keras.device(device_id):
+                            sliced_val_tensor = ops.convert_to_tensor(sliced_val, dtype=target_var.dtype)
                     
                     if target_var.shape == sliced_val_tensor.shape:
                         target_var.assign(sliced_val_tensor)
@@ -228,11 +253,9 @@ class ParameterShardingStrategy:
                         layer = None
                         attr_name = None
                         
-                        # Strategy A: Use ID Mapping
                         if id(target_var) in var_to_owner:
                             layer, attr_name = var_to_owner[id(target_var)]
                         
-                        # Strategy B: Path-based Fallback
                         if layer is None:
                             var_path = target_var.path if hasattr(target_var, 'path') else target_var.name
                             print(f"   ⚠️ [Fallback] ID mapping failed. Attempting path lookup for: {var_path}")
@@ -242,7 +265,6 @@ class ParameterShardingStrategy:
                             self._replace_variable(layer, attr_name, target_var, sliced_val_tensor)
                         else:
                             print(f"   ❌ CRITICAL WARNING: Could not find owner layer for {name}. Cannot resize variable!")
-                            print(f"   ❌ Attempting direct assign (This will likely fail with ValueError)...")
                             target_var.assign(sliced_val_tensor)
                     
                     modified.add(name)
