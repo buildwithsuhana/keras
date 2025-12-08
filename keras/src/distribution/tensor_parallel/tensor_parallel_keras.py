@@ -31,9 +31,7 @@ class TensorParallelKeras(Model):
             device_ids = [str(d) for d in all_devices]
 
         self.device_count = device_count
-        # FIX: Ensure normalize logic doesn't corrupt cuda:x strings
         self.devices = [self._normalize_device_id(d) for d in device_ids]
-        
         self.temp_dir = tempfile.mkdtemp(prefix="tp_weights_")
         
         if callable(model) and not isinstance(model, keras.Model):
@@ -57,6 +55,10 @@ class TensorParallelKeras(Model):
         self.model_shards = []
         print(f"🚀 Initializing TP on {self.devices}")
 
+        # Helper to map vars for migration
+        from keras.src.distribution.tensor_parallel.parameter_sharding import ParameterShardingStrategy
+        strat_helper = ParameterShardingStrategy(1, 0)
+
         for rank, device_id in enumerate(self.devices):
             print(f"[{device_id}] ⏳ Creating shard {rank+1}/{self.device_count}...")
             
@@ -74,27 +76,32 @@ class TensorParallelKeras(Model):
                 device_id=device_id,
             )
 
-            # Migration for non-sharded vars (e.g. small biases, layer norms)
-            # This is critical to ensure they don't stay on CPU
+            # --- MIGRATION OF REMAINING VARS ---
             try:
                 import jax
                 d_str = str(device_id)
-                if ":" in d_str:
-                    platform, idx = d_str.split(":")
-                    if platform == 'cuda': platform = 'gpu'
-                    target_device = jax.devices(platform)[int(idx)]
-                else:
-                    target_device = jax.devices()[0]
+                idx = int(d_str.split(":")[-1]) if ":" in d_str else 0
+                try: target_device = jax.devices('gpu')[idx]
+                except: target_device = jax.devices()[idx]
+                
+                # Re-map owners for migration
+                var_to_owner = strat_helper._map_variables_to_owners(shard)
                 
                 migrated_count = 0
                 for v in shard.variables:
                     v_name = v.path if hasattr(v, 'path') else v.name
                     if v_name in modified_vars: continue 
 
-                    # Force move to target device
-                    v.assign(jax.device_put(v.value, target_device))
-                    migrated_count += 1
+                    # Move to GPU
+                    val_gpu = jax.device_put(v.value, target_device)
+                    
+                    # REPLACE VARIABLE (Don't just assign)
+                    if id(v) in var_to_owner:
+                        layer, attr_name = var_to_owner[id(v)]
+                        strat_helper._replace_variable(layer, attr_name, v, val_gpu)
+                        migrated_count += 1
                 
+                # print(f"   ↳ Migrated {migrated_count} small variables.")
             except Exception as e:
                 print(f"⚠️ Migration Error: {e}")
 
@@ -144,8 +151,7 @@ class TensorParallelKeras(Model):
             if match: return f"tpu:{match.group(1)}"
             if ":" not in d_str: return f"tpu:{d_str}"
             return d_str
-        
-        # IMPORTANT: Keep cuda as is!
+        # Keep cuda/gpu as is
         if ":" not in d_str: return f"gpu:{d_str}"
         return d_str
 
@@ -153,6 +159,7 @@ class TensorParallelKeras(Model):
         if len(self.model_shards) > 1 and optimizer:
             opt = TensorParallelOptimizer(optimizer, self.device_count)
             opt._shard_models = self.model_shards
+            
             var_map = {}
             for i, shard in enumerate(self.model_shards):
                 for v in shard.trainable_variables:
@@ -160,12 +167,15 @@ class TensorParallelKeras(Model):
                     if key not in var_map: var_map[key] = [None]*self.device_count
                     var_map[key][i] = v
             opt._shard_var_map = var_map
+            
             super().compile(optimizer=opt, **kwargs)
+            
             for i, shard in enumerate(self.model_shards):
                 if isinstance(optimizer, str):
                     shard_opt = keras.optimizers.get(optimizer)
                 else:
                     shard_opt = optimizer.from_config(optimizer.get_config())
+                
                 with keras.device(self.devices[i]):
                     shard.compile(optimizer=shard_opt, **kwargs)
         else:
