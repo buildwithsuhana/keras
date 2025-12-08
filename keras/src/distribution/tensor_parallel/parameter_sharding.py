@@ -17,59 +17,37 @@ class ParameterShardingStrategy:
         self.rank = rank
 
     def _map_variables_to_owners(self, model):
-        """
-        Maps variable IDs to (layer, attribute_name).
-        Traverses attributes, lists, and DICTS to find all layers and variables.
-        """
         var_to_owner = {}
-        
         stack = [model]
         visited = set()
         
         while stack:
             layer = stack.pop()
-            if id(layer) in visited:
-                continue
+            if id(layer) in visited: continue
             visited.add(id(layer))
 
             layer_vars = {} 
-            
-            # Scan all attributes of the object
             for attr_name in dir(layer):
                 if attr_name.startswith("__"): continue
-                
-                try:
-                    attr_val = getattr(layer, attr_name, None)
-                except Exception:
-                    continue
-                
+                try: attr_val = getattr(layer, attr_name, None)
+                except Exception: continue
                 if attr_val is None: continue
                 if isinstance(attr_val, type): continue
 
-                # Duck typing checks
                 is_var = hasattr(attr_val, 'assign') and hasattr(attr_val, 'value') and hasattr(attr_val, 'dtype')
                 is_layer = (hasattr(attr_val, 'weights') and hasattr(attr_val, 'add_weight') and not is_var)
 
                 if is_var:
                     layer_vars.setdefault(id(attr_val), []).append(attr_name)
-                
                 elif is_layer:
                     stack.append(attr_val)
-                
                 elif isinstance(attr_val, (list, tuple)):
                     for item in attr_val:
-                        if item is None or isinstance(item, type): continue
-                        if hasattr(item, 'weights') and hasattr(item, 'add_weight'):
-                            stack.append(item)
-                            
-                # Dictionary Support
+                        if hasattr(item, 'weights'): stack.append(item)
                 elif isinstance(attr_val, dict):
                     for key, item in attr_val.items():
-                        if item is None or isinstance(item, type): continue
-                        if hasattr(item, 'weights') and hasattr(item, 'add_weight'):
-                            stack.append(item)
+                        if hasattr(item, 'weights'): stack.append(item)
 
-            # Resolve best name for variables
             for vid, names in layer_vars.items():
                 best_name = names[0]
                 for name in names:
@@ -77,26 +55,29 @@ class ParameterShardingStrategy:
                         best_name = name
                 var_to_owner[vid] = (layer, best_name)
 
-            # Standard Sub-layer traversal
             if hasattr(layer, 'layers'):
-                try:
-                    sublayers = layer.layers
-                    if sublayers and hasattr(sublayers, '__iter__'):
-                        stack.extend(sublayers)
+                try: stack.extend(layer.layers)
                 except Exception: pass
-
         return var_to_owner
 
     def _replace_variable(self, layer, attr_name, old_var, new_val_tensor):
-        print(f"      🛠️  [Resizing] Replacing '{attr_name}' on layer '{layer.name}' (ID: {id(layer)})...")
+        print(f"      🛠️  [Resizing] Replacing '{attr_name}' on layer '{layer.name}'...")
         VarClass = old_var.__class__
+        
+        # Determine strict device to ensure Keras doesn't move it back to CPU
+        # during initialization if context is wrong.
+        layout_map = None
+        if hasattr(old_var, 'layout'):
+            layout_map = old_var.layout
+            
         try:
             new_var = VarClass(
                 initializer=new_val_tensor,
                 shape=new_val_tensor.shape,
                 dtype=old_var.dtype,
                 trainable=old_var.trainable,
-                name=old_var.name
+                name=old_var.name,
+                layout=layout_map
             )
         except Exception:
             new_var = keras.Variable(
@@ -107,15 +88,10 @@ class ParameterShardingStrategy:
                 name=old_var.name
             )
         
-        # Bypass property setters and tracking locks
-        try: 
-            object.__setattr__(layer, attr_name, new_var)
-        except Exception as e: 
-            print(f"      ⚠️ object.__setattr__ failed: {e}. Trying setattr...")
-            setattr(layer, attr_name, new_var)
+        try: object.__setattr__(layer, attr_name, new_var)
+        except Exception: setattr(layer, attr_name, new_var)
         
-        # Update Keras internal tracking lists
-        for lst_name in ['_trainable_weights', '_non_trainable_weights', '_weights', 'weights', 'variables', 'trainable_weights', 'non_trainable_weights']:
+        for lst_name in ['_trainable_weights', '_non_trainable_weights', '_weights', 'weights', 'variables']:
             if hasattr(layer, lst_name):
                 lst = getattr(layer, lst_name)
                 if isinstance(lst, list):
@@ -124,16 +100,10 @@ class ParameterShardingStrategy:
         return new_var
 
     def _find_layer_by_path(self, model, var_path):
-        """
-        Traverses the model using the variable path to find the owner layer.
-        """
-        print(f"      🔎 [PathLookup] Starting lookup for: {var_path}")
         if ":" in var_path: var_path = var_path.split(":")[0]
         parts = var_path.split("/")
-        
         attr_name = parts[-1]
         layer_path = parts[:-1]
-        
         current = model
         
         def find_child(parent, name):
@@ -141,130 +111,90 @@ class ParameterShardingStrategy:
                 if attr.startswith("__"): continue
                 try: val = getattr(parent, attr)
                 except: continue
-                if hasattr(val, 'name') and val.name == name and hasattr(val, 'weights'):
-                    return val
-            
+                if hasattr(val, 'name') and val.name == name: return val
             if hasattr(parent, 'layers'):
                 for layer in parent.layers:
-                    if layer.name == name:
-                        return layer
+                    if layer.name == name: return layer
             return None
 
         for part in layer_path:
-            if hasattr(current, 'name') and current.name == part:
-                continue 
-                
+            if hasattr(current, 'name') and current.name == part: continue 
             next_node = find_child(current, part)
-            
-            if next_node:
-                current = next_node
+            if next_node: current = next_node
             else:
-                print(f"        ⚠️ '{part}' not found in '{current.name}'. Checking sub-modules...")
-                found_in_wrapper = False
                 for wrapper in ['backbone', 'model', 'encoder', 'decoder', 'transformer', 'preprocessor']:
                     if hasattr(current, wrapper):
-                        sub_module = getattr(current, wrapper)
-                        candidate = find_child(sub_module, part)
-                        if candidate:
-                            print(f"        -> Found '{part}' inside '{wrapper}'. Diving in.")
-                            current = candidate
-                            found_in_wrapper = True
-                            break
-                
-                if not found_in_wrapper:
-                    print(f"        ❌ Failed to resolve path part '{part}'.")
-                    return None, None
+                        current = find_child(getattr(current, wrapper), part)
+                        if current: break
+                if not current: return None, None
 
-        if hasattr(current, "_" + attr_name):
-            print(f"        -> Found '_{attr_name}' (preferred over '{attr_name}').")
-            return current, "_" + attr_name
-            
-        if hasattr(current, attr_name):
-            return current, attr_name
-            
-        print(f"        ❌ Attribute '{attr_name}' not found on final layer '{current.name}'.")
+        if hasattr(current, "_" + attr_name): return current, "_" + attr_name
+        if hasattr(current, attr_name): return current, attr_name
         return None, None
 
-    def shard_model_parameters(
-        self,
-        shard_model: "Model",
-        weight_loader: Callable[[str], np.ndarray],
-        config: Any,
-        device_id: Any,
-    ) -> Tuple["Model", Set[str]]:
-        
+    def shard_model_parameters(self, shard_model, weight_loader, config, device_id):
         modified = set()
         var_to_owner = self._map_variables_to_owners(shard_model)
         
-        # Try importing JAX for explicit placement
-        try: 
-            import jax
-        except ImportError: 
-            jax = None
+        # AGGRESSIVE JAX DEVICE RESOLUTION
+        jax_device_obj = None
+        if keras.config.backend() == "jax":
+            try:
+                import jax
+                d_str = str(device_id)
+                # Try to parse 'cuda:0' or 'gpu:0'
+                if ":" in d_str:
+                    platform, idx = d_str.split(":")
+                    # JAX calls it 'gpu' even if we ask for 'cuda'
+                    if platform == 'cuda': platform = 'gpu'
+                    try:
+                        jax_device_obj = jax.devices(platform)[int(idx)]
+                    except:
+                        # Fallback: just get the Nth global device
+                        jax_device_obj = jax.devices()[int(idx)]
+                else:
+                    jax_device_obj = jax.devices()[0]
+                
+                print(f"      🎯 Forced JAX Target: {jax_device_obj}")
+            except Exception as e:
+                print(f"      ⚠️ Could not resolve JAX device object: {e}")
 
         for pattern, action in config.state_rules.items():
             if callable(action):
                 targets = self._find_matching_parameters(shard_model, pattern)
-                
                 for name, target_var in targets:
                     print(f"⚡ [Sharding] Processing: {name}")
-                    try:
-                        source_val = weight_loader(name)
-                        if source_val is None: 
-                            print(f"   ⚠️ Source value not found for {name}, skipping.")
-                            continue
-                    except Exception as e:
-                        print(f"   ⚠️ Error loading {name}: {e}")
-                        continue
+                    source_val = weight_loader(name)
+                    if source_val is None: continue
 
                     sliced_val = action(source_val, self.rank)
                     
-                    # FORCE GPU PLACEMENT
-                    if jax is not None and keras.config.backend() == "jax":
-                        try:
-                            # Parse device string explicitly 'cuda:0' -> jax.devices()[0]
-                            d_str = str(device_id)
-                            if ":" in d_str:
-                                backend_type, idx = d_str.split(":")
-                                search_backend = 'gpu' if backend_type == 'cuda' else backend_type
-                                try:
-                                    target_device_obj = jax.devices(search_backend)[int(idx)]
-                                except RuntimeError:
-                                    # Fallback to default search if specific backend fails
-                                    target_device_obj = jax.devices()[int(idx)]
-                            else:
-                                target_device_obj = jax.devices()[0]
-
-                            # Move numpy array -> JAX array on GPU immediately
-                            sliced_val_tensor = jax.device_put(sliced_val, target_device_obj)
-                            # Ensure compatible dtype
-                            sliced_val_tensor = sliced_val_tensor.astype(target_var.dtype)
-                        except Exception as e:
-                            print(f"   ⚠️ JAX placement failed: {e}. Falling back to default.")
-                            with keras.device(device_id):
-                                sliced_val_tensor = ops.convert_to_tensor(sliced_val, dtype=target_var.dtype)
+                    # 1. Force data to device immediately
+                    if jax_device_obj is not None:
+                        # Direct JAX placement
+                        sliced_val_tensor = jax.device_put(sliced_val, jax_device_obj)
+                        sliced_val_tensor = sliced_val_tensor.astype(target_var.dtype)
                     else:
+                        # Fallback for TF/Torch
                         with keras.device(device_id):
                             sliced_val_tensor = ops.convert_to_tensor(sliced_val, dtype=target_var.dtype)
-                    
+
+                    # 2. Assign or Replace
                     if target_var.shape == sliced_val_tensor.shape:
                         target_var.assign(sliced_val_tensor)
                     else:
-                        layer = None
-                        attr_name = None
-                        
+                        layer, attr_name = None, None
                         if id(target_var) in var_to_owner:
                             layer, attr_name = var_to_owner[id(target_var)]
                         
                         if layer is None:
                             var_path = target_var.path if hasattr(target_var, 'path') else target_var.name
-                            print(f"   ⚠️ [Fallback] ID mapping failed. Attempting path lookup for: {var_path}")
                             layer, attr_name = self._find_layer_by_path(shard_model, var_path)
 
                         if layer and attr_name:
                             self._replace_variable(layer, attr_name, target_var, sliced_val_tensor)
                         else:
-                            print(f"   ❌ CRITICAL WARNING: Could not find owner layer for {name}. Cannot resize variable!")
+                            # Last resort: try assigning (will fail if shape mismatch)
                             target_var.assign(sliced_val_tensor)
                     
                     modified.add(name)

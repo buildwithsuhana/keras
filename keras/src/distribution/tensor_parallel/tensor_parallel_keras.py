@@ -17,13 +17,7 @@ import ctypes
 logger = logging.getLogger(__file__)
 
 class TensorParallelKeras(Model):
-    def __init__(
-        self,
-        model,
-        device_count=None,
-        device_ids=None,
-        **kwargs,
-    ):
+    def __init__(self, model, device_count=None, device_ids=None, **kwargs):
         super().__init__(**kwargs)
 
         def flush_memory():
@@ -31,13 +25,13 @@ class TensorParallelKeras(Model):
             try: ctypes.CDLL("libc.so.6").malloc_trim(0)
             except: pass
 
-        # Device Setup
         if device_count is None or device_ids is None:
             all_devices = list_devices()
             device_count = len(all_devices)
             device_ids = [str(d) for d in all_devices]
 
         self.device_count = device_count
+        # FIX: Ensure normalize logic doesn't corrupt cuda:x strings
         self.devices = [self._normalize_device_id(d) for d in device_ids]
         
         self.temp_dir = tempfile.mkdtemp(prefix="tp_weights_")
@@ -66,14 +60,11 @@ class TensorParallelKeras(Model):
         for rank, device_id in enumerate(self.devices):
             print(f"[{device_id}] ⏳ Creating shard {rank+1}/{self.device_count}...")
             
-            # 1. Create on CPU (Skeleton)
             with keras.device("cpu"):
                 shard = self.model_cls.from_config(self.model_config)
                 if hasattr(shard, 'build_from_config'):
                      shard.build_from_config(self.model_config)
 
-            # 2. Slice Weights (Disk -> CPU -> TPU)
-            # Capture the set of variables that were successfully sharded
             shard, modified_vars = make_parameter_sharded_model(
                 shard_model=shard,
                 weight_loader=self._weight_loader, 
@@ -83,45 +74,29 @@ class TensorParallelKeras(Model):
                 device_id=device_id,
             )
 
-            # 3. Smart Migration (Unsharded variables -> TPU)
+            # Migration for non-sharded vars (e.g. small biases, layer norms)
+            # This is critical to ensure they don't stay on CPU
             try:
                 import jax
-                # Handle both 'cuda:0' and 'gpu:0' formats
-                target_idx = int(device_id.split(":")[-1])
-                target_device = next(d for d in jax.devices() if d.id == target_idx)
+                d_str = str(device_id)
+                if ":" in d_str:
+                    platform, idx = d_str.split(":")
+                    if platform == 'cuda': platform = 'gpu'
+                    target_device = jax.devices(platform)[int(idx)]
+                else:
+                    target_device = jax.devices()[0]
                 
                 migrated_count = 0
                 for v in shard.variables:
-                    # Skip variables that are already on device (the sharded ones)
-                    # We check path/name against the modified set
                     v_name = v.path if hasattr(v, 'path') else v.name
-                    
-                    if v_name in modified_vars:
-                        continue 
+                    if v_name in modified_vars: continue 
 
-                    # DIAGNOSTIC: Check for huge unsharded variables (Likely Config Mismatch)
-                    # 50MB threshold
-                    if hasattr(v, 'value'):
-                        size_bytes = v.value.nbytes
-                        if size_bytes > 50_000_000:
-                            print(f"⚠️  [Rank {rank}] CRITICAL: Large variable '{v_name}' ({size_bytes/1e6:.1f}MB) was NOT sharded! Moving full size to TPU (Risk of OOM).")
-
-                    # Move to TPU
+                    # Force move to target device
                     v.assign(jax.device_put(v.value, target_device))
                     migrated_count += 1
                 
-                # print(f"   ↳ Migrated {migrated_count} small variables.")
-
             except Exception as e:
                 print(f"⚠️ Migration Error: {e}")
-
-            suffix = f"_tp{rank}"
-            try: shard._name = shard.name + suffix
-            except: pass
-            for layer in getattr(shard, 'layers', []):
-                try: 
-                    if not layer.name.endswith(suffix): layer._name = layer.name + suffix
-                except: continue
 
             self.model_shards.append(shard)
             flush_memory()
@@ -145,19 +120,14 @@ class TensorParallelKeras(Model):
         return total
 
     def _save_weights_to_disk(self, model):
-        """Saves weights to disk, ensuring they are compatible (casting bfloat16 to float32)."""
         for v in model.variables:
             name = v.path if hasattr(v, 'path') else v.name
             safe_name = name.replace("/", "_").replace(":", "_")
             path = os.path.join(self.temp_dir, safe_name + ".npy")
-            
             val = v.numpy()
-            
-            # Check for bfloat16 or similar problematic types and cast to float32
             if (hasattr(val, 'dtype') and (val.dtype.name == 'bfloat16' or str(val.dtype) == 'bfloat16')) or \
                (val.dtype.char == 'V' and val.itemsize == 2):
                 val = val.astype('float32')
-                
             np.save(path, val)
 
     def _weight_loader(self, param_name):
@@ -175,19 +145,14 @@ class TensorParallelKeras(Model):
             if ":" not in d_str: return f"tpu:{d_str}"
             return d_str
         
-        # FIX: Do not force replace 'cuda' with 'gpu'. JAX might expect 'cuda'.
-        # if d_str.startswith("cuda:"): return d_str.replace("cuda:", "gpu:")
-        
-        if ":" not in d_str: 
-            return f"gpu:{d_str}"
-            
+        # IMPORTANT: Keep cuda as is!
+        if ":" not in d_str: return f"gpu:{d_str}"
         return d_str
 
     def compile(self, optimizer=None, **kwargs):
         if len(self.model_shards) > 1 and optimizer:
             opt = TensorParallelOptimizer(optimizer, self.device_count)
             opt._shard_models = self.model_shards
-            
             var_map = {}
             for i, shard in enumerate(self.model_shards):
                 for v in shard.trainable_variables:
@@ -195,15 +160,12 @@ class TensorParallelKeras(Model):
                     if key not in var_map: var_map[key] = [None]*self.device_count
                     var_map[key][i] = v
             opt._shard_var_map = var_map
-            
             super().compile(optimizer=opt, **kwargs)
-            
             for i, shard in enumerate(self.model_shards):
                 if isinstance(optimizer, str):
                     shard_opt = keras.optimizers.get(optimizer)
                 else:
                     shard_opt = optimizer.from_config(optimizer.get_config())
-                
                 with keras.device(self.devices[i]):
                     shard.compile(optimizer=shard_opt, **kwargs)
         else:
