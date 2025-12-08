@@ -143,11 +143,11 @@ class TensorParallelKeras(Model):
         
         all_shard_grads_vars = []
         total_loss = 0.0
-        
+        import tensorflow as tf
         # 1. Forward & Backward on Shards
         for i, shard in enumerate(self.model_shards):
             with keras.device(self.devices[i]):
-                with keras.GradientTape() as tape:
+                with tf.GradientTape() as tape:
                     # Forward pass
                     y_pred = shard(x, training=True)
                     # Compute loss
