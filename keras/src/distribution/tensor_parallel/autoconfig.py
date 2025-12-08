@@ -1,6 +1,7 @@
 import functools
 
 from keras.src import layers
+from keras.src.backend import distribution_lib
 from keras.src.distribution.tensor_parallel.tensor_layout import LayoutMap
 from keras.src.distribution.tensor_parallel.tensor_layout import (
     split_tensor_for_parallelism,
@@ -54,6 +55,14 @@ def analyze_dense_layer(layer):
         return 'dense'
 
 
+def _reduce_sum(x):
+    return distribution_lib.all_reduce(x, op="sum", axis_name="model")
+
+
+def _gather(x, axis):
+    return distribution_lib.all_gather(x, axis=axis, axis_name="model")
+
+
 def _apply_layer_sharding_rules(layer, full_name, device_count, state_rules, output_rules):
     """
     Helper function that applies rules to a single layer instance.
@@ -63,6 +72,9 @@ def _apply_layer_sharding_rules(layer, full_name, device_count, state_rules, out
             split_tensor_for_parallelism, device_count=device_count, dim=dim
         )
 
+    def gather_rule(axis):
+        return functools.partial(_gather, axis=axis)
+
     if isinstance(layer, layers.Dense):
         mlp_type = analyze_dense_layer(layer)
 
@@ -70,27 +82,27 @@ def _apply_layer_sharding_rules(layer, full_name, device_count, state_rules, out
             state_rules[f"{full_name}.kernel"] = split_rule(dim=1)
             if layer.use_bias:
                 state_rules[f"{full_name}.bias"] = split_rule(dim=0)
-            output_rules[f"{full_name}"] = {0: "gather"}
+            output_rules[f"{full_name}"] = {0: gather_rule(axis=-1)}
 
         elif mlp_type == 'down_projection':
             state_rules[f"{full_name}.kernel"] = split_rule(dim=0)
-            output_rules[f"{full_name}"] = {0: "allreduce"}
+            output_rules[f"{full_name}"] = {0: _reduce_sum}
 
         else:
             state_rules[f"{full_name}.kernel"] = split_rule(dim=1)
             if layer.use_bias:
                 state_rules[f"{full_name}.bias"] = split_rule(dim=0)
-            output_rules[f"{full_name}"] = {0: "gather -1"}
+            output_rules[f"{full_name}"] = {0: gather_rule(axis=-1)}
 
     elif isinstance(layer, layers.EinsumDense):
         if "attention_output" in full_name:
             state_rules[f"{full_name}.kernel"] = split_rule(dim=0)
-            output_rules[f"{full_name}"] = {0: "allreduce"}
+            output_rules[f"{full_name}"] = {0: _reduce_sum}
         else:
             state_rules[f"{full_name}.kernel"] = split_rule(dim=1)
             if hasattr(layer, 'bias') and layer.bias is not None:
                 state_rules[f"{full_name}.bias"] = split_rule(dim=0)
-            output_rules[f"{full_name}"] = {0: "gather -1"}
+            output_rules[f"{full_name}"] = {0: gather_rule(axis=-1)}
 
     elif isinstance(layer, (layers.Embedding,)) or "Embedding" in layer.__class__.__name__:
         if hasattr(layer, 'weights'):
@@ -104,10 +116,10 @@ def _apply_layer_sharding_rules(layer, full_name, device_count, state_rules, out
                             break
                     
                     if not key_found:
-                        clean_name = weight.name.split('/')[-1]
+                        clean_name = weight.name.split('/')[-1].split(':')[0]
                         state_rules[f"{full_name}.{clean_name}"] = split_rule(dim=1)
 
-            output_rules[f"{full_name}"] = {0: "no_comm"}
+            output_rules[f"{full_name}"] = {0: lambda x: x}
 
 
 def get_default_config(model, device_ids):

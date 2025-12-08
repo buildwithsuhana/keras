@@ -11,7 +11,7 @@ from typing import List
 from typing import Optional
 
 import jax
-import jax.lax as lax  # <-- Added import
+import jax.lax as lax
 import numpy as np
 
 from keras.src.backend.common import global_state
@@ -40,7 +40,7 @@ def list_devices(device_type=None):
     return [f"{device.platform}:{device.id}" for device in jax_devices]
 
 
-def get_device_count():  # <-- ADDED
+def get_device_count():
     """Returns the number of local JAX devices.
 
     This function is based on the reviewer's suggestion to replace
@@ -370,18 +370,22 @@ def process_id():
     return jax.process_index()
 
 
-# --- ADDED COLLECTIVE OPS ---
+def all_reduce(x, op="sum", axis_name="model"):
+    """Reduces a tensor across a device mesh axis using a collective.
 
+    Args:
+        x: The tensor to reduce.
+        op: The reduction operation. "sum" or "mean".
+        axis_name: The name of the mesh axis to reduce over.
 
-def all_reduce(x, op="sum", axis_name="model"):  # <-- ADDED
-    """Reduces a tensor across a device mesh axis using a collective."""
+    Returns:
+        The reduced tensor.
+    """
     if op == "sum":
         return lax.psum(x, axis_name=axis_name)
     elif op == "mean":
-        # FIX: Manual mean calculation using psum(x) / psum(1) for reliability
         sum_val = lax.psum(x, axis_name=axis_name)
-        # Calculates the size of the axis reliably within the traced context
-        axis_size = lax.psum(1, axis_name=axis_name) 
+        axis_size = lax.psum(1, axis_name=axis_name)
         return sum_val / axis_size
     else:
         raise ValueError(
@@ -390,7 +394,7 @@ def all_reduce(x, op="sum", axis_name="model"):  # <-- ADDED
         )
 
 
-def all_gather(x, axis, axis_name="model"):  # <-- ADDED
+def all_gather(x, axis, axis_name="model"):
     """Gathers and concatenates tensors from all devices across a mesh axis.
 
     This function assumes it is called within a `pjit` context. It takes
@@ -410,9 +414,6 @@ def all_gather(x, axis, axis_name="model"):  # <-- ADDED
         all devices participating in the gather.
     """
     return lax.all_gather(x, axis_name=axis_name, axis=axis, tiled=True)
-
-
-# --- END ADDED COLLECTIVE OPS ---
 
 
 def _to_backend_device(device_name):
