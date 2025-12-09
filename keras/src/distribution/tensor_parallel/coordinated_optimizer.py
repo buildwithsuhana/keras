@@ -70,10 +70,24 @@ class CoordinatedOptimizer:
                     if g_and_v[i][0] is not None
                 ]
                 if grads_to_reduce:
-                    stacked_grads = ops.stack(
-                        [ops.convert_to_tensor(g) for g in grads_to_reduce], axis=0
-                    )
-                    mean_grad = ops.mean(stacked_grads, axis=0)
+                    # --- FIX START ---
+                    # Perform reduction iteratively to avoid creating a massive stacked tensor on CPU
+                    import keras 
+                    
+                    # Use the device of the first gradient as the reduction hub
+                    target_device = grads_to_reduce[0].device
+                    
+                    with keras.device(target_device):
+                        # Start with the first gradient
+                        total_grad = ops.convert_to_tensor(grads_to_reduce[0])
+                        
+                        # Add the rest (this moves them to target_device implicitly or explicitly)
+                        for g in grads_to_reduce[1:]:
+                            total_grad = ops.add(total_grad, ops.convert_to_tensor(g))
+                        
+                        # Compute mean
+                        mean_grad = ops.divide(total_grad, len(grads_to_reduce))
+                    # --- FIX END ---
                     
                     for shard_idx in range(self.device_count):
                         if gradients_and_vars[shard_idx][i][0] is not None:
