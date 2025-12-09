@@ -5,7 +5,6 @@ import logging
 import time
 import numpy as np
 
-# --- Environment ---
 if "XLA_FLAGS" in os.environ: del os.environ["XLA_FLAGS"]
 os.environ["KERAS_BACKEND"] = "jax"
 os.environ["XLA_PYTHON_CLIENT_PREALLOCATE"] = "false"
