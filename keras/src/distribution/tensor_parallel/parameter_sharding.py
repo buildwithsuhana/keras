@@ -14,26 +14,16 @@ if TYPE_CHECKING:
 
 logger = logging.getLogger(__name__)
 
-# --- Helper for Memory Logging ---
 def log_stats(stage=""):
-    # CPU
     process = psutil.Process(os.getpid())
     mem_mb = process.memory_info().rss / (1024 ** 2)
-    
-    # GPU
     gpu_str = ""
     try:
-        result = subprocess.check_output(
-            ['nvidia-smi', '--query-gpu=memory.used', '--format=csv,nounits,noheader'],
-            encoding='utf-8'
-        )
+        result = subprocess.check_output(['nvidia-smi', '--query-gpu=memory.used', '--format=csv,nounits,noheader'], encoding='utf-8')
         mems = [int(x) for x in result.strip().split('\n') if x.strip()]
-        for i, m in enumerate(mems):
-            gpu_str += f"G{i}:{m}M "
+        for i, m in enumerate(mems): gpu_str += f"G{i}:{m}M "
     except: pass
-
     print(f"   📊 [Stats] {stage} | RAM: {mem_mb:.0f}MB | {gpu_str}")
-# ---------------------------------
 
 class ParameterShardingStrategy:
     def __init__(self, device_count: int, rank: int):
@@ -44,62 +34,53 @@ class ParameterShardingStrategy:
         var_to_owner = {}
         stack = [model]
         visited = set()
-        
         while stack:
             layer = stack.pop()
             if id(layer) in visited: continue
             visited.add(id(layer))
-
             layer_vars = {} 
             for attr_name in dir(layer):
                 if attr_name.startswith("__"): continue
                 try: attr_val = getattr(layer, attr_name, None)
                 except Exception: continue
                 if attr_val is None: continue
-
                 is_var = hasattr(attr_val, 'assign') and hasattr(attr_val, 'value')
                 is_layer = (hasattr(attr_val, 'weights') and hasattr(attr_val, 'add_weight') and not is_var)
-
-                if is_var:
-                    layer_vars.setdefault(id(attr_val), []).append(attr_name)
-                elif is_layer:
-                    stack.append(attr_val)
+                if is_var: layer_vars.setdefault(id(attr_val), []).append(attr_name)
+                elif is_layer: stack.append(attr_val)
                 elif isinstance(attr_val, (list, tuple)):
                     for item in attr_val:
                         if hasattr(item, 'weights'): stack.append(item)
-
             for vid, names in layer_vars.items():
                 best_name = names[0]
-                # Prefer private names (e.g. _kernel) to bypass property locks
                 for name in names:
-                    if name.startswith("_"):
-                        best_name = name
-                        break
+                    if name.startswith("_"): best_name = name; break
                 var_to_owner[vid] = (layer, best_name)
-
             if hasattr(layer, 'layers'):
                 try: stack.extend(layer.layers)
-                except Exception: pass
+                except: pass
         return var_to_owner
 
     def _replace_variable(self, layer, attr_name, old_var, new_val_tensor, device_id=None):
-        print(f"      🛠️  [Swapping] '{attr_name}' on '{layer.name}' -> {new_val_tensor.device}")
+        print(f"      🛠️  [Swapping] '{attr_name}' on '{layer.name}' -> {device_id}")
+        
+        # CRITICAL FIX: Ensure unique naming for each shard variable
+        # and force device placement explicitly via context manager.
+        new_name = f"{old_var.name}_shard_{self.rank}"
         
         try:
-            # We assume new_val_tensor is already on the correct device (GPU)
-            # Using it as initializer forces the Variable to adopt that device.
-            new_var = keras.Variable(
-                initializer=new_val_tensor,
-                shape=new_val_tensor.shape,
-                dtype=old_var.dtype,
-                trainable=old_var.trainable,
-                name=old_var.name
-            )
+            with keras.device(device_id):
+                new_var = keras.Variable(
+                    initializer=new_val_tensor,
+                    shape=new_val_tensor.shape,
+                    dtype=old_var.dtype,
+                    trainable=old_var.trainable,
+                    name=new_name  # Unique name prevents collision/eviction
+                )
         except Exception as e:
             print(f"      ⚠️ Var creation failed: {e}")
             return old_var
         
-        # Force set the attribute, bypassing "built" checks
         success = False
         try:
             object.__setattr__(layer, attr_name, new_var)
@@ -112,17 +93,13 @@ class ParameterShardingStrategy:
                 success = True
             except Exception: pass
         
-        if not success:
-            print(f"      ⚠️ FAILED to swap attribute '{attr_name}'. Memory leak risk!")
-
-        # Update internal Keras lists so the new variable is actually used
+        # Update internal lists
         for lst_name in ['_trainable_weights', '_non_trainable_weights', '_weights', 'weights', 'variables']:
             if hasattr(layer, lst_name):
                 lst = getattr(layer, lst_name)
                 if isinstance(lst, list):
                     for i, v in enumerate(lst):
                         if v is old_var: lst[i] = new_var
-
         return new_var
 
     def _find_layer_by_path(self, model, var_path):
@@ -130,7 +107,6 @@ class ParameterShardingStrategy:
         parts = var_path.split("/")
         attr_name = parts[-1]
         current = model
-        
         def find_child(parent, name):
             for attr in dir(parent):
                 if attr.startswith("__"): continue
@@ -141,7 +117,6 @@ class ParameterShardingStrategy:
                 for layer in parent.layers:
                     if layer.name == name: return layer
             return None
-
         for part in parts[:-1]:
             if hasattr(current, 'name') and current.name == part: continue 
             next_node = find_child(current, part)
@@ -151,12 +126,8 @@ class ParameterShardingStrategy:
                 for wrapper in ['backbone', 'model', 'encoder', 'decoder', 'transformer', 'preprocessor']:
                     if hasattr(current, wrapper):
                         candidate = find_child(getattr(current, wrapper), part)
-                        if candidate: 
-                            current = candidate
-                            found = True
-                            break
+                        if candidate: current = candidate; found = True; break
                 if not found: return None, None
-
         if hasattr(current, "_" + attr_name): return current, "_" + attr_name
         if hasattr(current, attr_name): return current, attr_name
         return None, None
@@ -181,7 +152,7 @@ class ParameterShardingStrategy:
                 targets = self._find_matching_parameters(shard_model, pattern)
                 for name, target_var in targets:
                     print(f"⚡ [Sharding] Processing: {name}")
-                    log_stats(f"Before {name}")  # <--- LOG BEFORE
+                    log_stats(f"Before {name}")
 
                     try:
                         source_val = weight_loader(name)
@@ -192,7 +163,6 @@ class ParameterShardingStrategy:
                     
                     if jax_target is not None:
                         import jax
-                        # Push to GPU immediately
                         sliced_val_tensor = jax.device_put(sliced_val, jax_target)
                         sliced_val_tensor = sliced_val_tensor.astype(target_var.dtype)
                     else:
@@ -210,14 +180,13 @@ class ParameterShardingStrategy:
                     if layer and attr_name:
                         self._replace_variable(layer, attr_name, target_var, sliced_val_tensor, device_id=device_id)
                     else:
-                        # Fallback assign
                         target_var.assign(sliced_val_tensor)
                     
                     modified.add(name)
                     del source_val, sliced_val, sliced_val_tensor
                     gc.collect()
 
-                    log_stats(f"After  {name}") # <--- LOG AFTER
+                    log_stats(f"After  {name}")
         
         return shard_model, modified
 
@@ -225,8 +194,7 @@ class ParameterShardingStrategy:
         matches = []
         for v in model.variables:
             name = v.path if hasattr(v, 'path') else v.name
-            if re.search(pattern, name):
-                matches.append((name, v))
+            if re.search(pattern, name): matches.append((name, v))
         return matches
 
 def make_parameter_sharded_model(shard_model, weight_loader, config, rank, device_count, device_id):

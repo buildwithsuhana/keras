@@ -19,27 +19,16 @@ import ctypes
 
 logger = logging.getLogger(__file__)
 
-# --- Helper for Memory Logging ---
 def log_mem_stats(rank, device_id, stage=""):
-    # 1. CPU Mem
     process = psutil.Process(os.getpid())
     mem_mb = process.memory_info().rss / (1024 ** 2)
-    
-    # 2. GPU Mem
     gpu_str = ""
     try:
-        result = subprocess.check_output(
-            ['nvidia-smi', '--query-gpu=memory.used', '--format=csv,nounits,noheader'],
-            encoding='utf-8'
-        )
+        result = subprocess.check_output(['nvidia-smi', '--query-gpu=memory.used', '--format=csv,nounits,noheader'], encoding='utf-8')
         mems = [int(x) for x in result.strip().split('\n') if x.strip()]
-        for i, m in enumerate(mems):
-            gpu_str += f"GPU{i}:{m}MB "
-    except:
-        gpu_str = "N/A"
-
+        for i, m in enumerate(mems): gpu_str += f"G{i}:{m}MB "
+    except: gpu_str = "N/A"
     print(f"📈 [Shard {rank}|{device_id}] {stage} | Host RSS: {mem_mb:.0f} MB | {gpu_str}")
-# ---------------------------------
 
 class TensorParallelKeras(Model):
     def __init__(self, model, device_count=None, device_ids=None, **kwargs):
@@ -77,16 +66,14 @@ class TensorParallelKeras(Model):
         if 'model' in locals(): del model
         flush_memory()
 
-        # Bypass Keras tracking to prevent JAXTrainer from purging variables
         self.__dict__["model_shards"] = []
         print(f"🚀 Initializing TP on {self.devices}")
 
-        # Helper for migration
         from keras.src.distribution.tensor_parallel.parameter_sharding import ParameterShardingStrategy
         strat_helper = ParameterShardingStrategy(1, 0)
 
         for rank, device_id in enumerate(self.devices):
-            log_mem_stats(rank, device_id, "START creation") # <--- Log Start
+            log_mem_stats(rank, device_id, "START creation")
 
             print(f"[{device_id}] ⏳ Creating shard {rank+1}/{self.device_count}...")
             
@@ -122,15 +109,14 @@ class TensorParallelKeras(Model):
                     
                     if id(v) in var_to_owner:
                         layer, attr_name = var_to_owner[id(v)]
-                        strat_helper._replace_variable(layer, attr_name, v, val_gpu)
+                        strat_helper._replace_variable(layer, attr_name, v, val_gpu, device_id=device_id)
             except Exception as e:
                 print(f"⚠️ Migration Error: {e}")
 
             self.model_shards.append(shard)
             flush_memory()
             print(f"[{device_id}] ✅ Shard ready.")
-            
-            log_mem_stats(rank, device_id, "DONE creation") # <--- Log End
+            log_mem_stats(rank, device_id, "DONE creation")
 
         try: shutil.rmtree(self.temp_dir)
         except: pass
@@ -168,58 +154,31 @@ class TensorParallelKeras(Model):
         import jax.numpy as jnp
         from keras.src.trainers.data_adapters import data_adapter_utils
 
-        # 1. Unpack Data
         x, y, sample_weight = data_adapter_utils.unpack_x_y_sample_weight(data)
-        
         all_shard_grads_vars = []
         total_loss = 0.0
 
-        # 2. Forward & Backward Pass per Shard
         for i, shard in enumerate(self.model_shards):
             with keras.device(self.devices[i]):
-                
                 trainable_values = [v.value for v in shard.trainable_variables]
                 non_trainable_values = [v.value for v in shard.non_trainable_variables]
 
-                # FIX: Removed inner @jax.jit. 
-                # Let the outer tp_model.compile(jit_compile=True) handle global JIT.
                 def compute_loss(t_vars, nt_vars, x_data, y_data):
-                    y_pred, nt_updates = shard.stateless_call(
-                        t_vars, 
-                        nt_vars, 
-                        x_data, 
-                        training=True
-                    )
-                    loss = self.compute_loss(
-                        x=x_data, 
-                        y=y_data, 
-                        y_pred=y_pred, 
-                        sample_weight=sample_weight
-                    )
+                    y_pred, nt_updates = shard.stateless_call(t_vars, nt_vars, x_data, training=True)
+                    loss = self.compute_loss(x=x_data, y=y_data, y_pred=y_pred, sample_weight=sample_weight)
                     return loss, nt_updates
 
-                # --- FIX: Corrected variable name from 'non_trainable_vals' to 'non_trainable_values' ---
                 (loss_val, _), grads = jax.value_and_grad(compute_loss, has_aux=True)(
-                    trainable_values, 
-                    non_trainable_values, 
-                    x, 
-                    y
+                    trainable_values, non_trainable_values, x, y
                 )
                 
                 all_shard_grads_vars.append(list(zip(grads, shard.trainable_variables)))
-                
-                if i == 0:
-                    total_loss = loss_val
+                if i == 0: total_loss = loss_val
 
-        # 3. Apply Gradients
         self.optimizer.apply_gradients(all_shard_grads_vars, shard_models=self.model_shards)
-        
-        # 4. Update Metrics
         for metric in self.metrics:
-            if metric.name == "loss":
-                metric.update_state(total_loss)
+            if metric.name == "loss": metric.update_state(total_loss)
         
-        # FIX: Return ONLY metrics. Returning weights causes CPU OOM.
         return {m.name: m.result() for m in self.metrics}
 
     def _save_weights_to_disk(self, model):
