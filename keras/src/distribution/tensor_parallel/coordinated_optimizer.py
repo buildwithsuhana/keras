@@ -23,7 +23,6 @@ class CoordinatedOptimizer:
         self.sharded_states = {}
 
     def _initialize_sharded_states(self):
-        # BYPASS: CPU State allocation
         return
 
     def apply_gradients(
@@ -69,20 +68,16 @@ class CoordinatedOptimizer:
                     for g_and_v in gradients_and_vars
                     if g_and_v[i][0] is not None
                 ]
-                # Inside _synchronize_gradients
                 if grads_to_reduce:
-                    # FIX: Avoid ops.stack() which might pull massive tensors to CPU.
-                    # Use iterative accumulation on the target device instead.
+                    # FIX: Use iterative accumulation on the target device to avoid CPU stacking
                     import keras
-                    
-                    # Assume target is the device of the first gradient
                     target_device = grads_to_reduce[0].device
                     
                     with keras.device(target_device):
                         # Start with the first gradient
                         total_grad = ops.convert_to_tensor(grads_to_reduce[0])
                         
-                        # Add the rest (moves them to target_device directly)
+                        # Add the rest (implicitly or explicitly moves them to target_device)
                         for g in grads_to_reduce[1:]:
                             total_grad = ops.add(total_grad, ops.convert_to_tensor(g))
                         

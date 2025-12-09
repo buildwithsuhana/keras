@@ -88,7 +88,6 @@ class TensorParallelKeras(Model):
                 
                 var_to_owner = strat_helper._map_variables_to_owners(shard)
                 
-                migrated_count = 0
                 for v in shard.variables:
                     v_name = v.path if hasattr(v, 'path') else v.name
                     if v_name in modified_vars: continue 
@@ -98,7 +97,6 @@ class TensorParallelKeras(Model):
                     if id(v) in var_to_owner:
                         layer, attr_name = var_to_owner[id(v)]
                         strat_helper._replace_variable(layer, attr_name, v, val_gpu)
-                        migrated_count += 1
             except Exception as e:
                 print(f"⚠️ Migration Error: {e}")
 
@@ -121,7 +119,6 @@ class TensorParallelKeras(Model):
         if ":" not in d_str: return f"gpu:{d_str}"
         return d_str
 
-    # --- FIX 1: Prevent JAXTrainer from wiping variables ---
     def _purge_model_variables(self, *args, **kwargs):
         pass
 
@@ -156,52 +153,30 @@ class TensorParallelKeras(Model):
                 trainable_values = [v.value for v in shard.trainable_variables]
                 non_trainable_values = [v.value for v in shard.non_trainable_variables]
 
-                @jax.jit
-                def step_fn(trainable_vals, non_trainable_vals, x_in, y_target):
-                    def compute_loss(t_vars, nt_vars, x_data, y_data):
-                        y_pred, nt_updates = shard.stateless_call(
-                            t_vars, 
-                            nt_vars, 
-                            x_data, 
-                            training=True
-                        )
-                        loss = self.compute_loss(
-                            x=x_data, 
-                            y=y_data, 
-                            y_pred=y_pred, 
-                            sample_weight=sample_weight
-                        )
-                        return loss, nt_updates
-
-                    (loss_val, _), grads = jax.value_and_grad(compute_loss, has_aux=True)(
-                        trainable_vals, 
-                        non_trainable_vals, 
-                        x_in, 
-                        y_target
+                # FIX: Removed inner @jax.jit. 
+                # Let the outer tp_model.compile(jit_compile=True) handle global JIT.
+                def compute_loss(t_vars, nt_vars, x_data, y_data):
+                    y_pred, nt_updates = shard.stateless_call(
+                        t_vars, 
+                        nt_vars, 
+                        x_data, 
+                        training=True
                     )
+                    loss = self.compute_loss(
+                        x=x_data, 
+                        y=y_data, 
+                        y_pred=y_pred, 
+                        sample_weight=sample_weight
+                    )
+                    return loss, nt_updates
 
-                    # --- DEBUGGER 1: Print Loss every step (only on Shard 0 to avoid duplicates) ---
-                    # We use i (the shard index) from the closure.
-                    if i == 0:
-                        jax.debug.print("📉 [Shard 0] Loss: {x}", x=loss_val)
-
-                    # --- DEBUGGER 2: Check for NaNs/Infs in Gradients ---
-                    # Calculates global norm. If this is huge or NaN, your model is exploding.
-                    grad_norm = jnp.sqrt(sum([jnp.sum(g**2) for g in jax.tree_util.tree_leaves(grads)]))
-                    
-                    if i == 0:
-                        jax.debug.print("📏 [Shard 0] Grad Norm: {x}", x=grad_norm)
-                        
-                        # Optional: Hard crash if NaN is detected (Good for debugging Divergence)
-                        # jax.debug.callback(
-                        #     lambda n: raise ValueError("NaN Gradient Detected!") if np.isnan(n) else None, 
-                        #     grad_norm
-                        # )
-
-                    return loss_val, grads
-
-                # Run the JIT step
-                loss_val, grads = step_fn(trainable_values, non_trainable_values, x, y)
+                # --- FIX: Corrected variable name from 'non_trainable_vals' to 'non_trainable_values' ---
+                (loss_val, _), grads = jax.value_and_grad(compute_loss, has_aux=True)(
+                    trainable_values, 
+                    non_trainable_values, 
+                    x, 
+                    y
+                )
                 
                 all_shard_grads_vars.append(list(zip(grads, shard.trainable_variables)))
                 
@@ -216,6 +191,7 @@ class TensorParallelKeras(Model):
             if metric.name == "loss":
                 metric.update_state(total_loss)
         
+        # FIX: Return ONLY metrics. Returning weights causes CPU OOM.
         return {m.name: m.result() for m in self.metrics}
 
     def _save_weights_to_disk(self, model):
@@ -238,9 +214,6 @@ class TensorParallelKeras(Model):
     def compile(self, optimizer=None, **kwargs):
         if len(self.model_shards) > 1 and optimizer:
             opt = TensorParallelOptimizer(optimizer, self.device_count)
-            
-            # FIX: Use __dict__ to assign these properties prevents Keras/JAX 
-            # from tracking the shards via the optimizer.
             opt.__dict__["_shard_models"] = self.model_shards
             
             var_map = {}
