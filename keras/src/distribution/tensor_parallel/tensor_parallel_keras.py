@@ -5,6 +5,7 @@ import re
 import shutil
 import tempfile
 import numpy as np
+import psutil  # <--- NEW: For memory tracking
 import keras
 from keras import ops
 from keras.src.distribution.tensor_parallel.autoconfig import get_default_config
@@ -16,6 +17,13 @@ from keras.src.trainers.data_adapters import data_adapter_utils
 import ctypes
 
 logger = logging.getLogger(__file__)
+
+# --- Helper for Memory Logging ---
+def log_memory_shard(rank, device_id, stage=""):
+    process = psutil.Process(os.getpid())
+    mem_mb = process.memory_info().rss / (1024 ** 2)
+    print(f"📈 [Shard {rank}|{device_id}] {stage} | Host RSS: {mem_mb:.2f} MB")
+# ---------------------------------
 
 class TensorParallelKeras(Model):
     def __init__(self, model, device_count=None, device_ids=None, **kwargs):
@@ -62,6 +70,8 @@ class TensorParallelKeras(Model):
         strat_helper = ParameterShardingStrategy(1, 0)
 
         for rank, device_id in enumerate(self.devices):
+            log_memory_shard(rank, device_id, "START creation") # <--- Log Start
+
             print(f"[{device_id}] ⏳ Creating shard {rank+1}/{self.device_count}...")
             
             with keras.device("cpu"):
@@ -103,6 +113,8 @@ class TensorParallelKeras(Model):
             self.model_shards.append(shard)
             flush_memory()
             print(f"[{device_id}] ✅ Shard ready.")
+            
+            log_memory_shard(rank, device_id, "DONE creation") # <--- Log End
 
         try: shutil.rmtree(self.temp_dir)
         except: pass

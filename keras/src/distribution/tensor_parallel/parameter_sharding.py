@@ -1,6 +1,8 @@
 import logging
 import re
 import gc
+import os
+import psutil  # <--- NEW: For memory tracking
 from typing import Any, Tuple, Set, Callable, TYPE_CHECKING
 from keras import device, ops
 import keras
@@ -10,6 +12,13 @@ if TYPE_CHECKING:
     from keras.src.models import Model
 
 logger = logging.getLogger(__name__)
+
+# --- Helper for Memory Logging ---
+def log_memory(stage=""):
+    process = psutil.Process(os.getpid())
+    mem_mb = process.memory_info().rss / (1024 ** 2)
+    print(f"   📊 [MemUtil] {stage} | Host RSS: {mem_mb:.2f} MB")
+# ---------------------------------
 
 class ParameterShardingStrategy:
     def __init__(self, device_count: int, rank: int):
@@ -157,6 +166,8 @@ class ParameterShardingStrategy:
                 targets = self._find_matching_parameters(shard_model, pattern)
                 for name, target_var in targets:
                     print(f"⚡ [Sharding] Processing: {name}")
+                    log_memory(f"Before {name}")  # <--- LOG MEMORY BEFORE
+
                     try:
                         source_val = weight_loader(name)
                         if source_val is None: continue
@@ -190,6 +201,8 @@ class ParameterShardingStrategy:
                     modified.add(name)
                     del source_val, sliced_val, sliced_val_tensor
                     gc.collect()
+
+                    log_memory(f"After  {name}") # <--- LOG MEMORY AFTER
         
         return shard_model, modified
 
