@@ -216,17 +216,7 @@ class TensorParallelKeras(Model):
             if metric.name == "loss":
                 metric.update_state(total_loss)
         
-        new_trainable = [v.value for v in self.trainable_variables]
-        new_non_trainable = [v.value for v in self.non_trainable_variables]
-        new_optimizer = [v.value for v in self.optimizer.variables]
-        new_metrics = [v.value for v in self.metrics_variables]
-        
-        return {m.name: m.result() for m in self.metrics}, (
-            new_trainable, 
-            new_non_trainable, 
-            new_optimizer, 
-            new_metrics
-        )
+        return {m.name: m.result() for m in self.metrics}
 
     def _save_weights_to_disk(self, model):
         for v in model.variables:

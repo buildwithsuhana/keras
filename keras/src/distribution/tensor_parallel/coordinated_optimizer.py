@@ -69,25 +69,25 @@ class CoordinatedOptimizer:
                     for g_and_v in gradients_and_vars
                     if g_and_v[i][0] is not None
                 ]
+                # Inside _synchronize_gradients
                 if grads_to_reduce:
-                    # --- FIX START ---
-                    # Perform reduction iteratively to avoid creating a massive stacked tensor on CPU
-                    import keras 
+                    # FIX: Avoid ops.stack() which might pull massive tensors to CPU.
+                    # Use iterative accumulation on the target device instead.
+                    import keras
                     
-                    # Use the device of the first gradient as the reduction hub
+                    # Assume target is the device of the first gradient
                     target_device = grads_to_reduce[0].device
                     
                     with keras.device(target_device):
                         # Start with the first gradient
                         total_grad = ops.convert_to_tensor(grads_to_reduce[0])
                         
-                        # Add the rest (this moves them to target_device implicitly or explicitly)
+                        # Add the rest (moves them to target_device directly)
                         for g in grads_to_reduce[1:]:
                             total_grad = ops.add(total_grad, ops.convert_to_tensor(g))
                         
                         # Compute mean
                         mean_grad = ops.divide(total_grad, len(grads_to_reduce))
-                    # --- FIX END ---
                     
                     for shard_idx in range(self.device_count):
                         if gradients_and_vars[shard_idx][i][0] is not None:
