@@ -122,8 +122,9 @@ def run_training():
         optimizer=keras.optimizers.SGD(LEARNING_RATE, momentum=0.0),
         loss=keras.losses.SparseCategoricalCrossentropy(from_logits=True),
         metrics=["accuracy"],
-        run_eagerly=True,
-        jit_compile=False # <--- CRITICAL FOR JAX SIDE EFFECTS
+        # --- FIX: Disable Eager, Enable JIT ---
+        run_eagerly=False,  # Was True (Causes Host RAM crash)
+        jit_compile=True    # Was False (Now safe due to train_step fix)
     )
 
     logger.info("Training...")
