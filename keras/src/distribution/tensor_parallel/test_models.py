@@ -113,13 +113,10 @@ def run_training():
     logger.info(f"Using devices: {dev_ids}")
     
     tp_model = TensorParallelKeras(model=model_factory, device_count=count, device_ids=dev_ids)
-    print_memory("AFTER INIT")
 
     logger.info("Building...")
     tp_model({"token_ids": np.zeros((1, 128), "int32"), "padding_mask": np.ones((1, 128), "int32")})
-    print_memory("AFTER BUILD")
     
-    inspect_shards(tp_model, devices)
 
     logger.info("Compiling...")
     tp_model.compile(
