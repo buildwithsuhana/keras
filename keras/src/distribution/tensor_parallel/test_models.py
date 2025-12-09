@@ -99,7 +99,6 @@ def inspect_shards(tp_model, devices):
         logger.info(f"   Shard {i} | Expect: {expect} | Actual: {actual} | {status}")
 
 def run_training():
-    print_memory("START")
     count, devices = get_devices()
     if count < 2: 
         logger.error("Need 2+ accelerators")
@@ -109,7 +108,7 @@ def run_training():
     train_ds = load_data(MODEL_PRESET)
     
     logger.info("Init TP Model...")
-    dev_ids = [str(d) for d in devices]
+    dev_ids = [f"{d.platform}:{d.id}" for d in devices]
     logger.info(f"Using devices: {dev_ids}")
     
     tp_model = TensorParallelKeras(model=model_factory, device_count=count, device_ids=dev_ids)
