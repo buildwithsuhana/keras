@@ -5,7 +5,8 @@ import re
 import shutil
 import tempfile
 import numpy as np
-import psutil  # <--- NEW: For memory tracking
+import psutil
+import subprocess
 import keras
 from keras import ops
 from keras.src.distribution.tensor_parallel.autoconfig import get_default_config
@@ -19,10 +20,25 @@ import ctypes
 logger = logging.getLogger(__file__)
 
 # --- Helper for Memory Logging ---
-def log_memory_shard(rank, device_id, stage=""):
+def log_mem_stats(rank, device_id, stage=""):
+    # 1. CPU Mem
     process = psutil.Process(os.getpid())
     mem_mb = process.memory_info().rss / (1024 ** 2)
-    print(f"📈 [Shard {rank}|{device_id}] {stage} | Host RSS: {mem_mb:.2f} MB")
+    
+    # 2. GPU Mem
+    gpu_str = ""
+    try:
+        result = subprocess.check_output(
+            ['nvidia-smi', '--query-gpu=memory.used', '--format=csv,nounits,noheader'],
+            encoding='utf-8'
+        )
+        mems = [int(x) for x in result.strip().split('\n') if x.strip()]
+        for i, m in enumerate(mems):
+            gpu_str += f"GPU{i}:{m}MB "
+    except:
+        gpu_str = "N/A"
+
+    print(f"📈 [Shard {rank}|{device_id}] {stage} | Host RSS: {mem_mb:.0f} MB | {gpu_str}")
 # ---------------------------------
 
 class TensorParallelKeras(Model):
@@ -70,7 +86,7 @@ class TensorParallelKeras(Model):
         strat_helper = ParameterShardingStrategy(1, 0)
 
         for rank, device_id in enumerate(self.devices):
-            log_memory_shard(rank, device_id, "START creation") # <--- Log Start
+            log_mem_stats(rank, device_id, "START creation") # <--- Log Start
 
             print(f"[{device_id}] ⏳ Creating shard {rank+1}/{self.device_count}...")
             
@@ -114,7 +130,7 @@ class TensorParallelKeras(Model):
             flush_memory()
             print(f"[{device_id}] ✅ Shard ready.")
             
-            log_memory_shard(rank, device_id, "DONE creation") # <--- Log End
+            log_mem_stats(rank, device_id, "DONE creation") # <--- Log End
 
         try: shutil.rmtree(self.temp_dir)
         except: pass

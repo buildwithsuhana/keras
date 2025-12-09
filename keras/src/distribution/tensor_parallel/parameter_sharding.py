@@ -2,7 +2,8 @@ import logging
 import re
 import gc
 import os
-import psutil  # <--- NEW: For memory tracking
+import psutil
+import subprocess
 from typing import Any, Tuple, Set, Callable, TYPE_CHECKING
 from keras import device, ops
 import keras
@@ -14,10 +15,24 @@ if TYPE_CHECKING:
 logger = logging.getLogger(__name__)
 
 # --- Helper for Memory Logging ---
-def log_memory(stage=""):
+def log_stats(stage=""):
+    # CPU
     process = psutil.Process(os.getpid())
     mem_mb = process.memory_info().rss / (1024 ** 2)
-    print(f"   📊 [MemUtil] {stage} | Host RSS: {mem_mb:.2f} MB")
+    
+    # GPU
+    gpu_str = ""
+    try:
+        result = subprocess.check_output(
+            ['nvidia-smi', '--query-gpu=memory.used', '--format=csv,nounits,noheader'],
+            encoding='utf-8'
+        )
+        mems = [int(x) for x in result.strip().split('\n') if x.strip()]
+        for i, m in enumerate(mems):
+            gpu_str += f"G{i}:{m}M "
+    except: pass
+
+    print(f"   📊 [Stats] {stage} | RAM: {mem_mb:.0f}MB | {gpu_str}")
 # ---------------------------------
 
 class ParameterShardingStrategy:
@@ -166,7 +181,7 @@ class ParameterShardingStrategy:
                 targets = self._find_matching_parameters(shard_model, pattern)
                 for name, target_var in targets:
                     print(f"⚡ [Sharding] Processing: {name}")
-                    log_memory(f"Before {name}")  # <--- LOG MEMORY BEFORE
+                    log_stats(f"Before {name}")  # <--- LOG BEFORE
 
                     try:
                         source_val = weight_loader(name)
@@ -202,7 +217,7 @@ class ParameterShardingStrategy:
                     del source_val, sliced_val, sliced_val_tensor
                     gc.collect()
 
-                    log_memory(f"After  {name}") # <--- LOG MEMORY AFTER
+                    log_stats(f"After  {name}") # <--- LOG AFTER
         
         return shard_model, modified
 
