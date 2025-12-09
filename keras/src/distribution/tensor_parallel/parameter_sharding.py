@@ -64,8 +64,7 @@ class ParameterShardingStrategy:
     def _replace_variable(self, layer, attr_name, old_var, new_val_tensor, device_id=None):
         print(f"      🛠️  [Swapping] '{attr_name}' on '{layer.name}' -> {device_id}")
         
-        # CRITICAL FIX: Ensure unique naming for each shard variable
-        # and force device placement explicitly via context manager.
+        # Ensure unique naming for each shard variable
         new_name = f"{old_var.name}_shard_{self.rank}"
         
         try:
@@ -75,7 +74,7 @@ class ParameterShardingStrategy:
                     shape=new_val_tensor.shape,
                     dtype=old_var.dtype,
                     trainable=old_var.trainable,
-                    name=new_name  # Unique name prevents collision/eviction
+                    name=new_name 
                 )
         except Exception as e:
             print(f"      ⚠️ Var creation failed: {e}")

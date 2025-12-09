@@ -9,7 +9,6 @@ import numpy as np
 # --- 1. Environment Setup ---
 if "XLA_FLAGS" in os.environ: del os.environ["XLA_FLAGS"]
 os.environ["KERAS_BACKEND"] = "jax"
-# Prevent JAX from pre-allocating all VRAM
 os.environ["XLA_PYTHON_CLIENT_PREALLOCATE"] = "false"
 os.environ["XLA_PYTHON_CLIENT_ALLOCATOR"] = "platform"
 
@@ -78,32 +77,39 @@ def inspect_shards(tp_model, devices):
     for i, shard in enumerate(tp_model.model_shards):
         expect = str(devices[i]).lower()
         if not shard.trainable_variables:
+            logger.warning(f"   Shard {i} has no trainable variables.")
             continue
             
-        # Check first variable
         var = shard.trainable_variables[0]
         actual = "Unknown"
         
-        # JAX Variable Handling
+        # Robust JAX Device Check
         try:
-            # For JAX, value is a jax.Array which has a .device() or .sharding
             val = var.value
+            # Handle JAX Array device property (method vs attribute)
             if hasattr(val, 'device'):
-                actual = str(val.device()).lower()
+                d = val.device
+                actual = str(d() if callable(d) else d).lower()
             elif hasattr(val, 'devices'):
                  actual = str(list(val.devices())[0]).lower()
             elif hasattr(val, 'sharding'):
                  actual = str(list(val.sharding.device_set)[0]).lower()
-        except:
-            actual = str(var.device).lower()
+        except Exception as e:
+            # Fallback for standard Keras Variable
+            try:
+                actual = str(var.device).lower()
+            except:
+                actual = f"Error: {e}"
 
-        # Extract device ID (e.g. "gpu:0" or "cuda:0")
+        # Loose matching for "gpu:0" vs "cuda:0" vs "gpu:0"
         is_match = False
-        if "gpu" in expect and "gpu" in actual:
-             # Check if index matches
-             idx_expect = expect.split(':')[-1].strip()
-             idx_actual = actual.split(':')[-1].strip()
-             is_match = (idx_expect == idx_actual)
+        # Normalize expect/actual to just index if possible
+        def get_idx(s):
+            if ':' in s: return s.split(':')[-1].strip()
+            return '?'
+        
+        if ("gpu" in expect or "cuda" in expect) and ("gpu" in actual or "cuda" in actual):
+             is_match = (get_idx(expect) == get_idx(actual))
         
         status = "✅ OK" if is_match else f"❌ WRONG DEVICE (Got {actual})"
         logger.info(f"   Shard {i} | Expect: {expect} | Status: {status}")
@@ -132,14 +138,16 @@ def run_training():
     log_gpu_memory("Startup")
     count, devices = get_devices()
     logger.info(f"Detected {count} accelerators: {devices}")
-    if count < 2: return
+    if count < 2: 
+        logger.error("Need 2 accelerators.")
+        return
 
     gc.collect()
     train_ds = load_data(MODEL_PRESET)
     log_gpu_memory("After Data Load")
     
     logger.info("Init TP Model...")
-    # Normalize device IDs for Keras
+    # Explicitly list devices for Keras
     dev_ids = [f"gpu:{i}" for i in range(count)] 
     logger.info(f"Using devices: {dev_ids}")
     
@@ -149,6 +157,7 @@ def run_training():
     inspect_shards(tp_model, devices)
 
     logger.info("Building...")
+    # Dummy forward pass to initialize any lazy layers
     tp_model({"token_ids": np.zeros((BATCH_SIZE, SEQUENCE_LENGTH), "int32"), "padding_mask": np.ones((BATCH_SIZE, SEQUENCE_LENGTH), "int32")})
     log_gpu_memory("After Build")
 

@@ -70,8 +70,7 @@ class TensorParallelKeras(Model):
         print(f"🚀 Initializing TP on {self.devices}")
 
         from keras.src.distribution.tensor_parallel.parameter_sharding import ParameterShardingStrategy
-        strat_helper = ParameterShardingStrategy(1, 0)
-
+        
         for rank, device_id in enumerate(self.devices):
             log_mem_stats(rank, device_id, "START creation")
 
@@ -82,6 +81,7 @@ class TensorParallelKeras(Model):
                 if hasattr(shard, 'build_from_config'):
                      shard.build_from_config(self.model_config)
 
+            # 1. Sharded Variables (uses internal strategy with correct rank)
             shard, modified_vars = make_parameter_sharded_model(
                 shard_model=shard,
                 weight_loader=self._weight_loader, 
@@ -91,7 +91,11 @@ class TensorParallelKeras(Model):
                 device_id=device_id,
             )
 
-            # Migration of unsharded variables
+            # 2. Unsharded Variables (Migration)
+            # FIX: Initialize strategy with CURRENT rank so variables get unique names (e.g. _shard_1)
+            # This prevents collision with Shard 0's variables.
+            strat_helper = ParameterShardingStrategy(self.device_count, rank)
+            
             try:
                 import jax
                 d_str = str(device_id)
@@ -105,8 +109,10 @@ class TensorParallelKeras(Model):
                     v_name = v.path if hasattr(v, 'path') else v.name
                     if v_name in modified_vars: continue 
 
+                    # Move to GPU
                     val_gpu = jax.device_put(v.value, target_device)
                     
+                    # Update variable in the layer
                     if id(v) in var_to_owner:
                         layer, attr_name = var_to_owner[id(v)]
                         strat_helper._replace_variable(layer, attr_name, v, val_gpu, device_id=device_id)
