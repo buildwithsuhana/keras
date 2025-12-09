@@ -123,7 +123,7 @@ def run_training():
 
     logger.info("Compiling...")
     tp_model.compile(
-        optimizer=keras.optimizers.SGD(LEARNING_RATE),
+        optimizer=keras.optimizers.SGD(LEARNING_RATE, momentum=0.0),
         loss=keras.losses.SparseCategoricalCrossentropy(from_logits=True),
         metrics=["accuracy"],
         run_eagerly=True,
