@@ -5,10 +5,10 @@ import logging
 import time
 import numpy as np
 
-if "XLA_FLAGS" in os.environ: del os.environ["XLA_FLAGS"]
+# if "XLA_FLAGS" in os.environ: del os.environ["XLA_FLAGS"]
 os.environ["KERAS_BACKEND"] = "jax"
-os.environ["XLA_PYTHON_CLIENT_PREALLOCATE"] = "false"
-os.environ["XLA_PYTHON_CLIENT_ALLOCATOR"] = "platform"
+# os.environ["XLA_PYTHON_CLIENT_PREALLOCATE"] = "false"
+# os.environ["XLA_PYTHON_CLIENT_ALLOCATOR"] = "platform"
 
 import jax
 import jax.nn
