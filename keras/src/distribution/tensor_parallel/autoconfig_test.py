@@ -1,10 +1,31 @@
+import functools
+
 import keras
 from keras.src import layers
 from keras.src import testing
+from keras.src.distribution.tensor_parallel.autoconfig import _gather
+from keras.src.distribution.tensor_parallel.autoconfig import _reduce_sum
+from keras.src.distribution.tensor_parallel.autoconfig import (
+    analyze_dense_layer,
+)
+from keras.src.distribution.tensor_parallel.autoconfig import get_default_config
+from keras.src.distribution.tensor_parallel.tensor_layout import (
+    split_tensor_for_parallelism,
+)
 
-from autoconfig import analyze_dense_layer, get_default_config_keras
 
 class AutoConfigTest(testing.TestCase):
+    def check_rule(self, rule, expected_device_count, expected_dim):
+        """
+        Helper to verify a rule.
+        The rules are now functools.partial objects, so we verify their
+        configuration directly.
+        """
+        self.assertIsInstance(rule, functools.partial)
+        self.assertEqual(rule.func, split_tensor_for_parallelism)
+        self.assertEqual(rule.keywords["device_count"], expected_device_count)
+        self.assertEqual(rule.keywords["dim"], expected_dim)
+
     def test_analyze_dense_layer_directly(self):
         """Tests the heuristic for classifying Dense layers."""
         
@@ -37,30 +58,35 @@ class AutoConfigTest(testing.TestCase):
         model = keras.Sequential(
             [
                 keras.Input(shape=(32,)),
-                layers.Dense(128, name="mlp_up"),  # Up-projection
-                layers.Dense(32, name="mlp_down"),  # Down-projection
+                layers.Dense(128, name="mlp_up"),
+                layers.Dense(32, name="mlp_down"),
             ],
             name="mlp_block",
         )
 
-        layout_map = get_default_config_keras(model, devices)
+        layout_map = get_default_config(model, devices)
         state_rules = layout_map.state_rules
         output_rules = layout_map.output_rules
 
-        # Assertions for State (Weight) Sharding Rules
-        up_kernel_key = "mlp_block.mlp_up.kernel"
+        up_kernel_key = "mlp_block/mlp_up/kernel"
+        self.assertIn(up_kernel_key, state_rules)
         up_kernel_rule = state_rules[up_kernel_key]
-        self.assertEqual(up_kernel_rule.device_count, device_count) # FIX: Use .device_count
-        self.assertEqual(up_kernel_rule.dim, 1)
+        self.check_rule(up_kernel_rule, device_count, 1)
 
-        down_kernel_key = "mlp_block.mlp_down.kernel"
+        down_kernel_key = "mlp_block/mlp_down/kernel"
+        self.assertIn(down_kernel_key, state_rules)
         down_kernel_rule = state_rules[down_kernel_key]
-        self.assertEqual(down_kernel_rule.device_count, device_count) # FIX: Use .device_count
-        self.assertEqual(down_kernel_rule.dim, 0)
+        self.check_rule(down_kernel_rule, device_count, 0)
 
-        # Assertions for Output Communication Rules
-        self.assertEqual(output_rules["mlp_block.mlp_up"], {0: "gather"})
-        self.assertEqual(output_rules["mlp_block.mlp_down"], {0: "allreduce"})
+        self.assertIn("mlp_block/mlp_up", output_rules)
+        up_output_rule = output_rules["mlp_block/mlp_up"][0]
+        self.assertIsInstance(up_output_rule, functools.partial)
+        self.assertEqual(up_output_rule.func, _gather)
+        self.assertEqual(up_output_rule.keywords["axis"], -1)
+
+        self.assertIn("mlp_block/mlp_down", output_rules)
+        down_output_rule = output_rules["mlp_block/mlp_down"][0]
+        self.assertEqual(down_output_rule, _reduce_sum)
 
     def test_model_with_embedding_and_einsumdense(self):
         """Tests rule generation for Embedding and EinsumDense layers."""
@@ -95,24 +121,23 @@ class AutoConfigTest(testing.TestCase):
         model = SimpleTransformer(name="transformer")
         model(keras.ops.zeros((1, 10)))
 
-        layout_map = get_default_config_keras(model, devices)
+        layout_map = get_default_config(model, devices)
         state_rules = layout_map.state_rules
 
-        expected_key = "transformer.embedding.embeddings"
+        expected_key = "transformer/embedding/embeddings"
         self.assertIn(expected_key, state_rules)
         emb_rule = state_rules[expected_key]
-        self.assertEqual(emb_rule.device_count, device_count) # FIX: Use .device_count
-        self.assertEqual(emb_rule.dim, 1)
+        self.check_rule(emb_rule, device_count, 1)
 
-        qkv_key = "transformer.qkv_proj.kernel"
+        qkv_key = "transformer/qkv_proj/kernel"
+        self.assertIn(qkv_key, state_rules)
         qkv_rule = state_rules[qkv_key]
-        self.assertEqual(qkv_rule.device_count, device_count) # FIX: Use .device_count
-        self.assertEqual(qkv_rule.dim, 1)
+        self.check_rule(qkv_rule, device_count, 1)
 
-        attn_out_key = "transformer.attention_output.kernel"
+        attn_out_key = "transformer/attention_output/kernel"
+        self.assertIn(attn_out_key, state_rules)
         attn_out_rule = state_rules[attn_out_key]
-        self.assertEqual(attn_out_rule.device_count, device_count) # FIX: Use .device_count
-        self.assertEqual(attn_out_rule.dim, 0)
+        self.check_rule(attn_out_rule, device_count, 0)
 
     def test_nested_model(self):
         """Tests that the recursive traversal finds layers in nested models."""
@@ -129,11 +154,10 @@ class AutoConfigTest(testing.TestCase):
             ],
             name="outer_block",
         )
-        layout_map = get_default_config_keras(outer_model, devices)
+        layout_map = get_default_config(outer_model, devices)
         state_rules = layout_map.state_rules
         
-        expected_key = "outer_block.inner_block.inner_dense.kernel"
+        expected_key = "outer_block/inner_block/inner_dense/kernel"
         self.assertIn(expected_key, state_rules)
         inner_rule = state_rules[expected_key]
-        self.assertEqual(inner_rule.device_count, device_count) # FIX: Use .device_count
-        self.assertEqual(inner_rule.dim, 1)
+        self.check_rule(inner_rule, device_count, 1)

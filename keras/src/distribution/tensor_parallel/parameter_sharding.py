@@ -30,9 +30,11 @@ class ShardedWeight:
             f"'{name}' with shape {tensor_shard.shape}"
         )
 
+        safe_name = name.replace("/", "_").replace(":", "_")
+
         with device(current_dev_name):
             self._variable = Variable(
-                initializer=tensor_shard, trainable=trainable, name=name
+                initializer=tensor_shard, trainable=trainable, name=safe_name
             )
         self.regularizer = None
 
@@ -85,6 +87,7 @@ class ParameterShardingStrategy:
         self.original_weights = {}
         self.weight_mapping = {}
         self.sharded_weights_by_id = {}
+        self.param_path_map = {}
 
     def shard_model_parameters(
         self,
@@ -99,11 +102,12 @@ class ParameterShardingStrategy:
 
         print(f"🔧 Applying parameter-level sharding to {model.name}")
 
+        self.param_path_map = {w.path: w for w in model.weights}
+        
         self._store_original_weights(model)
         modified_parameters = set()
 
         for pattern, action in config.state_rules.items():
-            # FIX: Check if action is callable (lambda) instead of isinstance(Split)
             if callable(action):
                 matching_params = self._find_matching_parameters(model, pattern)
 
@@ -165,89 +169,27 @@ class ParameterShardingStrategy:
         return sharded_model, modified_parameters
 
     def _store_original_weights(self, model):
-        """Store original weights for reference."""
-        
-        def find_weights_recursive(current_layer, prefix=""):
-            name = current_layer.name
-            full_name = f"{prefix}.{name}" if prefix else name
-
-            if hasattr(current_layer, "weights") and current_layer.weights:
-                for weight in current_layer.weights:
-                    cleaned_name = weight.name.split("/")[-1].split(":")[0]
-                    param_name = f"{full_name}.{cleaned_name}"
-                    
-                    # FIX: Check for numpy capability before access
-                    if hasattr(weight, 'numpy'):
-                        self.original_weights[param_name] = weight.numpy()
-
-            if hasattr(current_layer, "layers") and current_layer.layers:
-                for sub_layer in current_layer.layers:
-                    find_weights_recursive(sub_layer, full_name)
-
-            for attr_name in dir(current_layer):
-                if attr_name.startswith("__") and attr_name.endswith("__"):
-                    continue
-                try:
-                    attr = getattr(current_layer, attr_name)
-                except Exception:
-                    continue
-                if isinstance(attr, layers.Layer) and attr is not current_layer:
-                    find_weights_recursive(attr, full_name)
-                elif isinstance(attr, (list, tuple)):
-                    for item in attr:
-                        if isinstance(item, layers.Layer):
-                            find_weights_recursive(item, full_name)
-
-        # Start recursion
-        find_weights_recursive(model, prefix="")
+        """Store original weights for reference using variable paths."""
+        for weight in model.weights:
+            if hasattr(weight, 'numpy'):
+                self.original_weights[weight.path] = weight.numpy()
 
     def _find_matching_parameters(self, model, pattern: str) -> List[Tuple[str, Any]]:
         """
-        Find parameters that match the given pattern using smart recursion.
+        Find parameters matching the pattern using the pre-computed path map.
         """
-        matching_params = []
-        processed_layers = set()
-
-        def search_layer_recursive(current_layer, prefix=""):
-            if id(current_layer) in processed_layers:
-                return
-            processed_layers.add(id(current_layer))
-
-            name = current_layer.name
-            full_name = f"{prefix}.{name}" if prefix else name
-
-            if hasattr(current_layer, "weights") and current_layer.weights:
-                for weight in current_layer.weights:
-                    cleaned_weight_name = weight.name.split("/")[-1].split(":")[0]
-                    param_name = f"{full_name}.{cleaned_weight_name}"
-
-                    # FIX: Use fullmatch for strict pattern adherence
-                    if re.fullmatch(pattern, param_name):
-                        matching_params.append((param_name, weight))
-
-            if hasattr(current_layer, "layers") and current_layer.layers:
-                for sub_layer in current_layer.layers:
-                    search_layer_recursive(sub_layer, full_name)
-
-            for attr_name in dir(current_layer):
-                if attr_name.startswith("__") and attr_name.endswith("__"):
-                    continue
-
-                try:
-                    attr = getattr(current_layer, attr_name)
-                except Exception:
-                    continue
-
-                if isinstance(attr, layers.Layer) and attr is not current_layer:
-                    search_layer_recursive(attr, full_name)
-
-                elif isinstance(attr, (list, tuple)):
-                    for item in attr:
-                        if isinstance(item, layers.Layer):
-                            search_layer_recursive(item, full_name)
-
-        search_layer_recursive(model, prefix="")
-        return matching_params
+        # 1. Exact match (Ideal case: autoconfig path matches model path exactly)
+        if pattern in self.param_path_map:
+            return [(pattern, self.param_path_map[pattern])]
+            
+        # 2. Suffix match (Common case: autoconfig generated paths without top-level model prefix)
+        matches = []
+        suffix = "/" + pattern
+        for path, weight in self.param_path_map.items():
+            if path.endswith(suffix):
+                matches.append((path, weight))
+        
+        return matches
 
 
 def _define_parameter_sharded_model():
@@ -500,12 +442,21 @@ def _define_parameter_sharded_model():
                         raise
 
                 # 4/5. Apply Communication Rules (AllReduce/Gather) and Cache Output
-                layer_path = layer.path
+                layer_path = getattr(layer, "path", layer.name)
                 output_rule = None
+                
+                # Check for exact match or suffix match in output_rules
                 for pattern, rule in self.config.output_rules.items():
-                    if re.search(pattern, layer_path):
+                    if pattern == layer_path or layer_path.endswith("/" + pattern):
                         output_rule = rule.get(0)
                         break
+                
+                # Fallback: check regex if simple matching failed
+                if not output_rule:
+                    for pattern, rule in self.config.output_rules.items():
+                        if re.search(pattern, layer_path):
+                            output_rule = rule.get(0)
+                            break
 
                 if output_rule:
                     if callable(output_rule):
