@@ -54,62 +54,52 @@ class ParameterShardingStrategy:
         return var_to_owner
 
     def shard_model_parameters(self, shard_model, weight_loader, config, device_id):
-        """Performs one-by-one sharding to minimize peak memory."""
         modified = set()
+        # Create a fresh map for this shard
         var_to_owner = self._map_variables_to_owners(shard_model)
         
-        # Determine sharding rules for each variable in the model
         for target_var in shard_model.variables:
-            name = target_var.path if hasattr(target_var, 'path') else target_var.name
-            action = None
-            for pattern, act in config.state_rules.items():
-                if re.search(pattern, name):
-                    action = act
-                    break
+            name = target_var.path
+            action = next((act for pat, act in config.state_rules.items() if re.search(pat, name)), None)
             
             if not action or not callable(action):
                 continue
 
-            # Load the full parameter from disk and slice it on CPU
             source_val = weight_loader(name)
             if source_val is None: continue
             sliced_val = action(source_val, self.rank)
 
             with keras.device(device_id):
-                # Ensure the sharded tensor is moved to the target device memory
                 sliced_val_tensor = ops.convert_to_tensor(sliced_val, dtype=target_var.dtype)
 
-            # FIND PARENT AND REPLACE (Handles shape changes)
+            # EFFICIENT REPLACEMENT
             if id(target_var) in var_to_owner:
                 layer, attr_name = var_to_owner[id(target_var)]
                 self._replace_variable(layer, attr_name, target_var, sliced_val_tensor, device_id)
-                modified.add(name)
             else:
-                # Handle ownerless variables (often top-level model weights)
-                print(f"🚨 Forced replacement for ownerless var: {name}")
-                with keras.device(device_id):
-                    new_var = keras.Variable(
-                        sliced_val_tensor, 
-                        dtype=target_var.dtype, 
-                        trainable=target_var.trainable,
-                        name=target_var.name + "_shard"
-                    )
+                # PATH-BASED FALLBACK: If id-map fails, use the path to find the layer
+                print(f"🔗 Path-based injection for: {name}")
+                parent_path = "/".join(name.split("/")[:-1])
+                attr_name = name.split("/")[-1]
                 
-                # Update model-level tracking properties safely
-                for attr in ["trainable_variables", "variables", "non_trainable_variables"]:
-                    if hasattr(shard_model, attr):
-                        try:
+                # Attempt to find the layer by walking the model
+                target_layer = shard_model
+                try:
+                    for part in parent_path.split("/"):
+                        if part: target_layer = getattr(target_layer, part)
+                    self._replace_variable(target_layer, attr_name, target_var, sliced_val_tensor, device_id)
+                except:
+                    # Final fallback: Manual list update (what you had, but corrected)
+                    with keras.device(device_id):
+                        new_var = keras.Variable(sliced_val_tensor, dtype=target_var.dtype, name=target_var.name + "_shard")
+                        for attr in ["trainable_variables", "variables"]:
                             lst = getattr(shard_model, attr)
                             for i, v in enumerate(lst):
-                                if v.path == target_var.path:
-                                    lst[i] = new_var
-                        except: continue
-                modified.add(name)
+                                if v.path == target_var.path: lst[i] = new_var
             
-            # Aggressive cleanup to avoid OOM during the sharding loop
+            modified.add(name)
             del source_val, sliced_val
             gc.collect()
-        
         return shard_model, modified
 
     def _replace_variable(self, layer, attr_name, old_var, new_val_tensor, device_id=None):
