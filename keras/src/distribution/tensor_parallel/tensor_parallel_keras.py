@@ -102,18 +102,16 @@ class TensorParallelKeras(Model):
             var_to_owner = strat_helper._map_variables_to_owners(shard)
             
             for v in shard.variables:
-                v_name = v.path if hasattr(v, 'path') else v.name
-                if v_name in modified_vars:
-                    continue 
-
+                if v.path in modified_vars: continue 
+                
                 with keras.device(device_id):
-                    val_cpu = self._weight_loader(v_name)
+                    val_cpu = self._weight_loader(v.path)
                     if val_cpu is not None:
+                        # Move to GPU via object replacement to ensure no property/setter issues
                         val_tensor = ops.convert_to_tensor(val_cpu, dtype=v.dtype)
                         if id(v) in var_to_owner:
                             layer, attr_name = var_to_owner[id(v)]
-                            # Use the fixed _replace_variable to avoid property errors
-                            strat_helper._replace_variable(layer, attr_name, v, val_tensor, device_id=device_id)
+                            strat_helper._replace_variable(layer, attr_name, v, val_tensor, device_id)
                         else:
                             v.assign(val_tensor)
                         del val_cpu, val_tensor

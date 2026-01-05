@@ -51,10 +51,11 @@ def _apply_layer_sharding_rules(layer, full_name, device_count, state_rules, out
     print(f"🔍 [AutoConfig] Analyzing: '{clean_name}' ({cls_name})")
 
     # 1. Shard Normalization (Crucial for input shape consistency)
+    # 1. Shard Normalization (MUST match the sharding of the preceding Dense layer)
     if "Normalization" in cls_name or "LayerNorm" in cls_name:
-        print(f"   ⚪ [Skip Rule] '{clean_name}' -> Normalization (Replicated for Stability)")
-        # By NOT adding a rule to state_rules, ParameterShardingStrategy 
-        # will treat these as un-sharded and handle them in the migration loop.
+        # If input dim is 3584 and we use 2 GPUs, this weight MUST become 1792
+        print(f"   ➕ [Add Rule] '{clean_name}' -> Normalization (Split Dim 0)")
+        state_rules[rule_key_scale] = _split_rule(device_count, dim=0)
         return
 
     # 2. Shard Dense / EinsumDense Layers
