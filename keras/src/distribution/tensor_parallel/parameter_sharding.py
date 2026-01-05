@@ -98,35 +98,35 @@ class ParameterShardingStrategy:
         for pattern, action in config.state_rules.items():
             if not callable(action): continue
             
-            # Find matching variables in the model
             for target_var in shard_model.variables:
                 name = target_var.path if hasattr(target_var, 'path') else target_var.name
                 if re.search(pattern, name):
-                    # Load the large parameter from disk/memory-mapped file
                     source_val = weight_loader(name)
                     if source_val is None: continue
 
-                    # Generate the shard
                     sliced_val = action(source_val, self.rank)
                     
-                    # Move to GPU/TPU device
-                    if jax_target is not None:
-                        import jax
-                        sliced_val_tensor = jax.device_put(sliced_val, jax_target).astype(target_var.dtype)
-                    else:
-                        with keras.device(device_id):
+                    with keras.device(device_id):
+                        # Convert to tensor on the correct device
+                        if jax_target is not None:
+                            import jax
+                            sliced_val_tensor = jax.device_put(sliced_val, jax_target).astype(target_var.dtype)
+                        else:
                             sliced_val_tensor = ops.convert_to_tensor(sliced_val, dtype=target_var.dtype)
 
-                    # Swap the variable in the model
+                    # FIX: Always attempt replacement to handle shape changes
+                    layer, attr_name = None, None
                     if id(target_var) in var_to_owner:
                         layer, attr_name = var_to_owner[id(target_var)]
+                    
+                    if layer and attr_name:
                         self._replace_variable(layer, attr_name, target_var, sliced_val_tensor, device_id)
                     else:
-                        target_var.assign(sliced_val_tensor)
+                        # Fallback for variables not found in owner map: 
+                        # We must update the model's internal tracking list directly
+                        target_var.assign(ops.cast(sliced_val_tensor, target_var.dtype)) if target_var.shape == sliced_val_tensor.shape else print(f"⚠️ Skipping {name} due to shape mismatch and no owner found.")
                     
                     modified.add(name)
-                    
-                    # Immediate cleanup: delete references and trigger GC to free RAM
                     del source_val, sliced_val, sliced_val_tensor
                     gc.collect()
         

@@ -51,14 +51,10 @@ def _apply_layer_sharding_rules(layer, full_name, device_count, state_rules, out
     print(f"🔍 [AutoConfig] Analyzing: '{clean_name}' ({cls_name})")
 
     # 1. Shard Normalization (Crucial for input shape consistency)
-    if "Normalization" in cls_name:
-        print(f"   ➕ [Add Rule] '{clean_name}' -> Normalization (Split Dim 0)")
-        def add_if_exists(attr, key):
-            if hasattr(layer, attr) and getattr(layer, attr) is not None:
-                state_rules[key] = _split_rule(device_count, dim=0)
-        add_if_exists("scale", rule_key_scale)
-        add_if_exists("gamma", rule_key_gamma)
-        add_if_exists("beta", rule_key_beta)
+    if "Normalization" in cls_name or "LayerNorm" in cls_name:
+        print(f"   ⚪ [Skip Rule] '{clean_name}' -> Normalization (Replicated for Stability)")
+        # By NOT adding a rule to state_rules, ParameterShardingStrategy 
+        # will treat these as un-sharded and handle them in the migration loop.
         return
 
     # 2. Shard Dense / EinsumDense Layers
