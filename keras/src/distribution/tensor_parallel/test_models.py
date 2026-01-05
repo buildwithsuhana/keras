@@ -104,13 +104,25 @@ def load_data(preset):
 
 def model_factory():
     """
-    Lazy Factory: Uses the preset to build an empty model shell on CPU 
-    to be filled one-by-one by TensorParallelKeras.
+    Lazy Factory: Forces the Keras backend to stay on CPU for the entire
+    instantiation process of the 18GB Gemma model.
     """
     logger.info(f"🏭 Factory: Instantiating {MODEL_PRESET}...")
-    # This remains on CPU, but since we call it inside TensorParallelKeras
-    # which now handles serialization, this is the only copy.
-    return keras_hub.models.GemmaCausalLM.from_preset(MODEL_PRESET)
+    
+    # Force the backend to use CPU for ALL initializations in this scope
+    with keras.utils.custom_object_scope(None):
+        with keras.device("cpu"):
+            # Use 'load_weights=False' initially if the Hub API supports it,
+            # or rely on the fact that TensorParallelKeras will swap these values anyway.
+            model = keras_hub.models.GemmaCausalLM.from_preset(
+                MODEL_PRESET, 
+                load_weights=True # Must be True to get the weights for offloading
+            )
+            return model
+
+# In run_training(), add this JAX-specific environment variable 
+# to prevent it from greedily taking the first GPU for construction
+os.environ["JAX_PLATFORM_NAME"] = "cpu"
 
 # --- 6. Execution ---
 def run_training():

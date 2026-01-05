@@ -51,11 +51,12 @@ class TensorParallelKeras(Model):
         self.temp_dir = tempfile.mkdtemp(prefix="tp_weights_")
         
         # Step 1: Handle Master Model and Offload to Disk
+        # Inside TensorParallelKeras.__init__
         if callable(model) and not isinstance(model, keras.Model):
             print("🏭 Executing Model Factory...")
-            loaded_model = model()
-        else:
-            loaded_model = model
+            # Ensure JAX default device is CPU during this execution
+            with keras.device("cpu"):
+                loaded_model = model()
 
         self.model_config = loaded_model.get_config()
         self.model_cls = loaded_model.__class__
