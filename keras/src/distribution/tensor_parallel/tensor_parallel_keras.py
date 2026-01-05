@@ -107,12 +107,12 @@ class TensorParallelKeras(Model):
                     continue 
 
                 with keras.device(device_id):
-                    # Load value from disk and move directly to target device
                     val_cpu = self._weight_loader(v_name)
                     if val_cpu is not None:
                         val_tensor = ops.convert_to_tensor(val_cpu, dtype=v.dtype)
                         if id(v) in var_to_owner:
                             layer, attr_name = var_to_owner[id(v)]
+                            # Use the fixed _replace_variable to avoid property errors
                             strat_helper._replace_variable(layer, attr_name, v, val_tensor, device_id=device_id)
                         else:
                             v.assign(val_tensor)

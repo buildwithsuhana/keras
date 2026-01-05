@@ -47,7 +47,9 @@ class ParameterShardingStrategy:
         return var_to_owner
 
     def _replace_variable(self, layer, attr_name, old_var, new_val_tensor, device_id=None):
-        """Efficiently swaps a full variable with its sharded version."""
+        """Swaps a property-based variable with its sharded version by bypassing setters."""
+        print(f"      🛠️  [Swapping] '{attr_name}' on '{layer.name}' -> {device_id}")
+        
         new_name = f"{old_var.name}_shard_{self.rank}"
         
         with keras.device(device_id):
@@ -59,10 +61,15 @@ class ParameterShardingStrategy:
                 name=new_name 
             )
         
-        # Directly overwrite the attribute on the layer
-        object.__setattr__(layer, attr_name, new_var)
+        # FIX: Bypass properties by writing directly to the instance __dict__
+        # This handles 'EinsumDense' kernel/bias property issues.
+        layer.__dict__[attr_name] = new_var
+
+        # If it was a private attribute (e.g. _kernel), ensure that is set too
+        if not attr_name.startswith("_"):
+            layer.__dict__["_" + attr_name] = new_var
         
-        # Update Keras internal tracking lists to ensure the new variable is used in the graph
+        # Update internal Keras tracking lists
         for lst_name in ['_trainable_weights', '_non_trainable_weights', '_weights']:
             if hasattr(layer, lst_name):
                 lst = getattr(layer, lst_name)
