@@ -73,29 +73,28 @@ class ParameterShardingStrategy:
                 sliced_val_tensor = ops.convert_to_tensor(sliced_val, dtype=target_var.dtype)
 
             # EFFICIENT REPLACEMENT
+            # Inside shard_model_parameters loop in parameter_sharding.py
             if id(target_var) in var_to_owner:
                 layer, attr_name = var_to_owner[id(target_var)]
                 self._replace_variable(layer, attr_name, target_var, sliced_val_tensor, device_id)
             else:
-                # PATH-BASED FALLBACK: If id-map fails, use the path to find the layer
-                print(f"🔗 Path-based injection for: {name}")
+                # PATH-BASED INJECTION: Walk the model tree to find the layer and force the GPU move
                 parent_path = "/".join(name.split("/")[:-1])
                 attr_name = name.split("/")[-1]
-                
-                # Attempt to find the layer by walking the model
                 target_layer = shard_model
                 try:
                     for part in parent_path.split("/"):
                         if part: target_layer = getattr(target_layer, part)
+                    # Use direct __dict__ write in _replace_variable
                     self._replace_variable(target_layer, attr_name, target_var, sliced_val_tensor, device_id)
-                except:
-                    # Final fallback: Manual list update (what you had, but corrected)
+                except Exception:
+                    # Fallback to list update
                     with keras.device(device_id):
-                        new_var = keras.Variable(sliced_val_tensor, dtype=target_var.dtype, name=target_var.name + "_shard")
-                        for attr in ["trainable_variables", "variables"]:
-                            lst = getattr(shard_model, attr)
-                            for i, v in enumerate(lst):
-                                if v.path == target_var.path: lst[i] = new_var
+                        new_var = keras.Variable(sliced_val_tensor, name=target_var.name + "_shard")
+                        # Update public lists to ensure training works
+                        if hasattr(shard_model, 'trainable_variables'):
+                            for i, v in enumerate(shard_model.trainable_variables):
+                                if v.path == target_var.path: shard_model.trainable_variables[i] = new_var
             
             modified.add(name)
             del source_val, sliced_val
