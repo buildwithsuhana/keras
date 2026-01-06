@@ -51,12 +51,12 @@ class TensorParallelKeras(Model):
         self.temp_dir = tempfile.mkdtemp(prefix="tp_weights_")
         
         # Step 1: Handle Master Model and Offload to Disk
-        # Inside TensorParallelKeras.__init__
         if callable(model) and not isinstance(model, keras.Model):
-            print("🏭 Executing Model Factory...")
-            # Ensure JAX default device is CPU during this execution
+            print("🏭 Executing Model Factory on CPU...")
             with keras.device("cpu"):
                 loaded_model = model()
+        else:
+            loaded_model = model
 
         self.model_config = loaded_model.get_config()
         self.model_cls = loaded_model.__class__
@@ -65,11 +65,9 @@ class TensorParallelKeras(Model):
         print(f"💾 Offloading {len(loaded_model.variables)} variables to disk...")
         self._save_weights_to_disk(loaded_model)
         
-        # Step 2: Critical Purge - Destroy the master model immediately
+        # Step 2: Critical Purge
         print("🗑️ Destroying Master Model to free system RAM...")
         del loaded_model
-        if 'model' in locals():
-            del model
         flush_memory()
 
         self.__dict__["model_shards"] = []
@@ -81,13 +79,13 @@ class TensorParallelKeras(Model):
         for rank, device_id in enumerate(self.devices):
             log_mem_stats(rank, device_id, "START Shard Creation")
 
-            # Create the architecture on CPU (Empty)
+            # Create architecture on CPU first
             with keras.device("cpu"):
                 shard = self.model_cls.from_config(self.model_config)
                 if hasattr(shard, 'build_from_config'):
                      shard.build_from_config(self.model_config)
 
-            # Shard parameters one-by-one from disk to the specific Device
+            # 1. Shard parameters (Linear kernels, etc.)
             shard, modified_vars = make_parameter_sharded_model(
                 shard_model=shard,
                 weight_loader=self._weight_loader, 
@@ -97,24 +95,30 @@ class TensorParallelKeras(Model):
                 device_id=device_id,
             )
 
-            # Move remaining un-sharded variables (LayerNorm, etc.) to the device
+            # 2. Move remaining un-sharded variables (LayerNorm, etc.) to the specific Device
             strat_helper = ParameterShardingStrategy(self.device_count, rank)
             var_to_owner = strat_helper._map_variables_to_owners(shard)
             
-            for v in shard.variables:
-                if v.path in modified_vars: continue 
+            for v in list(shard.variables):
+                if v.path in modified_vars: 
+                    continue 
                 
-                with keras.device(device_id):
-                    val_cpu = self._weight_loader(v.path)
-                    if val_cpu is not None:
-                        # Move to GPU via object replacement to ensure no property/setter issues
+                val_cpu = self._weight_loader(v.path)
+                if val_cpu is not None:
+                    # Move to specific Device via replacement to force VRAM allocation on correct GPU
+                    with keras.device(device_id):
                         val_tensor = ops.convert_to_tensor(val_cpu, dtype=v.dtype)
+                        
                         if id(v) in var_to_owner:
                             layer, attr_name = var_to_owner[id(v)]
+                            # Force the new variable object to be registered on device_id
                             strat_helper._replace_variable(layer, attr_name, v, val_tensor, device_id)
                         else:
+                            # Fallback assign (less robust for Hub models, but handles orphaned weights)
                             v.assign(val_tensor)
-                        del val_cpu, val_tensor
+                        
+                        del val_tensor
+                    del val_cpu
 
             self.model_shards.append(shard)
             
@@ -164,6 +168,7 @@ class TensorParallelKeras(Model):
 
         for i, shard in enumerate(self.model_shards):
             with keras.device(self.devices[i]):
+                # Shard models use stateless_call to handle JAX functional updates
                 trainable_values = [v.value for v in shard.trainable_variables]
                 non_trainable_values = [v.value for v in shard.non_trainable_variables]
 
@@ -194,9 +199,7 @@ class TensorParallelKeras(Model):
             safe_name = name.replace("/", "_").replace(":", "_")
             path = os.path.join(self.temp_dir, safe_name + ".npy")
             val = v.numpy()
-            # Preserve half-precision if hardware allows, else use float32
             if (hasattr(val, 'dtype') and (val.dtype.name == 'bfloat16' or str(val.dtype) == 'bfloat16')):
-                # Some numpy versions handle bf16 via objects; cast to float32 for safety in .npy files
                 val = val.astype('float32')
             np.save(path, val)
             del val
@@ -210,36 +213,26 @@ class TensorParallelKeras(Model):
 
     def compile(self, optimizer=None, loss=None, metrics=None, **kwargs):
         """Configures the model for training with coordinated tensor parallelism."""
-        # Store user inputs for reference
         self._user_loss = loss
         self._user_metrics = metrics
         
         if len(self.model_shards) > 1 and optimizer:
-            # 1. Create the coordinated Tensor Parallel Optimizer
-            # This wrapper handles gradient reduction across shards
             opt = TensorParallelOptimizer(optimizer, self.device_count)
             opt.__dict__["_shard_models"] = self.model_shards
             
-            # 2. Map variables across shards for the optimizer to track
             var_map = {}
             for i, shard in enumerate(self.model_shards):
                 for v in shard.trainable_variables:
-                    # Use path-based keys to align weights across physical devices
                     key = v.path if hasattr(v, "path") else v.name
                     if key not in var_map:
                         var_map[key] = [None] * self.device_count
                     var_map[key][i] = v
             
             opt.__dict__["_shard_var_map"] = var_map
-            
-            # 3. Compile the master wrapper model
             super().compile(optimizer=opt, loss=loss, metrics=metrics, **kwargs)
             
-            # 4. CRITICAL: Compile each shard individually
-            # This ensures that internal components like 'loss_container' are initialized 
-            # on the specific GPU/TPU device, preventing 'NoneType' errors in train_step.
+            # Individual compilation on GPU/TPU to initialize backend components
             for i, shard in enumerate(self.model_shards):
-                # Create a fresh optimizer instance for each shard from the original config
                 if isinstance(optimizer, str):
                     shard_opt = keras.optimizers.get(optimizer)
                 else:
@@ -252,8 +245,6 @@ class TensorParallelKeras(Model):
                         metrics=metrics, 
                         **kwargs
                     )
-                    # Mark the shard as built so it doesn't attempt re-initialization
                     shard.built = True
         else:
-            # Fallback to standard compilation if no sharding is active
             super().compile(optimizer=optimizer, loss=loss, metrics=metrics, **kwargs)

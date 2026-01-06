@@ -35,27 +35,26 @@ class ParameterShardingStrategy:
         var_to_owner = {}
         # Recursive scan of all layers to find which layer owns which Variable
         for layer in model._flatten_layers(include_self=True, recursive=True):
-            # Scan attributes for variables
-            for attr_name in dir(layer):
-                if attr_name.startswith("__"): continue
-                try:
-                    val = getattr(layer, attr_name, None)
-                    if hasattr(val, 'assign') and hasattr(val, 'value'):
-                        var_to_owner[id(val)] = (layer, attr_name)
-                except: continue
+            # Scan __dict__ directly to find variables (bypasses property logic)
+            for attr_name, val in layer.__dict__.items():
+                if id(val) in var_to_owner: continue
+                if hasattr(val, 'assign') and hasattr(val, 'value'):
+                    var_to_owner[id(val)] = (layer, attr_name)
             
             # Special check for internal tracking lists (handles hidden Hub weights)
-            if hasattr(layer, 'weights'):
-                for weight in layer.weights:
-                    if id(weight) not in var_to_owner:
-                        # Extract clean attribute name (e.g. 'embeddings:0' -> 'embeddings')
-                        attr_name = weight.name.split('/')[-1].split(':')[0]
-                        var_to_owner[id(weight)] = (layer, attr_name)
+            for lst_name in ['_trainable_weights', '_non_trainable_weights', '_weights', 'weights']:
+                if hasattr(layer, lst_name):
+                    weights_list = getattr(layer, lst_name)
+                    if not isinstance(weights_list, list): continue
+                    for weight in weights_list:
+                        if id(weight) not in var_to_owner:
+                            # Extract clean attribute name from path (e.g. 'embeddings' from 'token_embedding/embeddings')
+                            attr_name = weight.path.split('/')[-1] if hasattr(weight, 'path') else weight.name.split(':')[0]
+                            var_to_owner[id(weight)] = (layer, attr_name)
         return var_to_owner
 
     def shard_model_parameters(self, shard_model, weight_loader, config, device_id):
         modified = set()
-        # Create a fresh map for this shard
         var_to_owner = self._map_variables_to_owners(shard_model)
         
         for target_var in shard_model.variables:
@@ -73,39 +72,43 @@ class ParameterShardingStrategy:
                 sliced_val_tensor = ops.convert_to_tensor(sliced_val, dtype=target_var.dtype)
 
             # EFFICIENT REPLACEMENT
-            # Inside shard_model_parameters loop in parameter_sharding.py
+            owner_found = False
             if id(target_var) in var_to_owner:
                 layer, attr_name = var_to_owner[id(target_var)]
                 self._replace_variable(layer, attr_name, target_var, sliced_val_tensor, device_id)
+                owner_found = True
             else:
-                # PATH-BASED INJECTION: Walk the model tree to find the layer and force the GPU move
-                parent_path = "/".join(name.split("/")[:-1])
-                attr_name = name.split("/")[-1]
+                # PATH-BASED FALLBACK: Recursively find the sub-layer
+                # Path format: 'decoder_block_0/attention/query/kernel'
+                parts = name.split('/')
                 target_layer = shard_model
                 try:
-                    for part in parent_path.split("/"):
-                        if part: target_layer = getattr(target_layer, part)
-                    # Use direct __dict__ write in _replace_variable
+                    # Navigate to the penultimate part (the layer)
+                    for part in parts[:-1]:
+                        if hasattr(target_layer, part):
+                            target_layer = getattr(target_layer, part)
+                    
+                    attr_name = parts[-1]
                     self._replace_variable(target_layer, attr_name, target_var, sliced_val_tensor, device_id)
+                    owner_found = True
                 except Exception:
-                    # Fallback to list update
-                    with keras.device(device_id):
-                        new_var = keras.Variable(sliced_val_tensor, name=target_var.name + "_shard")
-                        # Update public lists to ensure training works
-                        if hasattr(shard_model, 'trainable_variables'):
-                            for i, v in enumerate(shard_model.trainable_variables):
-                                if v.path == target_var.path: shard_model.trainable_variables[i] = new_var
+                    pass
+
+            if not owner_found:
+                # Final fallback for variables not bound to attributes
+                with keras.device(device_id):
+                    target_var.assign(sliced_val_tensor)
             
             modified.add(name)
             del source_val, sliced_val
             gc.collect()
+            
         return shard_model, modified
 
     def _replace_variable(self, layer, attr_name, old_var, new_val_tensor, device_id=None):
-        """Swaps a variable with its sharded version by bypassing read-only properties."""
-        print(f"      🛠️  [Swapping] '{attr_name}' on '{layer.name}' -> {device_id}")
-        
-        new_name = f"{old_var.name}_shard_{self.rank}"
+        """Swaps a variable with its sharded version and forces GPU placement."""
+        # Sanitize attribute name
+        attr_name = attr_name.replace(":", "_").split("/")[-1]
         
         with keras.device(device_id):
             new_var = keras.Variable(
@@ -113,15 +116,15 @@ class ParameterShardingStrategy:
                 shape=new_val_tensor.shape,
                 dtype=old_var.dtype,
                 trainable=old_var.trainable,
-                name=new_name 
+                name=f"{old_var.name}_shard_{self.rank}"
             )
         
-        # Bypass potential property setters (common in Hub layers) by writing to __dict__
+        # 1. Update the instance attribute
         layer.__dict__[attr_name] = new_var
         if not attr_name.startswith("_"):
             layer.__dict__["_" + attr_name] = new_var
         
-        # Update layer's internal weight tracking lists
+        # 2. Update Keras internal tracking lists to ensure shard.trainable_variables is correct
         for lst_name in ['_trainable_weights', '_non_trainable_weights', '_weights']:
             if hasattr(layer, lst_name):
                 lst = getattr(layer, lst_name)
@@ -129,6 +132,8 @@ class ParameterShardingStrategy:
                     for i, v in enumerate(lst):
                         if v is old_var:
                             lst[i] = new_var
+                            
+        print(f"      ✅ [Mapped] '{attr_name}' on layer '{layer.name}' to {device_id}")
         return new_var
 
 def make_parameter_sharded_model(shard_model, weight_loader, config, rank, device_count, device_id):
