@@ -98,22 +98,28 @@ class TensorParallelKeras(Model):
 
             # 2. Move remaining un-sharded variables (Biases, Norm scales) to the device
             strat_helper = ParameterShardingStrategy(self.device_count, rank)
-            var_to_owner = strat_helper._map_variables_to_owners(shard)
             
-            # Use list copy to avoid iteration issues during dictionary updates
             for v in list(shard.variables):
                 if v.path in modified_vars: continue 
                 
                 val_cpu = self._weight_loader(v.path)
                 if val_cpu is not None:
-                    # Move to specific Device via object replacement to force VRAM allocation
                     with keras.device(device_id):
                         val_tensor = ops.convert_to_tensor(val_cpu, dtype=v.dtype)
-                        if id(v) in var_to_owner:
-                            layer, attr_name = var_to_owner[id(v)]
-                            # Force new Variable object on the correct GPU
-                            strat_helper._replace_variable(layer, attr_name, v, val_tensor, device_id)
-                        else:
+                        
+                        # --- PATH NAVIGATION FOR UN-SHARDED VARS ---
+                        owner_found = False
+                        parts = v.path.split('/')
+                        curr = shard
+                        try:
+                            for part in parts[:-1]:
+                                if hasattr(curr, part): curr = getattr(curr, part)
+                                else: curr = getattr(curr, f"_{part}")
+                            strat_helper._replace_variable(curr, parts[-1], v, val_tensor, device_id)
+                            owner_found = True
+                        except: pass
+
+                        if not owner_found:
                             v.assign(val_tensor)
                         del val_tensor
                     del val_cpu
