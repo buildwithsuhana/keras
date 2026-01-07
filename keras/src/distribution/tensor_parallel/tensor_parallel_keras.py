@@ -14,6 +14,7 @@ from keras.src.distribution.tensor_parallel.parameter_sharding import make_param
 from keras.src.distribution.tensor_parallel.coordinated_optimizer import TensorParallelOptimizer
 from keras.src.distribution import list_devices
 from keras.src.models import Model
+from keras.src.trainers.data_adapters import data_adapter_utils
 import ctypes
 
 logger = logging.getLogger(__file__)
@@ -34,12 +35,9 @@ class TensorParallelKeras(Model):
         super().__init__(**kwargs)
 
         def flush_memory():
-            """Force garbage collection and return memory to the OS."""
             gc.collect()
-            try:
-                ctypes.CDLL("libc.so.6").malloc_trim(0)
-            except Exception:
-                pass
+            try: ctypes.CDLL("libc.so.6").malloc_trim(0)
+            except: pass
 
         if device_count is None or device_ids is None:
             all_devices = list_devices()
@@ -50,96 +48,87 @@ class TensorParallelKeras(Model):
         self.devices = [self._normalize_device_id(d) for d in device_ids]
         self.temp_dir = tempfile.mkdtemp(prefix="tp_weights_")
         
-        # Step 1: Execute Model Factory on CPU to save system RAM
         if callable(model) and not isinstance(model, keras.Model):
-            print("🏭 Executing Model Factory on CPU...")
-            with keras.device("cpu"):
-                loaded_model = model()
+            print("🏭 Executing Model Factory...")
+            loaded_model = model()
         else:
             loaded_model = model
 
         self.model_config = loaded_model.get_config()
         self.model_cls = loaded_model.__class__
-        # Generate slash-based config paths
         self.tensor_parallel_config = get_default_config(loaded_model, self.devices)
 
-        print(f"💾 Offloading {len(loaded_model.variables)} variables to disk...")
+        print(f"💾 Offloading {len(loaded_model.variables)} variables...")
         self._save_weights_to_disk(loaded_model)
         
-        # Step 2: Immediate purge of master model to free host RAM
-        print("🗑️ Destroying Master Model to free system RAM...")
+        print("🗑️  Destroying Master Model...")
         del loaded_model
+        if 'model' in locals(): del model
         flush_memory()
 
         self.__dict__["model_shards"] = []
-        print(f"🚀 Initializing TP on {self.devices} (Serialised Creation)")
+        print(f"🚀 Initializing TP on {self.devices}")
 
         from keras.src.distribution.tensor_parallel.parameter_sharding import ParameterShardingStrategy
         
-        # Step 3: Serialised Shard Creation Loop
         for rank, device_id in enumerate(self.devices):
-            log_mem_stats(rank, device_id, "START Shard Creation")
+            log_mem_stats(rank, device_id, "START creation")
 
-            # Create architecture on CPU (Empty)
-            with keras.device("cpu"):
+            print(f"[{device_id}] ⏳ Creating shard {rank+1}/{self.device_count}...")
+            
+            # FIX: Execute shard creation and all parameter updates strictly within device context
+            with keras.device(device_id):
                 shard = self.model_cls.from_config(self.model_config)
                 if hasattr(shard, 'build_from_config'):
                      shard.build_from_config(self.model_config)
 
-            # 1. Shard parameters (kernels/embeddings) one-by-one to the specific GPU
-            shard, modified_vars = make_parameter_sharded_model(
-                shard_model=shard,
-                weight_loader=self._weight_loader, 
-                config=self.tensor_parallel_config,
-                rank=rank,
-                device_count=self.device_count,
-                device_id=device_id,
-            )
+                # 1. Sharded Variables (uses internal strategy with correct rank)
+                shard, modified_vars = make_parameter_sharded_model(
+                    shard_model=shard,
+                    weight_loader=self._weight_loader, 
+                    config=self.tensor_parallel_config,
+                    rank=rank,
+                    device_count=self.device_count,
+                    device_id=device_id,
+                )
 
-            # 2. Move remaining un-sharded variables (Biases, Norm scales) to the device
-            strat_helper = ParameterShardingStrategy(self.device_count, rank)
-            
-            for v in list(shard.variables):
-                if v.path in modified_vars: continue 
+                # 2. Unsharded Variables (Migration)
+                strat_helper = ParameterShardingStrategy(self.device_count, rank)
                 
-                val_cpu = self._weight_loader(v.path)
-                if val_cpu is not None:
-                    with keras.device(device_id):
-                        val_tensor = ops.convert_to_tensor(val_cpu, dtype=v.dtype)
+                try:
+                    import jax
+                    d_str = str(device_id)
+                    idx = int(d_str.split(":")[-1]) if ":" in d_str else 0
+                    try: target_device = jax.devices('gpu')[idx]
+                    except: target_device = jax.devices()[idx]
+                    
+                    var_to_owner = strat_helper._map_variables_to_owners(shard)
+                    
+                    for v in shard.variables:
+                        v_name = v.path if hasattr(v, 'path') else v.name
+                        if v_name in modified_vars: continue 
+
+                        # Move to GPU and ensure it is treated as a persistent buffer on target_device
+                        val_gpu = jax.device_put(v.value, target_device)
                         
-                        # --- PATH NAVIGATION FOR UN-SHARDED VARS ---
-                        owner_found = False
-                        parts = v.path.split('/')
-                        curr = shard
-                        try:
-                            for part in parts[:-1]:
-                                if hasattr(curr, part): curr = getattr(curr, part)
-                                else: curr = getattr(curr, f"_{part}")
-                            strat_helper._replace_variable(curr, parts[-1], v, val_tensor, device_id)
-                            owner_found = True
-                        except: pass
-
-                        if not owner_found:
-                            v.assign(val_tensor)
-                        del val_tensor
-                    del val_cpu
-
-            # DEBUG: Health check to verify physical placement
-            cpu_vars = [v.path for v in shard.variables if "cpu" in str(getattr(v, "device", "")).lower()]
-            if cpu_vars:
-                print(f"   ⚠️ [WARNING] Shard {rank} has {len(cpu_vars)} variables still on CPU!")
-            else:
-                print(f"   ✅ [DEBUG] Shard {rank} all variables verified on {device_id}")
+                        # Update variable in the layer
+                        if id(v) in var_to_owner:
+                            layer, attr_name = var_to_owner[id(v)]
+                            # FIX: Explicitly pass device_id to replace_variable to anchor the new Variable
+                            strat_helper._replace_variable(layer, attr_name, v, val_gpu, device_id=device_id)
+                        else:
+                            # Fallback for ownerless variables
+                            v.assign(val_gpu)
+                except Exception as e:
+                    print(f"⚠️ Migration Error: {e}")
 
             self.model_shards.append(shard)
             flush_memory()
-            log_mem_stats(rank, device_id, "DONE Shard Creation")
+            print(f"[{device_id}] ✅ Shard ready.")
+            log_mem_stats(rank, device_id, "DONE creation")
 
-        # Cleanup Disk Offload
-        try:
-            shutil.rmtree(self.temp_dir)
-        except Exception:
-            pass
+        try: shutil.rmtree(self.temp_dir)
+        except: pass
         self.built = True
 
     def _normalize_device_id(self, device_id):
@@ -153,10 +142,14 @@ class TensorParallelKeras(Model):
         if ":" not in d_str: return f"gpu:{d_str}"
         return d_str
 
+    def _purge_model_variables(self, *args, **kwargs):
+        pass
+
     def call(self, inputs, training=None, **kwargs):
         results = []
         for i, shard in enumerate(self.model_shards):
-            with keras.device(self.devices[i]):
+            target_device = self.devices[i]
+            with keras.device(target_device):
                 out = shard(inputs, training=training, **kwargs)
                 results.append(out)
         
@@ -167,6 +160,7 @@ class TensorParallelKeras(Model):
     
     def train_step(self, state, data):
         import jax
+        import jax.numpy as jnp
         from keras.src.trainers.data_adapters import data_adapter_utils
 
         x, y, sample_weight = data_adapter_utils.unpack_x_y_sample_weight(data)
@@ -175,12 +169,10 @@ class TensorParallelKeras(Model):
 
         for i, shard in enumerate(self.model_shards):
             with keras.device(self.devices[i]):
-                # Access variables safely from the specific GPU shard
                 trainable_values = [v.value for v in shard.trainable_variables]
                 non_trainable_values = [v.value for v in shard.non_trainable_variables]
 
                 def compute_loss(t_vars, nt_vars, x_data, y_data):
-                    # Internal call check to prevent 'NoneType' errors
                     y_pred, nt_updates = shard.stateless_call(t_vars, nt_vars, x_data, training=True)
                     loss = self.compute_loss(x=x_data, y=y_data, y_pred=y_pred, sample_weight=sample_weight)
                     return loss, nt_updates
@@ -190,14 +182,11 @@ class TensorParallelKeras(Model):
                 )
                 
                 all_shard_grads_vars.append(list(zip(grads, shard.trainable_variables)))
-                if i == 0:
-                    total_loss = loss_val
+                if i == 0: total_loss = loss_val
 
-        # Optimizer reduction logic handles cross-device communication
         self.optimizer.apply_gradients(all_shard_grads_vars, shard_models=self.model_shards)
         for metric in self.metrics:
-            if metric.name == "loss":
-                metric.update_state(total_loss)
+            if metric.name == "loss": metric.update_state(total_loss)
         
         return {m.name: m.result() for m in self.metrics}
 
@@ -207,23 +196,18 @@ class TensorParallelKeras(Model):
             safe_name = name.replace("/", "_").replace(":", "_")
             path = os.path.join(self.temp_dir, safe_name + ".npy")
             val = v.numpy()
-            if (hasattr(val, 'dtype') and (val.dtype.name == 'bfloat16' or str(val.dtype) == 'bfloat16')):
+            if (hasattr(val, 'dtype') and (val.dtype.name == 'bfloat16' or str(val.dtype) == 'bfloat16')) or \
+               (val.dtype.char == 'V' and val.itemsize == 2):
                 val = val.astype('float32')
             np.save(path, val)
-            del val
 
     def _weight_loader(self, param_name):
         safe_name = param_name.replace("/", "_").replace(":", "_")
         path = os.path.join(self.temp_dir, safe_name + ".npy")
-        if os.path.exists(path):
-            return np.load(path, mmap_mode='r')
+        if os.path.exists(path): return np.load(path, mmap_mode='r')
         return None
 
-    def compile(self, optimizer=None, loss=None, metrics=None, **kwargs):
-        """Configures coordinated TP training."""
-        self._user_loss = loss
-        self._user_metrics = metrics
-        
+    def compile(self, optimizer=None, **kwargs):
         if len(self.model_shards) > 1 and optimizer:
             opt = TensorParallelOptimizer(optimizer, self.device_count)
             opt.__dict__["_shard_models"] = self.model_shards
@@ -232,22 +216,20 @@ class TensorParallelKeras(Model):
             for i, shard in enumerate(self.model_shards):
                 for v in shard.trainable_variables:
                     key = v.path if hasattr(v, "path") else v.name
-                    if key not in var_map:
-                        var_map[key] = [None] * self.device_count
+                    if key not in var_map: var_map[key] = [None]*self.device_count
                     var_map[key][i] = v
             
             opt.__dict__["_shard_var_map"] = var_map
-            super().compile(optimizer=opt, loss=loss, metrics=metrics, **kwargs)
             
-            # Individual shard compilation on target devices to initialize backend state
+            super().compile(optimizer=opt, **kwargs)
+            
             for i, shard in enumerate(self.model_shards):
                 if isinstance(optimizer, str):
                     shard_opt = keras.optimizers.get(optimizer)
                 else:
-                    shard_opt = optimizer.__class__.from_config(optimizer.get_config())
+                    shard_opt = optimizer.from_config(optimizer.get_config())
                 
                 with keras.device(self.devices[i]):
-                    shard.compile(optimizer=shard_opt, loss=loss, metrics=metrics, **kwargs)
-                    shard.built = True
+                    shard.compile(optimizer=shard_opt, **kwargs)
         else:
-            super().compile(optimizer=optimizer, loss=loss, metrics=metrics, **kwargs)
+            super().compile(optimizer=optimizer, **kwargs)
