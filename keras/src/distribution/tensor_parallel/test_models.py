@@ -26,7 +26,7 @@ import tensorflow_datasets as tfds
 
 # --- 2. GPU/TPU Configuration ---
 keras.config.set_dtype_policy("bfloat16")
-tf.config.set_visible_devices([], "GPU") 
+# Allow GPUs to be visible for data placement 
 
 logging.basicConfig(level=logging.INFO, format="%(asctime)s - %(levelname)s - %(message)s")
 logger = logging.getLogger(__name__)
@@ -120,9 +120,7 @@ def model_factory():
             )
             return model
 
-# In run_training(), add this JAX-specific environment variable 
-# to prevent it from greedily taking the first GPU for construction
-os.environ["JAX_PLATFORM_NAME"] = "cpu"
+# Allow JAX to use GPUs for computation
 
 # --- 6. Execution ---
 def run_training():
