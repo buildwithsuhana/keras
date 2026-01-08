@@ -49,7 +49,7 @@ except:
 from keras.src.distribution.tensor_parallel.tensor_parallel_keras import TensorParallelKeras
 
 # --- 4. Config ---
-MODEL_PRESET = "gemma2_9b_en"
+MODEL_PRESET = "gemma_1b_en"
 BATCH_SIZE = 1 
 SEQUENCE_LENGTH = 128
 LEARNING_RATE = 1e-4 
