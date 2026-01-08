@@ -63,7 +63,6 @@ class TensorParallelKeras(Model):
         
         print("🗑️  Destroying Master Model...")
         del loaded_model
-        if 'model' in locals(): del model
         flush_memory()
 
         self.__dict__["model_shards"] = []
@@ -73,16 +72,17 @@ class TensorParallelKeras(Model):
         
         for rank, device_id in enumerate(self.devices):
             log_mem_stats(rank, device_id, "START creation")
-
             print(f"[{device_id}] ⏳ Creating shard {rank+1}/{self.device_count}...")
             
-            # FIX: Execute shard creation and all parameter updates strictly within device context
+            # FIXED: Entire shard lifecycle must be within the target device scope
             with keras.device(device_id):
+                # 1. Instantiate the model skeleton on the target device
                 shard = self.model_cls.from_config(self.model_config)
                 if hasattr(shard, 'build_from_config'):
                      shard.build_from_config(self.model_config)
-
-                # 1. Sharded Variables (uses internal strategy with correct rank)
+                
+                # 2. Shard specific variables (Weight Sharding)
+                # This function now executes within the GPU device context
                 shard, modified_vars = make_parameter_sharded_model(
                     shard_model=shard,
                     weight_loader=self._weight_loader, 
@@ -92,11 +92,12 @@ class TensorParallelKeras(Model):
                     device_id=device_id,
                 )
 
-                # 2. Unsharded Variables (Migration)
+                # 3. Unsharded Variables (Migration/Replication)
                 strat_helper = ParameterShardingStrategy(self.device_count, rank)
                 
                 try:
                     import jax
+                    # Resolve JAX device for hardware-level placement
                     d_str = str(device_id)
                     idx = int(d_str.split(":")[-1]) if ":" in d_str else 0
                     try: target_device = jax.devices('gpu')[idx]
@@ -108,19 +109,17 @@ class TensorParallelKeras(Model):
                         v_name = v.path if hasattr(v, 'path') else v.name
                         if v_name in modified_vars: continue 
 
-                        # Move to GPU and ensure it is treated as a persistent buffer on target_device
+                        # Explicitly move the tensor value to the specific GPU device
                         val_gpu = jax.device_put(v.value, target_device)
                         
-                        # Update variable in the layer
+                        # Replace the CPU variable with a GPU variable tied to device_id
                         if id(v) in var_to_owner:
                             layer, attr_name = var_to_owner[id(v)]
-                            # FIX: Explicitly pass device_id to replace_variable to anchor the new Variable
                             strat_helper._replace_variable(layer, attr_name, v, val_gpu, device_id=device_id)
                         else:
-                            # Fallback for ownerless variables
                             v.assign(val_gpu)
                 except Exception as e:
-                    print(f"⚠️ Migration Error: {e}")
+                    print(f"⚠️ Migration Error on {device_id}: {e}")
 
             self.model_shards.append(shard)
             flush_memory()
@@ -142,17 +141,14 @@ class TensorParallelKeras(Model):
         if ":" not in d_str: return f"gpu:{d_str}"
         return d_str
 
-    def _purge_model_variables(self, *args, **kwargs):
-        pass
-
     def call(self, inputs, training=None, **kwargs):
         results = []
         for i, shard in enumerate(self.model_shards):
-            target_device = self.devices[i]
-            with keras.device(target_device):
+            with keras.device(self.devices[i]):
                 out = shard(inputs, training=training, **kwargs)
                 results.append(out)
         
+        # Combine shard outputs
         total = results[0]
         for i in range(1, len(results)):
             total = ops.add(total, results[i])
@@ -160,7 +156,6 @@ class TensorParallelKeras(Model):
     
     def train_step(self, state, data):
         import jax
-        import jax.numpy as jnp
         from keras.src.trainers.data_adapters import data_adapter_utils
 
         x, y, sample_weight = data_adapter_utils.unpack_x_y_sample_weight(data)
@@ -182,6 +177,7 @@ class TensorParallelKeras(Model):
                 )
                 
                 all_shard_grads_vars.append(list(zip(grads, shard.trainable_variables)))
+                # For TP, we aggregate the loss or take it from one shard if mathematically equivalent
                 if i == 0: total_loss = loss_val
 
         self.optimizer.apply_gradients(all_shard_grads_vars, shard_models=self.model_shards)
