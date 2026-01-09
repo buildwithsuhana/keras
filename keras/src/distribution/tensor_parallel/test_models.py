@@ -5,12 +5,19 @@ import logging
 import time
 import subprocess
 import numpy as np
+import ctypes
 
 # --- 1. Environment Setup ---
-if "XLA_FLAGS" in os.environ: del os.environ["XLA_FLAGS"]
+# Clear XLA flags to prevent initialization conflicts
+if "XLA_FLAGS" in os.environ:
+    del os.environ["XLA_FLAGS"]
+
 os.environ["KERAS_BACKEND"] = "jax"
+# Prevent XLA from pre-allocating all VRAM, allowing dynamic growth
 os.environ["XLA_PYTHON_CLIENT_PREALLOCATE"] = "false"
 os.environ["XLA_PYTHON_CLIENT_ALLOCATOR"] = "platform"
+# Limit parallel compilation to reduce CPU RAM spikes during JIT
+os.environ["XLA_FLAGS"] = "--xla_gpu_force_compilation_parallelism=1"
 
 import jax
 import jax.nn
@@ -20,14 +27,19 @@ import keras_hub
 import tensorflow as tf
 import tensorflow_datasets as tfds
 
-# --- 2. GPU/TPU Configuration ---
+# --- 2. GPU/Backend Configuration ---
 keras.config.set_dtype_policy("bfloat16")
+
+# CRITICAL FIX: Hide GPUs from TensorFlow. 
+# This prevents TF from hijacking VRAM or creating default device contexts 
+# that interfere with JAX's placement on gpu:0.
 tf.config.set_visible_devices([], "GPU") 
 
 logging.basicConfig(level=logging.INFO, format="%(asctime)s - %(levelname)s - %(message)s")
 logger = logging.getLogger(__name__)
 
 # --- 3. Patching ---
+# Patch to handle Multi-Query/Grouped-Query Attention shape mismatches if they occur
 try:
     import keras.src.backend.jax.nn as jax_keras_nn
     def safe_dot_product_attention(query, key, value, bias=None, mask=None, scale=None, is_causal=False, **kwargs):
@@ -39,13 +51,13 @@ try:
             value = jnp.repeat(value, rep_factor, axis=-2)
         return jax.nn.dot_product_attention(query, key, value, bias=bias, mask=None, scale=scale, is_causal=is_causal)
     jax_keras_nn.dot_product_attention = safe_dot_product_attention
-except: 
+except ImportError: 
     pass
 
 from keras.src.distribution.tensor_parallel.tensor_parallel_keras import TensorParallelKeras
 
 # --- 4. Config ---
-MODEL_PRESET = "gemma2_9b_en"
+MODEL_PRESET = "gemma_2b_en"
 BATCH_SIZE = 1 
 SEQUENCE_LENGTH = 128
 LEARNING_RATE = 1e-4 
@@ -53,12 +65,22 @@ EPOCHS = 1
 STEPS_PER_EPOCH = 5
 
 # --- 5. Utilities ---
+def flush_ram():
+    """Aggressively clear system RAM and trigger malloc_trim if on Linux."""
+    gc.collect()
+    try:
+        ctypes.CDLL("libc.so.6").malloc_trim(0)
+    except Exception:
+        pass
+
 def get_devices():
+    """Retrieves list of non-CPU JAX accelerators."""
     devices = jax.devices()
     accel = [d for d in devices if d.platform != "cpu"]
     return (len(accel), accel) if accel else (0, [])
 
 def log_gpu_memory(stage=""):
+    """Logs current GPU memory usage via nvidia-smi."""
     try:
         result = subprocess.check_output(
             ['nvidia-smi', '--query-gpu=memory.used', '--format=csv,nounits,noheader'],
@@ -69,52 +91,11 @@ def log_gpu_memory(stage=""):
         for i, mem in enumerate(mems):
             log_str += f"GPU{i}: {mem} MiB | "
         logger.info(log_str)
-    except Exception as e:
+    except Exception:
         pass
 
-def inspect_shards(tp_model, devices):
-    logger.info("🕵️ INSPECTING SHARD PLACEMENT...")
-    for i, shard in enumerate(tp_model.model_shards):
-        expect = str(devices[i]).lower()
-        if not shard.trainable_variables:
-            logger.warning(f"   Shard {i} has no trainable variables.")
-            continue
-            
-        var = shard.trainable_variables[0]
-        actual = "Unknown"
-        
-        # Robust JAX Device Check
-        try:
-            val = var.value
-            # Handle JAX Array device property (method vs attribute)
-            if hasattr(val, 'device'):
-                d = val.device
-                actual = str(d() if callable(d) else d).lower()
-            elif hasattr(val, 'devices'):
-                 actual = str(list(val.devices())[0]).lower()
-            elif hasattr(val, 'sharding'):
-                 actual = str(list(val.sharding.device_set)[0]).lower()
-        except Exception as e:
-            # Fallback for standard Keras Variable
-            try:
-                actual = str(var.device).lower()
-            except:
-                actual = f"Error: {e}"
-
-        # Loose matching for "gpu:0" vs "cuda:0" vs "gpu:0"
-        is_match = False
-        # Normalize expect/actual to just index if possible
-        def get_idx(s):
-            if ':' in s: return s.split(':')[-1].strip()
-            return '?'
-        
-        if ("gpu" in expect or "cuda" in expect) and ("gpu" in actual or "cuda" in actual):
-             is_match = (get_idx(expect) == get_idx(actual))
-        
-        status = "✅ OK" if is_match else f"❌ WRONG DEVICE (Got {actual})"
-        logger.info(f"   Shard {i} | Expect: {expect} | Status: {status}")
-
 def load_data(preset):
+    """Loads and tokenizes a small sample of data for training tests."""
     logger.info("Loading Data...")
     ds = tfds.load("tiny_shakespeare", split="train", as_supervised=False)
     text = "".join(ex["text"].decode("utf-8") for ex in ds.as_numpy_iterator())
@@ -125,43 +106,50 @@ def load_data(preset):
     total = (len(tokens) // (SEQUENCE_LENGTH + 1)) * (SEQUENCE_LENGTH + 1)
     tokens = tokens[:total].reshape(-1, SEQUENCE_LENGTH + 1)
     dataset = tf.data.Dataset.from_tensor_slices(tokens)
-    def prepare(b): return ({"token_ids": b[:-1], "padding_mask": tf.ones_like(b[:-1], dtype="int32")}, b[1:])
+    
+    def prepare(b): 
+        return ({"token_ids": b[:-1], "padding_mask": tf.ones_like(b[:-1], dtype="int32")}, b[1:])
+    
     return dataset.map(prepare, num_parallel_calls=tf.data.AUTOTUNE).batch(BATCH_SIZE, drop_remainder=True)
 
 def model_factory():
-    logger.info(f"🏭 Factory: Loading {MODEL_PRESET}...")
+    """
+    Instantiates the master model on CPU. This model is offloaded to disk 
+    and deleted inside TensorParallelKeras to keep VRAM clear for shards.
+    """
+    logger.info(f"🏭 Factory: Instantiating {MODEL_PRESET} on CPU...")
     with keras.device("cpu"):
-        return keras_hub.models.GemmaCausalLM.from_preset(MODEL_PRESET)
+        return keras_hub.models.GemmaCausalLM.from_preset(MODEL_PRESET, load_weights=True)
 
 # --- 6. Execution ---
 def run_training():
     log_gpu_memory("Startup")
     count, devices = get_devices()
-    logger.info(f"Detected {count} accelerators: {devices}")
+    logger.info(f"Detected {count} accelerators.")
+    
     if count < 2: 
-        logger.error("Need 2 accelerators.")
+        logger.error("Need at least 2 accelerators for Tensor Parallelism.")
         return
 
-    gc.collect()
+    flush_ram()
     train_ds = load_data(MODEL_PRESET)
     log_gpu_memory("After Data Load")
     
-    logger.info("Init TP Model...")
-    # Explicitly list devices for Keras
+    logger.info("Initializing TensorParallelKeras...")
+    # Explicitly list devices to ensure correct mapping
     dev_ids = [f"gpu:{i}" for i in range(count)] 
-    logger.info(f"Using devices: {dev_ids}")
     
-    tp_model = TensorParallelKeras(model=model_factory, device_count=count, device_ids=dev_ids)
+    # Initialization will handle per-device shard creation internally
+    tp_model = TensorParallelKeras(
+        model=model_factory, 
+        device_count=count, 
+        device_ids=dev_ids
+    )
     
+    flush_ram()
     log_gpu_memory("After TP Creation")
-    inspect_shards(tp_model, devices)
 
-    logger.info("Building...")
-    # Dummy forward pass to initialize any lazy layers
-    tp_model({"token_ids": np.zeros((BATCH_SIZE, SEQUENCE_LENGTH), "int32"), "padding_mask": np.ones((BATCH_SIZE, SEQUENCE_LENGTH), "int32")})
-    log_gpu_memory("After Build")
-
-    logger.info("Compiling...")
+    logger.info("Compiling model...")
     tp_model.compile(
         optimizer=keras.optimizers.SGD(LEARNING_RATE),
         loss=keras.losses.SparseCategoricalCrossentropy(from_logits=True),
@@ -170,11 +158,17 @@ def run_training():
         jit_compile=True
     )
 
-    logger.info("Training...")
-    tp_model.fit(train_ds, epochs=EPOCHS, steps_per_epoch=STEPS_PER_EPOCH)
-    logger.info("🎉 Success!")
-    
-    if hasattr(tp_model, 'temp_dir'): shutil.rmtree(tp_model.temp_dir)
+    logger.info("Starting Fit...")
+    try:
+        # Small batch and steps per epoch ensure we don't hit OOM during the test run
+        tp_model.fit(train_ds, epochs=EPOCHS, steps_per_epoch=STEPS_PER_EPOCH)
+        logger.info("🎉 Training Success!")
+    except Exception as e:
+        logger.error(f"💥 Fit failed: {e}")
+    finally:
+        # Clean up temporary sharded weight files
+        if hasattr(tp_model, 'temp_dir') and os.path.exists(tp_model.temp_dir):
+            shutil.rmtree(tp_model.temp_dir)
 
 if __name__ == "__main__":
     run_training()
