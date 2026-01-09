@@ -33,8 +33,8 @@ class ParameterShardingStrategy:
     # buildwithsuhana/keras/keras-ananta/keras/src/distribution/tensor_parallel/parameter_sharding.py
 
     def _map_variables_to_owners(self, model):
-        """Maps every variable ID to a LIST of layers and attributes that own it."""
-        var_to_owners = {}  # Changed to store lists
+        """Maps every variable ID to a LIST of (layer, attribute) pairs that point to it."""
+        var_to_owners = {}
         stack = [model]
         visited = set()
         while stack:
@@ -48,7 +48,7 @@ class ParameterShardingStrategy:
                 
                 is_var = hasattr(attr_val, 'assign') and hasattr(attr_val, 'value')
                 if is_var:
-                    # Track EVERY layer/attribute that points to this variable
+                    # Store a LIST of all layers/attributes sharing this variable
                     var_to_owners.setdefault(id(attr_val), []).append((layer, attr_name))
                 elif hasattr(attr_val, 'weights') and not is_var:
                     stack.append(attr_val)
@@ -141,7 +141,7 @@ class ParameterShardingStrategy:
             if callable(action):
                 targets = self._find_matching_parameters(shard_model, pattern)
                 for name, target_var in targets:
-                    # FIX: Strip the 'shard_N/' prefix added by name_scope
+                    # Strip name_scope prefix for disk lookup
                     lookup_name = name
                     prefix = f"shard_{self.rank}/"
                     if name.startswith(prefix):
@@ -155,31 +155,22 @@ class ParameterShardingStrategy:
                     sliced_val = action(source_val, self.rank)
                     
                     if jax_target is not None:
-                        import jax
                         sliced_val_tensor = jax.device_put(sliced_val, jax_target)
                         sliced_val_tensor = sliced_val_tensor.astype(target_var.dtype)
                     else:
                         with keras.device(device_id):
                             sliced_val_tensor = ops.convert_to_tensor(sliced_val, dtype=target_var.dtype)
 
-                    layer, attr_name = None, None
-                    if id(target_var) in var_to_owner:
-                        layer, attr_name = var_to_owner[id(target_var)]
-                    
-                    if layer is None:
-                        var_path = target_var.path if hasattr(target_var, 'path') else target_var.name
-                        layer, attr_name = self._find_layer_by_path(shard_model, var_path)
-
-                    if layer and attr_name:
-                        self._replace_variable(layer, attr_name, target_var, sliced_val_tensor, device_id=device_id)
+                    # FIX: Iterate through ALL owners of this variable (e.g. Embedding and Head)
+                    if id(target_var) in var_to_owners:
+                        for layer, attr_name in var_to_owners[id(target_var)]:
+                            self._replace_variable(layer, attr_name, target_var, sliced_val_tensor, device_id=device_id)
                     else:
                         target_var.assign(sliced_val_tensor)
                     
                     modified.add(name)
                     del source_val, sliced_val, sliced_val_tensor
                     gc.collect()
-
-                    log_stats(f"After  {name}")
         
         return shard_model, modified
 

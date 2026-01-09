@@ -82,12 +82,11 @@ class TensorParallelKeras(Model):
 
             with keras.name_scope(f"shard_{rank}"):
                 with keras.device("cpu"):
-                    # Force unique model name to isolate internal JAX structures
                     config = self.model_config.copy()
                     config["name"] = f"shard_model_{rank}"
                     shard = self.model_cls.from_config(config)
                     
-                    # BUILD ONLY: Creates variables without triggering 5GB+ JIT compilation
+                    # BUILD ONLY: Avoids the massive RAM spike from forward pass compilation
                     shard.build({"token_ids": (None, 128), "padding_mask": (None, 128)})
 
             # 3. Sharding
@@ -114,11 +113,12 @@ class TensorParallelKeras(Model):
                     lookup_name = v_name
                     if v_name.startswith(f"shard_{rank}/"):
                         lookup_name = v_name[len(f"shard_{rank}/"):]
-                    
+
                     raw_val = self._weight_loader(lookup_name)
                     if raw_val is not None:
                         val_gpu = jax.device_put(raw_val, target_device)
-                        # FIX: Replace variable for EVERY owner (handles Embedding/Head sharing)
+                        
+                        # FIX: Iterate through ALL owners for migration weights as well
                         if id(v) in var_to_owners:
                             for layer, attr_name in var_to_owners[id(v)]:
                                 strat_helper._replace_variable(layer, attr_name, v, val_gpu, device_id=device_id)
@@ -126,7 +126,7 @@ class TensorParallelKeras(Model):
                 print(f"⚠️ Migration Error: {e}")
 
             self.model_shards.append(shard)
-            flush_memory()  # Now effectively clears the CPU variables
+            flush_memory() # Now correctly clears the CPU variables
             log_mem_stats(rank, device_id, "DONE creation")
 
         try: shutil.rmtree(self.temp_dir)
