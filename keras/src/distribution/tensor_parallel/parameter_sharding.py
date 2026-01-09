@@ -61,11 +61,11 @@ class ParameterShardingStrategy:
                 except: pass
         return var_to_owner
 
+    # buildwithsuhana/keras/keras-ananta/keras/src/distribution/tensor_parallel/parameter_sharding.py
+
     def _replace_variable(self, layer, attr_name, old_var, new_val_tensor, device_id=None):
-        print(f"      🛠️  [Swapping] '{attr_name}' on '{layer.name}' -> {device_id}")
-        
-        # Ensure unique naming for each shard variable
-        new_name = f"{old_var.name}_shard_{self.rank}"
+        # FIX: The Main TP class now handles the name_scope, so just keep the name
+        new_name = old_var.name 
         
         try:
             with keras.device(device_id):
@@ -77,28 +77,22 @@ class ParameterShardingStrategy:
                     name=new_name 
                 )
         except Exception as e:
-            print(f"      ⚠️ Var creation failed: {e}")
             return old_var
         
-        success = False
+        # 1. Update the attribute on the layer
         try:
             object.__setattr__(layer, attr_name, new_var)
-            success = True
         except Exception: pass
 
-        if not success and not attr_name.startswith("_"):
-            try:
-                object.__setattr__(layer, "_" + attr_name, new_var)
-                success = True
-            except Exception: pass
-        
-        # Update internal lists
-        for lst_name in ['_trainable_weights', '_non_trainable_weights', '_weights', 'weights', 'variables']:
+        # 2. CRITICAL FIX: Update actual internal mutable lists.
+        # This is what ensures 'shard.trainable_variables' returns the GPU version.
+        for lst_name in ['_trainable_weights', '_non_trainable_weights', '_weights']:
             if hasattr(layer, lst_name):
                 lst = getattr(layer, lst_name)
                 if isinstance(lst, list):
                     for i, v in enumerate(lst):
-                        if v is old_var: lst[i] = new_var
+                        if v is old_var: 
+                            lst[i] = new_var
         return new_var
 
     def _find_layer_by_path(self, model, var_path):

@@ -9,6 +9,9 @@ from keras import ops
 from keras.src.distribution.tensor_parallel.autoconfig import get_default_config
 from keras.src.distribution.tensor_parallel.parameter_sharding import make_parameter_sharded_model
 from keras.src.distribution.tensor_parallel.coordinated_optimizer import TensorParallelOptimizer
+from keras.src.distribution.tensor_parallel.parameter_sharding import (
+    ParameterShardingStrategy,
+)
 
 class TensorParallelKeras(keras.Model):
     def __init__(self, model, device_count=None, device_ids=None, **kwargs):
@@ -40,34 +43,52 @@ class TensorParallelKeras(keras.Model):
 
         self.__dict__["model_shards"] = []
 
+        # buildwithsuhana/keras/keras-ananta/keras/src/distribution/tensor_parallel/tensor_parallel_keras.py
+
         for rank, device_id in enumerate(self.devices):
-            print(f"[{device_id}] ⏳ Physical anchoring of shard {rank+1}/{self.device_count}...")
-            
-            with keras.name_scope(device_id):
-                # FIXED: Create model directly in device scope
-                shard = self.model_cls.from_config(self.model_config)
+            # FIX: Use a unique name scope to isolate variable identities in JAX
+            with keras.name_scope(f"shard_{rank}"):
+                with keras.device(device_id):
+                    shard = self.model_cls.from_config(self.model_config)
+                    if hasattr(shard, 'build_from_config'):
+                         shard.build_from_config(self.model_config)
+
+            # 1. Sharded Variables 
+            shard, modified_vars = make_parameter_sharded_model(
+                shard_model=shard,
+                weight_loader=self._weight_loader, 
+                config=self.tensor_parallel_config,
+                rank=rank,
+                device_count=self.device_count,
+                device_id=device_id,
+            )
+
+            # 2. Unsharded Variables (Migration)
+            strat_helper = ParameterShardingStrategy(self.device_count, rank)
+            try:
+                import jax
+                target_device = jax.devices('gpu')[rank]
+                var_to_owner = strat_helper._map_variables_to_owners(shard)
                 
-                # FORCE PHYSICAL INITIALIZATION:
-                # We trigger variable creation ON GPU immediately so they aren't lazy-loaded to CPU later.
-                if hasattr(shard, 'build_from_config'):
-                    shard.build_from_config(self.model_config)
-                
-                # If still not built, force it with a dummy input (adjust shape to your model)
-                if not shard.built:
-                    shard.compute_output_spec(ops.ones((1, 256), dtype="int32"))
-                
-                # 2. Shard/Replicate parameters onto this specific GPU
-                shard, _ = make_parameter_sharded_model(
-                    shard_model=shard,
-                    weight_loader=self._weight_loader, 
-                    config=self.tensor_parallel_config,
-                    rank=rank,
-                    device_count=self.device_count,
-                    device_id=device_id,
-                )
+                for v in shard.variables:
+                    v_name = v.path if hasattr(v, 'path') else v.name
+                    if v_name in modified_vars: continue 
+
+                    # FIX: Strip the 'shard_N/' name_scope prefix to find the weight on disk
+                    lookup_name = v_name
+                    if v_name.startswith(f"shard_{rank}/"):
+                        lookup_name = v_name[len(f"shard_{rank}/"):]
+                    
+                    raw_val = self._weight_loader(lookup_name)
+                    if raw_val is not None:
+                        val_gpu = jax.device_put(raw_val, target_device)
+                        if id(v) in var_to_owner:
+                            layer, attr_name = var_to_owner[id(v)]
+                            strat_helper._replace_variable(layer, attr_name, v, val_gpu, device_id=device_id)
+            except Exception as e:
+                print(f"⚠️ Migration Error: {e}")
 
             self.model_shards.append(shard)
-            gc.collect()
 
         try: shutil.rmtree(self.temp_dir)
         except: pass
