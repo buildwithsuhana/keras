@@ -76,10 +76,11 @@ class TensorParallelKeras(Model):
 
             print(f"[{device_id}] ⏳ Creating shard {rank+1}/{self.device_count}...")
             
-            with keras.device("cpu"):
-                shard = self.model_cls.from_config(self.model_config)
-                if hasattr(shard, 'build_from_config'):
-                     shard.build_from_config(self.model_config)
+            with keras.name_scope(f"shard_{rank}"):
+                with keras.device(device_id):
+                    shard = self.model_cls.from_config(self.model_config)
+                    if hasattr(shard, 'build_from_config'):
+                         shard.build_from_config(self.model_config)
 
             # 1. Sharded Variables (uses internal strategy with correct rank)
             shard, modified_vars = make_parameter_sharded_model(
@@ -108,14 +109,16 @@ class TensorParallelKeras(Model):
                 for v in shard.variables:
                     v_name = v.path if hasattr(v, 'path') else v.name
                     if v_name in modified_vars: continue 
+                    lookup_name = v_name
+                    if v_name.startswith(f"shard_{rank}/"):
+                        lookup_name = v_name[len(f"shard_{rank}/"):]
 
-                    # Move to GPU
-                    val_gpu = jax.device_put(v.value, target_device)
-                    
-                    # Update variable in the layer
-                    if id(v) in var_to_owner:
-                        layer, attr_name = var_to_owner[id(v)]
-                        strat_helper._replace_variable(layer, attr_name, v, val_gpu, device_id=device_id)
+                    raw_val = self._weight_loader(lookup_name)
+                    if raw_val is not None:
+                        val_gpu = jax.device_put(raw_val, target_device)
+                        if id(v) in var_to_owner:
+                            layer, attr_name = var_to_owner[id(v)]
+                            strat_helper._replace_variable(layer, attr_name, v, val_gpu, device_id=device_id)
             except Exception as e:
                 print(f"⚠️ Migration Error: {e}")
 

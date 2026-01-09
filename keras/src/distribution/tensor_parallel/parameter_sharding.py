@@ -150,11 +150,14 @@ class ParameterShardingStrategy:
             if callable(action):
                 targets = self._find_matching_parameters(shard_model, pattern)
                 for name, target_var in targets:
-                    print(f"⚡ [Sharding] Processing: {name}")
-                    log_stats(f"Before {name}")
+                    # FIX: Strip the 'shard_N/' prefix added by name_scope
+                    lookup_name = name
+                    prefix = f"shard_{self.rank}/"
+                    if name.startswith(prefix):
+                        lookup_name = name[len(prefix):]
 
                     try:
-                        source_val = weight_loader(name)
+                        source_val = weight_loader(lookup_name)
                         if source_val is None: continue
                     except: continue
 
