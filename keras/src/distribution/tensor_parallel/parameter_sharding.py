@@ -66,9 +66,7 @@ class ParameterShardingStrategy:
     # buildwithsuhana/keras/keras-ananta/keras/src/distribution/tensor_parallel/parameter_sharding.py
 
     def _replace_variable(self, layer, attr_name, old_var, new_val_tensor, device_id=None):
-        # Unique name is handled by the name_scope in the main class
-        new_name = old_var.name 
-        
+        """Forcefully replaces CPU weights with GPU weights in Keras internal state."""
         try:
             with keras.device(device_id):
                 new_var = keras.Variable(
@@ -76,25 +74,27 @@ class ParameterShardingStrategy:
                     shape=new_val_tensor.shape,
                     dtype=old_var.dtype,
                     trainable=old_var.trainable,
-                    name=new_name 
+                    name=old_var.name 
                 )
         except Exception:
             return old_var
         
-        # 1. Update the instance attribute
+        # 1. Update the layer attribute
         try:
             object.__setattr__(layer, attr_name, new_var)
+            if not attr_name.startswith("_"):
+                object.__setattr__(layer, "_" + attr_name, new_var)
         except Exception: pass
 
-        # 2. CRITICAL FIX: Only update internal mutable lists. 
-        # Accessing 'variables' or 'weights' as properties returns temp copies.
+        # 2. CRITICAL: Update the actual internal source-of-truth lists.
+        # This breaks the reference to the original CPU data.
         for lst_name in ['_trainable_weights', '_non_trainable_weights', '_weights']:
             if hasattr(layer, lst_name):
                 lst = getattr(layer, lst_name)
                 if isinstance(lst, list):
                     for i, v in enumerate(lst):
                         if v is old_var:
-                            lst[i] = new_var # Perform the reference swap
+                            lst[i] = new_var 
         return new_var
 
     def _find_layer_by_path(self, model, var_path):

@@ -73,22 +73,24 @@ class TensorParallelKeras(Model):
         
         # buildwithsuhana/keras/keras-ananta/keras/src/distribution/tensor_parallel/tensor_parallel_keras.py
 
+        # buildwithsuhana/keras/keras-ananta/keras/src/distribution/tensor_parallel/tensor_parallel_keras.py
+
         for rank, device_id in enumerate(self.devices):
             log_mem_stats(rank, device_id, "START creation")
 
-            # FIX 1: Create the template shard on CPU to save VRAM
             with keras.name_scope(f"shard_{rank}"):
                 with keras.device("cpu"):
-                    # FIX 2: Give each shard model a unique name to prevent JAX buffer reuse
+                    # Force a unique model name to prevent JAX variable/executable collision
                     config = self.model_config.copy()
-                    if "name" in config:
-                        config["name"] = f"shard_model_{rank}"
+                    config["name"] = f"shard_model_{rank}"
                     
                     shard = self.model_cls.from_config(config)
-                    if hasattr(shard, 'build_from_config'):
-                         shard.build_from_config(config)
+                    
+                    # BUILD ONLY: Avoid compilation. We provide the expected input shape.
+                    # Gemma uses [batch, sequence] for token_ids and padding_mask.
+                    shard.build({"token_ids": (None, 128), "padding_mask": (None, 128)})
 
-            # 1. Sharded Variables (Now correctly moves slices from CPU to target GPU)
+            # 3. Sharding (moves sliced parameters from CPU to target GPU)
             shard, modified_vars = make_parameter_sharded_model(
                 shard_model=shard,
                 weight_loader=self._weight_loader, 
@@ -98,7 +100,7 @@ class TensorParallelKeras(Model):
                 device_id=device_id,
             )
 
-            # 2. Unsharded Variables (Migration)
+            # 4. Migration (moves remaining parameters to GPU)
             strat_helper = ParameterShardingStrategy(self.device_count, rank)
             try:
                 import jax
@@ -109,15 +111,13 @@ class TensorParallelKeras(Model):
                     v_name = v.path if hasattr(v, 'path') else v.name
                     if v_name in modified_vars: continue 
 
-                    # FIX 3: Strip the 'shard_N/' prefix to find weights on disk
+                    # Strip name_scope prefix for weight loader lookup
                     lookup_name = v_name
-                    prefix = f"shard_{rank}/"
-                    if v_name.startswith(prefix):
-                        lookup_name = v_name[len(prefix):]
-
+                    if v_name.startswith(f"shard_{rank}/"):
+                        lookup_name = v_name[len(f"shard_{rank}/"):]
+                    
                     raw_val = self._weight_loader(lookup_name)
                     if raw_val is not None:
-                        # Move the variable from CPU/Disk to GPU
                         val_gpu = jax.device_put(raw_val, target_device)
                         if id(v) in var_to_owner:
                             layer, attr_name = var_to_owner[id(v)]
@@ -126,7 +126,7 @@ class TensorParallelKeras(Model):
                 print(f"⚠️ Migration Error: {e}")
 
             self.model_shards.append(shard)
-            flush_memory()
+            flush_memory() # Clear the CPU variables we just replaced
             log_mem_stats(rank, device_id, "DONE creation")
 
         try: shutil.rmtree(self.temp_dir)
