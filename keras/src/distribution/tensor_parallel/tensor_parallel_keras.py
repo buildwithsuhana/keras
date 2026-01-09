@@ -115,7 +115,6 @@ class TensorParallelKeras(Model):
                     v_name = v.path if hasattr(v, 'path') else v.name
                     if v_name in modified_vars: continue 
 
-                    # FIX: Strip the name scope prefix to find the original weight on disk
                     lookup_name = v_name
                     prefix = f"shard_{rank}/"
                     if v_name.startswith(prefix):
