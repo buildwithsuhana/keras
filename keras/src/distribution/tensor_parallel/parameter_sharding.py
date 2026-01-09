@@ -124,7 +124,7 @@ class ParameterShardingStrategy:
 
     def shard_model_parameters(self, shard_model, weight_loader, config, device_id):
         modified = set()
-        var_to_owner = self._map_variables_to_owners(shard_model)
+        var_to_owners = self._map_variables_to_owners(shard_model)
         
         jax_target = None
         if keras.config.backend() == "jax":
