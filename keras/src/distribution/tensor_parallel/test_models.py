@@ -8,12 +8,15 @@ import numpy as np
 import ctypes
 
 # --- 1. Environment Setup ---
-if "XLA_FLAGS" in os.environ: del os.environ["XLA_FLAGS"]
+# Clear XLA flags to prevent initialization conflicts
+if "XLA_FLAGS" in os.environ:
+    del os.environ["XLA_FLAGS"]
+
 os.environ["KERAS_BACKEND"] = "jax"
-# Prevent XLA from reserving all GPU memory at once
+# Prevent XLA from pre-allocating all VRAM, allowing dynamic growth
 os.environ["XLA_PYTHON_CLIENT_PREALLOCATE"] = "false"
 os.environ["XLA_PYTHON_CLIENT_ALLOCATOR"] = "platform"
-# Limit compilation threads to prevent CPU RAM spikes during JIT
+# Limit parallel compilation to reduce CPU RAM spikes during JIT
 os.environ["XLA_FLAGS"] = "--xla_gpu_force_compilation_parallelism=1"
 
 import jax
@@ -24,14 +27,19 @@ import keras_hub
 import tensorflow as tf
 import tensorflow_datasets as tfds
 
-# --- 2. GPU/TPU Configuration ---
+# --- 2. GPU/Backend Configuration ---
 keras.config.set_dtype_policy("bfloat16")
-# Allow GPUs to be visible for data placement 
+
+# CRITICAL FIX: Hide GPUs from TensorFlow. 
+# This prevents TF from hijacking VRAM or creating default device contexts 
+# that interfere with JAX's placement on gpu:0.
+tf.config.set_visible_devices([], "GPU") 
 
 logging.basicConfig(level=logging.INFO, format="%(asctime)s - %(levelname)s - %(message)s")
 logger = logging.getLogger(__name__)
 
 # --- 3. Patching ---
+# Patch to handle Multi-Query/Grouped-Query Attention shape mismatches if they occur
 try:
     import keras.src.backend.jax.nn as jax_keras_nn
     def safe_dot_product_attention(query, key, value, bias=None, mask=None, scale=None, is_causal=False, **kwargs):
@@ -43,7 +51,7 @@ try:
             value = jnp.repeat(value, rep_factor, axis=-2)
         return jax.nn.dot_product_attention(query, key, value, bias=bias, mask=None, scale=scale, is_causal=is_causal)
     jax_keras_nn.dot_product_attention = safe_dot_product_attention
-except: 
+except ImportError: 
     pass
 
 from keras.src.distribution.tensor_parallel.tensor_parallel_keras import TensorParallelKeras
@@ -58,19 +66,21 @@ STEPS_PER_EPOCH = 5
 
 # --- 5. Utilities ---
 def flush_ram():
-    """Aggressively clear system RAM."""
+    """Aggressively clear system RAM and trigger malloc_trim if on Linux."""
     gc.collect()
     try:
         ctypes.CDLL("libc.so.6").malloc_trim(0)
-    except:
+    except Exception:
         pass
 
 def get_devices():
+    """Retrieves list of non-CPU JAX accelerators."""
     devices = jax.devices()
     accel = [d for d in devices if d.platform != "cpu"]
     return (len(accel), accel) if accel else (0, [])
 
 def log_gpu_memory(stage=""):
+    """Logs current GPU memory usage via nvidia-smi."""
     try:
         result = subprocess.check_output(
             ['nvidia-smi', '--query-gpu=memory.used', '--format=csv,nounits,noheader'],
@@ -85,8 +95,8 @@ def log_gpu_memory(stage=""):
         pass
 
 def load_data(preset):
-    logger.info("Loading Data (Streaming Mode)...")
-    # Tiny shakespeare is small, but we use a pattern for larger datasets to save RAM
+    """Loads and tokenizes a small sample of data for training tests."""
+    logger.info("Loading Data...")
     ds = tfds.load("tiny_shakespeare", split="train", as_supervised=False)
     text = "".join(ex["text"].decode("utf-8") for ex in ds.as_numpy_iterator())
     tokenizer = keras_hub.models.GemmaTokenizer.from_preset(preset)
@@ -104,23 +114,12 @@ def load_data(preset):
 
 def model_factory():
     """
-    Lazy Factory: Forces the Keras backend to stay on CPU for the entire
-    instantiation process of the 18GB Gemma model.
+    Instantiates the master model on CPU. This model is offloaded to disk 
+    and deleted inside TensorParallelKeras to keep VRAM clear for shards.
     """
-    logger.info(f"🏭 Factory: Instantiating {MODEL_PRESET}...")
-    
-    # Force the backend to use CPU for ALL initializations in this scope
-    with keras.utils.custom_object_scope(None):
-        with keras.device("cpu"):
-            # Use 'load_weights=False' initially if the Hub API supports it,
-            # or rely on the fact that TensorParallelKeras will swap these values anyway.
-            model = keras_hub.models.GemmaCausalLM.from_preset(
-                MODEL_PRESET, 
-                load_weights=True # Must be True to get the weights for offloading
-            )
-            return model
-
-# Allow JAX to use GPUs for computation
+    logger.info(f"🏭 Factory: Instantiating {MODEL_PRESET} on CPU...")
+    with keras.device("cpu"):
+        return keras_hub.models.GemmaCausalLM.from_preset(MODEL_PRESET, load_weights=True)
 
 # --- 6. Execution ---
 def run_training():
@@ -132,16 +131,15 @@ def run_training():
         logger.error("Need at least 2 accelerators for Tensor Parallelism.")
         return
 
-    # Clear RAM before loading anything heavy
     flush_ram()
-    
     train_ds = load_data(MODEL_PRESET)
     log_gpu_memory("After Data Load")
     
     logger.info("Initializing TensorParallelKeras...")
+    # Explicitly list devices to ensure correct mapping
     dev_ids = [f"gpu:{i}" for i in range(count)] 
     
-    # The Model Factory is passed as a lambda to avoid immediate allocation
+    # Initialization will handle per-device shard creation internally
     tp_model = TensorParallelKeras(
         model=model_factory, 
         device_count=count, 
@@ -151,7 +149,7 @@ def run_training():
     flush_ram()
     log_gpu_memory("After TP Creation")
 
-    logger.info("Compiling with JIT (Serialized)...")
+    logger.info("Compiling model...")
     tp_model.compile(
         optimizer=keras.optimizers.SGD(LEARNING_RATE),
         loss=keras.losses.SparseCategoricalCrossentropy(from_logits=True),
@@ -160,14 +158,15 @@ def run_training():
         jit_compile=True
     )
 
-    logger.info("Starting Training Fit...")
-    # BATCH_SIZE=1 and tiny steps per epoch ensure we test the loop without hitting limits
+    logger.info("Starting Fit...")
     try:
+        # Small batch and steps per epoch ensure we don't hit OOM during the test run
         tp_model.fit(train_ds, epochs=EPOCHS, steps_per_epoch=STEPS_PER_EPOCH)
-        logger.info("🎉 Step Execution Success!")
+        logger.info("🎉 Training Success!")
     except Exception as e:
-        logger.error(f"💥 Training failed: {e}")
+        logger.error(f"💥 Fit failed: {e}")
     finally:
+        # Clean up temporary sharded weight files
         if hasattr(tp_model, 'temp_dir') and os.path.exists(tp_model.temp_dir):
             shutil.rmtree(tp_model.temp_dir)
 
