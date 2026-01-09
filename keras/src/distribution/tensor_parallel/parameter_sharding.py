@@ -30,43 +30,38 @@ class ParameterShardingStrategy:
         self.device_count = device_count
         self.rank = rank
 
+    # buildwithsuhana/keras/keras-ananta/keras/src/distribution/tensor_parallel/parameter_sharding.py
+
     def _map_variables_to_owners(self, model):
-        var_to_owner = {}
+        """Maps every variable ID to a LIST of layers and attributes that own it."""
+        var_to_owners = {}  # Changed to store lists
         stack = [model]
         visited = set()
         while stack:
             layer = stack.pop()
             if id(layer) in visited: continue
             visited.add(id(layer))
-            layer_vars = {} 
             for attr_name in dir(layer):
                 if attr_name.startswith("__"): continue
                 try: attr_val = getattr(layer, attr_name, None)
                 except Exception: continue
-                if attr_val is None: continue
+                
                 is_var = hasattr(attr_val, 'assign') and hasattr(attr_val, 'value')
-                is_layer = (hasattr(attr_val, 'weights') and hasattr(attr_val, 'add_weight') and not is_var)
-                if is_var: layer_vars.setdefault(id(attr_val), []).append(attr_name)
-                elif is_layer: stack.append(attr_val)
+                if is_var:
+                    # Track EVERY layer/attribute that points to this variable
+                    var_to_owners.setdefault(id(attr_val), []).append((layer, attr_name))
+                elif hasattr(attr_val, 'weights') and not is_var:
+                    stack.append(attr_val)
                 elif isinstance(attr_val, (list, tuple)):
                     for item in attr_val:
                         if hasattr(item, 'weights'): stack.append(item)
-            for vid, names in layer_vars.items():
-                best_name = names[0]
-                for name in names:
-                    if name.startswith("_"): best_name = name; break
-                var_to_owner[vid] = (layer, best_name)
             if hasattr(layer, 'layers'):
                 try: stack.extend(layer.layers)
                 except: pass
-        return var_to_owner
-
-    # buildwithsuhana/keras/keras-ananta/keras/src/distribution/tensor_parallel/parameter_sharding.py
-
-    # buildwithsuhana/keras/keras-ananta/keras/src/distribution/tensor_parallel/parameter_sharding.py
+        return var_to_owners
 
     def _replace_variable(self, layer, attr_name, old_var, new_val_tensor, device_id=None):
-        """Forcefully replaces CPU weights with GPU weights in Keras internal state."""
+        """Creates a new GPU variable and swaps it into the layer's internal lists."""
         try:
             with keras.device(device_id):
                 new_var = keras.Variable(
@@ -87,7 +82,7 @@ class ParameterShardingStrategy:
         except Exception: pass
 
         # 2. CRITICAL: Update the actual internal source-of-truth lists.
-        # This breaks the reference to the original CPU data.
+        # This is what allows the old CPU variable to be garbage collected.
         for lst_name in ['_trainable_weights', '_non_trainable_weights', '_weights']:
             if hasattr(layer, lst_name):
                 lst = getattr(layer, lst_name)
