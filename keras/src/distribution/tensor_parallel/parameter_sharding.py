@@ -9,31 +9,23 @@ class ParameterShardingStrategy:
         self.rank = rank
 
     def _replace_variable(self, layer, attr_name, old_var, new_val_tensor, device_id=None):
-        # Create a new Variable strictly anchored to the specific GPU
-        new_name = f"{old_var.name.split(':')[0]}_shard_{self.rank}"
-        
         with keras.device(device_id):
             new_var = keras.Variable(
                 initializer=new_val_tensor,
-                shape=new_val_tensor.shape,
-                dtype=old_var.dtype,
                 trainable=old_var.trainable,
-                name=new_name 
+                name=old_var.name # Name scope handled in TP class
             )
 
-        # Update the layer attribute
+        # Force update the layer attribute
         object.__setattr__(layer, attr_name, new_var)
 
-        # FIXED: Update internal Keras tracking lists so model.trainable_variables
-        # points to the new GPU Variable instead of the old CPU one.
-        for attr in ['_trainable_weights', '_non_trainable_weights', '_weights']:
-            if hasattr(layer, attr):
-                weights_list = getattr(layer, attr)
-                if isinstance(weights_list, list):
-                    for i, v in enumerate(weights_list):
-                        if v is old_var:
-                            weights_list[i] = new_var
-        return new_var
+        # CRITICAL: Force update the internal source-of-truth lists
+        for list_name in ["_trainable_weights", "_non_trainable_weights", "_weights"]:
+            if hasattr(layer, list_name):
+                weights_list = getattr(layer, list_name)
+                for i, v in enumerate(weights_list):
+                    if v is old_var:
+                        weights_list[i] = new_var # This breaks the CPU stickiness
 
     def shard_model_parameters(self, shard_model, weight_loader, config, device_id):
         modified = set()
@@ -49,14 +41,19 @@ class ParameterShardingStrategy:
         jax_target = jax.devices('gpu')[idx]
 
         for pattern, action in config.state_rules.items():
-            if not callable(action): continue
-            
-            for v in shard_model.variables:
-                v_path = v.path if hasattr(v, 'path') else v.name
-                if not re.search(pattern, v_path): continue
-                
-                source_val = weight_loader(v_path)
-                if source_val is None: continue
+            if callable(action):
+                targets = self._find_matching_parameters(shard_model, pattern)
+                for name, target_var in targets:
+                    # FIX: Strip the 'shard_N/' prefix to find weights in the loader
+                    lookup_name = name
+                    prefix = f"shard_{self.rank}/"
+                    if name.startswith(prefix):
+                        lookup_name = name[len(prefix):]
+
+                    try:
+                        source_val = weight_loader(lookup_name)
+                        if source_val is None: continue
+                    except: continue
 
                 # Slice on CPU, then transfer directly to the target GPU
                 sliced_val = action(source_val, self.rank)

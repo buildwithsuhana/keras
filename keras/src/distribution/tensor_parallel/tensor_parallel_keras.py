@@ -43,7 +43,7 @@ class TensorParallelKeras(keras.Model):
         for rank, device_id in enumerate(self.devices):
             print(f"[{device_id}] ⏳ Physical anchoring of shard {rank+1}/{self.device_count}...")
             
-            with keras.device(device_id):
+            with keras.name_scope(device_id):
                 # FIXED: Create model directly in device scope
                 shard = self.model_cls.from_config(self.model_config)
                 
