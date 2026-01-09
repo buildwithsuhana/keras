@@ -76,25 +76,19 @@ class TensorParallelKeras(Model):
         for rank, device_id in enumerate(self.devices):
             log_mem_stats(rank, device_id, "START creation")
 
-            # 1. Isolate the shard with a unique name and device
+            # FIX 1: Create the template shard on CPU to save VRAM
             with keras.name_scope(f"shard_{rank}"):
-                with keras.device(device_id):
-                    # Force unique model name to prevent JAX variable collision
+                with keras.device("cpu"):
+                    # FIX 2: Give each shard model a unique name to prevent JAX buffer reuse
                     config = self.model_config.copy()
                     if "name" in config:
                         config["name"] = f"shard_model_{rank}"
                     
                     shard = self.model_cls.from_config(config)
-                    
-                    # 2. FORCE BUILD: Hub models need input shapes to create variables
-                    # We use Gemma's expected input format
-                    dummy_inputs = {
-                        "token_ids": np.zeros((1, 128), dtype="int32"),
-                        "padding_mask": np.ones((1, 128), dtype="int32")
-                    }
-                    shard(dummy_inputs) # This creates shard.variables
+                    if hasattr(shard, 'build_from_config'):
+                         shard.build_from_config(config)
 
-            # 3. Sharded Variables
+            # 1. Sharded Variables (Now correctly moves slices from CPU to target GPU)
             shard, modified_vars = make_parameter_sharded_model(
                 shard_model=shard,
                 weight_loader=self._weight_loader, 
@@ -104,7 +98,7 @@ class TensorParallelKeras(Model):
                 device_id=device_id,
             )
 
-            # 4. Unsharded Variables (Migration)
+            # 2. Unsharded Variables (Migration)
             strat_helper = ParameterShardingStrategy(self.device_count, rank)
             try:
                 import jax
@@ -115,14 +109,15 @@ class TensorParallelKeras(Model):
                     v_name = v.path if hasattr(v, 'path') else v.name
                     if v_name in modified_vars: continue 
 
-                    # FIX: Strip the name scope prefix to find the original weight on disk
+                    # FIX 3: Strip the 'shard_N/' prefix to find weights on disk
                     lookup_name = v_name
                     prefix = f"shard_{rank}/"
                     if v_name.startswith(prefix):
                         lookup_name = v_name[len(prefix):]
-                    
+
                     raw_val = self._weight_loader(lookup_name)
                     if raw_val is not None:
+                        # Move the variable from CPU/Disk to GPU
                         val_gpu = jax.device_put(raw_val, target_device)
                         if id(v) in var_to_owner:
                             layer, attr_name = var_to_owner[id(v)]
@@ -132,7 +127,6 @@ class TensorParallelKeras(Model):
 
             self.model_shards.append(shard)
             flush_memory()
-            print(f"[{device_id}] ✅ Shard ready.")
             log_mem_stats(rank, device_id, "DONE creation")
 
         try: shutil.rmtree(self.temp_dir)

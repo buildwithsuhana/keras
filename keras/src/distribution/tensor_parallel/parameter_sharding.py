@@ -63,8 +63,10 @@ class ParameterShardingStrategy:
 
     # buildwithsuhana/keras/keras-ananta/keras/src/distribution/tensor_parallel/parameter_sharding.py
 
+    # buildwithsuhana/keras/keras-ananta/keras/src/distribution/tensor_parallel/parameter_sharding.py
+
     def _replace_variable(self, layer, attr_name, old_var, new_val_tensor, device_id=None):
-        # The name scope is already handled by the caller, so we keep the name
+        # Unique name is handled by the name_scope in the main class
         new_name = old_var.name 
         
         try:
@@ -76,7 +78,7 @@ class ParameterShardingStrategy:
                     trainable=old_var.trainable,
                     name=new_name 
                 )
-        except Exception as e:
+        except Exception:
             return old_var
         
         # 1. Update the instance attribute
@@ -84,21 +86,15 @@ class ParameterShardingStrategy:
             object.__setattr__(layer, attr_name, new_var)
         except Exception: pass
 
-        if not attr_name.startswith("_"):
-            try:
-                object.__setattr__(layer, "_" + attr_name, new_var)
-            except Exception: pass
-        
-        # 2. CRITICAL FIX: Update the actual internal tracking lists.
-        # This ensures 'shard.variables' returns the new GPU versions.
-        # Remove 'variables' and 'weights' from this loop as they are properties!
+        # 2. CRITICAL FIX: Only update internal mutable lists. 
+        # Accessing 'variables' or 'weights' as properties returns temp copies.
         for lst_name in ['_trainable_weights', '_non_trainable_weights', '_weights']:
             if hasattr(layer, lst_name):
                 lst = getattr(layer, lst_name)
                 if isinstance(lst, list):
                     for i, v in enumerate(lst):
                         if v is old_var:
-                            lst[i] = new_var # Reference swap
+                            lst[i] = new_var # Perform the reference swap
         return new_var
 
     def _find_layer_by_path(self, model, var_path):
