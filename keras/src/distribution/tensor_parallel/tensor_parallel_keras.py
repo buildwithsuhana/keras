@@ -60,15 +60,15 @@ class TensorParallelKeras(Model):
         for rank, device_id in enumerate(self.devices):
             log_mem_stats(rank, device_id, "START creation")
 
-            # Create blueprint on CPU
             with keras.name_scope(f"shard_{rank}"):
                 with keras.device("cpu"):
                     config = self.model_config.copy()
                     config["name"] = f"shard_model_{rank}"
                     shard = self.model_cls.from_config(config)
+                    # Building with size 1 to minimize peak transient RAM
                     shard.build({"token_ids": (None, 1), "padding_mask": (None, 1)})
 
-            # Shard and Replace Variables (Destructive)
+            # 3. Sharding (Destructive)
             shard, modified_vars = make_parameter_sharded_model(
                 shard_model=shard,
                 weight_loader=self._weight_loader, 
@@ -78,7 +78,7 @@ class TensorParallelKeras(Model):
                 device_id=device_id,
             )
 
-            # Replicate and Replace remaining variables (Destructive)
+            # 4. Migration for Replicated weights (Destructive)
             from keras.src.distribution.tensor_parallel.parameter_sharding import ParameterShardingStrategy, log_stats
             strat_helper = ParameterShardingStrategy(self.device_count, rank)
             try:
@@ -87,6 +87,7 @@ class TensorParallelKeras(Model):
                 target_jax_device = jax.devices('gpu')[d_idx]
                 var_to_owners = strat_helper._map_variables_to_owners(shard)
                 
+                # Iterate a static list to avoid iterator mutation issues
                 vars_to_process = list(shard.variables)
                 for v in vars_to_process:
                     v_name = v.path if hasattr(v, 'path') else v.name
@@ -97,6 +98,7 @@ class TensorParallelKeras(Model):
                     if raw_val is not None:
                         val_gpu = jax.device_put(raw_val, target_jax_device)
                         
+                        # Replace and Destroy CPU buffer for non-sharded weights
                         if id(v) in var_to_owners:
                             for layer, attr_name in var_to_owners[id(v)]:
                                 strat_helper._replace_variable(layer, attr_name, v, val_gpu, device_id=device_id)
@@ -105,14 +107,14 @@ class TensorParallelKeras(Model):
                         
                         del raw_val
                         gc.collect()
-                        # NEW: Per-variable migration log
-                        log_stats(f"Migrated {v_name}")
+                        log_stats(f"Migrated {v_name}") # Memory log after every parameter
             except Exception as e:
                 print(f"⚠️ Migration Error rank {rank}: {e}")
 
             self.model_shards.append(shard)
-            flush_memory() 
+            flush_memory() # RSS should now drop back to baseline after every rank
             log_mem_stats(rank, device_id, "DONE creation")
+
 
         try: shutil.rmtree(self.temp_dir)
         except: pass

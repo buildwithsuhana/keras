@@ -1,5 +1,3 @@
-# buildwithsuhana/keras/keras-ananta/keras/src/distribution/tensor_parallel/parameter_sharding.py
-
 import logging
 import re
 import gc
@@ -11,7 +9,7 @@ from keras import device, ops
 import keras
 import numpy as np
 
-# Registers bfloat16 with numpy to avoid the |V2 error
+# CRITICAL: Registers bfloat16 with numpy to prevent the |V2 (void) dtype error
 try:
     import ml_dtypes
 except ImportError:
@@ -40,6 +38,7 @@ class ParameterShardingStrategy:
         self.rank = rank
 
     def _map_variables_to_owners(self, model):
+        """Maps every variable ID to a LIST of (layer, attribute) pairs that point to it."""
         var_to_owners = {}
         stack = [model]
         visited = set()
@@ -50,7 +49,8 @@ class ParameterShardingStrategy:
             for attr_name in dir(layer):
                 if attr_name.startswith("__"): continue
                 try: attr_val = getattr(layer, attr_name, None)
-                except: continue
+                except Exception: continue
+                
                 is_var = hasattr(attr_val, 'assign') and hasattr(attr_val, 'value')
                 if is_var:
                     var_to_owners.setdefault(id(attr_val), []).append((layer, attr_name))
@@ -65,7 +65,7 @@ class ParameterShardingStrategy:
         return var_to_owners
 
     def _replace_variable(self, layer, attr_name, old_var, new_val_tensor, device_id=None):
-        """Creates GPU variable and swap-destroys the CPU one to break Host RAM references."""
+        """Creates a new GPU variable and swap-destroys the CPU one to release Host RAM."""
         try:
             with keras.device(device_id):
                 new_var = keras.Variable(
@@ -75,24 +75,39 @@ class ParameterShardingStrategy:
                     trainable=old_var.trainable,
                     name=old_var.name 
                 )
-        except: return old_var
+        except Exception:
+            return old_var
         
-        object.__setattr__(layer, attr_name, new_var)
-        if not attr_name.startswith("_"):
-            try: object.__setattr__(layer, "_" + attr_name, new_var)
-            except: pass
+        # 1. Update the layer attribute. 
+        # FIXED: Wrap in try-except to handle read-only properties (like EinsumDense.kernel)
+        try:
+            object.__setattr__(layer, attr_name, new_var)
+        except (AttributeError, TypeError):
+            pass 
 
+        # Handle potential private counterparts (e.g., _kernel)
+        if not attr_name.startswith("_"):
+            try:
+                object.__setattr__(layer, "_" + attr_name, new_var)
+            except (AttributeError, TypeError):
+                pass
+
+        # 2. Update internal source-of-truth lists (e.g., layer.trainable_variables)
         for lst_name in ['_trainable_weights', '_non_trainable_weights', '_weights']:
             if hasattr(layer, lst_name):
                 lst = getattr(layer, lst_name)
                 if isinstance(lst, list):
                     for i, v in enumerate(lst):
-                        if v is old_var: lst[i] = new_var 
+                        if v is old_var:
+                            lst[i] = new_var 
 
-        # DESTRUCTIVE: Shrink CPU buffer to release 18GB Host RAM allocation
+        # 3. DESTRUCTIVE STEP: Shrink the old CPU buffer immediately.
+        # This breaks the reference to the large physical RAM allocation.
         try:
-            old_var.assign(np.zeros((1,), dtype=old_var.dtype))
-        except: pass
+            old_var.assign(ops.cast(ops.zeros((1,)), old_var.dtype))
+        except:
+            pass
+
         return new_var
 
     def shard_model_parameters(self, shard_model, weight_loader, config, device_id):
@@ -114,14 +129,23 @@ class ParameterShardingStrategy:
                     try:
                         source_val = weight_loader(lookup_name)
                         if source_val is None: continue
+                        
+                        # FIXED: Cast |V2 dtype back to bfloat16 using ml_dtypes
                         if hasattr(source_val, 'dtype') and (str(source_val.dtype).startswith('|V') or source_val.dtype == np.dtype('V2')):
-                            source_val = source_val.view(ml_dtypes.bfloat16) if ml_dtypes else source_val.astype('float32')
+                            if ml_dtypes:
+                                source_val = source_val.view(ml_dtypes.bfloat16)
+                            else:
+                                source_val = source_val.astype('float32')
                     except: continue
 
+                    # Slicing creates a temporary CPU slice
                     sliced_val = action(source_val, self.rank)
+                    
+                    # Move to GPU
                     sliced_val_tensor = jax.device_put(sliced_val, jax_target)
                     sliced_val_tensor = sliced_val_tensor.astype(target_var.dtype)
 
+                    # Replace and Destroy CPU buffer
                     if id(target_var) in var_to_owners:
                         for layer, attr_name in var_to_owners[id(target_var)]:
                             self._replace_variable(layer, attr_name, target_var, sliced_val_tensor, device_id=device_id)
@@ -129,15 +153,18 @@ class ParameterShardingStrategy:
                         target_var.assign(sliced_val_tensor)
                     
                     modified.add(name)
+                    
+                    # Cleanup temporary slices
                     del source_val, sliced_val, sliced_val_tensor
                     gc.collect()
-                    # NEW: Per-variable memory log
-                    log_stats(f"Sharded {name}")
+                    log_stats(f"Sharded {name}") # Memory log after every parameter
         
         return shard_model, modified
 
     def _find_matching_parameters(self, model, pattern: str):
-        return [(v.path if hasattr(v, 'path') else v.name, v) for v in model.variables if re.search(pattern, v.path if hasattr(v, 'path') else v.name)]
+        return [(v.path if hasattr(v, 'path') else v.name, v) 
+                for v in model.variables 
+                if re.search(pattern, v.path if hasattr(v, 'path') else v.name)]
 
 def make_parameter_sharded_model(shard_model, weight_loader, config, rank, device_count, device_id):
     strategy = ParameterShardingStrategy(device_count, rank)
