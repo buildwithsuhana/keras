@@ -271,6 +271,11 @@ def _to_backend_device(device_name):
     if isinstance(device_name, jax.Device):
         return device_name
     device_name = str(device_name)
+    
+    # ADD THIS CHECK:
+    if device_name == "meta":
+        return "meta"
+        
     if ":" not in device_name:
         device_type, device_id = device_name, 0
     else:

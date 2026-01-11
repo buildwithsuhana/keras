@@ -24,13 +24,13 @@ def log_mem_stats(rank, device_id, stage=""):
 
 class TensorParallelKeras(Model):
     def __init__(self, model, device_count=None, device_ids=None, **kwargs):
-        import jax
         super().__init__(**kwargs)
 
         def flush_memory():
             import jax
             gc.collect()
-            jax.clear_caches() # Critical for JAX memory pressure
+            # CRITICAL: Clears JAX's internal buffer caches that hold Host RAM
+            jax.clear_caches() 
             try: ctypes.CDLL("libc.so.6").malloc_trim(0)
             except: pass
 
@@ -66,14 +66,15 @@ class TensorParallelKeras(Model):
             log_mem_stats(rank, device_id, "START creation")
 
             with keras.name_scope(f"shard_{rank}"):
-                # CRITICAL CHANGE: Use "meta" instead of "cpu"
-                with keras.device("meta"): 
+                # Now this will use 0MB RAM/VRAM
+                with keras.device("meta"):
                     config = self.model_config.copy()
                     config["name"] = f"shard_model_{rank}"
                     shard = self.model_cls.from_config(config)
                     shard.build({"token_ids": (None, 1), "padding_mask": (None, 1)})
 
             # 3. Sharding (Destructive)
+            # This utility moves slices from disk -> GPU and replaces 'meta' vars
             shard, modified_vars = make_parameter_sharded_model(
                 shard_model=shard,
                 weight_loader=self._weight_loader, 

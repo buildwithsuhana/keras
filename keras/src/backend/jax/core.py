@@ -627,4 +627,8 @@ def device_scope(device_name):
         )
     else:
         jax_device = device_name
+
+    if jax_device == "meta":
+        import contextlib
+        return contextlib.nullcontext()
     return jax.default_device(jax_device)
