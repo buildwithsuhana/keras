@@ -16,6 +16,7 @@ os.environ["KERAS_BACKEND"] = "jax"
 # Prevent XLA from pre-allocating all VRAM, allowing dynamic growth
 os.environ["XLA_PYTHON_CLIENT_PREALLOCATE"] = "false"
 os.environ["XLA_PYTHON_CLIENT_ALLOCATOR"] = "platform"
+os.environ["XLA_PYTHON_CLIENT_MEM_FRACTION"] = "0.90"
 # Limit parallel compilation to reduce CPU RAM spikes during JIT
 os.environ["XLA_FLAGS"] = "--xla_gpu_force_compilation_parallelism=1"
 

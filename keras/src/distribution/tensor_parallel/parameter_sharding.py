@@ -9,6 +9,13 @@ from keras import device, ops
 import keras
 import numpy as np
 
+# CRITICAL: This import registers the 'bfloat16' dtype with numpy.
+# Without it, np.load will return dtypes as '|V2' which JAX rejects.
+try:
+    import ml_dtypes
+except ImportError:
+    ml_dtypes = None
+
 if TYPE_CHECKING:
     from keras.src.models import Model
 
@@ -30,8 +37,6 @@ class ParameterShardingStrategy:
         self.device_count = device_count
         self.rank = rank
 
-    # buildwithsuhana/keras/keras-ananta/keras/src/distribution/tensor_parallel/parameter_sharding.py
-
     def _map_variables_to_owners(self, model):
         """Maps every variable ID to a LIST of (layer, attribute) pairs that point to it."""
         var_to_owners = {}
@@ -48,7 +53,6 @@ class ParameterShardingStrategy:
                 
                 is_var = hasattr(attr_val, 'assign') and hasattr(attr_val, 'value')
                 if is_var:
-                    # Store a LIST of all layers/attributes sharing this variable
                     var_to_owners.setdefault(id(attr_val), []).append((layer, attr_name))
                 elif hasattr(attr_val, 'weights') and not is_var:
                     stack.append(attr_val)
@@ -74,15 +78,12 @@ class ParameterShardingStrategy:
         except Exception:
             return old_var
         
-        # 1. Update the layer attribute
         try:
             object.__setattr__(layer, attr_name, new_var)
             if not attr_name.startswith("_"):
                 object.__setattr__(layer, "_" + attr_name, new_var)
         except Exception: pass
 
-        # 2. CRITICAL: Update the actual internal source-of-truth lists.
-        # This is what allows the old CPU variable to be garbage collected.
         for lst_name in ['_trainable_weights', '_non_trainable_weights', '_weights']:
             if hasattr(layer, lst_name):
                 lst = getattr(layer, lst_name)
@@ -91,36 +92,6 @@ class ParameterShardingStrategy:
                         if v is old_var:
                             lst[i] = new_var 
         return new_var
-
-    def _find_layer_by_path(self, model, var_path):
-        if ":" in var_path: var_path = var_path.split(":")[0]
-        parts = var_path.split("/")
-        attr_name = parts[-1]
-        current = model
-        def find_child(parent, name):
-            for attr in dir(parent):
-                if attr.startswith("__"): continue
-                try: val = getattr(parent, attr)
-                except: continue
-                if hasattr(val, 'name') and val.name == name: return val
-            if hasattr(parent, 'layers'):
-                for layer in parent.layers:
-                    if layer.name == name: return layer
-            return None
-        for part in parts[:-1]:
-            if hasattr(current, 'name') and current.name == part: continue 
-            next_node = find_child(current, part)
-            if next_node: current = next_node
-            else:
-                found = False
-                for wrapper in ['backbone', 'model', 'encoder', 'decoder', 'transformer', 'preprocessor']:
-                    if hasattr(current, wrapper):
-                        candidate = find_child(getattr(current, wrapper), part)
-                        if candidate: current = candidate; found = True; break
-                if not found: return None, None
-        if hasattr(current, "_" + attr_name): return current, "_" + attr_name
-        if hasattr(current, attr_name): return current, attr_name
-        return None, None
 
     def shard_model_parameters(self, shard_model, weight_loader, config, device_id):
         modified = set()
@@ -141,7 +112,6 @@ class ParameterShardingStrategy:
             if callable(action):
                 targets = self._find_matching_parameters(shard_model, pattern)
                 for name, target_var in targets:
-                    # Strip name_scope prefix for disk lookup
                     lookup_name = name
                     prefix = f"shard_{self.rank}/"
                     if name.startswith(prefix):
@@ -150,18 +120,27 @@ class ParameterShardingStrategy:
                     try:
                         source_val = weight_loader(lookup_name)
                         if source_val is None: continue
+                        
+                        # FIX: Check for the '|V2' (void) dtype and cast to bfloat16
+                        # This happens if np.load doesn't recognize the bfloat16 type string.
+                        if hasattr(source_val, 'dtype') and (str(source_val.dtype).startswith('|V') or source_val.dtype == np.dtype('V2')):
+                            if ml_dtypes is not None:
+                                source_val = source_val.view(ml_dtypes.bfloat16)
+                            else:
+                                # Fallback to float32 if ml_dtypes isn't available
+                                source_val = source_val.astype('float32')
                     except: continue
 
                     sliced_val = action(source_val, self.rank)
                     
                     if jax_target is not None:
+                        # Ensure the sliced value is compatible with JAX
                         sliced_val_tensor = jax.device_put(sliced_val, jax_target)
                         sliced_val_tensor = sliced_val_tensor.astype(target_var.dtype)
                     else:
                         with keras.device(device_id):
                             sliced_val_tensor = ops.convert_to_tensor(sliced_val, dtype=target_var.dtype)
 
-                    # FIX: Iterate through ALL owners of this variable (e.g. Embedding and Head)
                     if id(target_var) in var_to_owners:
                         for layer, attr_name in var_to_owners[id(target_var)]:
                             self._replace_variable(layer, attr_name, target_var, sliced_val_tensor, device_id=device_id)
