@@ -24,10 +24,13 @@ def log_mem_stats(rank, device_id, stage=""):
 
 class TensorParallelKeras(Model):
     def __init__(self, model, device_count=None, device_ids=None, **kwargs):
+        import jax
         super().__init__(**kwargs)
 
         def flush_memory():
+            import jax
             gc.collect()
+            jax.clear_caches() # Critical for JAX memory pressure
             try: ctypes.CDLL("libc.so.6").malloc_trim(0)
             except: pass
 
@@ -51,24 +54,26 @@ class TensorParallelKeras(Model):
         self.tensor_parallel_config = get_default_config(loaded_model, self.devices)
 
         self._save_weights_to_disk(loaded_model)
-        del loaded_model # FREE ~18GB immediately
+        del loaded_model 
         flush_memory()
 
         self.__dict__["model_shards"] = []
 
         # 2. Sequential Shard Creation
         for rank, device_id in enumerate(self.devices):
-            log_mem_stats(rank, device_id, "START creation")
+            log_mem_stats(rank, device_id, f"START creation Shard {rank}")
 
             with keras.name_scope(f"shard_{rank}"):
+                # OPTIMIZATION: Use 'meta' or 'cpu' but with zero initialization
+                # to minimize transient memory during build.
                 with keras.device("cpu"):
                     config = self.model_config.copy()
                     config["name"] = f"shard_model_{rank}"
                     shard = self.model_cls.from_config(config)
-                    # Building with size 1 to minimize peak transient RAM
+                    # Building with minimum size
                     shard.build({"token_ids": (None, 1), "padding_mask": (None, 1)})
 
-            # 3. Sharding (Destructive)
+            # 3. Sharding (Handled by your existing utility)
             shard, modified_vars = make_parameter_sharded_model(
                 shard_model=shard,
                 weight_loader=self._weight_loader, 
@@ -78,42 +83,50 @@ class TensorParallelKeras(Model):
                 device_id=device_id,
             )
 
-            # 4. Migration for Replicated weights (Destructive)
-            from keras.src.distribution.tensor_parallel.parameter_sharding import ParameterShardingStrategy, log_stats
+            # 4. Deep Migration for Replicated Weights
+            from keras.src.distribution.tensor_parallel.parameter_sharding import ParameterShardingStrategy
             strat_helper = ParameterShardingStrategy(self.device_count, rank)
-            try:
-                import jax
-                d_idx = int(str(device_id).split(":")[-1]) if ":" in str(device_id) else 0
-                target_jax_device = jax.devices('gpu')[d_idx]
-                var_to_owners = strat_helper._map_variables_to_owners(shard)
+            
+            # Map every variable to its owner layer/attribute
+            var_to_owners = strat_helper._map_variables_to_owners(shard)
+            d_idx = int(str(device_id).split(":")[-1]) if ":" in str(device_id) else 0
+            target_jax_device = jax.devices('gpu')[d_idx]
+
+            # We iterate through the model's variables and replace them on the layers
+            # with GPU-resident versions.
+            for v in list(shard.variables):
+                v_name = v.path if hasattr(v, 'path') else v.name
+                # Skip if already sharded by make_parameter_sharded_model
+                if v_name in modified_vars: 
+                    continue 
+
+                lookup_name = v_name.replace(f"shard_{rank}/", "")
+                raw_val = self._weight_loader(lookup_name)
                 
-                # Iterate a static list to avoid iterator mutation issues
-                vars_to_process = list(shard.variables)
-                for v in vars_to_process:
-                    v_name = v.path if hasattr(v, 'path') else v.name
-                    if v_name in modified_vars: continue 
+                if raw_val is not None:
+                    # Move data to GPU immediately
+                    val_gpu = jax.device_put(raw_val, target_jax_device)
+                    
+                    # Replace the Variable object on the layer to orphan the CPU buffer
+                    if id(v) in var_to_owners:
+                        for layer, attr_name in var_to_owners[id(v)]:
+                            strat_helper._replace_variable(
+                                layer, attr_name, v, val_gpu, device_id=device_id
+                            )
+                    else:
+                        # Fallback for untracked variables
+                        v.assign(val_gpu)
+                    
+                    del raw_val
+                    del val_gpu
 
-                    lookup_name = v_name.replace(f"shard_{rank}/", "")
-                    raw_val = self._weight_loader(lookup_name)
-                    if raw_val is not None:
-                        val_gpu = jax.device_put(raw_val, target_jax_device)
-                        
-                        # Replace and Destroy CPU buffer for non-sharded weights
-                        if id(v) in var_to_owners:
-                            for layer, attr_name in var_to_owners[id(v)]:
-                                strat_helper._replace_variable(layer, attr_name, v, val_gpu, device_id=device_id)
-                        else:
-                            v.assign(val_gpu)
-                        
-                        del raw_val
-                        gc.collect()
-                        log_stats(f"Migrated {v_name}") # Memory log after every parameter
-            except Exception as e:
-                print(f"⚠️ Migration Error rank {rank}: {e}")
-
+            # 5. Finalize Shard and Purge CPU references
             self.model_shards.append(shard)
-            flush_memory() # RSS should now drop back to baseline after every rank
-            log_mem_stats(rank, device_id, "DONE creation")
+            
+            # CRITICAL: Clear references to the temporary 'vars' list and 'shard' local
+            del shard
+            flush_memory() 
+            log_mem_stats(rank, device_id, f"DONE creation Shard {rank}")
 
 
         try: shutil.rmtree(self.temp_dir)
