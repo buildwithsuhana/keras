@@ -60,20 +60,20 @@ class TensorParallelKeras(Model):
         self.__dict__["model_shards"] = []
 
         # 2. Sequential Shard Creation
+        # ... (around line 52)
+        # 2. Sequential Shard Creation
         for rank, device_id in enumerate(self.devices):
-            log_mem_stats(rank, device_id, f"START creation Shard {rank}")
+            log_mem_stats(rank, device_id, "START creation")
 
             with keras.name_scope(f"shard_{rank}"):
-                # OPTIMIZATION: Use 'meta' or 'cpu' but with zero initialization
-                # to minimize transient memory during build.
-                with keras.device("cpu"):
+                # CRITICAL CHANGE: Use "meta" instead of "cpu"
+                with keras.device("meta"): 
                     config = self.model_config.copy()
                     config["name"] = f"shard_model_{rank}"
                     shard = self.model_cls.from_config(config)
-                    # Building with minimum size
                     shard.build({"token_ids": (None, 1), "padding_mask": (None, 1)})
 
-            # 3. Sharding (Handled by your existing utility)
+            # 3. Sharding (Destructive)
             shard, modified_vars = make_parameter_sharded_model(
                 shard_model=shard,
                 weight_loader=self._weight_loader, 
@@ -83,50 +83,46 @@ class TensorParallelKeras(Model):
                 device_id=device_id,
             )
 
-            # 4. Deep Migration for Replicated Weights
+            # 4. Migration for Replicated weights (Destructive)
             from keras.src.distribution.tensor_parallel.parameter_sharding import ParameterShardingStrategy
             strat_helper = ParameterShardingStrategy(self.device_count, rank)
-            
-            # Map every variable to its owner layer/attribute
-            var_to_owners = strat_helper._map_variables_to_owners(shard)
-            d_idx = int(str(device_id).split(":")[-1]) if ":" in str(device_id) else 0
-            target_jax_device = jax.devices('gpu')[d_idx]
-
-            # We iterate through the model's variables and replace them on the layers
-            # with GPU-resident versions.
-            for v in list(shard.variables):
-                v_name = v.path if hasattr(v, 'path') else v.name
-                # Skip if already sharded by make_parameter_sharded_model
-                if v_name in modified_vars: 
-                    continue 
-
-                lookup_name = v_name.replace(f"shard_{rank}/", "")
-                raw_val = self._weight_loader(lookup_name)
+            try:
+                import jax
+                d_idx = int(str(device_id).split(":")[-1]) if ":" in str(device_id) else 0
+                target_jax_device = jax.devices('gpu')[d_idx]
+                var_to_owners = strat_helper._map_variables_to_owners(shard)
                 
-                if raw_val is not None:
-                    # Move data to GPU immediately
-                    val_gpu = jax.device_put(raw_val, target_jax_device)
-                    
-                    # Replace the Variable object on the layer to orphan the CPU buffer
-                    if id(v) in var_to_owners:
-                        for layer, attr_name in var_to_owners[id(v)]:
-                            strat_helper._replace_variable(
-                                layer, attr_name, v, val_gpu, device_id=device_id
-                            )
-                    else:
-                        # Fallback for untracked variables
-                        v.assign(val_gpu)
-                    
-                    del raw_val
-                    del val_gpu
+                # --- START OF YOUR SNIPPET ---
+                vars_to_process = list(shard.variables)
+                for v in vars_to_process:
+                    v_name = v.path if hasattr(v, 'path') else v.name
+                    if v_name in modified_vars: continue 
 
-            # 5. Finalize Shard and Purge CPU references
+                    lookup_name = v_name.replace(f"shard_{rank}/", "")
+                    raw_val = self._weight_loader(lookup_name)
+                    if raw_val is not None:
+                        # Move the replicated weight directly to the specific GPU
+                        val_gpu = jax.device_put(raw_val, target_jax_device)
+                        
+                        if id(v) in var_to_owners:
+                            for layer, attr_name in var_to_owners[id(v)]:
+                                # Use helper to replace 'meta' Variable with the GPU one
+                                strat_helper._replace_variable(
+                                    layer, attr_name, v, val_gpu, device_id=device_id
+                                )
+                        else:
+                            v.assign(val_gpu)
+                        
+                        del raw_val, val_gpu
+                        gc.collect()
+                # --- END OF YOUR SNIPPET ---
+
+            except Exception as e:
+                print(f"⚠️ Migration Error rank {rank}: {e}")
+
             self.model_shards.append(shard)
-            
-            # CRITICAL: Clear references to the temporary 'vars' list and 'shard' local
-            del shard
             flush_memory() 
-            log_mem_stats(rank, device_id, f"DONE creation Shard {rank}")
+            log_mem_stats(rank, device_id, "DONE creation")
 
 
         try: shutil.rmtree(self.temp_dir)
