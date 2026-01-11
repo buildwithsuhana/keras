@@ -14,7 +14,6 @@ from keras.src.distribution.tensor_parallel.parameter_sharding import make_param
 from keras.src.distribution.tensor_parallel.coordinated_optimizer import TensorParallelOptimizer
 from keras.src.distribution import list_devices
 from keras.src.models import Model
-from keras.src.trainers.data_adapters import data_adapter_utils
 import ctypes
 
 logger = logging.getLogger(__file__)
@@ -36,8 +35,10 @@ class TensorParallelKeras(Model):
 
         def flush_memory():
             gc.collect()
-            try: ctypes.CDLL("libc.so.6").malloc_trim(0)
-            except: pass
+            try:
+                ctypes.CDLL("libc.so.6").malloc_trim(0)
+            except:
+                pass
 
         if device_count is None or device_ids is None:
             all_devices = list_devices()
@@ -48,6 +49,7 @@ class TensorParallelKeras(Model):
         self.devices = [self._normalize_device_id(d) for d in device_ids]
         self.temp_dir = tempfile.mkdtemp(prefix="tp_weights_")
         
+        # 1. Instantiate or reference the master model
         if callable(model) and not isinstance(model, keras.Model):
             print("🏭 Executing Model Factory...")
             loaded_model = model()
@@ -58,12 +60,12 @@ class TensorParallelKeras(Model):
         self.model_cls = loaded_model.__class__
         self.tensor_parallel_config = get_default_config(loaded_model, self.devices)
 
-        print(f"💾 Offloading {len(loaded_model.variables)} variables...")
+        # 2. Offload to disk and PURGE CPU copy immediately
+        print(f"💾 Offloading {len(loaded_model.variables)} variables to disk...")
         self._save_weights_to_disk(loaded_model)
         
-        print("🗑️  Destroying Master Model...")
+        print("🗑️ Destroying Master Model to free CPU RAM...")
         del loaded_model
-        if 'model' in locals(): del model
         flush_memory()
 
         self.__dict__["model_shards"] = []
@@ -71,25 +73,19 @@ class TensorParallelKeras(Model):
 
         from keras.src.distribution.tensor_parallel.parameter_sharding import ParameterShardingStrategy
         
-        # buildwithsuhana/keras/keras-ananta/keras/src/distribution/tensor_parallel/tensor_parallel_keras.py
-
-        # buildwithsuhana/keras/keras-ananta/keras/src/distribution/tensor_parallel/tensor_parallel_keras.py
-
-        # buildwithsuhana/keras/keras-ananta/keras/src/distribution/tensor_parallel/tensor_parallel_keras.py
-
         for rank, device_id in enumerate(self.devices):
             log_mem_stats(rank, device_id, "START creation")
 
+            # Create the blueprint of the model on CPU
             with keras.name_scope(f"shard_{rank}"):
                 with keras.device("cpu"):
                     config = self.model_config.copy()
                     config["name"] = f"shard_model_{rank}"
                     shard = self.model_cls.from_config(config)
-                    
-                    # BUILD ONLY: Avoids the massive RAM spike from forward pass compilation
-                    shard.build({"token_ids": (None, 128), "padding_mask": (None, 128)})
+                    # Use a minimal build to avoid temporary memory spikes
+                    shard.build({"token_ids": (None, 1), "padding_mask": (None, 1)})
 
-            # 3. Sharding
+            # Sharding logic splits the variables
             shard, modified_vars = make_parameter_sharded_model(
                 shard_model=shard,
                 weight_loader=self._weight_loader, 
@@ -99,15 +95,16 @@ class TensorParallelKeras(Model):
                 device_id=device_id,
             )
 
-            # 4. Migration
+            # 4. Migration: Move CPU variables to GPU and release CPU buffers
             strat_helper = ParameterShardingStrategy(self.device_count, rank)
             try:
                 import jax
-                target_device = jax.devices('gpu')[rank]
+                target_jax_device = jax.devices('gpu')[rank]
                 var_to_owners = strat_helper._map_variables_to_owners(shard)
                 
                 for v in shard.variables:
                     v_name = v.path if hasattr(v, 'path') else v.name
+                    # Skip if already handled by parameter_sharding (e.g. sharded weights)
                     if v_name in modified_vars: continue 
 
                     lookup_name = v_name
@@ -116,21 +113,26 @@ class TensorParallelKeras(Model):
 
                     raw_val = self._weight_loader(lookup_name)
                     if raw_val is not None:
-                        val_gpu = jax.device_put(raw_val, target_device)
+                        # CRITICAL: device_put moves to GPU; v.assign replaces CPU buffer
+                        val_gpu = jax.device_put(raw_val, target_jax_device)
+                        v.assign(val_gpu)
                         
-                        # FIX: Iterate through ALL owners for migration weights as well
+                        # Handle duplicate references (owners)
                         if id(v) in var_to_owners:
                             for layer, attr_name in var_to_owners[id(v)]:
                                 strat_helper._replace_variable(layer, attr_name, v, val_gpu, device_id=device_id)
+                        del raw_val # release file handle/buffer
             except Exception as e:
-                print(f"⚠️ Migration Error: {e}")
+                print(f"⚠️ Migration Error Shard {rank}: {e}")
 
             self.model_shards.append(shard)
-            flush_memory() # Now correctly clears the CPU variables
+            flush_memory() # Clear the specific CPU blueprint just sharded
             log_mem_stats(rank, device_id, "DONE creation")
 
-        try: shutil.rmtree(self.temp_dir)
-        except: pass
+        try:
+            shutil.rmtree(self.temp_dir)
+        except:
+            pass
         self.built = True
 
     def _normalize_device_id(self, device_id):
@@ -143,9 +145,6 @@ class TensorParallelKeras(Model):
             return d_str
         if ":" not in d_str: return f"gpu:{d_str}"
         return d_str
-
-    def _purge_model_variables(self, *args, **kwargs):
-        pass
 
     def call(self, inputs, training=None, **kwargs):
         results = []
@@ -162,7 +161,6 @@ class TensorParallelKeras(Model):
     
     def train_step(self, state, data):
         import jax
-        import jax.numpy as jnp
         from keras.src.trainers.data_adapters import data_adapter_utils
 
         x, y, sample_weight = data_adapter_utils.unpack_x_y_sample_weight(data)
@@ -193,20 +191,21 @@ class TensorParallelKeras(Model):
         return {m.name: m.result() for m in self.metrics}
 
     def _save_weights_to_disk(self, model):
+        """Saves weights without doubling RAM via float32 conversion."""
         for v in model.variables:
             name = v.path if hasattr(v, 'path') else v.name
             safe_name = name.replace("/", "_").replace(":", "_")
             path = os.path.join(self.temp_dir, safe_name + ".npy")
+            
             val = v.numpy()
-            if (hasattr(val, 'dtype') and (val.dtype.name == 'bfloat16' or str(val.dtype) == 'bfloat16')) or \
-               (val.dtype.char == 'V' and val.itemsize == 2):
-                val = val.astype('float32')
             np.save(path, val)
+            del val
 
     def _weight_loader(self, param_name):
         safe_name = param_name.replace("/", "_").replace(":", "_")
         path = os.path.join(self.temp_dir, safe_name + ".npy")
-        if os.path.exists(path): return np.load(path, mmap_mode='r')
+        if os.path.exists(path):
+            return np.load(path, mmap_mode='r')
         return None
 
     def compile(self, optimizer=None, **kwargs):
