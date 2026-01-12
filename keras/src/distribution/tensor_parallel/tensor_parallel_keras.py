@@ -53,7 +53,14 @@ class TensorParallelKeras(Model):
                 loaded_model = model()
             else:
                 loaded_model = model
-            loaded_model.build({"token_ids": (None, 1), "padding_mask": (None, 1)})
+            # Build with a flexible sequence length (None) to avoid creating variables
+            # that depend on a hard-coded sequence length of 1 which can lead to
+            # shape mismatches later during training (e.g., normalization params).
+            try:
+                loaded_model.build({"token_ids": (None, None), "padding_mask": (None, None)})
+            except Exception:
+                # Fallback to original conservative build if some models require fixed dims
+                loaded_model.build({"token_ids": (None, 1), "padding_mask": (None, 1)})
 
         self.model_config = loaded_model.get_config()
         self.model_cls = loaded_model.__class__
@@ -80,7 +87,10 @@ class TensorParallelKeras(Model):
                 config = self.model_config.copy()
                 config["name"] = f"shard_model_{rank}"
                 shard = self.model_cls.from_config(config)
-                shard.build({"token_ids": (None, 1), "padding_mask": (None, 1)})
+                try:
+                    shard.build({"token_ids": (None, None), "padding_mask": (None, None)})
+                except Exception:
+                    shard.build({"token_ids": (None, 1), "padding_mask": (None, 1)})
 
             # Shard parameters
             shard, modified_vars = make_parameter_sharded_model(
