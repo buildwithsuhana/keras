@@ -9,23 +9,10 @@ from keras import device, ops
 import keras
 import numpy as np
 
-# Registers bfloat16 with numpy to prevent the |V2 (void) dtype error
 try:
     import ml_dtypes
 except ImportError:
     ml_dtypes = None
-
-def log_stats(stage=""):
-    """Logs current system RAM and GPU VRAM usage."""
-    process = psutil.Process(os.getpid())
-    mem_mb = process.memory_info().rss / (1024 ** 2)
-    gpu_str = ""
-    try:
-        result = subprocess.check_output(['nvidia-smi', '--query-gpu=memory.used', '--format=csv,nounits,noheader'], encoding='utf-8')
-        mems = [int(x) for x in result.strip().split('\n') if x.strip()]
-        for i, m in enumerate(mems): gpu_str += f"G{i}:{m}M "
-    except: pass
-    print(f"   📊 [Stats] {stage} | RAM: {mem_mb:.0f}MB | {gpu_str}")
 
 class ParameterShardingStrategy:
     def __init__(self, device_count: int, rank: int):
@@ -33,12 +20,11 @@ class ParameterShardingStrategy:
         self.rank = rank
 
     def _map_variables_to_owners(self, model):
-        """Maps every variable ID to a LIST of all its owners (layers and internal lists)."""
+        """Maps variable IDs to ALL layers/lists that own them (essential for tied weights)."""
         var_to_owners = {}
         stack = [model]
         visited = set()
-        
-        # Internal lists that must be searched to handle tied weights correctly
+        # Internal lists to search for shared variable references
         WEIGHT_LISTS = ['_trainable_weights', '_non_trainable_weights', '_weights', '_variables']
 
         while stack:
@@ -46,14 +32,12 @@ class ParameterShardingStrategy:
             if id(layer) in visited: continue
             visited.add(id(layer))
 
-            # 1. Search attributes in __dict__
             for attr_name, attr_val in layer.__dict__.items():
                 if attr_name.startswith("__"): continue
-                
                 if hasattr(attr_val, 'assign') and hasattr(attr_val, 'value'):
                     var_to_owners.setdefault(id(attr_val), []).append((layer, attr_name, None))
                 
-                # Recurse into sub-layers, weights, or the hidden _layers list
+                # Deeply recurse into sub-structures
                 if hasattr(attr_val, 'layers') or hasattr(attr_val, 'weights') or hasattr(attr_val, '_layers'):
                     stack.append(attr_val)
                 elif isinstance(attr_val, (list, tuple)):
@@ -61,7 +45,6 @@ class ParameterShardingStrategy:
                         if hasattr(item, 'layers') or hasattr(item, 'weights') or hasattr(item, '_layers'):
                             stack.append(item)
 
-            # 2. Search Keras internal weight lists
             for lst_name in WEIGHT_LISTS:
                 if hasattr(layer, lst_name):
                     lst = getattr(layer, lst_name)
@@ -72,7 +55,7 @@ class ParameterShardingStrategy:
         return var_to_owners
 
     def _replace_variable(self, layer, attr_name, old_var, new_var, index=None):
-        """Swaps variable objects and updates layer metadata for shape consistency."""
+        """Swaps the variable object and updates metadata to reflect sharded shapes."""
         if index is not None:
             lst = getattr(layer, attr_name)
             if isinstance(lst, list) and index < len(lst) and lst[index] is old_var:
@@ -86,7 +69,7 @@ class ParameterShardingStrategy:
                 except: pass
         except: pass
 
-        # Update layer units/output_dim to prevent shape mismatch errors in logic
+        # Update metadata to prevent 'Shape Mismatch' errors in layer logic
         if hasattr(layer, "output_dim") and "Embedding" in layer.__class__.__name__:
             layer.output_dim = new_var.shape[-1]
         elif hasattr(layer, "units") and (new_var is getattr(layer, 'kernel', None) or "Dense" in layer.__class__.__name__):
@@ -109,9 +92,8 @@ class ParameterShardingStrategy:
                 if id(target_var) in old_to_new:
                     new_var = old_to_new[id(target_var)]
                 else:
-                    # Strip shard prefix and leading model name to find original saved weight
+                    # Strip shard prefix to find original weight on disk
                     lookup_name = re.sub(r'^shard_model_\d+/', '', name)
-                    lookup_name = re.sub(r'^[a-zA-Z0-9_]+/', '', lookup_name)
                     raw_val = weight_loader(lookup_name)
                     if raw_val is None: continue
                     
@@ -123,24 +105,17 @@ class ParameterShardingStrategy:
                     val_gpu = jax.device_put(sliced_val, jax_target)
                     
                     with keras.device(device_id):
-                        new_var = keras.Variable(
-                            val_gpu,
-                            dtype=target_var.dtype,
-                            trainable=target_var.trainable,
-                            name=target_var.name
-                        )
+                        new_var = keras.Variable(val_gpu, dtype=target_var.dtype, name=target_var.name)
                     old_to_new[id(target_var)] = new_var
 
                 if id(target_var) in var_to_owners:
                     for owner, attr_name, index in var_to_owners[id(target_var)]:
                         self._replace_variable(owner, attr_name, target_var, new_var, index=index)
 
-                # Shred CPU RAM of the OLD variable object
+                # Shred OLD CPU variable immediately to free RAM
                 try: object.__setattr__(target_var, "_value", jax.numpy.zeros((0,), dtype=target_var.dtype))
                 except: pass
-                
                 modified_ids.add(id(target_var))
-                log_stats(f"Sharded {name}")
         
         return shard_model, {v.path if hasattr(v, 'path') else v.name for v in shard_model.variables if id(v) in modified_ids}
     

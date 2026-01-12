@@ -6,7 +6,7 @@ import tempfile
 import numpy as np
 import psutil
 import subprocess
-import re  # <--- Add this import
+import re
 import keras
 from keras import ops
 from keras.src.distribution.tensor_parallel.autoconfig import get_default_config
@@ -15,6 +15,9 @@ from keras.src.distribution import list_devices
 from keras.src.models import Model
 import ctypes
 import jax
+
+# CRITICAL: Force low-memory policy for large models on Kaggle
+keras.config.set_dtype_policy("bfloat16")
 
 def log_mem_stats(rank, device_id, stage=""):
     process = psutil.Process(os.getpid())
@@ -44,6 +47,7 @@ class TensorParallelKeras(Model):
         self.devices = [self._normalize_device_id(d) for d in device_ids]
         self.temp_dir = tempfile.mkdtemp(prefix="tp_weights_")
         
+        # 1. Instantiate Master Model on CPU
         with jax.default_device(jax.devices("cpu")[0]):
             if callable(model) and not isinstance(model, keras.Model):
                 loaded_model = model()
@@ -55,9 +59,13 @@ class TensorParallelKeras(Model):
         self.model_cls = loaded_model.__class__
         self.tensor_parallel_config = get_default_config(loaded_model, self.devices)
 
-        self._save_weights_to_disk(loaded_model)
+        # 2. Save and Shred ONE VARIABLE AT A TIME (Prevents peak RSS doubling)
         for v in loaded_model.variables:
-            shred_variable(v)
+            name = (v.path if hasattr(v, 'path') else v.name).replace("/", "_").replace(":", "_")
+            path = os.path.join(self.temp_dir, name + ".npy")
+            np.save(path, np.array(v)) # Use np.array to convert JAX -> NumPy
+            shred_variable(v) # Free RAM immediately after saving
+        
         del loaded_model 
         flush_memory()
 
@@ -67,12 +75,14 @@ class TensorParallelKeras(Model):
         for rank, device_id in enumerate(self.devices):
             log_mem_stats(rank, device_id, "START creation")
 
+            # Build shard on CPU
             with keras.device("cpu"):
                 config = self.model_config.copy()
                 config["name"] = f"shard_model_{rank}"
                 shard = self.model_cls.from_config(config)
                 shard.build({"token_ids": (None, 1), "padding_mask": (None, 1)})
 
+            # Shard parameters
             shard, modified_vars = make_parameter_sharded_model(
                 shard_model=shard,
                 weight_loader=self._weight_loader, 
@@ -91,7 +101,7 @@ class TensorParallelKeras(Model):
                 
                 for v in list(shard.variables):
                     v_name = v.path if hasattr(v, 'path') else v.name
-                    # FIX: Correctly match 'shard_model_{rank}/' prefix
+                    # FIX: Correct naming match
                     clean_name = re.sub(r'^shard_model_\d+/', '', v_name).replace("/", ".")
                     if clean_name in modified_vars or v_name in modified_vars: 
                         continue 
@@ -105,7 +115,7 @@ class TensorParallelKeras(Model):
                                 strat_helper._replace_variable(layer, attr_name, v, val_gpu, index=idx)
                         else:
                             v.assign(val_gpu)
-                        # CRITICAL: DO NOT shred variables here as they are kept in the shard
+                        # NOTE: Don't shred assigned variables, they are now on GPU
             except Exception as e:
                 print(f"⚠️ Migration Error rank {rank}: {e}")
 
@@ -116,14 +126,8 @@ class TensorParallelKeras(Model):
         try: shutil.rmtree(self.temp_dir)
         except: pass
         self.built = True
-    @property
-    def trainable_variables(self):
-        return []
 
-    @property
-    def non_trainable_variables(self):
-        return []
-    
+    # ... (rest of the Model class same as before)
     def _normalize_device_id(self, device_id):
         d_str = str(device_id).lower()
         if "tpu" in d_str: return f"tpu:{d_str.split(':')[-1]}" if ":" in d_str else f"tpu:{d_str}"
@@ -145,48 +149,29 @@ class TensorParallelKeras(Model):
             with keras.device(self.devices[i]):
                 t_vars = [v.value for v in shard.trainable_variables]
                 nt_vars = [v.value for v in shard.non_trainable_variables]
-                
                 def compute_loss(tv, ntv, xd, yd):
                     yp, ntu = shard.stateless_call(tv, ntv, xd, training=True)
                     l = self.compute_loss(x=xd, y=yd, y_pred=yp, sample_weight=sample_weight)
                     return l, ntu
-                
                 (loss_val, _), grads = jax.value_and_grad(compute_loss, has_aux=True)(t_vars, nt_vars, x, y)
                 all_shard_grads_vars.append(list(zip(grads, shard.trainable_variables)))
                 if i == 0: total_loss = loss_val
 
-        # Stateful update of optimizer and metrics
         self.optimizer.apply_gradients(all_shard_grads_vars, shard_models=self.model_shards)
-        
-        # Update metrics (Standard Keras 3 JAX backend updates the loss tracker automatically)
         for metric in self.metrics:
-            if metric.name == "loss": 
-                metric.update_state(total_loss)
-        
+            if metric.name == "loss": metric.update_state(total_loss)
         return {m.name: m.result() for m in self.metrics}, state
-
-    def _save_weights_to_disk(self, model):
-        for v in model.variables:
-            name = (v.path if hasattr(v, 'path') else v.name).replace("/", "_").replace(":", "_")
-            path = os.path.join(self.temp_dir, name + ".npy")
-            np.save(path, v.numpy())
 
     def _weight_loader(self, param_name):
         name = param_name.replace("/", "_").replace(":", "_")
         path = os.path.join(self.temp_dir, name + ".npy")
-        if not os.path.exists(path):
-            return None
-        
-        # Load with mmap to save RAM
+        if not os.path.exists(path): return None
         val = np.load(path, mmap_mode='r')
-        
-        # FIXED: Robust check for |V2 / void16 (bfloat16 placeholder)
         if hasattr(val, 'dtype') and ("V" in str(val.dtype) or "void" in str(val.dtype)):
             try:
                 import ml_dtypes
                 return val.view(ml_dtypes.bfloat16)
-            except ImportError:
-                return val.astype("float32") # Fallback if ml_dtypes is missing
+            except ImportError: return val.astype("float32")
         return val
 
     def compile(self, optimizer=None, **kwargs):
