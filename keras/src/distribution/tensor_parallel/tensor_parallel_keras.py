@@ -111,10 +111,35 @@ class TensorParallelKeras(Model):
                     if raw_val is not None:
                         val_gpu = jax.device_put(raw_val, target_jax_device)
                         if id(v) in var_to_owners:
+                            # Create a proper Keras Variable on the target device
+                            try:
+                                with keras.device(device_id):
+                                    new_var = keras.Variable(val_gpu, dtype=v.dtype, name=v.name)
+                            except Exception:
+                                # Fallback to assigning the array if Variable creation fails
+                                new_var = None
+
                             for layer, attr_name, idx in var_to_owners[id(v)]:
-                                strat_helper._replace_variable(layer, attr_name, v, val_gpu, index=idx)
+                                if new_var is not None:
+                                    strat_helper._replace_variable(layer, attr_name, v, new_var, index=idx)
+                                else:
+                                    # If we couldn't create a Variable, try assigning into the existing variable
+                                    try:
+                                        owner_list = getattr(layer, attr_name)
+                                        if isinstance(owner_list, list) and idx is not None and idx < len(owner_list):
+                                            owner_list[idx] = val_gpu
+                                        else:
+                                            object.__setattr__(layer, attr_name, val_gpu)
+                                    except Exception:
+                                        pass
                         else:
-                            v.assign(val_gpu)
+                            # Assign value into the existing Variable
+                            try:
+                                v.assign(val_gpu)
+                            except Exception:
+                                # As a last resort, replace attribute directly
+                                try: object.__setattr__(v, '_value', val_gpu)
+                                except: pass
                         # NOTE: Don't shred assigned variables, they are now on GPU
             except Exception as e:
                 print(f"⚠️ Migration Error rank {rank}: {e}")
