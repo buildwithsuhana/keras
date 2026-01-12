@@ -100,10 +100,13 @@ class TensorParallelKeras(Model):
                 
                 for v in list(shard.variables):
                     v_name = v.path if hasattr(v, 'path') else v.name
-                    if v_name in modified_vars: continue 
+                    
+                    # FIX 1: Normalize name to match autoconfig keys (dots instead of slashes)
+                    clean_name = v_name.replace(f"shard_{rank}/", "").replace("/", ".")
+                    if clean_name in modified_vars: 
+                        continue 
 
                     lookup_name = v_name.replace(f"shard_{rank}/", "")
-                    # The fixed _weight_loader now returns valid bfloat16/float32
                     raw_val = self._weight_loader(lookup_name) 
                     if raw_val is not None:
                         val_gpu = jax.device_put(raw_val, target_jax_device)
@@ -152,7 +155,6 @@ class TensorParallelKeras(Model):
 
         for i, shard in enumerate(self.model_shards):
             with keras.device(self.devices[i]):
-                # Access variables directly from shards
                 t_vars = [v.value for v in shard.trainable_variables]
                 nt_vars = [v.value for v in shard.non_trainable_variables]
                 
@@ -165,13 +167,14 @@ class TensorParallelKeras(Model):
                 all_shard_grads_vars.append(list(zip(grads, shard.trainable_variables)))
                 if i == 0: total_loss = loss_val
 
+        # Stateful update of optimizer and metrics
         self.optimizer.apply_gradients(all_shard_grads_vars, shard_models=self.model_shards)
         
+        # Update metrics (Standard Keras 3 JAX backend updates the loss tracker automatically)
         for metric in self.metrics:
             if metric.name == "loss": 
                 metric.update_state(total_loss)
         
-        # Return metrics and the original state (since parent model state is empty)
         return {m.name: m.result() for m in self.metrics}, state
 
     def _save_weights_to_disk(self, model):
