@@ -124,7 +124,14 @@ class TensorParallelKeras(Model):
         try: shutil.rmtree(self.temp_dir)
         except: pass
         self.built = True
+    @property
+    def trainable_variables(self):
+        return []
 
+    @property
+    def non_trainable_variables(self):
+        return []
+    
     def _normalize_device_id(self, device_id):
         d_str = str(device_id).lower()
         if "tpu" in d_str: return f"tpu:{d_str.split(':')[-1]}" if ":" in d_str else f"tpu:{d_str}"
@@ -136,7 +143,7 @@ class TensorParallelKeras(Model):
         for i in range(1, len(results)): total = ops.add(total, results[i])
         return total
     
-    def train_step(self, state, data): # Added 'state' argument
+    def train_step(self, state, data):
         from keras.src.trainers.data_adapters import data_adapter_utils
         x, y, sample_weight = data_adapter_utils.unpack_x_y_sample_weight(data)
         all_shard_grads_vars = []
@@ -144,12 +151,15 @@ class TensorParallelKeras(Model):
 
         for i, shard in enumerate(self.model_shards):
             with keras.device(self.devices[i]):
+                # Access variables directly from shards
                 t_vars = [v.value for v in shard.trainable_variables]
                 nt_vars = [v.value for v in shard.non_trainable_variables]
+                
                 def compute_loss(tv, ntv, xd, yd):
                     yp, ntu = shard.stateless_call(tv, ntv, xd, training=True)
                     l = self.compute_loss(x=xd, y=yd, y_pred=yp, sample_weight=sample_weight)
                     return l, ntu
+                
                 (loss_val, _), grads = jax.value_and_grad(compute_loss, has_aux=True)(t_vars, nt_vars, x, y)
                 all_shard_grads_vars.append(list(zip(grads, shard.trainable_variables)))
                 if i == 0: total_loss = loss_val
@@ -159,8 +169,8 @@ class TensorParallelKeras(Model):
         for metric in self.metrics:
             if metric.name == "loss": 
                 metric.update_state(total_loss)
-                
-        # Must return a tuple of (metrics_dict, state)
+        
+        # Return metrics and the original state (since parent model state is empty)
         return {m.name: m.result() for m in self.metrics}, state
 
     def _save_weights_to_disk(self, model):
