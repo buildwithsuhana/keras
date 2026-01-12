@@ -118,6 +118,7 @@ def _apply_layer_sharding_rules(layer, full_name, device_count, state_rules, out
     # 3. Embedding
     elif "Embedding" in cls_name:
         if hasattr(layer, 'weights'):
+            any_sharded = False
             for weight in layer.weights:
                 if "embedding" in weight.name or "weight" in weight.name:
                     attr_name = None
@@ -127,14 +128,23 @@ def _apply_layer_sharding_rules(layer, full_name, device_count, state_rules, out
                             break
                     if not attr_name:
                         attr_name = weight.name.split('/')[-1].split(':')[0]
-                    
-                    # Split Weights (Column Parallel) -> Outputs 1792
-                    print(f"   ➕ [Add Rule] '{clean_name}' -> Embedding ({attr_name}) (Column Parallel)")
-                    state_rules[f"{clean_name}.{attr_name}"] = _split_rule(device_count, dim=1)
-            
-            # Disable Gather to keep it sharded
-            print(f"   ➕ [Output Rule] '{clean_name}' -> No Comm (Keep Sharded)")
-            output_rules[clean_name] = {0: "no_comm"}
+
+                    # Decide whether to replicate the full embedding on each device (safe for token
+                    # embeddings) or to column-split it (column parallel) for memory savings.
+                    is_token = 'token' in clean_name.lower() or 'token' in (lname or '') or 'token' in attr_name.lower()
+                    if is_token:
+                        print(f"   ➕ [Add Rule] '{clean_name}' -> Embedding ({attr_name}) (Replicated)")
+                        state_rules[f"{clean_name}.{attr_name}"] = (lambda x, index: x)
+                    else:
+                        print(f"   ➕ [Add Rule] '{clean_name}' -> Embedding ({attr_name}) (Column Parallel)")
+                        state_rules[f"{clean_name}.{attr_name}"] = _split_rule(device_count, dim=1)
+                        any_sharded = True
+
+            # If at least one weight in this embedding layer is sharded, keep the layer marked
+            # as "no_comm" (no gather). If all embeddings were replicated, we don't force no_comm.
+            if any_sharded:
+                print(f"   ➕ [Output Rule] '{clean_name}' -> No Comm (Keep Sharded)")
+                output_rules[clean_name] = {0: "no_comm"}
 
 def get_default_config(module, device_ids):
     print(f"\n🚀 [AutoConfig] Starting generation for model: {module.name}")
