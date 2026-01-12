@@ -37,6 +37,42 @@ class ParameterShardingStrategy:
         self.device_count = device_count
         self.rank = rank
 
+    def _map_variables_to_owners(self, model):
+        """Maps every variable ID to a LIST of (layer, attribute) pairs."""
+        var_to_owners = {}
+        stack = [model]
+        visited = set()
+        while stack:
+            layer = stack.pop()
+            if id(layer) in visited: continue
+            visited.add(id(layer))
+
+            # 1. Check direct attributes and internal lists (CRITICAL)
+            # We look for variables in attributes and in the hidden weight lists
+            targets = dir(layer) + ['_trainable_weights', '_non_trainable_weights', '_weights']
+            for attr_name in targets:
+                if attr_name.startswith("__") or attr_name in ['trainable_variables', 'variables', 'weights']: 
+                    continue
+                try: attr_val = getattr(layer, attr_name, None)
+                except Exception: continue
+                
+                if hasattr(attr_val, 'assign') and hasattr(attr_val, 'value'):
+                    # Direct attribute is a variable
+                    var_to_owners.setdefault(id(attr_val), []).append((layer, attr_name))
+                elif isinstance(attr_val, list):
+                    # Attribute is a list (like _trainable_weights) containing variables
+                    for v in attr_val:
+                        if hasattr(v, 'assign') and hasattr(v, 'value'):
+                            var_to_owners.setdefault(id(v), []).append((layer, attr_name))
+                
+                # Recursion for nested layers
+                if hasattr(attr_val, 'layers') or hasattr(attr_val, 'weights'):
+                    stack.append(attr_val)
+                elif isinstance(attr_val, (list, tuple)):
+                    for item in attr_val:
+                        if hasattr(item, 'layers') or hasattr(item, 'weights'): stack.append(item)
+        return var_to_owners
+
     def _replace_variable(self, layer, attr_name, old_var, new_var):
         """Swaps variable objects and updates layer metadata for shape consistency."""
         # 1. Update list-based attributes
@@ -63,33 +99,6 @@ class ParameterShardingStrategy:
         elif hasattr(layer, "units") and new_var is getattr(layer, "kernel", None):
             if new_var.shape[-1] != layer.units:
                 layer.units = new_var.shape[-1]
-
-    def _replace_variable(self, layer, attr_name, old_var, new_var):
-        """Swaps the variable and updates layer metadata to match sharded shapes."""
-        # 1. Update List Elements
-        if attr_name in ['_trainable_weights', '_non_trainable_weights', '_weights']:
-            lst = getattr(layer, attr_name)
-            if isinstance(lst, list):
-                for i, v in enumerate(lst):
-                    if v is old_var:
-                        lst[i] = new_var
-        else:
-            # 2. Update Direct Attributes
-            try:
-                object.__setattr__(layer, attr_name, new_var)
-                if not attr_name.startswith("_"):
-                    try: object.__setattr__(layer, "_" + attr_name, new_var)
-                    except: pass
-            except: pass
-
-        # 3. Update Layer Metadata (prevents ops from expecting full shapes)
-        # Use hasattr to support standard Dense and skip EinsumDense/Custom layers safely
-        if hasattr(layer, "units") and new_var is getattr(layer, 'kernel', None):
-            if new_var.shape[-1] != layer.units:
-                layer.units = new_var.shape[-1]
-        elif hasattr(layer, "output_dim") and "Embedding" in layer.__class__.__name__:
-            if new_var.shape[-1] != layer.output_dim:
-                layer.output_dim = new_var.shape[-1]
 
     def shard_model_parameters(self, shard_model, weight_loader, config, device_id):
         modified_ids = set()
