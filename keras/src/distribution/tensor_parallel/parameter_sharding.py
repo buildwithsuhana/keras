@@ -64,8 +64,9 @@ class ParameterShardingStrategy:
                 except: pass
         return var_to_owners
 
+    # ... (inside ParameterShardingStrategy class)
     def _replace_variable(self, layer, attr_name, old_var, new_val_tensor, device_id=None):
-        """Creates a new GPU variable and swap-destroys the CPU one to release Host RAM."""
+        """Creates a new GPU variable and swap-destroys the CPU one."""
         try:
             with keras.device(device_id):
                 new_var = keras.Variable(
@@ -78,21 +79,15 @@ class ParameterShardingStrategy:
         except Exception:
             return old_var
         
-        # 1. Update the layer attribute. 
-        # FIXED: Wrap in try-except to handle read-only properties (like EinsumDense.kernel)
-        try:
-            object.__setattr__(layer, attr_name, new_var)
-        except (AttributeError, TypeError):
-            pass 
+        # 1. Update the layer attribute.
+        try: object.__setattr__(layer, attr_name, new_var)
+        except: pass 
 
-        # Handle potential private counterparts (e.g., _kernel)
         if not attr_name.startswith("_"):
-            try:
-                object.__setattr__(layer, "_" + attr_name, new_var)
-            except (AttributeError, TypeError):
-                pass
+            try: object.__setattr__(layer, "_" + attr_name, new_var)
+            except: pass
 
-        # 2. Update internal source-of-truth lists (e.g., layer.trainable_variables)
+        # 2. Update internal source-of-truth lists
         for lst_name in ['_trainable_weights', '_non_trainable_weights', '_weights']:
             if hasattr(layer, lst_name):
                 lst = getattr(layer, lst_name)
@@ -101,10 +96,11 @@ class ParameterShardingStrategy:
                         if v is old_var:
                             lst[i] = new_var 
 
-        # 3. DESTRUCTIVE STEP: Shrink the old CPU buffer immediately.
-        # This breaks the reference to the large physical RAM allocation.
+        # 3. DESTRUCTIVE STEP: Bypass shape checks to clear Host RAM
+        # This replaces the failing old_var.assign(...) call
         try:
-            old_var.assign(ops.cast(ops.zeros((1,)), old_var.dtype))
+            import jax
+            object.__setattr__(old_var, "_value", jax.numpy.zeros((0,), dtype=old_var.dtype))
         except:
             pass
 
