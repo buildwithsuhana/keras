@@ -136,7 +136,7 @@ class TensorParallelKeras(Model):
         for i in range(1, len(results)): total = ops.add(total, results[i])
         return total
     
-    def train_step(self, data):
+    def train_step(self, state, data): # Added 'state' argument
         from keras.src.trainers.data_adapters import data_adapter_utils
         x, y, sample_weight = data_adapter_utils.unpack_x_y_sample_weight(data)
         all_shard_grads_vars = []
@@ -155,9 +155,13 @@ class TensorParallelKeras(Model):
                 if i == 0: total_loss = loss_val
 
         self.optimizer.apply_gradients(all_shard_grads_vars, shard_models=self.model_shards)
+        
         for metric in self.metrics:
-            if metric.name == "loss": metric.update_state(total_loss)
-        return {m.name: m.result() for m in self.metrics}
+            if metric.name == "loss": 
+                metric.update_state(total_loss)
+                
+        # Must return a tuple of (metrics_dict, state)
+        return {m.name: m.result() for m in self.metrics}, state
 
     def _save_weights_to_disk(self, model):
         for v in model.variables:
