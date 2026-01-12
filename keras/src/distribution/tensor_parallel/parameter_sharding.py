@@ -38,71 +38,72 @@ class ParameterShardingStrategy:
         self.rank = rank
 
     def _map_variables_to_owners(self, model):
-        """Maps every variable ID to a LIST of (layer, attribute) pairs."""
+        """Maps every variable ID to a LIST of (owner, attribute_name, index_if_list)."""
         var_to_owners = {}
         stack = [model]
         visited = set()
+        
+        # Internal lists that should be searched but never overwritten via setattr
+        WEIGHT_LISTS = ['_trainable_weights', '_non_trainable_weights', '_weights']
+
         while stack:
             layer = stack.pop()
             if id(layer) in visited: continue
             visited.add(id(layer))
 
-            # 1. Check direct attributes and internal lists (CRITICAL)
-            # We look for variables in attributes and in the hidden weight lists
-            targets = dir(layer) + ['_trainable_weights', '_non_trainable_weights', '_weights']
-            for attr_name in targets:
-                if attr_name.startswith("__") or attr_name in ['trainable_variables', 'variables', 'weights']: 
-                    continue
-                try: attr_val = getattr(layer, attr_name, None)
-                except Exception: continue
+            # 1. Search attributes in __dict__ (avoids properties)
+            for attr_name, attr_val in layer.__dict__.items():
+                if attr_name.startswith("__"): continue
                 
                 if hasattr(attr_val, 'assign') and hasattr(attr_val, 'value'):
-                    # Direct attribute is a variable
-                    var_to_owners.setdefault(id(attr_val), []).append((layer, attr_name))
-                elif isinstance(attr_val, list):
-                    # Attribute is a list (like _trainable_weights) containing variables
-                    for v in attr_val:
-                        if hasattr(v, 'assign') and hasattr(v, 'value'):
-                            var_to_owners.setdefault(id(v), []).append((layer, attr_name))
+                    var_to_owners.setdefault(id(attr_val), []).append((layer, attr_name, None))
                 
-                # Recursion for nested layers
+                # Recurse into sub-layers or lists of layers
                 if hasattr(attr_val, 'layers') or hasattr(attr_val, 'weights'):
                     stack.append(attr_val)
                 elif isinstance(attr_val, (list, tuple)):
                     for item in attr_val:
-                        if hasattr(item, 'layers') or hasattr(item, 'weights'): stack.append(item)
+                        if hasattr(item, 'layers') or hasattr(item, 'weights'):
+                            stack.append(item)
+
+            # 2. Search Keras internal weight lists
+            for lst_name in WEIGHT_LISTS:
+                if hasattr(layer, lst_name):
+                    lst = getattr(layer, lst_name)
+                    if isinstance(lst, list):
+                        for i, v in enumerate(lst):
+                            if hasattr(v, 'assign') and hasattr(v, 'value'):
+                                var_to_owners.setdefault(id(v), []).append((layer, lst_name, i))
         return var_to_owners
 
-    def _replace_variable(self, layer, attr_name, old_var, new_var):
+    def _replace_variable(self, layer, attr_name, old_var, new_var, index=None):
         """Swaps variable objects and updates layer metadata for shape consistency."""
-        # 1. Update list-based attributes
-        if attr_name in ['_trainable_weights', '_non_trainable_weights', '_weights']:
+        # 1. Update List Elements (prevents overwriting the list itself)
+        if index is not None:
             lst = getattr(layer, attr_name)
-            for i, v in enumerate(lst):
-                if v is old_var:
-                    lst[i] = new_var
-        else:
-            # 2. Update standard attributes
-            try:
-                object.__setattr__(layer, attr_name, new_var)
-                if not attr_name.startswith("_"):
-                    try: object.__setattr__(layer, "_" + attr_name, new_var)
-                    except: pass
-            except: pass
+            if isinstance(lst, list) and index < len(lst) and lst[index] is old_var:
+                lst[index] = new_var
+            return
 
-        # 3. Update Metadata (Prevents shape mismatch errors during layer.call)
-        # For Gemma's ReversibleEmbedding
+        # 2. Update Direct Attributes
+        try:
+            object.__setattr__(layer, attr_name, new_var)
+            if not attr_name.startswith("_"):
+                try: object.__setattr__(layer, "_" + attr_name, new_var)
+                except: pass
+        except: pass
+
+        # 3. Update Metadata (Prevents shape mismatch errors in layer logic)
         if hasattr(layer, "output_dim") and "Embedding" in layer.__class__.__name__:
             if new_var.shape[-1] != layer.output_dim:
                 layer.output_dim = new_var.shape[-1]
-        # For standard Dense (Note: EinsumDense uses 'output_shape' logic, usually handled by variables)
-        elif hasattr(layer, "units") and new_var is getattr(layer, "kernel", None):
+        elif hasattr(layer, "units") and new_var is getattr(layer, 'kernel', None):
             if new_var.shape[-1] != layer.units:
                 layer.units = new_var.shape[-1]
 
     def shard_model_parameters(self, shard_model, weight_loader, config, device_id):
         modified_ids = set()
-        old_to_new = {} # Cache to handle tied weights (Embedding <-> Head)
+        old_to_new = {} 
         var_to_owners = self._map_variables_to_owners(shard_model)
         
         jax_target = None
@@ -118,7 +119,6 @@ class ParameterShardingStrategy:
                 for name, target_var in targets:
                     if id(target_var) in modified_ids: continue
 
-                    # 1. Create or retrieve the sharded variable
                     if id(target_var) in old_to_new:
                         new_var = old_to_new[id(target_var)]
                     else:
@@ -126,7 +126,11 @@ class ParameterShardingStrategy:
                         raw_val = weight_loader(lookup_name)
                         if raw_val is None: continue
                         
-                        # Apply sharding rule on CPU then move to GPU
+                        # Restore bfloat16 if needed
+                        if hasattr(raw_val, 'dtype') and ("V" in str(raw_val.dtype) or "void" in str(raw_val.dtype)):
+                            import ml_dtypes
+                            raw_val = raw_val.view(ml_dtypes.bfloat16)
+
                         sliced_val = action(raw_val, self.rank)
                         val_gpu = jax.device_put(sliced_val, jax_target)
                         
@@ -140,19 +144,18 @@ class ParameterShardingStrategy:
                             )
                         old_to_new[id(target_var)] = new_var
 
-                    # 2. Replace the old variable object in all layers and lists
+                    # Replace variable in all owner locations
                     if id(target_var) in var_to_owners:
-                        for owner, attr_name in var_to_owners[id(target_var)]:
-                            self._replace_variable(owner, attr_name, target_var, new_var)
+                        for owner, attr_name, index in var_to_owners[id(target_var)]:
+                            self._replace_variable(owner, attr_name, target_var, new_var, index=index)
 
-                    # 3. Shred the old CPU buffer
+                    # Shred CPU RAM
                     try: object.__setattr__(target_var, "_value", jax.numpy.zeros((0,), dtype=target_var.dtype))
                     except: pass
                     
                     modified_ids.add(id(target_var))
                     log_stats(f"Sharded {name}")
         
-        # Collect all paths associated with sharded variables
         all_sharded_paths = {v.path if hasattr(v, 'path') else v.name 
                             for v in shard_model.variables if id(v) in modified_ids}
         return shard_model, all_sharded_paths
