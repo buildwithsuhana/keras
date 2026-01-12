@@ -74,14 +74,12 @@ class TensorParallelKeras(Model):
         for rank, device_id in enumerate(self.devices):
             log_mem_stats(rank, device_id, "START creation")
 
-            # Build on CPU first (prevents RESOURCE_EXHAUSTED)
             with keras.device("cpu"):
                 config = self.model_config.copy()
                 config["name"] = f"shard_model_{rank}"
                 shard = self.model_cls.from_config(config)
                 shard.build({"token_ids": (None, 1), "padding_mask": (None, 1)})
 
-            # Shard and move weights to GPU piece-by-piece
             shard, modified_vars = make_parameter_sharded_model(
                 shard_model=shard,
                 weight_loader=self._weight_loader, 
@@ -91,7 +89,6 @@ class TensorParallelKeras(Model):
                 device_id=device_id,
             )
 
-            # Migration for Replicated weights
             strat_helper = ParameterShardingStrategy(self.device_count, rank)
             try:
                 d_idx = int(str(device_id).split(":")[-1]) if ":" in str(device_id) else 0
@@ -100,29 +97,26 @@ class TensorParallelKeras(Model):
                 
                 for v in list(shard.variables):
                     v_name = v.path if hasattr(v, 'path') else v.name
-                    
-                    # FIX 1: Normalize name to match autoconfig keys (dots instead of slashes)
-                    clean_name = v_name.replace(f"shard_{rank}/", "").replace("/", ".")
-                    if clean_name in modified_vars: 
+                    # FIX: Correctly match 'shard_model_{rank}/' prefix
+                    clean_name = re.sub(r'^shard_model_\d+/', '', v_name).replace("/", ".")
+                    if clean_name in modified_vars or v_name in modified_vars: 
                         continue 
 
-                    lookup_name = v_name.replace(f"shard_{rank}/", "")
+                    lookup_name = re.sub(r'^shard_model_\d+/', '', v_name)
                     raw_val = self._weight_loader(lookup_name) 
                     if raw_val is not None:
                         val_gpu = jax.device_put(raw_val, target_jax_device)
                         if id(v) in var_to_owners:
-                            for layer, attr_name in var_to_owners[id(v)]:
-                                strat_helper._replace_variable(layer, attr_name, v, val_gpu, device_id=device_id)
+                            for layer, attr_name, idx in var_to_owners[id(v)]:
+                                strat_helper._replace_variable(layer, attr_name, v, val_gpu, index=idx)
                         else:
                             v.assign(val_gpu)
-                        
-                        del raw_val
-                        shred_variable(v) # Ensure CPU buffer is cleared
+                        # CRITICAL: DO NOT shred variables here as they are kept in the shard
             except Exception as e:
                 print(f"⚠️ Migration Error rank {rank}: {e}")
 
             self.model_shards.append(shard)
-            flush_memory() 
+            flush_memory()
             log_mem_stats(rank, device_id, "DONE creation")
 
         try: shutil.rmtree(self.temp_dir)
