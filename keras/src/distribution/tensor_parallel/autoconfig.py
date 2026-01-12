@@ -55,7 +55,11 @@ def _apply_layer_sharding_rules(layer, full_name, device_count, state_rules, out
         print(f"   ➕ [Add Rule] '{clean_name}' -> Normalization (Split Dim 0)")
         def add_if_exists(attr, key):
             if hasattr(layer, attr) and getattr(layer, attr) is not None:
-                state_rules[key] = _split_rule(device_count, dim=0)
+                # Normalization parameters (scale/gamma/beta) should be replicated across
+                # devices rather than sharded. RMSNormalization parameters match the
+                # last feature dimension and must be full-sized on each shard to avoid
+                # broadcasting/shape errors during stateless calls.
+                state_rules[key] = (lambda x, index: x)
         add_if_exists("scale", rule_key_scale)
         add_if_exists("gamma", rule_key_gamma)
         add_if_exists("beta", rule_key_beta)
