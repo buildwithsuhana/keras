@@ -103,7 +103,8 @@ class TensorParallelKeras(Model):
                     if v_name in modified_vars: continue 
 
                     lookup_name = v_name.replace(f"shard_{rank}/", "")
-                    raw_val = self._weight_loader(lookup_name)
+                    # The fixed _weight_loader now returns valid bfloat16/float32
+                    raw_val = self._weight_loader(lookup_name) 
                     if raw_val is not None:
                         val_gpu = jax.device_put(raw_val, target_jax_device)
                         if id(v) in var_to_owners:
@@ -182,7 +183,20 @@ class TensorParallelKeras(Model):
     def _weight_loader(self, param_name):
         name = param_name.replace("/", "_").replace(":", "_")
         path = os.path.join(self.temp_dir, name + ".npy")
-        return np.load(path, mmap_mode='r') if os.path.exists(path) else None
+        if not os.path.exists(path):
+            return None
+        
+        # Load with mmap to save RAM
+        val = np.load(path, mmap_mode='r')
+        
+        # FIXED: Robust check for |V2 / void16 (bfloat16 placeholder)
+        if hasattr(val, 'dtype') and ("V" in str(val.dtype) or "void" in str(val.dtype)):
+            try:
+                import ml_dtypes
+                return val.view(ml_dtypes.bfloat16)
+            except ImportError:
+                return val.astype("float32") # Fallback if ml_dtypes is missing
+        return val
 
     def compile(self, optimizer=None, **kwargs):
         if len(self.model_shards) > 1 and optimizer:
