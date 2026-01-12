@@ -26,15 +26,12 @@ class TensorParallelKeras(Model):
 
         def flush_memory():
             gc.collect()
-            jax.clear_caches() # Critical: Frees Host-side JAX buffers
+            jax.clear_caches()
             try: ctypes.CDLL("libc.so.6").malloc_trim(0)
             except: pass
 
         def shred_variable(v):
-            """Bypasses shape checks to release physical RAM allocation."""
-            try:
-                # Set internal value to a 0-byte array to orphan the 18GB buffer
-                object.__setattr__(v, "_value", jax.numpy.zeros((0,), dtype=v.dtype))
+            try: object.__setattr__(v, "_value", jax.numpy.zeros((0,), dtype=v.dtype))
             except: pass
 
         if device_count is None or device_ids is None:
@@ -46,8 +43,6 @@ class TensorParallelKeras(Model):
         self.devices = [self._normalize_device_id(d) for d in device_ids]
         self.temp_dir = tempfile.mkdtemp(prefix="tp_weights_")
         
-        # 1. Instantiate the Master Model on CPU
-        # Force CPU device to prevent JAX from trying to initialize on GPU 0
         with jax.default_device(jax.devices("cpu")[0]):
             if callable(model) and not isinstance(model, keras.Model):
                 loaded_model = model()
@@ -59,16 +54,13 @@ class TensorParallelKeras(Model):
         self.model_cls = loaded_model.__class__
         self.tensor_parallel_config = get_default_config(loaded_model, self.devices)
 
-        # 2. Offload and Shred Master Model
         self._save_weights_to_disk(loaded_model)
         for v in loaded_model.variables:
             shred_variable(v)
         del loaded_model 
-        flush_memory() # RSS should drop to baseline (~1.5GB)
+        flush_memory()
 
         self.__dict__["model_shards"] = []
-
-        # 3. Sequential Shard Creation
         from keras.src.distribution.tensor_parallel.parameter_sharding import make_parameter_sharded_model, ParameterShardingStrategy
         
         for rank, device_id in enumerate(self.devices):
@@ -89,6 +81,7 @@ class TensorParallelKeras(Model):
                 device_id=device_id,
             )
 
+            # Migration for Replicated weights
             strat_helper = ParameterShardingStrategy(self.device_count, rank)
             try:
                 d_idx = int(str(device_id).split(":")[-1]) if ":" in str(device_id) else 0
@@ -116,7 +109,7 @@ class TensorParallelKeras(Model):
                 print(f"⚠️ Migration Error rank {rank}: {e}")
 
             self.model_shards.append(shard)
-            flush_memory()
+            flush_memory() 
             log_mem_stats(rank, device_id, "DONE creation")
 
         try: shutil.rmtree(self.temp_dir)
