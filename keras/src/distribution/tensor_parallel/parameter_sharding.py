@@ -38,7 +38,7 @@ class ParameterShardingStrategy:
         self.rank = rank
 
     def _map_variables_to_owners(self, model):
-        """Maps every variable ID to a LIST of (layer, attribute) pairs that point to it."""
+        """Maps every variable ID to a LIST of (layer, attribute) pairs."""
         var_to_owners = {}
         stack = [model]
         visited = set()
@@ -46,68 +46,61 @@ class ParameterShardingStrategy:
             layer = stack.pop()
             if id(layer) in visited: continue
             visited.add(id(layer))
+
+            # 1. Check tracking lists (CRITICAL for Functional models and weight tying)
+            for lst_name in ['_trainable_weights', '_non_trainable_weights', '_weights']:
+                if hasattr(layer, lst_name):
+                    lst = getattr(layer, lst_name)
+                    if isinstance(lst, list):
+                        for v in lst:
+                            if hasattr(v, 'assign') and hasattr(v, 'value'):
+                                var_to_owners.setdefault(id(v), []).append((layer, lst_name))
+
+            # 2. Check direct attributes
             for attr_name in dir(layer):
-                if attr_name.startswith("__"): continue
+                if attr_name.startswith("__") or attr_name in ['trainable_variables', 'variables', 'weights']: 
+                    continue
                 try: attr_val = getattr(layer, attr_name, None)
                 except Exception: continue
                 
-                is_var = hasattr(attr_val, 'assign') and hasattr(attr_val, 'value')
-                if is_var:
+                if hasattr(attr_val, 'assign') and hasattr(attr_val, 'value'):
                     var_to_owners.setdefault(id(attr_val), []).append((layer, attr_name))
-                elif hasattr(attr_val, 'weights') and not is_var:
+                elif hasattr(attr_val, 'layers') or hasattr(attr_val, 'weights'):
                     stack.append(attr_val)
                 elif isinstance(attr_val, (list, tuple)):
                     for item in attr_val:
-                        if hasattr(item, 'weights'): stack.append(item)
-            if hasattr(layer, 'layers'):
-                try: stack.extend(layer.layers)
-                except: pass
+                        if hasattr(item, 'layers') or hasattr(item, 'weights'): 
+                            stack.append(item)
         return var_to_owners
 
-    # ... (inside ParameterShardingStrategy class)
-    def _replace_variable(self, layer, attr_name, old_var, new_val_tensor, device_id=None):
-        """Creates a new GPU variable and swap-destroys the CPU one."""
-        try:
-            with keras.device(device_id):
-                new_var = keras.Variable(
-                    initializer=new_val_tensor,
-                    shape=new_val_tensor.shape,
-                    dtype=old_var.dtype,
-                    trainable=old_var.trainable,
-                    name=old_var.name 
-                )
-        except Exception:
-            return old_var
-        
-        # 1. Update the layer attribute.
-        try: object.__setattr__(layer, attr_name, new_var)
-        except: pass 
+    def _replace_variable(self, layer, attr_name, old_var, new_var):
+        """Swaps the variable and updates layer metadata to match sharded shapes."""
+        # 1. Update List Elements
+        if attr_name in ['_trainable_weights', '_non_trainable_weights', '_weights']:
+            lst = getattr(layer, attr_name)
+            for i, v in enumerate(lst):
+                if v is old_var:
+                    lst[i] = new_var
+        else:
+            # 2. Update Direct Attributes
+            object.__setattr__(layer, attr_name, new_var)
+            if not attr_name.startswith("_"):
+                try: object.__setattr__(layer, "_" + attr_name, new_var)
+                except: pass
 
-        if not attr_name.startswith("_"):
-            try: object.__setattr__(layer, "_" + attr_name, new_var)
-            except: pass
-
-        # 2. Update internal source-of-truth lists
-        for lst_name in ['_trainable_weights', '_non_trainable_weights', '_weights']:
-            if hasattr(layer, lst_name):
-                lst = getattr(layer, lst_name)
-                if isinstance(lst, list):
-                    for i, v in enumerate(lst):
-                        if v is old_var:
-                            lst[i] = new_var 
-
-        # 3. DESTRUCTIVE STEP: Bypass shape checks to clear Host RAM
-        # This replaces the failing old_var.assign(...) call
-        try:
-            import jax
-            object.__setattr__(old_var, "_value", jax.numpy.zeros((0,), dtype=old_var.dtype))
-        except:
-            pass
-
-        return new_var
+        # 3. Update Layer Metadata (CRITICAL: prevents ops from expecting full shapes)
+        if "Dense" in layer.__class__.__name__:
+            # If we sharded the output dimension, update 'units'
+            if new_var is getattr(layer, 'kernel', None) and new_var.shape[-1] != layer.units:
+                layer.units = new_var.shape[-1]
+        elif "Embedding" in layer.__class__.__name__:
+            # If we sharded the embedding dimension, update 'output_dim'
+            if new_var.shape[-1] != layer.output_dim:
+                layer.output_dim = new_var.shape[-1]
 
     def shard_model_parameters(self, shard_model, weight_loader, config, device_id):
-        modified = set()
+        modified_ids = set()
+        old_to_new = {} # Cache to preserve weight tying
         var_to_owners = self._map_variables_to_owners(shard_model)
         
         jax_target = None
@@ -121,41 +114,44 @@ class ParameterShardingStrategy:
             if callable(action):
                 targets = self._find_matching_parameters(shard_model, pattern)
                 for name, target_var in targets:
-                    lookup_name = name.replace(f"shard_{self.rank}/", "")
-                    try:
-                        source_val = weight_loader(lookup_name)
-                        if source_val is None: continue
-                        
-                        # FIXED: Cast |V2 dtype back to bfloat16 using ml_dtypes
-                        if hasattr(source_val, 'dtype') and (str(source_val.dtype).startswith('|V') or source_val.dtype == np.dtype('V2')):
-                            if ml_dtypes:
-                                source_val = source_val.view(ml_dtypes.bfloat16)
-                            else:
-                                source_val = source_val.astype('float32')
-                    except: continue
+                    if id(target_var) in modified_ids: continue
 
-                    # Slicing creates a temporary CPU slice
-                    sliced_val = action(source_val, self.rank)
-                    
-                    # Move to GPU
-                    sliced_val_tensor = jax.device_put(sliced_val, jax_target)
-                    sliced_val_tensor = sliced_val_tensor.astype(target_var.dtype)
-
-                    # Replace and Destroy CPU buffer
-                    if id(target_var) in var_to_owners:
-                        for layer, attr_name in var_to_owners[id(target_var)]:
-                            self._replace_variable(layer, attr_name, target_var, sliced_val_tensor, device_id=device_id)
+                    # 1. Use cached new_var if this is a tied weight
+                    if id(target_var) in old_to_new:
+                        new_var = old_to_new[id(target_var)]
                     else:
-                        target_var.assign(sliced_val_tensor)
+                        lookup_name = name.replace(f"shard_{self.rank}/", "")
+                        raw_val = weight_loader(lookup_name)
+                        if raw_val is None: continue
+                        
+                        # Apply sharding rule on CPU
+                        sliced_val = action(raw_val, self.rank)
+                        val_gpu = jax.device_put(sliced_val, jax_target)
+                        
+                        with keras.device(device_id):
+                            new_var = keras.Variable(
+                                initializer=val_gpu,
+                                shape=val_gpu.shape,
+                                dtype=target_var.dtype,
+                                trainable=target_var.trainable,
+                                name=target_var.name
+                            )
+                        old_to_new[id(target_var)] = new_var
+
+                    # 2. Swap in all locations (Layer attributes and Model lists)
+                    if id(target_var) in var_to_owners:
+                        for owner, attr_name in var_to_owners[id(target_var)]:
+                            self._replace_variable(owner, attr_name, target_var, new_var)
+
+                    # 3. Shred the old CPU buffer
+                    try: object.__setattr__(target_var, "_value", jax.numpy.zeros((0,), dtype=target_var.dtype))
+                    except: pass
                     
-                    modified.add(name)
-                    
-                    # Cleanup temporary slices
-                    del source_val, sliced_val, sliced_val_tensor
-                    gc.collect()
-                    log_stats(f"Sharded {name}") # Memory log after every parameter
+                    modified_ids.add(id(target_var))
         
-        return shard_model, modified
+        # Collect names of variables that were sharded
+        modified_names = {v.path if hasattr(v, 'path') else v.name for v in shard_model.variables if id(v) in modified_ids}
+        return shard_model, modified_names
 
     def _find_matching_parameters(self, model, pattern: str):
         return [(v.path if hasattr(v, 'path') else v.name, v) 
