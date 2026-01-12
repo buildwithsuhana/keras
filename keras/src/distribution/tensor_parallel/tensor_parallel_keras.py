@@ -6,6 +6,7 @@ import tempfile
 import numpy as np
 import psutil
 import subprocess
+import re  # <--- Add this import
 import keras
 from keras import ops
 from keras.src.distribution.tensor_parallel.autoconfig import get_default_config
