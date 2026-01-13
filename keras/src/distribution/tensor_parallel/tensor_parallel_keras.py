@@ -16,7 +16,8 @@ from keras.src.models import Model
 import ctypes
 import jax
 
-# CRITICAL: Force low-memory policy for large models on Kaggle
+# Kaggle Protocol Buffers and Memory Policy
+os.environ["PROTOCOL_BUFFERS_PYTHON_IMPLEMENTATION"] = "python"
 keras.config.set_dtype_policy("bfloat16")
 
 def log_mem_stats(rank, device_id, stage=""):
@@ -43,35 +44,23 @@ class TensorParallelKeras(Model):
             device_count = len(all_devices)
             device_ids = [str(d) for d in all_devices]
 
-        self.device_count = device_count
-        self.devices = [self._normalize_device_id(d) for d in device_ids]
+        self.device_count, self.devices = device_count, [self._normalize_device_id(d) for d in device_ids]
         self.temp_dir = tempfile.mkdtemp(prefix="tp_weights_")
         
-        # 1. Instantiate Master Model on CPU
+        # 1. Build Master on CPU
         with jax.default_device(jax.devices("cpu")[0]):
-            if callable(model) and not isinstance(model, keras.Model):
-                loaded_model = model()
-            else:
-                loaded_model = model
-            # Build with a flexible sequence length (None) to avoid creating variables
-            # that depend on a hard-coded sequence length of 1 which can lead to
-            # shape mismatches later during training (e.g., normalization params).
-            try:
-                loaded_model.build({"token_ids": (None, None), "padding_mask": (None, None)})
-            except Exception:
-                # Fallback to original conservative build if some models require fixed dims
-                loaded_model.build({"token_ids": (None, 1), "padding_mask": (None, 1)})
+            loaded_model = model() if callable(model) and not isinstance(model, keras.Model) else model
+            loaded_model.build({"token_ids": (None, 1), "padding_mask": (None, 1)})
 
         self.model_config = loaded_model.get_config()
         self.model_cls = loaded_model.__class__
         self.tensor_parallel_config = get_default_config(loaded_model, self.devices)
 
-        # 2. Save and Shred ONE VARIABLE AT A TIME (Prevents peak RSS doubling)
+        # 2. Sequential Save and Shred
         for v in loaded_model.variables:
             name = (v.path if hasattr(v, 'path') else v.name).replace("/", "_").replace(":", "_")
-            path = os.path.join(self.temp_dir, name + ".npy")
-            np.save(path, np.array(v)) # Use np.array to convert JAX -> NumPy
-            shred_variable(v) # Free RAM immediately after saving
+            np.save(os.path.join(self.temp_dir, name + ".npy"), np.array(v))
+            shred_variable(v)
         
         del loaded_model 
         flush_memory()
@@ -81,78 +70,32 @@ class TensorParallelKeras(Model):
         
         for rank, device_id in enumerate(self.devices):
             log_mem_stats(rank, device_id, "START creation")
-
-            # Build shard on CPU
             with keras.device("cpu"):
                 config = self.model_config.copy()
                 config["name"] = f"shard_model_{rank}"
                 shard = self.model_cls.from_config(config)
-                try:
-                    shard.build({"token_ids": (None, None), "padding_mask": (None, None)})
-                except Exception:
-                    shard.build({"token_ids": (None, 1), "padding_mask": (None, 1)})
+                shard.build({"token_ids": (None, 1), "padding_mask": (None, 1)})
 
-            # Shard parameters
-            shard, modified_vars = make_parameter_sharded_model(
-                shard_model=shard,
-                weight_loader=self._weight_loader, 
-                config=self.tensor_parallel_config,
-                rank=rank,
-                device_count=self.device_count,
-                device_id=device_id,
-            )
+            shard, modified_vars = make_parameter_sharded_model(shard, self._weight_loader, self.tensor_parallel_config, rank, self.device_count, device_id)
 
-            # Migration for Replicated weights
             strat_helper = ParameterShardingStrategy(self.device_count, rank)
             try:
                 d_idx = int(str(device_id).split(":")[-1]) if ":" in str(device_id) else 0
                 target_jax_device = jax.devices('gpu')[d_idx]
                 var_to_owners = strat_helper._map_variables_to_owners(shard)
-                
                 for v in list(shard.variables):
                     v_name = v.path if hasattr(v, 'path') else v.name
-                    # FIX: Correct naming match
                     clean_name = re.sub(r'^shard_model_\d+/', '', v_name).replace("/", ".")
-                    if clean_name in modified_vars or v_name in modified_vars: 
-                        continue 
-
+                    if clean_name in modified_vars or v_name in modified_vars: continue 
                     lookup_name = re.sub(r'^shard_model_\d+/', '', v_name)
                     raw_val = self._weight_loader(lookup_name) 
                     if raw_val is not None:
                         val_gpu = jax.device_put(raw_val, target_jax_device)
                         if id(v) in var_to_owners:
-                            # Create a proper Keras Variable on the target device
-                            try:
-                                with keras.device(device_id):
-                                    new_var = keras.Variable(val_gpu, dtype=v.dtype, name=v.name)
-                            except Exception:
-                                # Fallback to assigning the array if Variable creation fails
-                                new_var = None
-
                             for layer, attr_name, idx in var_to_owners[id(v)]:
-                                if new_var is not None:
-                                    strat_helper._replace_variable(layer, attr_name, v, new_var, index=idx)
-                                else:
-                                    # If we couldn't create a Variable, try assigning into the existing variable
-                                    try:
-                                        owner_list = getattr(layer, attr_name)
-                                        if isinstance(owner_list, list) and idx is not None and idx < len(owner_list):
-                                            owner_list[idx] = val_gpu
-                                        else:
-                                            object.__setattr__(layer, attr_name, val_gpu)
-                                    except Exception:
-                                        pass
-                        else:
-                            # Assign value into the existing Variable
-                            try:
-                                v.assign(val_gpu)
-                            except Exception:
-                                # As a last resort, replace attribute directly
-                                try: object.__setattr__(v, '_value', val_gpu)
-                                except: pass
-                        # NOTE: Don't shred assigned variables, they are now on GPU
-            except Exception as e:
-                print(f"⚠️ Migration Error rank {rank}: {e}")
+                                strat_helper._replace_variable(layer, attr_name, v, val_gpu, index=idx)
+                        else: v.assign(val_gpu)
+            except Exception as e: print(f"⚠️ Migration Error rank {rank}: {e}")
 
             self.model_shards.append(shard)
             flush_memory() 
@@ -162,7 +105,7 @@ class TensorParallelKeras(Model):
         except: pass
         self.built = True
 
-    # ... (rest of the Model class same as before)
+    # ... (remaining call/train_step/compile logic same as before)
     def _normalize_device_id(self, device_id):
         d_str = str(device_id).lower()
         if "tpu" in d_str: return f"tpu:{d_str.split(':')[-1]}" if ":" in d_str else f"tpu:{d_str}"
