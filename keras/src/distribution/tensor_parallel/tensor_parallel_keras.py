@@ -100,8 +100,14 @@ class TensorParallelKeras(Model):
 
                 with device(self.devices[0]):
                     self.model_shards[0] = model
-            self.built = True
+            
             self.assembled_model = self._original_model
+
+            if hasattr(self._original_model, "inputs"):
+                self._inputs = self._original_model.inputs
+                self._outputs = self._original_model.outputs
+            
+            self.built = True
             return
 
         if self.tensor_parallel_config is None:
@@ -167,6 +173,8 @@ class TensorParallelKeras(Model):
         self.built = True
         if self.distributed:
             self.assembled_model = self.build_assembled_model()
+            self._inputs = self.assembled_model.inputs
+            self._outputs = self.assembled_model.outputs
         else:
             self.assembled_model = self._original_model
 

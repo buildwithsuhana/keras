@@ -86,8 +86,8 @@ class TensorParallelOptimizer(optimizers.Optimizer):
         self.base_optimizer.build(variables)
 
         if variables:
-            dummy_grads = [ops.zeros_like(v) for v in variables]
-            self.base_optimizer.apply_gradients(zip(dummy_grads, variables))
+            grads = [ops.zeros_like(v) for v in variables]
+            self.base_optimizer.apply_gradients(zip(grads, variables))
                     
         if self.shard_optimizer_states:
             self._initialize_sharded_states()
@@ -286,19 +286,23 @@ class TensorParallelOptimizer(optimizers.Optimizer):
                 or 'to_global' (local -> global).
         """
         for var in local_opt.variables:
+            target_dtype = backend.standardize_dtype(var.dtype)
+            
             if var is local_opt.iterations:
                 if direction == "to_local":
-                    var.assign(ops.cast(self._sharded_states["iterations"][shard_idx], var.dtype))
+                    val = self._sharded_states["iterations"][shard_idx]
+                    var.assign(ops.cast(val, target_dtype))
                 else:
                     self._sharded_states["iterations"][shard_idx] = ops.convert_to_numpy(var)
                 continue
                 
             param = self._state_var_to_param.get(var.path)
             slot = self._var_to_slot_name.get(var.path)
+            
             if param and slot in self._sharded_states and param.path in self._sharded_states[slot]:
                 if direction == "to_local":
                     val = self._sharded_states[slot][param.path][shard_idx]
                     if var.shape == val.shape:
-                        var.assign(ops.cast(val, var.dtype))
+                        var.assign(ops.cast(val, target_dtype))
                 else:
                     self._sharded_states[slot][param.path][shard_idx] = ops.convert_to_numpy(var)
