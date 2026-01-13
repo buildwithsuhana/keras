@@ -11,14 +11,9 @@ def analyze_dense_layer(layer):
     kernel = getattr(layer, "kernel", getattr(layer, "_kernel", None))
     if kernel is not None and len(kernel.shape) == 2:
         input_dim, output_dim = kernel.shape[0], kernel.shape[1]
-    if output_dim is None and hasattr(layer, "units"):
-        output_dim = layer.units
-    if input_dim is None and hasattr(layer, "input_shape") and layer.input_shape:
-        input_dim = layer.input_shape[-1]
     if input_dim is None or output_dim is None: return "dense"
-    threshold = 1.5
-    if output_dim > input_dim * threshold: return "up_projection"
-    if input_dim > output_dim * threshold: return "down_projection"
+    if output_dim > input_dim * 1.5: return "up_projection"
+    if input_dim > output_dim * 1.5: return "down_projection"
     return "dense"
 
 def _reduce_sum(x):
@@ -30,34 +25,30 @@ def _gather(x, axis):
 def _apply_layer_sharding_rules(layer, device_count, state_rules, output_rules):
     def split_rule(dim):
         return functools.partial(split_tensor_for_parallelism, device_count=device_count, dim=dim)
-    def gather_rule(axis):
-        return functools.partial(_gather, axis=axis)
 
     layer_path = layer.path
     if isinstance(layer, layers.Dense):
         mlp_type = analyze_dense_layer(layer)
         if mlp_type in ["up_projection", "dense"]:
             state_rules[layer.kernel.path] = split_rule(dim=1)
-            if layer.use_bias: state_rules[layer.bias.path] = split_rule(dim=0)
-            output_rules[layer_path] = gather_rule(axis=-1)
+            output_rules[layer_path] = functools.partial(_gather, axis=-1)
         elif mlp_type == "down_projection":
             state_rules[layer.kernel.path] = split_rule(dim=0)
             output_rules[layer_path] = _reduce_sum
 
     elif isinstance(layer, layers.EinsumDense):
         if "attention_output" in layer.name:
-            # Row Parallel: Split heads, then sum output
             state_rules[layer.kernel.path] = split_rule(dim=0)
             output_rules[layer_path] = _reduce_sum
         elif any(x in layer.name for x in ["query", "key", "value"]):
-            # Column Parallel (Heads): No gathering, keep activations sharded for Attention layer
+            # Column Parallel: shard heads, keep activations sharded for attention
             state_rules[layer.kernel.path] = split_rule(dim=1)
             if hasattr(layer, "bias") and layer.bias is not None:
                 state_rules[layer.bias.path] = split_rule(dim=0)
             output_rules[layer_path] = lambda x: x
         else:
             state_rules[layer.kernel.path] = split_rule(dim=1)
-            output_rules[layer_path] = gather_rule(axis=-1)
+            output_rules[layer_path] = functools.partial(_gather, axis=-1)
 
     elif "Embedding" in layer.__class__.__name__:
         emb = getattr(layer, "embeddings", None)
@@ -65,7 +56,6 @@ def _apply_layer_sharding_rules(layer, device_count, state_rules, output_rules):
         output_rules[layer_path] = lambda x: x
 
     elif "Normalization" in layer.__class__.__name__:
-        # Shard normalization scale/bias along the feature dimension
         for attr in ["scale", "gamma", "beta"]:
             var = getattr(layer, attr, None)
             if var is not None: state_rules[var.path] = split_rule(dim=0)

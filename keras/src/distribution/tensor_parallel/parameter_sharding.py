@@ -1,12 +1,11 @@
 import logging
 import re
-import gc
-import os
 import psutil
-from typing import Any, Tuple, Set, Callable
+import os
 import keras
 import numpy as np
 import jax
+from typing import Any, Tuple, Set, Callable
 
 class ParameterShardingStrategy:
     def __init__(self, device_count: int, rank: int):
@@ -14,7 +13,6 @@ class ParameterShardingStrategy:
         self.rank = rank
 
     def _map_variables_to_owners(self, model):
-        """Exhaustively maps variable IDs to all layers and internal lists that reference them."""
         var_to_owners = {}
         stack, visited = [model], set()
         WEIGHT_LISTS = ['_trainable_weights', '_non_trainable_weights', '_weights', '_variables']
@@ -42,7 +40,6 @@ class ParameterShardingStrategy:
         return var_to_owners
 
     def _replace_variable(self, layer, attr_name, old_var, new_var, index=None):
-        """Swaps variable objects and updates layer metadata for sharded shapes."""
         if index is not None:
             lst = getattr(layer, attr_name)
             if isinstance(lst, list) and index < len(lst) and lst[index] is old_var:
@@ -54,11 +51,21 @@ class ParameterShardingStrategy:
                 try: object.__setattr__(layer, "_" + attr_name, new_var)
                 except: pass
         except: pass
-        # Update layer metadata to prevent 'Build' or 'Shape' errors
+        
+        # CRITICAL: Update layer metadata to match the new sharded shape
         if hasattr(layer, "output_dim") and "Embedding" in layer.__class__.__name__:
             layer.output_dim = new_var.shape[-1]
-        elif hasattr(layer, "units") and ("Dense" in layer.__class__.__name__):
-            layer.units = new_var.shape[-1]
+        elif "EinsumDense" in layer.__class__.__name__:
+            # EinsumDense often caches its output shape or reduction dims
+            if hasattr(layer, "output_shape") and layer.output_shape:
+                new_shape = list(layer.output_shape)
+                # If we sharded the output dimension (dim 1 of kernel usually)
+                if new_var.shape[-1] != old_var.shape[-1]:
+                    new_shape[-1] = new_var.shape[-1]
+                layer.output_shape = tuple(new_shape)
+        elif "Dense" in layer.__class__.__name__:
+            if hasattr(layer, "units"):
+                layer.units = new_var.shape[-1]
 
     def shard_model_parameters(self, shard_model, weight_loader, config, device_id):
         modified_paths = set() 
@@ -69,7 +76,6 @@ class ParameterShardingStrategy:
         for pattern, action in config.state_rules.items():
             targets = self._find_matching_parameters(shard_model, pattern)
             for name, target_var in targets:
-                # FIX: Check path instead of ID to avoid re-sharding or skipping replaced vars
                 if name in modified_paths: continue
 
                 lookup_name = re.sub(r'^shard_model_\d+/', '', name)
@@ -82,7 +88,6 @@ class ParameterShardingStrategy:
 
                 sliced_val = action(raw_val, self.rank)
                 val_gpu = jax.device_put(sliced_val, jax_target)
-                
                 with keras.device(device_id):
                     new_var = keras.Variable(val_gpu, dtype=target_var.dtype, name=target_var.name)
 
@@ -90,19 +95,15 @@ class ParameterShardingStrategy:
                     for owner, attr_name, index in var_to_owners[id(target_var)]:
                         self._replace_variable(owner, attr_name, target_var, new_var, index=index)
 
-                # Memory Logging
                 mem_mb = psutil.Process(os.getpid()).memory_info().rss / (1024 ** 2)
                 print(f"⛓️ [Rank {self.rank}] Sharded variable: {name} | Host RSS: {mem_mb:.0f} MB")
-
                 try: object.__setattr__(target_var, "_value", jax.numpy.zeros((0,), dtype=target_var.dtype))
                 except: pass
                 modified_paths.add(name)
-        
         return shard_model, modified_paths
     
     def _find_matching_parameters(self, model, pattern: str):
-        return [(v.path if hasattr(v, 'path') else v.name, v) for v in model.variables 
-                if re.search(pattern, v.path if hasattr(v, 'path') else v.name)]
+        return [(v.path if hasattr(v, 'path') else v.name, v) for v in model.variables if re.search(pattern, v.path if hasattr(v, 'path') else v.name)]
 
 def make_parameter_sharded_model(shard_model, weight_loader, config, rank, device_count, device_id):
     strategy = ParameterShardingStrategy(device_count, rank)

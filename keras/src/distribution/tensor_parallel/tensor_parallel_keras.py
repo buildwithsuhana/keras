@@ -82,7 +82,7 @@ class TensorParallelKeras(Model):
                     if id(v) in var_to_owners:
                         for layer, attr_name, idx in var_to_owners[id(v)]:
                             strat_helper._replace_variable(layer, attr_name, v, val_gpu, index=idx)
-                    print(f"🔄 [Rank {rank}] Replicated variable: {v_path} | Host RSS: {psutil.Process(os.getpid()).memory_info().rss/(1024**2):.0f} MB")
+                    else: v.assign(val_gpu)
             self.model_shards.append(shard)
             flush_memory() 
         self.built = True
