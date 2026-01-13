@@ -26,35 +26,18 @@ def analyze_dense_layer(layer):
     output_dim = None
 
     kernel = getattr(layer, "kernel", getattr(layer, "_kernel", None))
-    if kernel is not None:
-        if len(kernel.shape) == 2:
-            input_dim = kernel.shape[0]
-            output_dim = kernel.shape[1]
-
+    if kernel is not None and len(kernel.shape) == 2:
+        input_dim, output_dim = kernel.shape[0], kernel.shape[1]
     if output_dim is None and hasattr(layer, "units"):
         output_dim = layer.units
-
-    if (
-        input_dim is None
-        and hasattr(layer, "input_shape")
-        and layer.input_shape
-        and len(layer.input_shape) > 1
-    ):
+    if input_dim is None and hasattr(layer, "input_shape") and layer.input_shape:
         input_dim = layer.input_shape[-1]
-
-    if input_dim is None or output_dim is None:
-        return "dense"
-
-    expansion_threshold = 1.5
-    is_expansion = output_dim > input_dim * expansion_threshold
-    is_contraction = input_dim > output_dim * expansion_threshold
-
-    if is_expansion:
-        return "up_projection"
-    elif is_contraction:
-        return "down_projection"
-    else:
-        return "dense"
+    if input_dim is None or output_dim is None: return "dense"
+    
+    threshold = 1.5
+    if output_dim > input_dim * threshold: return "up_projection"
+    if input_dim > output_dim * threshold: return "down_projection"
+    return "dense"
 
 
 def _reduce_sum(x):
@@ -100,10 +83,7 @@ def _apply_layer_sharding_rules(layer, device_count, state_rules, output_rules):
     """
 
     def split_rule(dim):
-        return functools.partial(
-            split_tensor_for_parallelism, device_count=device_count, dim=dim
-        )
-
+        return functools.partial(split_tensor_for_parallelism, device_count=device_count, dim=dim)
     def gather_rule(axis):
         return functools.partial(_gather, axis=axis)
 
@@ -114,38 +94,28 @@ def _apply_layer_sharding_rules(layer, device_count, state_rules, output_rules):
         mlp_type = analyze_dense_layer(layer)
 
         if mlp_type == "up_projection":
-            state_rules[id(layer.kernel)] = split_rule(dim=1)
-            if layer.use_bias:
-                state_rules[id(layer.bias)] = split_rule(dim=0)
+            state_rules[layer.kernel.path] = split_rule(dim=1)
+            if layer.use_bias: state_rules[layer.bias.path] = split_rule(dim=0)
             output_rules[layer_path] = gather_rule(axis=-1)
-
         elif mlp_type == "down_projection":
-            state_rules[id(layer.kernel)] = split_rule(dim=0)
+            state_rules[layer.kernel.path] = split_rule(dim=0)
             output_rules[layer_path] = _reduce_sum
-
         else:
-            state_rules[id(layer.kernel)] = split_rule(dim=1)
-            if layer.use_bias:
-                state_rules[id(layer.bias)] = split_rule(dim=0)
+            state_rules[layer.kernel.path] = split_rule(dim=1)
+            if layer.use_bias: state_rules[layer.bias.path] = split_rule(dim=0)
             output_rules[layer_path] = gather_rule(axis=-1)
-
     elif isinstance(layer, layers.EinsumDense):
         if "attention_output" in layer.name:
-            state_rules[id(layer.kernel)] = split_rule(dim=0)
+            state_rules[layer.kernel.path] = split_rule(dim=0)
             output_rules[layer_path] = _reduce_sum
         else:
-            state_rules[id(layer.kernel)] = split_rule(dim=1)
+            state_rules[layer.kernel.path] = split_rule(dim=1)
             if hasattr(layer, "bias") and layer.bias is not None:
-                state_rules[id(layer.bias)] = split_rule(dim=0)
+                state_rules[layer.bias.path] = split_rule(dim=0)
             output_rules[layer_path] = gather_rule(axis=-1)
-
-    elif (
-        isinstance(layer, (layers.Embedding,))
-        or "Embedding" in layer.__class__.__name__
-    ):
-        embeddings_var = getattr(layer, "embeddings", None)
-        if embeddings_var is not None:
-            state_rules[id(embeddings_var)] = split_rule(dim=1)
+    elif isinstance(layer, (layers.Embedding,)) or "Embedding" in layer.__class__.__name__:
+        emb = getattr(layer, "embeddings", None)
+        if emb is not None: state_rules[emb.path] = split_rule(dim=1)
         output_rules[layer_path] = lambda x: x
 
 
@@ -169,12 +139,7 @@ def get_default_config(model, device_ids):
         `output_rules` for tensor parallelism.
     """
     device_count = len(device_ids)
-    state_rules = {}
-    output_rules = {}
-
+    state_rules, output_rules = {}, {}
     for layer in model._flatten_layers(recursive=True, include_self=True):
-        _apply_layer_sharding_rules(
-            layer, device_count, state_rules, output_rules
-        )
-
+        _apply_layer_sharding_rules(layer, device_count, state_rules, output_rules)
     return LayoutMap(state_rules=state_rules, output_rules=output_rules)
