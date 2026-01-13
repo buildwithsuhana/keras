@@ -6,11 +6,7 @@ from keras.src import saving
 from keras.src.backend import distribution_lib
 
 class TensorParallelOptimizer(optimizers.Optimizer):
-    """Consolidated Keras Optimizer for tensor-parallel distributed training.
-    
-    This class handles gradient synchronization, state sharding, and weight 
-    updates across multiple devices in a single class.
-    """
+    """Consolidated Keras Optimizer for tensor-parallel distributed training."""
 
     def __init__(
         self,
@@ -21,26 +17,30 @@ class TensorParallelOptimizer(optimizers.Optimizer):
         name=None,
         **kwargs,
     ):
-        # 1. Initialize Base Optimizer
+        # 1. Essential: Call super().__init__ FIRST
+        # We use a placeholder LR of 0.0 because we will sync it 
+        # with the base_optimizer immediately after.
+        super().__init__(learning_rate=0.0, name=name, **kwargs)
+
+        # 2. Initialize Base Optimizer
         if isinstance(base_optimizer, str):
             self.base_optimizer = optimizers.get(base_optimizer)
         else:
             self.base_optimizer = base_optimizer
 
-        # 2. Extract LR and Setup Keras Optimizer properties
+        # 3. Sync Learning Rate from base to self
         lr = self.base_optimizer.learning_rate
-        lr_val = float(ops.convert_to_numpy(lr(0))) if callable(lr) else float(ops.convert_to_numpy(lr))
-        
-        name = name or f"TensorParallel_{self.base_optimizer.name}"
-        kwargs.pop("learning_rate", None)
-        super().__init__(learning_rate=lr_val, name=name, **kwargs)
+        if callable(lr):
+            self.learning_rate = float(ops.convert_to_numpy(lr(0)))
+        else:
+            self.learning_rate = float(ops.convert_to_numpy(lr))
 
-        # 3. Distributed Training Config
+        # 4. Distributed Training Config
         self.device_count = device_count
         self.shard_optimizer_states = shard_optimizer_states
         self.tensor_parallel_config = tensor_parallel_config
         
-        # 4. Internal State Management
+        # 5. Internal State Management
         self._sharded_states = {}
         self._state_var_to_param = {}
         self._var_to_slot_name = {}
@@ -56,7 +56,11 @@ class TensorParallelOptimizer(optimizers.Optimizer):
 
         # Dry run to initialize optimizer slots (moments, velocity, etc.)
         if variables:
-            zero_grads = [ops.zeros(v.shape, dtype=v.dtype) for v in variables]
+            # Standardize dtypes for safety
+            zero_grads = [
+                ops.zeros(v.shape, dtype=backend.standardize_dtype(v.dtype)) 
+                for v in variables
+            ]
             self.base_optimizer.apply_gradients(zip(zero_grads, variables))
         
         # Initialize sharding map
@@ -65,24 +69,25 @@ class TensorParallelOptimizer(optimizers.Optimizer):
             
         super().build(variables)
 
-    # --- Sharding Logic ---
-
     def _initialize_sharded_states(self):
         """Maps optimizer slots to model parameters and partitions them."""
         self._sharded_states = {}
         for state_var in self.base_optimizer.variables:
-            if state_var is self.base_optimizer.iterations:
+            # Handle the 'iterations' global variable
+            if "iterations" in state_var.path or state_var is self.base_optimizer.iterations:
                 self._sharded_states["iterations"] = self._partition_state(state_var, 0)
                 continue
 
-            # Identify which model parameter this state variable belongs to
+            # Map state variables to model parameters
             for model_var in self._model_variables:
                 if model_var.path in state_var.path:
-                    slot_name = state_var.path.split(model_var.path)[-1].strip("/")
+                    # Extract the slot name (e.g., 'm' or 'v' for Adam)
+                    suffix = state_var.path.split(model_var.path)[-1]
+                    slot_name = suffix.strip("/")
+                    
                     self._state_var_to_param[state_var.path] = model_var
                     self._var_to_slot_name[state_var.path] = slot_name
                     
-                    # Determine sharding dimension
                     dim = self._get_sharding_dim(model_var)
                     partitioned = self._partition_state(state_var, dim)
                     self._sharded_states.setdefault(slot_name, {})[model_var.path] = partitioned
@@ -96,47 +101,51 @@ class TensorParallelOptimizer(optimizers.Optimizer):
         return [np.copy(arr) for _ in range(self.device_count)]
 
     def _get_sharding_dim(self, param):
-        """Retrieves sharding dimension from config if available."""
         if not self.tensor_parallel_config:
             return 0
         rule = self.tensor_parallel_config.state_rules.get(id(param))
         if rule:
-            return rule.keywords.get("dim", 0) if hasattr(rule, "keywords") else getattr(rule, "dim", 0)
+            if hasattr(rule, "keywords") and "dim" in rule.keywords:
+                return rule.keywords["dim"]
+            return getattr(rule, "dim", 0)
         return 0
 
-    # --- Gradient Application ---
-
     def apply_gradients(self, grads_and_vars, **kwargs):
-        """Main entry point for updates."""
-        # Check if we are receiving a list of lists (sharded gradients)
-        is_sharded = isinstance(grads_and_vars, list) and isinstance(grads_and_vars[0], list)
+        """Coordinates gradient synchronization and application."""
+        # Determine if we have nested lists (sharded mode)
+        is_sharded = (
+            isinstance(grads_and_vars, list) and 
+            len(grads_and_vars) > 0 and 
+            isinstance(grads_and_vars[0], list)
+        )
         
         if not is_sharded:
             return self.base_optimizer.apply_gradients(grads_and_vars, **kwargs)
 
         shard_models = kwargs.get("shard_models")
         if not shard_models:
-            raise ValueError("`shard_models` is required for sharded gradient updates.")
+            raise ValueError("`shard_models` is required when applying sharded gradients.")
 
-        # 1. Sync gradients across devices (All-Reduce)
+        # 1. All-Reduce non-parallel gradients
         synced_grads_and_vars = self._synchronize_gradients(grads_and_vars)
 
-        # 2. Apply updates shard-by-shard
+        # 2. Update each shard locally
         for i in range(self.device_count):
             shard_opt = shard_models[i].optimizer.base_optimizer
             
-            # Load local shard of optimizer state
+            # Shard -> Local Optimizer
             self._transfer_state(shard_opt, shard_idx=i, direction="to_local")
             
-            # Perform update
+            # Local Update
             shard_opt.apply_gradients(synced_grads_and_vars[i])
             
-            # Save updated state back to global sharded storage
+            # Local Optimizer -> Shard
             self._transfer_state(shard_opt, shard_idx=i, direction="to_global")
 
     def _transfer_state(self, local_opt, shard_idx, direction="to_local"):
-        """Moves data between the local optimizer instance and global sharded state."""
+        """Syncs data between sharded numpy storage and local optimizer variables."""
         for var in local_opt.variables:
+            # Handle Iterations
             if var is local_opt.iterations:
                 if direction == "to_local":
                     var.assign(ops.cast(self._sharded_states["iterations"][shard_idx], var.dtype))
@@ -144,6 +153,7 @@ class TensorParallelOptimizer(optimizers.Optimizer):
                     self._sharded_states["iterations"][shard_idx] = ops.convert_to_numpy(var)
                 continue
 
+            # Handle Slots
             param = self._state_var_to_param.get(var.path)
             slot = self._var_to_slot_name.get(var.path)
             
@@ -156,17 +166,16 @@ class TensorParallelOptimizer(optimizers.Optimizer):
                     self._sharded_states[slot][param.path][shard_idx] = ops.convert_to_numpy(var)
 
     def _synchronize_gradients(self, gradients_and_vars):
-        """Performs All-Reduce logic based on TP configuration."""
+        """Cross-device gradient reduction."""
         if not self.tensor_parallel_config:
             return gradients_and_vars
 
-        # Simplify: Perform mean All-Reduce for non-tensor-parallel weights
         for i in range(len(gradients_and_vars[0])):
             var = gradients_and_vars[0][i][1]
+            # Reduce gradients for variables NOT covered by TP rules
             if var.path not in self.tensor_parallel_config.state_rules:
                 grads = [shard[i][0] for shard in gradients_and_vars if shard[i][0] is not None]
                 if grads:
-                    # Use backend communication if available
                     if distribution_lib.get_device_count() > 1:
                         reduced = distribution_lib.all_reduce(grads[0], op="mean", axis_name="model")
                     else:
@@ -175,8 +184,6 @@ class TensorParallelOptimizer(optimizers.Optimizer):
                     for shard_idx in range(self.device_count):
                         gradients_and_vars[shard_idx][i] = (reduced, var)
         return gradients_and_vars
-
-    # --- Keras Boilerplate ---
 
     def get_config(self):
         config = super().get_config()
@@ -192,7 +199,4 @@ class TensorParallelOptimizer(optimizers.Optimizer):
     def variables(self): return self.base_optimizer.variables
 
     @property
-    def learning_rate(self): return self.base_optimizer.learning_rate
-
-    @learning_rate.setter
-    def learning_rate(self, value): self.base_optimizer.learning_rate = value
+    def iterations(self): return self.base_optimizer.iterations
