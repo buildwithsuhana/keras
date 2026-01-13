@@ -1,62 +1,180 @@
-import re
-import numpy as np
+import functools
+
 from keras.src import layers
+from keras.src.backend import distribution_lib
 from keras.src.distribution.tensor_parallel.tensor_layout import LayoutMap
+from keras.src.distribution.tensor_parallel.tensor_layout import (
+    split_tensor_for_parallelism,
+)
 
-def _split_tensor_cpu(x, index, device_count, dim):
-    """Splits the tensor using standard NumPy on CPU to avoid GPU OOM."""
-    splits = np.array_split(x, device_count, axis=dim)
-    return splits[index]
 
-def _split_rule(device_count, dim):
-    return lambda x, index: _split_tensor_cpu(x, index, device_count, dim=dim)
+def analyze_dense_layer(layer):
+    """Classifies a Dense layer based on its input/output dimensions.
 
-def _apply_layer_sharding_rules(layer, full_name, device_count, state_rules, output_rules):
-    lname = layer.name.lower() if layer.name else ""
-    cls_name = layer.__class__.__name__
-    clean_name = full_name.lstrip(".")
-    rule_key_kernel = f"{clean_name}.kernel"
+    This function uses a heuristic to determine if a Dense layer acts as an
+    'up_projection' (expansion), a 'down_projection' (contraction), or a
+    standard 'dense' layer. This classification is used to determine the
+    appropriate sharding strategy (e.g., column-parallel vs row-parallel).
 
-    # 1. Shard Normalization (Crucial for sharded tensor support)
-    if "Normalization" in cls_name:
-        for attr in ["scale", "gamma", "beta"]:
-            if hasattr(layer, attr) and getattr(layer, attr) is not None:
-                state_rules[f"{clean_name}.{attr}"] = _split_rule(device_count, dim=0)
-        return
+    Args:
+        layer: The Keras Dense layer instance to analyze.
 
-    # 2. Shard Dense / EinsumDense Layers
-    if "Dense" in cls_name:
-        is_proj = any(x in lname for x in ["proj", "output", "gate", "ffw", "query", "key", "value"])
-        if is_proj:
-            # Persistent Row-Parallel: Always split the input dimension
-            state_rules[rule_key_kernel] = _split_rule(device_count, dim=0)
+    Returns:
+        str: One of 'up_projection', 'down_projection', or 'dense'.
+    """
+    input_dim = None
+    output_dim = None
 
-    elif "Embedding" in cls_name:
-        for v in layer.variables:
-            attr = v.path.split("/")[-1] if hasattr(v, "path") else v.name.split("/")[-1].split(":")[0]
-            state_rules[f"{clean_name}.{attr}"] = _split_rule(device_count, dim=1)
-        output_rules[clean_name] = {0: "no_comm"}
+    kernel = getattr(layer, "kernel", getattr(layer, "_kernel", None))
+    if kernel is not None:
+        if len(kernel.shape) == 2:
+            input_dim = kernel.shape[0]
+            output_dim = kernel.shape[1]
 
-def get_default_config(module, device_ids):
+    if output_dim is None and hasattr(layer, "units"):
+        output_dim = layer.units
+
+    if (
+        input_dim is None
+        and hasattr(layer, "input_shape")
+        and layer.input_shape
+        and len(layer.input_shape) > 1
+    ):
+        input_dim = layer.input_shape[-1]
+
+    if input_dim is None or output_dim is None:
+        return "dense"
+
+    expansion_threshold = 1.5
+    is_expansion = output_dim > input_dim * expansion_threshold
+    is_contraction = input_dim > output_dim * expansion_threshold
+
+    if is_expansion:
+        return "up_projection"
+    elif is_contraction:
+        return "down_projection"
+    else:
+        return "dense"
+
+
+def _reduce_sum(x):
+    """Performs an all-reduce sum operation across the 'model' mesh axis.
+
+    Args:
+        x: The input tensor to reduce.
+
+    Returns:
+        The reduced tensor, summed across all devices in the model axis.
+    """
+    return distribution_lib.all_reduce(x, op="sum", axis_name="model")
+
+
+def _gather(x, axis):
+    """Performs an all-gather operation across the 'model' mesh axis.
+
+    Args:
+        x: The input tensor shard to gather.
+        axis: The axis along which to concatenate the gathered parts.
+
+    Returns:
+        The gathered tensor, concatenated along the specified axis.
+    """
+    return distribution_lib.all_gather(x, axis=axis, axis_name="model")
+
+
+def _apply_layer_sharding_rules(layer, device_count, state_rules, output_rules):
+    """Applies sharding rules to a single layer based on its type.
+
+    This function populates `state_rules` and `output_rules` with strategies
+    specific to the layer class (e.g., Dense, EinsumDense, Embedding). It
+    determines how weights should be partitioned (state rules) and how outputs
+    should be synchronized (output rules).
+
+    Args:
+        layer: The Keras layer instance to configure.
+        device_count: The number of devices available for tensor parallelism.
+        state_rules: A dictionary mapping variable paths to sharding functions.
+            Updated in-place.
+        output_rules: A dictionary mapping layer paths to output communication
+            functions. Updated in-place.
+    """
+
+    def split_rule(dim):
+        return functools.partial(
+            split_tensor_for_parallelism, device_count=device_count, dim=dim
+        )
+
+    def gather_rule(axis):
+        return functools.partial(_gather, axis=axis)
+
+    # Use layer.path directly as Keras 3+ guarantees its availability.
+    layer_path = layer.path
+
+    if isinstance(layer, layers.Dense):
+        mlp_type = analyze_dense_layer(layer)
+
+        if mlp_type == "up_projection":
+            state_rules[id(layer.kernel)] = split_rule(dim=1)
+            if layer.use_bias:
+                state_rules[id(layer.bias)] = split_rule(dim=0)
+            output_rules[layer_path] = gather_rule(axis=-1)
+
+        elif mlp_type == "down_projection":
+            state_rules[id(layer.kernel)] = split_rule(dim=0)
+            output_rules[layer_path] = _reduce_sum
+
+        else:
+            state_rules[id(layer.kernel)] = split_rule(dim=1)
+            if layer.use_bias:
+                state_rules[id(layer.bias)] = split_rule(dim=0)
+            output_rules[layer_path] = gather_rule(axis=-1)
+
+    elif isinstance(layer, layers.EinsumDense):
+        if "attention_output" in layer.name:
+            state_rules[id(layer.kernel)] = split_rule(dim=0)
+            output_rules[layer_path] = _reduce_sum
+        else:
+            state_rules[id(layer.kernel)] = split_rule(dim=1)
+            if hasattr(layer, "bias") and layer.bias is not None:
+                state_rules[id(layer.bias)] = split_rule(dim=0)
+            output_rules[layer_path] = gather_rule(axis=-1)
+
+    elif (
+        isinstance(layer, (layers.Embedding,))
+        or "Embedding" in layer.__class__.__name__
+    ):
+        embeddings_var = getattr(layer, "embeddings", None)
+        if embeddings_var is not None:
+            state_rules[id(embeddings_var)] = split_rule(dim=1)
+        output_rules[layer_path] = lambda x: x
+
+
+def get_default_config(model, device_ids):
+    """Generates a default tensor parallelism configuration for a model.
+
+    This function traverses the model's layer hierarchy and
+    automatically generates a `LayoutMap`. This map contains:
+    1.  `state_rules`: How to shard the weights of supported layers
+        across the specified devices.
+    2.  `output_rules`: How to synchronize or gather the outputs of
+        these layers during the forward pass.
+
+    Args:
+        model: The Keras model to configure.
+        device_ids: A list of device identifiers to be used
+            for distribution.
+
+    Returns:
+        LayoutMap: A configuration object containing `state_rules` and
+        `output_rules` for tensor parallelism.
+    """
     device_count = len(device_ids)
-    state_rules, output_rules, processed_layers = {}, {}, set()
-    stack = [(module, "")]
-    while stack:
-        current_layer, prefix = stack.pop()
-        if id(current_layer) in processed_layers: continue
-        processed_layers.add(id(current_layer))
-        name = current_layer.name
-        full_name = f"{prefix}.{name}" if prefix else name
-        full_name = ".".join([p for i, p in enumerate(full_name.split('.')) if i == 0 or p != full_name.split('.')[i-1]])
-        _apply_layer_sharding_rules(current_layer, full_name, device_count, state_rules, output_rules)
-        for attr_name in dir(current_layer):
-            if attr_name.startswith('_'): continue
-            try:
-                attr_value = getattr(current_layer, attr_name)
-                if isinstance(attr_value, layers.Layer) and attr_value is not current_layer:
-                    stack.append((attr_value, full_name))
-                elif isinstance(attr_value, (list, tuple)):
-                    for item in attr_value:
-                        if isinstance(item, layers.Layer): stack.append((item, full_name))
-            except: continue
+    state_rules = {}
+    output_rules = {}
+
+    for layer in model._flatten_layers(recursive=True, include_self=True):
+        _apply_layer_sharding_rules(
+            layer, device_count, state_rules, output_rules
+        )
+
     return LayoutMap(state_rules=state_rules, output_rules=output_rules)

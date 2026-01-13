@@ -16,8 +16,9 @@ from keras.src.models import Model
 import ctypes
 import jax
 
-# Kaggle Protocol Buffers and Memory Policy
+# FIX 1: Prevent Prototype/Protobuf Errors
 os.environ["PROTOCOL_BUFFERS_PYTHON_IMPLEMENTATION"] = "python"
+# FIX 2: Force bfloat16 to stay under Kaggle's 30GB RAM limit (Gemma 9B is 18GB in BF16)
 keras.config.set_dtype_policy("bfloat16")
 
 def log_mem_stats(rank, device_id, stage=""):
@@ -44,22 +45,27 @@ class TensorParallelKeras(Model):
             device_count = len(all_devices)
             device_ids = [str(d) for d in all_devices]
 
-        self.device_count, self.devices = device_count, [self._normalize_device_id(d) for d in device_ids]
+        self.device_count = device_count
+        self.devices = [self._normalize_device_id(d) for d in device_ids]
         self.temp_dir = tempfile.mkdtemp(prefix="tp_weights_")
         
-        # 1. Build Master on CPU
+        # 1. Build Master Model on CPU
         with jax.default_device(jax.devices("cpu")[0]):
-            loaded_model = model() if callable(model) and not isinstance(model, keras.Model) else model
+            if callable(model) and not isinstance(model, keras.Model):
+                loaded_model = model()
+            else:
+                loaded_model = model
             loaded_model.build({"token_ids": (None, 1), "padding_mask": (None, 1)})
 
         self.model_config = loaded_model.get_config()
         self.model_cls = loaded_model.__class__
         self.tensor_parallel_config = get_default_config(loaded_model, self.devices)
 
-        # 2. Sequential Save and Shred
+        # 2. Save and Shred to baseline (Should drop RSS to ~1.5GB)
         for v in loaded_model.variables:
             name = (v.path if hasattr(v, 'path') else v.name).replace("/", "_").replace(":", "_")
-            np.save(os.path.join(self.temp_dir, name + ".npy"), np.array(v))
+            path = os.path.join(self.temp_dir, name + ".npy")
+            np.save(path, np.array(v))
             shred_variable(v)
         
         del loaded_model 
@@ -70,23 +76,36 @@ class TensorParallelKeras(Model):
         
         for rank, device_id in enumerate(self.devices):
             log_mem_stats(rank, device_id, "START creation")
+
+            # Build shard on CPU (Sequential creation prevents OOM)
             with keras.device("cpu"):
                 config = self.model_config.copy()
                 config["name"] = f"shard_model_{rank}"
                 shard = self.model_cls.from_config(config)
                 shard.build({"token_ids": (None, 1), "padding_mask": (None, 1)})
 
-            shard, modified_vars = make_parameter_sharded_model(shard, self._weight_loader, self.tensor_parallel_config, rank, self.device_count, device_id)
+            shard, modified_vars = make_parameter_sharded_model(
+                shard_model=shard,
+                weight_loader=self._weight_loader, 
+                config=self.tensor_parallel_config,
+                rank=rank,
+                device_count=self.device_count,
+                device_id=device_id,
+            )
 
+            # Migration for Replicated weights
             strat_helper = ParameterShardingStrategy(self.device_count, rank)
             try:
                 d_idx = int(str(device_id).split(":")[-1]) if ":" in str(device_id) else 0
                 target_jax_device = jax.devices('gpu')[d_idx]
                 var_to_owners = strat_helper._map_variables_to_owners(shard)
+                
                 for v in list(shard.variables):
                     v_name = v.path if hasattr(v, 'path') else v.name
                     clean_name = re.sub(r'^shard_model_\d+/', '', v_name).replace("/", ".")
-                    if clean_name in modified_vars or v_name in modified_vars: continue 
+                    if clean_name in modified_vars or v_name in modified_vars: 
+                        continue 
+
                     lookup_name = re.sub(r'^shard_model_\d+/', '', v_name)
                     raw_val = self._weight_loader(lookup_name) 
                     if raw_val is not None:
@@ -94,8 +113,10 @@ class TensorParallelKeras(Model):
                         if id(v) in var_to_owners:
                             for layer, attr_name, idx in var_to_owners[id(v)]:
                                 strat_helper._replace_variable(layer, attr_name, v, val_gpu, index=idx)
-                        else: v.assign(val_gpu)
-            except Exception as e: print(f"⚠️ Migration Error rank {rank}: {e}")
+                        else:
+                            v.assign(val_gpu)
+            except Exception as e:
+                print(f"⚠️ Migration Error rank {rank}: {e}")
 
             self.model_shards.append(shard)
             flush_memory() 
@@ -105,7 +126,7 @@ class TensorParallelKeras(Model):
         except: pass
         self.built = True
 
-    # ... (remaining call/train_step/compile logic same as before)
+
     def _normalize_device_id(self, device_id):
         d_str = str(device_id).lower()
         if "tpu" in d_str: return f"tpu:{d_str.split(':')[-1]}" if ":" in d_str else f"tpu:{d_str}"
