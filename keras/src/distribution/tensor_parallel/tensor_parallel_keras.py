@@ -15,7 +15,8 @@ from keras.src.distribution.tensor_parallel.autoconfig import get_default_config
 from keras.src.distribution.tensor_parallel.coordinated_optimizer import TensorParallelOptimizer
 from keras.src.models import Model
 
-# Force bfloat16 for high-memory efficiency
+# FIX: Prevent Prototype/Protobuf Errors by setting this before Keras/TF imports
+os.environ["PROTOCOL_BUFFERS_PYTHON_IMPLEMENTATION"] = "python"
 keras.config.set_dtype_policy("bfloat16")
 
 class TensorParallelKeras(Model):
@@ -74,7 +75,7 @@ class TensorParallelKeras(Model):
                 device_count=self.device_count, device_id=device_id,
             )
 
-            # Replicate weights not covered by sharding rules
+            # Replicate weights not covered by sharding rules (LayerNorms, etc.)
             strat_helper = ParameterShardingStrategy(self.device_count, rank)
             d_idx = int(str(device_id).split(":")[-1]) if ":" in str(device_id) else 0
             target_jax_device = jax.devices('gpu')[d_idx]
@@ -107,7 +108,14 @@ class TensorParallelKeras(Model):
         name = param_name.replace("/", "_").replace(":", "_")
         path = os.path.join(self.temp_dir, name + ".npy")
         if not os.path.exists(path): return None
-        return np.load(path)
+        # FIX: Use mmap and handle bfloat16 view to avoid TypeError in JAX
+        val = np.load(path, mmap_mode='r')
+        if hasattr(val, 'dtype') and ("V" in str(val.dtype) or "void" in str(val.dtype)):
+            try:
+                import ml_dtypes
+                return val.view(ml_dtypes.bfloat16)
+            except ImportError: return val.astype("float32")
+        return val
 
     def call(self, inputs, training=None, **kwargs):
         results = [shard(inputs, training=training, **kwargs) for shard in self.model_shards]
