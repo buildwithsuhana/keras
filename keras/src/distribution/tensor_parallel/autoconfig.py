@@ -110,40 +110,33 @@ def _apply_layer_sharding_rules(layer, device_count, state_rules, output_rules):
     # Use layer.path directly as Keras 3+ guarantees its availability.
     layer_path = layer.path
 
-    # ... (inside _apply_layer_sharding_rules)
-
     if isinstance(layer, layers.Dense):
         mlp_type = analyze_dense_layer(layer)
 
         if mlp_type == "up_projection":
-            # CHANGE: Use .path instead of id()
-            state_rules[layer.kernel.path] = split_rule(dim=1)
+            state_rules[id(layer.kernel)] = split_rule(dim=1)
             if layer.use_bias:
-                state_rules[layer.bias.path] = split_rule(dim=0)
+                state_rules[id(layer.bias)] = split_rule(dim=0)
             output_rules[layer_path] = gather_rule(axis=-1)
 
         elif mlp_type == "down_projection":
-            # CHANGE: Use .path instead of id()
-            state_rules[layer.kernel.path] = split_rule(dim=0)
+            state_rules[id(layer.kernel)] = split_rule(dim=0)
             output_rules[layer_path] = _reduce_sum
 
         else:
-            # CHANGE: Use .path instead of id()
-            state_rules[layer.kernel.path] = split_rule(dim=1)
+            state_rules[id(layer.kernel)] = split_rule(dim=1)
             if layer.use_bias:
-                state_rules[layer.bias.path] = split_rule(dim=0)
+                state_rules[id(layer.bias)] = split_rule(dim=0)
             output_rules[layer_path] = gather_rule(axis=-1)
 
     elif isinstance(layer, layers.EinsumDense):
         if "attention_output" in layer.name:
-            # CHANGE: Use .path instead of id()
-            state_rules[layer.kernel.path] = split_rule(dim=0)
+            state_rules[id(layer.kernel)] = split_rule(dim=0)
             output_rules[layer_path] = _reduce_sum
         else:
-            # CHANGE: Use .path instead of id()
-            state_rules[layer.kernel.path] = split_rule(dim=1)
+            state_rules[id(layer.kernel)] = split_rule(dim=1)
             if hasattr(layer, "bias") and layer.bias is not None:
-                state_rules[layer.bias.path] = split_rule(dim=0)
+                state_rules[id(layer.bias)] = split_rule(dim=0)
             output_rules[layer_path] = gather_rule(axis=-1)
 
     elif (
@@ -152,8 +145,7 @@ def _apply_layer_sharding_rules(layer, device_count, state_rules, output_rules):
     ):
         embeddings_var = getattr(layer, "embeddings", None)
         if embeddings_var is not None:
-            # CHANGE: Use .path instead of id()
-            state_rules[embeddings_var.path] = split_rule(dim=1)
+            state_rules[id(embeddings_var)] = split_rule(dim=1)
         output_rules[layer_path] = lambda x: x
 
 
