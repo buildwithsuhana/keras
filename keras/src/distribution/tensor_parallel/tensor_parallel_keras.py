@@ -399,10 +399,11 @@ class TensorParallelKeras(Model):
         """
         return self.assembled_model(inputs, training=training, **kwargs)
 
-    def compile(self, optimizer=None, loss=None, metrics=None, **kwargs):
+    def compile(self, optimizer=None, loss=None, metrics=None, loss_weights=None, **kwargs):
         """
         Compile the tensor parallel model.
         """
+        # Case 1: Active Tensor Parallelism (multiple devices)
         if len(self.model_shards) > 1 and optimizer is not None:
             self.coordinated_optimizer = TensorParallelOptimizer(
                 optimizer,
@@ -455,6 +456,7 @@ class TensorParallelKeras(Model):
                 optimizer=self.coordinated_optimizer,
                 loss=loss,
                 metrics=metrics,
+                loss_weights=loss_weights,
                 **kwargs,
             )
             logger.info(
@@ -462,7 +464,13 @@ class TensorParallelKeras(Model):
             )
 
         else:
-            super().compile(optimizer, loss, metrics, **kwargs)
+            super().compile(
+                optimizer=optimizer,
+                loss=loss,
+                metrics=metrics,
+                loss_weights=loss_weights,
+                **kwargs
+            )
 
     def fit(self, x=None, y=None, **kwargs):
         """Use standard Keras training which correctly handles the train_step."""
