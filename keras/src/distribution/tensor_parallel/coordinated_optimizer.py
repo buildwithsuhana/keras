@@ -129,7 +129,7 @@ class TensorParallelOptimizer(optimizers.Optimizer):
                     
                     if slot_name not in self._sharded_states:
                         self._sharded_states[slot_name] = {}
-                    self._sharded_states[slot_name][model_var.path] = partitioned
+                    self._sharded_states[slot_name][model_var.path] = (partitioned)
                     break
 
     def update_step(self, gradient, variable, learning_rate=None):
