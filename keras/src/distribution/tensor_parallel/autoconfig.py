@@ -34,7 +34,6 @@ def _apply_layer_sharding_rules(layer, device_count, state_rules, output_rules):
         return functools.partial(_gather, axis=axis)
 
     layer_path = layer.path
-    # 1. Core Layers
     if isinstance(layer, layers.Dense):
         mlp_type = analyze_dense_layer(layer)
         if mlp_type in ["up_projection", "dense"]:
@@ -44,27 +43,32 @@ def _apply_layer_sharding_rules(layer, device_count, state_rules, output_rules):
         elif mlp_type == "down_projection":
             state_rules[layer.kernel.path] = split_rule(dim=0)
             output_rules[layer_path] = _reduce_sum
+
     elif isinstance(layer, layers.EinsumDense):
         if "attention_output" in layer.name:
+            # Row Parallel: Split heads, then sum output
             state_rules[layer.kernel.path] = split_rule(dim=0)
             output_rules[layer_path] = _reduce_sum
-        else:
+        elif any(x in layer.name for x in ["query", "key", "value"]):
+            # Column Parallel (Heads): No gathering, keep activations sharded for Attention layer
             state_rules[layer.kernel.path] = split_rule(dim=1)
             if hasattr(layer, "bias") and layer.bias is not None:
                 state_rules[layer.bias.path] = split_rule(dim=0)
+            output_rules[layer_path] = lambda x: x
+        else:
+            state_rules[layer.kernel.path] = split_rule(dim=1)
             output_rules[layer_path] = gather_rule(axis=-1)
-    elif isinstance(layer, (layers.Embedding,)) or "Embedding" in layer.__class__.__name__:
+
+    elif "Embedding" in layer.__class__.__name__:
         emb = getattr(layer, "embeddings", None)
         if emb is not None: state_rules[emb.path] = split_rule(dim=1)
         output_rules[layer_path] = lambda x: x
-    
-    # 2. Normalization Layers (CRITICAL FIX)
+
     elif "Normalization" in layer.__class__.__name__:
-        for attr in ["scale", "gamma", "beta", "bias"]:
+        # Shard normalization scale/bias along the feature dimension
+        for attr in ["scale", "gamma", "beta"]:
             var = getattr(layer, attr, None)
-            if var is not None:
-                # Normalization weights are 1D, split along dim 0
-                state_rules[var.path] = split_rule(dim=0)
+            if var is not None: state_rules[var.path] = split_rule(dim=0)
         output_rules[layer_path] = lambda x: x
 
 def get_default_config(model, device_ids):

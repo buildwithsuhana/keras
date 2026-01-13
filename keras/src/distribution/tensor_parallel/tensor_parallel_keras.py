@@ -13,7 +13,6 @@ from keras.src.distribution.tensor_parallel.autoconfig import get_default_config
 from keras.src.distribution.tensor_parallel.coordinated_optimizer import TensorParallelOptimizer
 from keras.src.models import Model
 
-# Global Fixes
 os.environ["PROTOCOL_BUFFERS_PYTHON_IMPLEMENTATION"] = "python"
 keras.config.set_dtype_policy("bfloat16")
 
@@ -61,7 +60,7 @@ class TensorParallelKeras(Model):
                 shard = self.model_cls.from_config(config)
                 shard.build({"token_ids": (None, 1), "padding_mask": (None, 1)})
 
-            shard, modified_vars = make_parameter_sharded_model(
+            shard, modified_paths = make_parameter_sharded_model(
                 shard_model=shard, weight_loader=self._weight_loader, 
                 config=self.tensor_parallel_config, rank=rank,
                 device_count=self.device_count, device_id=device_id,
@@ -73,17 +72,17 @@ class TensorParallelKeras(Model):
             var_to_owners = strat_helper._map_variables_to_owners(shard)
             
             for v in list(shard.variables):
-                v_name = v.path if hasattr(v, 'path') else v.name
-                if v_name in modified_vars: continue 
+                v_path = v.path if hasattr(v, 'path') else v.name
+                if v_path in modified_paths: continue 
 
-                lookup_name = re.sub(r'^shard_model_\d+/', '', v_name)
+                lookup_name = re.sub(r'^shard_model_\d+/', '', v_path)
                 raw_val = self._weight_loader(lookup_name) 
                 if raw_val is not None:
                     val_gpu = jax.device_put(raw_val, target_jax_device)
                     if id(v) in var_to_owners:
                         for layer, attr_name, idx in var_to_owners[id(v)]:
                             strat_helper._replace_variable(layer, attr_name, v, val_gpu, index=idx)
-                    print(f"🔄 [Rank {rank}] Replicated variable: {v_name} | Host RSS: {psutil.Process(os.getpid()).memory_info().rss/(1024**2):.0f} MB")
+                    print(f"🔄 [Rank {rank}] Replicated variable: {v_path} | Host RSS: {psutil.Process(os.getpid()).memory_info().rss/(1024**2):.0f} MB")
             self.model_shards.append(shard)
             flush_memory() 
         self.built = True
@@ -93,7 +92,6 @@ class TensorParallelKeras(Model):
         path = os.path.join(self.temp_dir, name + ".npy")
         if not os.path.exists(path): return None
         val = np.load(path, mmap_mode='r')
-        # FIX: Restore bfloat16 view for JAX compatibility
         if hasattr(val, 'dtype') and ("V" in str(val.dtype) or "void" in str(val.dtype)):
             try:
                 import ml_dtypes
