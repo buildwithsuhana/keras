@@ -4,7 +4,7 @@ from keras.src import backend
 from keras.src import ops
 from keras.src import optimizers
 from keras.src.backend import distribution_lib
-
+from keras.src.saving import serialization_lib
 
 class TensorParallelOptimizer(optimizers.Optimizer):
     """An optimizer wrapper for Tensor Parallelism and Optimizer State Sharding.
@@ -35,10 +35,13 @@ class TensorParallelOptimizer(optimizers.Optimizer):
             name: String, name of the optimizer.
             **kwargs: Additional arguments passed to the base optimizer class.
         """
+        kwargs.pop("learning_rate", None)
         super().__init__(learning_rate=0.0, name=name, **kwargs)
 
         if isinstance(base_optimizer, str):
             self.base_optimizer = optimizers.get(base_optimizer)
+        elif isinstance(base_optimizer, dict):
+            self.base_optimizer = serialization_lib.deserialize_keras_object(base_optimizer)
         else:
             self.base_optimizer = base_optimizer
 
@@ -51,7 +54,7 @@ class TensorParallelOptimizer(optimizers.Optimizer):
         self.device_count = device_count
         self.shard_optimizer_states = shard_optimizer_states
         self.tensor_parallel_config = tensor_parallel_config
-
+        
         self._sharded_states = {}
         self._state_var_to_param = {}
         self._var_to_slot_name = {}
@@ -66,21 +69,50 @@ class TensorParallelOptimizer(optimizers.Optimizer):
         """
         if self.built:
             return
-
+        
         self._model_variables = variables
         self.base_optimizer.build(variables)
 
         if variables:
-            zero_grads = [
-                ops.zeros(v.shape, dtype=backend.standardize_dtype(v.dtype))
-                for v in variables
-            ]
-            self.base_optimizer.apply_gradients(zip(zero_grads, variables))
-
+            dummy_grads = [ops.zeros_like(v) for v in variables]
+            self.base_optimizer.apply_gradients(zip(dummy_grads, variables))
+                    
         if self.shard_optimizer_states:
             self._initialize_sharded_states()
-
+            
         super().build(variables)
+
+    def _initialize_sharded_states(self):
+        """Partitions all optimizer state variables into the sharded state cache."""
+        self._sharded_states = {}
+        
+        for state_var in self.base_optimizer.variables:
+            path = state_var.path
+            if "iteration" in path:
+                self._sharded_states["iterations"] = self._partition_state(state_var, 0)
+                continue
+
+            if "learning_rate" in path:
+                continue
+
+            for model_var in self._model_variables:
+                m_path_norm = model_var.path.replace("/", "_")
+                s_path_norm = path.replace("/", "_")
+                
+                if m_path_norm in s_path_norm:
+                    remainder = s_path_norm.split(m_path_norm)[-1].strip("_")
+                    slot_name = remainder if remainder else "unknown"
+                    
+                    self._state_var_to_param[path] = model_var
+                    self._var_to_slot_name[path] = slot_name
+                    
+                    dim = self._get_sharding_dim(model_var)
+                    partitioned = self._partition_state(state_var, dim)
+                    
+                    if slot_name not in self._sharded_states:
+                        self._sharded_states[slot_name] = {}
+                    self._sharded_states[slot_name][model_var.path] = partitioned
+                    break
 
     def update_step(self, gradient, variable, learning_rate=None):
         """Performs a single weight update.
@@ -106,11 +138,11 @@ class TensorParallelOptimizer(optimizers.Optimizer):
             ValueError: If gradients are sharded but `shard_models` is missing.
         """
         is_sharded = (
-            isinstance(grads_and_vars, list)
-            and len(grads_and_vars) > 0
-            and isinstance(grads_and_vars[0], list)
+            isinstance(grads_and_vars, list) and 
+            len(grads_and_vars) > 0 and 
+            isinstance(grads_and_vars[0], list)
         )
-
+        
         if not is_sharded:
             return super().apply_gradients(grads_and_vars, **kwargs)
 
@@ -127,32 +159,39 @@ class TensorParallelOptimizer(optimizers.Optimizer):
             self._transfer_state(shard_opt, shard_idx=i, direction="to_local")
             shard_opt.apply_gradients(synced_grads_and_vars[i])
             self._transfer_state(shard_opt, shard_idx=i, direction="to_global")
+     
 
-    def _initialize_sharded_states(self):
-        """Partitions all optimizer state variables into the sharded
-        state cache."""
-        self._sharded_states = {}
-        for state_var in self.base_optimizer.variables:
-            if (
-                "iterations" in state_var.path
-                or state_var is self.base_optimizer.iterations
-            ):
-                self._sharded_states["iterations"] = self._partition_state(
-                    state_var, 0
-                )
-                continue
-            for model_var in self._model_variables:
-                if model_var.path in state_var.path:
-                    suffix = state_var.path.split(model_var.path)[-1]
-                    slot_name = suffix.strip("/")
-                    self._state_var_to_param[state_var.path] = model_var
-                    self._var_to_slot_name[state_var.path] = slot_name
-                    dim = self._get_sharding_dim(model_var)
-                    partitioned = self._partition_state(state_var, dim)
-                    self._sharded_states.setdefault(slot_name, {})[
-                        model_var.path
-                    ] = partitioned
-                    break
+    def _synchronize_gradients(self, gradients_and_vars):
+        """Averages gradients for variables that are not sharded."""
+        if self.tensor_parallel_config:
+            return gradients_and_vars
+
+        def sync_variable(shards_for_this_var):
+            """Calculates the mean gradient across all shards for one variable."""
+            grads = [g for g, v in shards_for_this_var if g is not None]
+            if not grads:
+                return shards_for_this_var
+            
+            reduced_grad = ops.mean(ops.stack(grads), axis=0)
+            return [(reduced_grad, v) for _, v in shards_for_this_var]
+
+        return [list(shard) for shard in zip(*[sync_variable(v) for v in zip(*gradients_and_vars)])]
+
+    def get_config(self):
+        config = super().get_config()
+        config.update({
+            "base_optimizer": serialization_lib.serialize_keras_object(self.base_optimizer),
+            "device_count": self.device_count,
+            "shard_optimizer_states": self.shard_optimizer_states,
+            "tensor_parallel_config": self.tensor_parallel_config,
+        })
+        return config
+
+    @property
+    def variables(self): return self.base_optimizer.variables
+
+    @property
+    def iterations(self): return self.base_optimizer.iterations
 
     def _partition_state(self, state_variable, dim):
         """Splits a state variable into N chunks along a specific dimension.
@@ -188,82 +227,19 @@ class TensorParallelOptimizer(optimizers.Optimizer):
         return 0
 
     def _transfer_state(self, local_opt, shard_idx, direction="to_local"):
-        """Syncs data between the global sharded state and a specific
-           local optimizer.
-
-        Args:
-            local_opt: The optimizer instance local to a specific shard/device.
-            shard_idx: The index of the shard being processed.
-            direction: String, either 'to_local' or 'to_global'.
-        """
         for var in local_opt.variables:
             if var is local_opt.iterations:
                 if direction == "to_local":
-                    var.assign(
-                        ops.cast(
-                            self._sharded_states["iterations"][shard_idx],
-                            var.dtype,
-                        )
-                    )
+                    var.assign(ops.cast(self._sharded_states["iterations"][shard_idx], var.dtype))
                 else:
-                    self._sharded_states["iterations"][shard_idx] = (
-                        ops.convert_to_numpy(var)
-                    )
+                    self._sharded_states["iterations"][shard_idx] = ops.convert_to_numpy(var)
                 continue
             param = self._state_var_to_param.get(var.path)
             slot = self._var_to_slot_name.get(var.path)
-            if (
-                param
-                and slot in self._sharded_states
-                and param.path in self._sharded_states[slot]
-            ):
+            if param and slot in self._sharded_states and param.path in self._sharded_states[slot]:
                 if direction == "to_local":
                     val = self._sharded_states[slot][param.path][shard_idx]
                     if var.shape == val.shape:
                         var.assign(ops.cast(val, var.dtype))
                 else:
-                    self._sharded_states[slot][param.path][shard_idx] = (
-                        ops.convert_to_numpy(var)
-                    )
-
-    def _synchronize_gradients(self, gradients_and_vars):
-        """Averages gradients for variables that are not sharded by
-           tensor parallelism.
-
-        Args:
-            gradients_and_vars: List of lists containing (gradient, variable)
-            tuples.
-
-        Returns:
-            The list of gradients with non-sharded variables synchronized.
-        """
-        if not self.tensor_parallel_config:
-            return gradients_and_vars
-        for i in range(len(gradients_and_vars[0])):
-            var = gradients_and_vars[0][i][1]
-            if var.path not in self.tensor_parallel_config.state_rules:
-                grads = [
-                    shard[i][0]
-                    for shard in gradients_and_vars
-                    if shard[i][0] is not None
-                ]
-                if grads:
-                    if distribution_lib.get_device_count() > 1:
-                        reduced = distribution_lib.all_reduce(
-                            grads[0], op="mean", axis_name="model"
-                        )
-                    else:
-                        reduced = ops.mean(ops.stack(grads), axis=0)
-                    for shard_idx in range(self.device_count):
-                        gradients_and_vars[shard_idx][i] = (reduced, var)
-        return gradients_and_vars
-
-    @property
-    def variables(self):
-        """Returns the variables of the base optimizer."""
-        return self.base_optimizer.variables
-
-    @property
-    def iterations(self):
-        """Returns the iteration count of the base optimizer."""
-        return self.base_optimizer.iterations
+                    self._sharded_states[slot][param.path][shard_idx] = ops.convert_to_numpy(var)
