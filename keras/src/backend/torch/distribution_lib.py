@@ -55,11 +55,10 @@ def list_devices(device_type=None):
 
 
 def get_device_count(device_type=None):
-    """
-    Returns the number of available PyTorch devices.
+    """Returns the number of available PyTorch devices.
     
     Args:
-        device_type: Optional device type to count (e.g., "cpu", "cuda", "mps").
+        device_type: Optional device type to count (e.g., "cpu", "gpu", "cuda", "mps").
             If `None`, it defaults to counting "cuda" or "mps" devices if 
             available, otherwise it counts "cpu" devices.
             
@@ -69,8 +68,8 @@ def get_device_count(device_type=None):
     if device_type:
         device_type = device_type.lower()
     
-    if device_type == "cuda":
-        return torch.cuda.device_count()
+    if device_type in ("cuda", "gpu"):
+        return torch.cuda.device_count() if torch.cuda.is_available() else 0
     if device_type == "mps":
         return 1 if torch.backends.mps.is_available() else 0
     if device_type == "cpu":
@@ -381,6 +380,58 @@ def process_id():
     if dist.is_initialized():
         return dist.get_rank()
     return 0
+
+
+def all_reduce(x, op="sum", axis_name="model"):
+    """Reduces a tensor across all devices using a collective.
+
+    Args:
+        x: The tensor to reduce.
+        op: The reduction operation. "sum" or "mean".
+        axis_name: The name of the mesh axis to reduce over.
+
+    Returns:
+        The reduced tensor.
+    """
+    if not dist.is_initialized():
+        return x
+
+    if op == "sum":
+        reduce_op = dist.ReduceOp.SUM
+    elif op == "mean":
+        reduce_op = dist.ReduceOp.AVG
+    else:
+        raise ValueError(
+            f"Unsupported reduction operation: {op}. "
+            "Supported options are 'sum' and 'mean'."
+        )
+
+    x_out = x.clone()
+    dist.all_reduce(x_out, op=reduce_op)
+    return x_out
+
+
+def all_gather(x, axis, axis_name="model"):
+    """Gathers and concatenates tensors from all devices across a mesh axis.
+
+    Args:
+        x (torch.Tensor): The input local tensor.
+        axis (int): The tensor axis along which to concatenate the gathered
+            shards.
+        axis_name (str, optional): The name of the mesh axis to gather
+            from. Defaults to 'model'.
+
+    Returns:
+        torch.Tensor: The full, gathered tensor.
+    """
+    if not dist.is_initialized():
+        return x
+
+    world_size = dist.get_world_size()
+    gather_list = [torch.empty_like(x) for _ in range(world_size)]
+    dist.all_gather(gather_list, x)
+
+    return torch.cat(gather_list, dim=axis)
 
 
 def _to_backend_device(device_name):
