@@ -9,6 +9,7 @@ os.environ["XLA_FLAGS"] = "--xla_force_host_platform_device_count=2"
 import keras
 from keras import ops
 from keras import distribution
+from keras.src import backend
 from keras.src.distribution.tensor_parallel.tensor_layout import LayoutMap, split_tensor_for_parallelism
 
 # Import your sharding implementation
@@ -25,14 +26,18 @@ def _create_simple_mlp():
     outputs = keras.layers.Dense(8, use_bias=False, name="down_proj")(x)
     return keras.Model(inputs=inputs, outputs=outputs, name="simple_mlp")
 
+# --- BACKEND SKIP LOGIC ---
+@pytest.mark.skipif(
+    backend.backend() not in ("jax", "torch"),
+    reason="Parameter sharding tests are only supported for JAX and PyTorch backends.",
+)
 class UnifiedParameterShardingTest(TestCase):
     def setUp(self):
         super().setUp()
         
         # Discover devices
         self.all_devices = distribution.list_devices()
-        # JAX often forces 4 devices if run in certain environments; 
-        # we adapt to whatever is actually available.
+        # Adapt to whatever is actually available in the environment.
         self.device_count = len(self.all_devices) if len(self.all_devices) > 0 else 1
         self.devices = self.all_devices if self.all_devices else ["cpu"]
             
@@ -112,8 +117,7 @@ class UnifiedParameterShardingTest(TestCase):
         
         for w in sharded_model.weights:
             if isinstance(w, ShardedWeight):
-                # FIXED: Access device via the underlying value tensor
-                # This works for JAX (TFRT_CPU_0) and Torch (cpu)
+                # Access device via the underlying value tensor
                 val = w.variable.value
                 actual_device = str(getattr(val, "device", "cpu")).lower()
                 
