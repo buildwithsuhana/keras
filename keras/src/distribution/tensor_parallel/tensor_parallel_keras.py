@@ -17,9 +17,6 @@ from keras.src.distribution.tensor_parallel.autoconfig import (
 from keras.src.distribution.tensor_parallel.parameter_sharding import (
     make_parameter_sharded_model,
 )
-from keras.src.distribution.tensor_parallel.coordinated_optimizer import (
-    TensorParallelOptimizer,
-)
 
 from keras.src.distribution import list_devices
 
@@ -403,74 +400,16 @@ class TensorParallelKeras(Model):
         """
         Compile the tensor parallel model.
         """
-        # Case 1: Active Tensor Parallelism (multiple devices)
-        if len(self.model_shards) > 1 and optimizer is not None:
-            self.coordinated_optimizer = TensorParallelOptimizer(
-                optimizer,
-                self.device_count,
-                tensor_parallel_config=self.tensor_parallel_config,
-            )
-            logger.info(
-                f"Created coordinated optimizer for {self.device_count} shards"
-            )
-            
-            try:
-                self.coordinated_optimizer._shard_models = self.model_shards
-
-                var_map = {}
-                assembled = getattr(self, "assembled_model", None)
-                assembled_vars = (
-                    assembled.variables if assembled is not None else []
-                )
-
-                for a_var in assembled_vars:
-                    key = getattr(a_var, "path", None) or a_var.name
-                    suffix = key.split("/")[-1]
-                    per_shard = []
-                    for shard in self.model_shards:
-                        match = next(
-                            (
-                                v
-                                for v in shard.variables
-                                if v.name.endswith(suffix)
-                            ),
-                            None,
-                        )
-                        per_shard.append(match)
-                    var_map[key] = per_shard
-
-                self.coordinated_optimizer._shard_var_map = var_map
-                
-                inner = getattr(
-                    self.coordinated_optimizer, "coordinated_optimizer", None
-                )
-                if inner is not None:
-                    inner._shard_models = self.model_shards
-                    inner._shard_var_map = var_map
-            except Exception:
-                logger.exception(
-                    "Failed to register shard mapping on coordinated optimizer"
-                )
-
-            super().compile(
-                optimizer=self.coordinated_optimizer,
-                loss=loss,
-                metrics=metrics,
-                loss_weights=loss_weights,
-                **kwargs,
-            )
-            logger.info(
-                "Compiled TensorParallelKeras model with coordinated optimizer."
-            )
-
-        else:
-            super().compile(
-                optimizer=optimizer,
-                loss=loss,
-                metrics=metrics,
-                loss_weights=loss_weights,
-                **kwargs
-            )
+        super().compile(
+            optimizer=optimizer,
+            loss=loss,
+            metrics=metrics,
+            loss_weights=loss_weights,
+            **kwargs
+        )
+        logger.info(
+            "Compiled TensorParallelKeras model with native Keras distribution logic."
+        )
 
     def fit(self, x=None, y=None, **kwargs):
         """Use standard Keras training which correctly handles the train_step."""
