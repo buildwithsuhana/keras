@@ -106,6 +106,7 @@ class ParameterShardingStrategy:
 
         self.param_path_map = {w.path: w for w in model.weights}
         
+        # Build ID mapping for normalization
         for w in model.weights:
             self._id_to_param_map[id(w)] = (w.path, w)
             exp_ref_fn = getattr(w, "experimental_ref", None)
@@ -118,16 +119,17 @@ class ParameterShardingStrategy:
                 for attr in ["embeddings", "position_embeddings", "_embeddings"]:
                     var = getattr(layer, attr, None)
                     if var is not None:
-                        var_id = id(getattr(var, "experimental_ref", lambda: var)())
+                        var_ref = getattr(var, "experimental_ref", lambda: var)()
+                        var_id = id(var_ref)
                         if var_id not in config.state_rules:
-                            # Shard along embedding dim (1) using same order as autoconfig
+                            # Shard along embedding dim (1) using correct rank/count order
                             config.state_rules[var_id] = functools.partial(
                                 split_tensor_for_parallelism, 
                                 device_count=self.device_count, 
                                 dim=1
                             )
 
-        # --- FIX: Normalize config keys (ID -> Path) to prevent library crashes ---
+        # --- FIX: Normalize config keys (ID -> Path) to prevent library crashes (re.search) ---
         normalized_updates = {}
         for pattern, action in list(config.state_rules.items()):
             if isinstance(pattern, int) and pattern in self._id_to_param_map:
@@ -267,7 +269,7 @@ def _define_parameter_sharded_model():
                 if isinstance(layer, layers.InputLayer):
                     continue
                 
-                layer_inputs = []
+                reconstructed_inputs = []
                 for node in layer._inbound_nodes:
                     for symbolic_input_tensor in node.input_tensors:
                         val = tensor_cache.get(id(symbolic_input_tensor))
@@ -276,43 +278,51 @@ def _define_parameter_sharded_model():
                             if name:
                                 val = tensor_cache.get(name.split(":")[0], tensor_cache.get(name))
                         if val is not None:
-                            layer_inputs.append(val)
+                            reconstructed_inputs.append(val)
                 
-                # --- FIX: Reconstruct Dict for Backbones to resolve structural mismatch ---
-                if isinstance(layer, (Functional, Model)):
-                    layer_input_names = getattr(layer, "input_names", [])
-                    if not layer_input_names and hasattr(layer, "inputs") and layer.inputs:
-                        layer_input_names = [getattr(x, "name", "").split(":")[0] for x in layer.inputs]
-                    
-                    if layer_input_names and len(layer_inputs) == len(layer_input_names):
-                        layer_inputs = dict(zip(layer_input_names, layer_inputs))
-                elif len(layer_inputs) == 1:
-                    layer_inputs = layer_inputs[0]
-
-                if not layer_inputs and (isinstance(layer_inputs, (list, tuple, dict)) or layer_inputs is None):
+                # --- FIX: Format detection and Dict reconstruction for Backbones ---
+                layer_inputs = None
+                if len(reconstructed_inputs) == 0:
                     layer_inputs = inputs
+                else:
+                    if isinstance(layer, (Functional, Model)):
+                        layer_input_names = getattr(layer, "input_names", [])
+                        if not layer_input_names and hasattr(layer, "inputs") and layer.inputs:
+                            layer_input_names = [getattr(x, "name", "").split(":")[0] for x in layer.inputs]
+                        
+                        if layer_input_names and len(reconstructed_inputs) == len(layer_input_names):
+                            layer_inputs = dict(zip(layer_input_names, reconstructed_inputs))
+                        else:
+                            layer_inputs = reconstructed_inputs
+                    elif len(reconstructed_inputs) == 1:
+                        layer_inputs = reconstructed_inputs[0]
+                    else:
+                        layer_inputs = reconstructed_inputs
 
                 call_kwargs = {"training": training} if training is not None else {}
                 node_args = getattr(node, "arguments", None)
                 if node_args:
-                    extra_kwargs = getattr(node_args, "kwargs", {})
-                    if extra_kwargs:
-                        for k, v in extra_kwargs.items():
-                            if k != "training":
-                                call_kwargs[k] = v
+                    for k, v in (getattr(node_args, "kwargs", {}) or {}).items():
+                        if k != "training":
+                            call_kwargs[k] = v
 
+                # FIX: Explicit type check before calling Truth Value logic
                 current_tensor = layer(layer_inputs, **call_kwargs)
 
                 # 4. Apply Communication Rules
                 layer_path = getattr(layer, "path", layer.name)
                 output_rule = None
                 for pattern, rule in self.config.output_rules.items():
-                    if pattern == layer_path or layer_path.endswith("/" + pattern) or re.search(str(pattern), layer_path):
-                        output_rule = rule.get(0) if isinstance(rule, dict) else rule
-                        break
+                    if isinstance(pattern, str):
+                        if pattern == layer_path or layer_path.endswith("/" + pattern) or re.search(pattern, layer_path):
+                            output_rule = rule.get(0) if isinstance(rule, dict) else rule
+                            break
 
                 if output_rule:
-                    current_tensor = output_rule(current_tensor) if callable(output_rule) else self._apply_communication(current_tensor, layer.name, output_rule)
+                    if callable(output_rule):
+                        current_tensor = output_rule(current_tensor)
+                    else:
+                        current_tensor = self._apply_communication(current_tensor, layer.name, output_rule)
 
                 # 5. Map Outputs
                 for node_idx, node in enumerate(layer._inbound_nodes):
