@@ -41,6 +41,24 @@ class TestTorchDistributionLibLive:
     ## Section 1: Device and Process Info
     # ------------------------------------
 
+    def test_get_device_count(self):
+        """Tests the get_device_count helper against the runtime environment."""
+        assert distribution_lib.get_device_count("cpu") == 1
+        
+        if torch.cuda.is_available():
+            gpu_count = torch.cuda.device_count()
+            assert distribution_lib.get_device_count("gpu") == gpu_count
+            assert distribution_lib.get_device_count("cuda") == gpu_count
+        else:
+            assert distribution_lib.get_device_count("gpu") == 0
+
+        if torch.cuda.is_available():
+            assert distribution_lib.get_device_count() == torch.cuda.device_count()
+        elif hasattr(torch.backends, "mps") and torch.backends.mps.is_available():
+            assert distribution_lib.get_device_count() == 1
+        else:
+            assert distribution_lib.get_device_count() == 1
+
     def test_device_listing_and_info(self):
         """Tests device discovery functions against the runtime environment."""
         # Test basic listing based on actual hardware

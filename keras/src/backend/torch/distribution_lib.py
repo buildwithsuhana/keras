@@ -54,6 +54,35 @@ def list_devices(device_type=None):
     raise ValueError(f"Unknown device type: {device_type}")
 
 
+def get_device_count(device_type=None):
+    """
+    Returns the number of available PyTorch devices.
+    
+    Args:
+        device_type: Optional device type to count (e.g., "cpu", "cuda", "mps").
+            If `None`, it defaults to counting "cuda" or "mps" devices if 
+            available, otherwise it counts "cpu" devices.
+            
+    Returns:
+        int: The total number of PyTorch devices for the specified type.
+    """
+    if device_type:
+        device_type = device_type.lower()
+    
+    if device_type == "cuda":
+        return torch.cuda.device_count()
+    if device_type == "mps":
+        return 1 if torch.backends.mps.is_available() else 0
+    if device_type == "cpu":
+        return 1
+        
+    if torch.cuda.is_available():
+        return torch.cuda.device_count()
+    if torch.backends.mps.is_available():
+        return 1
+        
+    return 1
+
 def get_device_info(device_id: str) -> Dict[str, any]:
     """
     Get detailed information about a specific device.
