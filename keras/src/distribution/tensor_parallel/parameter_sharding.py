@@ -1,6 +1,7 @@
 import logging
 import inspect
 import re
+import functools
 from typing import Any, Dict, List, Optional, Set, Tuple, TYPE_CHECKING
 
 import numpy as np
@@ -10,7 +11,7 @@ from keras.src import ops
 from keras.src import layers
 from keras import Variable, device 
 
-from keras.src.distribution.tensor_parallel.tensor_layout import LayoutMap
+from keras.src.distribution.tensor_parallel.tensor_layout import LayoutMap, split_tensor_for_parallelism
 
 if TYPE_CHECKING:
     from keras.src.models import Model
@@ -88,6 +89,7 @@ class ParameterShardingStrategy:
         self.weight_mapping = {}
         self.sharded_weights_by_id = {}
         self.param_path_map = {}
+        self._id_to_param_map = {}
 
     def shard_model_parameters(
         self,
@@ -104,6 +106,36 @@ class ParameterShardingStrategy:
 
         self.param_path_map = {w.path: w for w in model.weights}
         
+        for w in model.weights:
+            self._id_to_param_map[id(w)] = (w.path, w)
+            exp_ref_fn = getattr(w, "experimental_ref", None)
+            if exp_ref_fn:
+                self._id_to_param_map[id(exp_ref_fn())] = (w.path, w)
+        
+        # --- FIX: Discover missing Embeddings (e.g. PositionEmbedding) to reach 122 ---
+        for layer in model._flatten_layers(recursive=True, include_self=True):
+            if "Embedding" in layer.__class__.__name__:
+                for attr in ["embeddings", "position_embeddings", "_embeddings"]:
+                    var = getattr(layer, attr, None)
+                    if var is not None:
+                        var_id = id(getattr(var, "experimental_ref", lambda: var)())
+                        if var_id not in config.state_rules:
+                            # Shard along embedding dim (1) using same order as autoconfig
+                            config.state_rules[var_id] = functools.partial(
+                                split_tensor_for_parallelism, 
+                                device_count=self.device_count, 
+                                dim=1
+                            )
+
+        # --- FIX: Normalize config keys (ID -> Path) to prevent library crashes ---
+        normalized_updates = {}
+        for pattern, action in list(config.state_rules.items()):
+            if isinstance(pattern, int) and pattern in self._id_to_param_map:
+                path, _ = self._id_to_param_map[pattern]
+                normalized_updates[path] = action
+                del config.state_rules[pattern]
+        config.state_rules.update(normalized_updates)
+
         self._store_original_weights(model)
         modified_parameters = set()
 
@@ -112,49 +144,24 @@ class ParameterShardingStrategy:
                 matching_params = self._find_matching_parameters(model, pattern)
 
                 for param_name, param in matching_params:
-                    try:
-                        param_id = id(param.experimental_ref())
-                    except AttributeError:
-                        param_id = id(param)
+                    exp_ref_fn = getattr(param, "experimental_ref", None)
+                    param_id = id(exp_ref_fn()) if exp_ref_fn else id(param)
 
-                    # Weight tying logic
                     if param_id in self.sharded_weights_by_id:
-                        self.sharded_weights[param_name] = self.sharded_weights_by_id[
-                            param_id
-                        ]
-                        
-                        # Find existing name for logging/mapping
-                        existing_param_name = "unknown"
-                        for name, shard in self.sharded_weights.items():
-                            if shard is self.sharded_weights_by_id[param_id]:
-                                existing_param_name = name
-                                break
-
-                        self.weight_mapping[param_name] = self.weight_mapping.get(
-                            existing_param_name, {}
-                        )
+                        self.sharded_weights[param_name] = self.sharded_weights_by_id[param_id]
                         modified_parameters.add(param_name)
-                        print(
-                            f"   🔗 Tied {param_name} to existing shard from {existing_param_name}"
-                        )
                         continue
 
-                    # Execute the lambda to get the shard (slice)
                     sharded_tensor = action(param, self.rank)
-
                     self.sharded_weights[param_name] = sharded_tensor
                     self.sharded_weights_by_id[param_id] = sharded_tensor
-
                     self.weight_mapping[param_name] = {
                         "original_shape": param.shape,
                         "sharded_shape": sharded_tensor.shape,
                         "action": action,
                     }
-
                     modified_parameters.add(param_name)
-                    print(
-                        f"   ✅ Sharded {param_name}: {param.shape} -> {sharded_tensor.shape}"
-                    )
+                    print(f"   ✅ Sharded {param_name}: {param.shape} -> {sharded_tensor.shape}")
 
         sharded_model = ParameterShardedModel(
             original_model=model,
@@ -163,68 +170,44 @@ class ParameterShardingStrategy:
             device_id=device_id,
         )
 
-        print(
-            f"🎯 Parameter sharding completed: {len(modified_parameters)} parameters sharded"
-        )
+        print(f"🎯 Parameter sharding completed: {len(modified_parameters)} parameters sharded")
         return sharded_model, modified_parameters
 
     def _store_original_weights(self, model):
-        """Store original weights for reference using variable paths."""
         for weight in model.weights:
             if hasattr(weight, 'numpy'):
                 self.original_weights[weight.path] = weight.numpy()
 
-    def _find_matching_parameters(self, model, pattern: str) -> List[Tuple[str, Any]]:
-        """
-        Find parameters matching the pattern using the pre-computed path map.
-        """
-        # 1. Exact match (Ideal case: autoconfig path matches model path exactly)
+    def _find_matching_parameters(self, model, pattern: Any) -> List[Tuple[str, Any]]:
+        if isinstance(pattern, int):
+            if pattern in self._id_to_param_map:
+                return [self._id_to_param_map[pattern]]
+            return []
+        if not isinstance(pattern, str):
+            return []
         if pattern in self.param_path_map:
             return [(pattern, self.param_path_map[pattern])]
-            
-        # 2. Suffix match (Common case: autoconfig generated paths without top-level model prefix)
         matches = []
         suffix = "/" + pattern
         for path, weight in self.param_path_map.items():
             if path.endswith(suffix):
                 matches.append((path, weight))
-        
         return matches
 
 
 def _define_parameter_sharded_model():
-    """
-    Factory function to define and return the ParameterShardedModel class.
-    This delays the import of keras.src.models.Model to break circular dependencies.
-    """
-    from keras.src.models import Model
-    from keras.src.models import Functional
+    from keras.src.models import Model, Functional
 
     class ParameterShardedModel(Model):
-        """
-        Wrapper model that handles parameter sharding without rebuilding the structure.
-        """
-
-        def __init__(
-            self,
-            original_model: Model,
-            sharding_strategy: ParameterShardingStrategy,
-            config: LayoutMap,
-            device_id: Any,
-        ):
+        def __init__(self, original_model: Model, sharding_strategy: ParameterShardingStrategy, config: LayoutMap, device_id: Any):
             super().__init__(name=original_model.name)
-
             self.original_model = original_model
             self.sharding_strategy = sharding_strategy
             self.config = config
             self._device = device_id
-
-            # Build if not built (vital for inputs access)
             if not self.original_model.built and self.original_model.inputs:
                 self.original_model.build(self.original_model.inputs[0].shape)
-
             self._build_and_cache_weights()
-
             print("🚀 ParameterShardedModel created successfully")
 
         @property
@@ -232,361 +215,144 @@ def _define_parameter_sharded_model():
             return self._device
 
         def _build_and_cache_weights(self):
-            print("   - Building and caching the definitive weights list...")
             weights_list = []
-
-            sharded_weight_ids = set(
-                self.sharding_strategy.sharded_weights_by_id.keys()
-            )
-
-            for (
-                param_name,
-                sharded_tensor,
-            ) in self.sharding_strategy.sharded_weights.items():
-                weights_list.append(
-                    ShardedWeight(
-                        sharded_tensor, 
-                        param_name, 
-                        device_id=self._device
-                    )
-                )
-
-            unsharded_count = 0
+            sharded_weight_ids = set(self.sharding_strategy.sharded_weights_by_id.keys())
+            for param_name, sharded_tensor in self.sharding_strategy.sharded_weights.items():
+                weights_list.append(ShardedWeight(sharded_tensor, param_name, device_id=self._device))
             for weight in self.original_model.weights:
-                try:
-                    weight_id = id(weight.experimental_ref())
-                except AttributeError:
-                    weight_id = id(weight)
-
+                exp_ref_fn = getattr(weight, "experimental_ref", None)
+                weight_id = id(exp_ref_fn()) if exp_ref_fn else id(weight)
                 if weight_id not in sharded_weight_ids:
                     weights_list.append(weight)
-                    unsharded_count += 1
-
             self._weights_list = weights_list
 
         @property
         def weights(self):
             return self._weights_list
         
-        # --- FIX: Robust Output Spec handling ---
         def compute_output_shape(self, input_shape):
             return self.original_model.compute_output_shape(input_shape)
 
         def compute_output_spec(self, *args, **kwargs):
-            try:
+            if args:
                 return self.original_model.compute_output_spec(args[0])
-            except Exception:
-                return self.original_model.compute_output_spec(*args, **kwargs)
+            return self.original_model.compute_output_spec(**kwargs)
 
         def call(self, inputs, training=None, mask=None):
-
             tensor_cache = {}
-
             # 1. Cache Inputs
             if isinstance(inputs, dict):
                 for inp_tensor in self.original_model.inputs:
-                    name = inp_tensor.name
-                    clean_name = name.split(":")[0]
-                    # Prefer exact name key, then cleaned name; store by id
-                    if name in inputs:
-                        val = inputs[name]
-                    elif clean_name in inputs:
-                        val = inputs[clean_name]
-                    else:
-                        val = None
-
-                    if val is not None:
-                        tensor_cache[id(inp_tensor)] = val
-                        # also store by cleaned name so lookups can match
-                        tensor_cache[clean_name] = val
-                        tensor_cache[name] = val
+                    name = getattr(inp_tensor, "name", None)
+                    if name:
+                        clean_name = name.split(":")[0]
+                        val = inputs.get(name, inputs.get(clean_name))
+                        if val is not None:
+                            tensor_cache[id(inp_tensor)] = val
+                            tensor_cache[clean_name] = val
+                            tensor_cache[name] = val
             else:
-                input_list = ops.convert_to_tensor(inputs)
-                if not isinstance(input_list, (list, tuple)):
-                    input_list = [input_list]
-                
+                input_list = inputs if isinstance(inputs, (list, tuple)) else [inputs]
                 for i, inp_tensor in enumerate(self.original_model.inputs):
                     if i < len(input_list):
                         val = input_list[i]
                         tensor_cache[id(inp_tensor)] = val
-                        try:
-                            name = inp_tensor.name
-                            clean_name = name.split(":")[0]
-                            tensor_cache[clean_name] = val
+                        name = getattr(inp_tensor, "name", None)
+                        if name:
+                            tensor_cache[name.split(":")[0]] = val
                             tensor_cache[name] = val
-                        except Exception:
-                            pass
 
             # 2. Iterate Layers
             for layer in self.original_model.layers:
                 if isinstance(layer, layers.InputLayer):
                     continue
                 
-                # Reconstruct inputs for this layer from the cache
                 layer_inputs = []
                 for node in layer._inbound_nodes:
                     for symbolic_input_tensor in node.input_tensors:
-                        key_id = id(symbolic_input_tensor)
-                        if key_id in tensor_cache:
-                            layer_inputs.append(tensor_cache[key_id])
-                        else:
-                            # Fallback: try matching by cleaned symbolic name
-                            try:
-                                name = symbolic_input_tensor.name
-                                clean_name = name.split(":")[0]
-                            except Exception:
-                                name = None
-                                clean_name = None
-
-                            if clean_name and clean_name in tensor_cache:
-                                layer_inputs.append(tensor_cache[clean_name])
-                            elif name and name in tensor_cache:
-                                layer_inputs.append(tensor_cache[name])
+                        val = tensor_cache.get(id(symbolic_input_tensor))
+                        if val is None:
+                            name = getattr(symbolic_input_tensor, "name", None)
+                            if name:
+                                val = tensor_cache.get(name.split(":")[0], tensor_cache.get(name))
+                        if val is not None:
+                            layer_inputs.append(val)
                 
-                # --- CRITICAL FIX: Handle Dictionary Inputs for Backbones ---
-                if (
-                    (isinstance(layer, Functional) or isinstance(layer, Model))
-                    and hasattr(layer, "input_names")
-                ):
-                    if len(layer_inputs) == len(layer.input_names) and len(layer_inputs) > 0:
-                        layer_inputs = dict(zip(layer.input_names, layer_inputs))
-                
+                # --- FIX: Reconstruct Dict for Backbones to resolve structural mismatch ---
+                if isinstance(layer, (Functional, Model)):
+                    layer_input_names = getattr(layer, "input_names", [])
+                    if not layer_input_names and hasattr(layer, "inputs") and layer.inputs:
+                        layer_input_names = [getattr(x, "name", "").split(":")[0] for x in layer.inputs]
+                    
+                    if layer_input_names and len(layer_inputs) == len(layer_input_names):
+                        layer_inputs = dict(zip(layer_input_names, layer_inputs))
                 elif len(layer_inputs) == 1:
                     layer_inputs = layer_inputs[0]
 
-                try:
-                    is_empty_container = (
-                        layer_inputs is None
-                        or (isinstance(layer_inputs, (list, tuple)) and len(layer_inputs) == 0)
-                        or (isinstance(layer_inputs, dict) and len(layer_inputs) == 0)
-                    )
+                if not layer_inputs and (isinstance(layer_inputs, (list, tuple, dict)) or layer_inputs is None):
+                    layer_inputs = inputs
 
-                    if is_empty_container:
-                        logger.debug(
-                            "Layer '%s' received empty reconstructed inputs; forwarding top-level inputs",
-                            layer.name,
-                        )
-                        layer_inputs = inputs
+                call_kwargs = {"training": training} if training is not None else {}
+                node_args = getattr(node, "arguments", None)
+                if node_args:
+                    extra_kwargs = getattr(node_args, "kwargs", {})
+                    if extra_kwargs:
+                        for k, v in extra_kwargs.items():
+                            if k != "training":
+                                call_kwargs[k] = v
 
-                    node_kwargs = {}
-                    try:
-                        if hasattr(node, "arguments") and getattr(node, "arguments") is not None:
-                            node_kwargs = getattr(node.arguments, "kwargs", {}) or {}
-                    except Exception:
-                        node_kwargs = {}
+                current_tensor = layer(layer_inputs, **call_kwargs)
 
-                    call_kwargs = {"training": training} if training is not None else {}
-                    for k, v in node_kwargs.items():
-                        if k != "training":
-                            call_kwargs[k] = v
-
-                    current_tensor = layer(layer_inputs, **call_kwargs)
-                except Exception:
-                    tried_call = False
-
-                    # (1) list/tuple -> dict by names
-                    if isinstance(layer_inputs, (list, tuple)):
-                        cleaned_names = None
-                        try:
-                            if hasattr(layer, "inputs") and layer.inputs:
-                                cleaned_names = [n.name.split(":")[0] for n in layer.inputs]
-                        except Exception:
-                            cleaned_names = None
-
-                        if not cleaned_names and hasattr(layer, "input_names"):
-                            try:
-                                cleaned_names = [n.split(":")[0] for n in layer.input_names]
-                            except Exception:
-                                cleaned_names = None
-
-                        if cleaned_names and len(cleaned_names) == len(layer_inputs):
-                            alt_inputs = dict(zip(cleaned_names, layer_inputs))
-                            try:
-                                logger.debug(
-                                    "Retrying layer '%s' with dict inputs: %s",
-                                    layer.name,
-                                    list(alt_inputs.keys()),
-                                )
-                                current_tensor = layer(alt_inputs, training=training)
-                                tried_call = True
-                            except Exception:
-                                tried_call = False
-
-                    # (2) dict -> single tensor (first value)
-                    if not tried_call and isinstance(layer_inputs, dict):
-                        first_val = next(iter(layer_inputs.values()), None)
-                        if first_val is not None:
-                            try:
-                                logger.debug(
-                                    "Retrying layer '%s' with single tensor from dict inputs",
-                                    layer.name,
-                                )
-                                current_tensor = layer(first_val, training=training)
-                                tried_call = True
-                            except Exception:
-                                tried_call = False
-
-                    # (3) list/tuple -> single positional tensor (first element)
-                    if not tried_call and isinstance(layer_inputs, (list, tuple)) and len(layer_inputs) > 0:
-                        try:
-                            logger.debug(
-                                "Retrying layer '%s' with first element of positional inputs",
-                                layer.name,
-                            )
-                            current_tensor = layer(layer_inputs[0], training=training)
-                            tried_call = True
-                        except Exception:
-                            tried_call = False
-
-                    if not tried_call:
-                        raise
-
-                # 4/5. Apply Communication Rules (AllReduce/Gather) and Cache Output
+                # 4. Apply Communication Rules
                 layer_path = getattr(layer, "path", layer.name)
                 output_rule = None
-                
-                # Check for exact match or suffix match in output_rules
                 for pattern, rule in self.config.output_rules.items():
-                    if pattern == layer_path or layer_path.endswith("/" + pattern):
-                        output_rule = rule.get(0)
+                    if pattern == layer_path or layer_path.endswith("/" + pattern) or re.search(str(pattern), layer_path):
+                        output_rule = rule.get(0) if isinstance(rule, dict) else rule
                         break
-                
-                # Fallback: check regex if simple matching failed
-                if not output_rule:
-                    for pattern, rule in self.config.output_rules.items():
-                        if re.search(pattern, layer_path):
-                            output_rule = rule.get(0)
-                            break
 
                 if output_rule:
-                    if callable(output_rule):
-                        logger.debug(f"Applying callable Output Rule to {layer.name}")
-                        current_tensor = output_rule(current_tensor)
-                    else:
-                        # Fallback for strings (legacy support)
-                        current_tensor = self._apply_communication(
-                            current_tensor, layer.name, output_rule
-                        )
+                    current_tensor = output_rule(current_tensor) if callable(output_rule) else self._apply_communication(current_tensor, layer.name, output_rule)
 
-                # Map the runtime outputs back to the symbolic output tensors
+                # 5. Map Outputs
                 for node_idx, node in enumerate(layer._inbound_nodes):
-                    try:
-                        outputs = getattr(node, "output_tensors", None)
-                    except Exception:
-                        outputs = None
-
+                    outputs = getattr(node, "output_tensors", None)
                     if not outputs:
                         continue
-
-                    if isinstance(current_tensor, (list, tuple)):
-                        for out_idx, (sym, val) in enumerate(zip(outputs, current_tensor)):
-                            tensor_cache[id(sym)] = val
-                            try:
-                                layer_key = ("layer_node_output", layer.name, node_idx, out_idx)
-                                tensor_cache[layer_key] = val
-                            except Exception:
-                                pass
-                            try:
-                                name = getattr(sym, "name", None)
-                                if name:
-                                    clean_name = name.split(":")[0]
-                                    tensor_cache[clean_name] = val
-                                    tensor_cache[name] = val
-                            except Exception:
-                                pass
-                    else:
-                        for out_idx, sym in enumerate(outputs):
-                            tensor_cache[id(sym)] = current_tensor
-                            try:
-                                layer_key = ("layer_node_output", layer.name, node_idx, out_idx)
-                                tensor_cache[layer_key] = current_tensor
-                            except Exception:
-                                pass
-                            try:
-                                name = getattr(sym, "name", None)
-                                if name:
-                                    clean_name = name.split(":")[0]
-                                    tensor_cache[clean_name] = current_tensor
-                                    tensor_cache[name] = current_tensor
-                            except Exception:
-                                pass
+                    vals = current_tensor if isinstance(current_tensor, (list, tuple)) else [current_tensor]
+                    for out_idx, (sym, val) in enumerate(zip(outputs, vals)):
+                        tensor_cache[id(sym)] = val
+                        tensor_cache[("layer_node_output", layer.name, node_idx, out_idx)] = val
+                        name = getattr(sym, "name", None)
+                        if name:
+                            tensor_cache[name.split(":")[0]] = val
+                            tensor_cache[name] = val
 
             final_outputs = []
             for symbolic_output in self.original_model.outputs:
-                val = None
-                try:
-                    val = tensor_cache.get(id(symbolic_output), None)
-                except Exception:
-                    val = None
-
+                val = tensor_cache.get(id(symbolic_output))
                 if val is None:
-                    try:
-                        name = getattr(symbolic_output, "name", None)
-                        if name:
-                            clean_name = name.split(":")[0]
-                            val = tensor_cache.get(clean_name, tensor_cache.get(name, None))
-                    except Exception:
-                        val = None
-
+                    name = getattr(symbolic_output, "name", None)
+                    if name:
+                        val = tensor_cache.get(name.split(":")[0], tensor_cache.get(name))
                 if val is None:
-                    try:
-                        history = getattr(symbolic_output, "_keras_history", None)
-                        if history and len(history) >= 3:
-                            producing_layer_obj = history[0]
-                            node_index = history[1]
-                            tensor_index = history[2]
-                            layer_key = ("layer_node_output", getattr(producing_layer_obj, "name", None), node_index, tensor_index)
-                            val = tensor_cache.get(layer_key, None)
-                    except Exception:
-                        val = None
-
+                    hist = getattr(symbolic_output, "_keras_history", None)
+                    if hist and len(hist) >= 3:
+                        val = tensor_cache.get(("layer_node_output", getattr(hist[0], "name", None), hist[1], hist[2]))
                 if val is None:
-                    try:
-                        name = getattr(symbolic_output, "name", None)
-                        if name:
-                            base_name = name.split(":")[0].split("/")[-1]
-                            val = tensor_cache.get(base_name, None)
-                    except Exception:
-                        val = None
-
-                if val is None:
-                    raise RuntimeError(
-                        f"Missing runtime value for model output symbolic tensor: {symbolic_output}."
-                        " Available tensor_cache keys: " + ",".join([str(k) for k in list(tensor_cache.keys())[:20]])
-                    )
-
+                    raise RuntimeError(f"Missing runtime value for output: {symbolic_output}.")
                 final_outputs.append(val)
 
-            if len(final_outputs) == 1:
-                return final_outputs[0]
-            return final_outputs
+            return final_outputs[0] if len(final_outputs) == 1 else final_outputs
 
         def _apply_communication(self, sharded_output, layer_name, rule_str: str):
-            """Applies communication directly using the distributed backend."""
-            # This method is retained for backward compatibility if strings are passed.
             if "sum" in rule_str or "allreduce" in rule_str:
-                logger.debug(f"Applying AllReduce (sum) to {layer_name}")
-                return distribution_lib.all_reduce(
-                    sharded_output, op="sum", axis_name="model"
-                )
-
-            elif "gather" in rule_str:
-                try:
-                    parts = rule_str.split(" ")
-                    if len(parts) > 1:
-                        dim = int(parts[-1])
-                    else:
-                        dim = -1
-                except (ValueError, IndexError):
-                    dim = -1
-                
-                logger.debug(f"Applying AllGather (dim={dim}) to {layer_name}")
-                return distribution_lib.all_gather(
-                    sharded_output, axis=dim, axis_name="model"
-                )
-
-            else:
-                return sharded_output
+                return distribution_lib.all_reduce(sharded_output, op="sum", axis_name="model")
+            if "gather" in rule_str:
+                parts = rule_str.split(" ")
+                dim = int(parts[-1]) if len(parts) > 1 and parts[-1].lstrip('-').isdigit() else -1
+                return distribution_lib.all_gather(sharded_output, axis=dim, axis_name="model")
+            return sharded_output
 
         def get_config(self):
             return self.original_model.get_config()
@@ -598,20 +364,6 @@ def _define_parameter_sharded_model():
     return ParameterShardedModel
 
 
-def make_parameter_sharded_model(
-    module: "Model",
-    config: LayoutMap,
-    rank: int,
-    device_count: int,
-    device_id: Any,
-) -> Tuple["Model", Set[str]]:
-    """
-    Create a parameter-sharded version of a Keras model.
-    """
+def make_parameter_sharded_model(module: "Model", config: LayoutMap, rank: int, device_count: int, device_id: Any) -> Tuple["Model", Set[str]]:
     sharding_strategy = ParameterShardingStrategy(device_count, rank)
-
-    sharded_model, modified_parameters = sharding_strategy.shard_model_parameters(
-        module, config, device_id
-    )
-
-    return sharded_model, modified_parameters
+    return sharding_strategy.shard_model_parameters(module, config, device_id)
