@@ -1,6 +1,5 @@
 import keras.src.distribution.tensor_parallel.autoconfig
 import keras.src.distribution.tensor_parallel.tensor_layout
-import keras.src.distribution.tensor_parallel.coordinated_optimizer
 from keras.src.distribution.distribution_lib import AutoTPDistribution
 from keras.src.distribution.distribution_lib import DataParallel
 from keras.src.distribution.distribution_lib import DeviceMesh
