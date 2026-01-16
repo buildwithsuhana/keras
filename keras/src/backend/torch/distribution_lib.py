@@ -56,19 +56,24 @@ def _to_backend_layout(tensor_layout):
         raise ValueError("Device mesh must be set for TensorLayout.")
 
     mesh_axis_names = tensor_layout.device_mesh.axis_names
-    # PyTorch requires one placement per dimension of the DEVICE MESH.
+    # Initialize all mesh dimensions to Replicate by default.
+    # PyTorch DTensor requires one placement per dimension of the DEVICE MESH.
     placements = [Replicate()] * len(mesh_axis_names)
 
-    # Iterate through the TENSOR dimensions
+    # tensor_layout.axes contains the mesh axis names for each TENSOR dimension.
+    # We must iterate over the tensor dimensions (enumerate) to get the correct index.
     for i, axis in enumerate(tensor_layout.axes):
         if axis is not None:
             if axis not in mesh_axis_names:
                 raise ValueError(f"Axis {axis} not found in {mesh_axis_names}")
             
-            # Find which MESH dimension this TENSOR dimension 'i' maps to
+            # Identify which dimension of the physical DEVICE MESH corresponds to 
+            # this logical axis name.
             mesh_dim_index = mesh_axis_names.index(axis)
-            # Shard the TENSOR dimension 'i' over MESH dimension 'mesh_dim_index'
-            placements[mesh_dim_index] = Shard(i) 
+            
+            # IMPORTANT: Shard(i) tells Torch to shard the i-th dimension of the TENSOR.
+            # We place this instruction at the mesh_dim_index of the placements list.
+            placements[mesh_dim_index] = Shard(i)
             
     return placements
 
