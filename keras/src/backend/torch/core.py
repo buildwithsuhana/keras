@@ -104,7 +104,9 @@ def to_torch_dtype(dtype):
 class Variable(KerasVariable):
     def _initialize(self, value):
         from keras.src.distribution import distribution_lib as high_level_dist_lib
+        from keras.src.backend.torch import distribution_lib as torch_dist_lib
         
+        # Check if ModelParallel is active via global context
         dist = high_level_dist_lib.distribution()
         layout = None
         if dist is not None:
@@ -113,13 +115,11 @@ class Variable(KerasVariable):
         if isinstance(value, torch.nn.Parameter):
             self._value = value
         else:
-            # Convert initial value to tensor
             tensor_value = convert_to_tensor(value, dtype=self._dtype)
             
-            # Apply sharding if a layout is provided by ModelParallel
+            # Apply sharding if ModelParallel layout is assigned to this weight path
             if layout is not None:
-                # distribution_lib is the new file created in Step 2
-                tensor_value = distribution_lib.distribute_tensor(tensor_value, layout)
+                tensor_value = torch_dist_lib.distribute_tensor(tensor_value, layout)
             
             self._value = torch.nn.Parameter(
                 tensor_value,
@@ -127,7 +127,7 @@ class Variable(KerasVariable):
             ).to(get_device())
 
     def _convert_to_tensor(self, value, dtype=None):
-        # This fix resolves the NotImplementedError
+        # Override required to satisfy KerasVariable contract
         return convert_to_tensor(value, dtype=dtype)
 
     # Overload native accessor.
