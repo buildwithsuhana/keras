@@ -993,7 +993,7 @@ class AutoTPDistribution(Distribution):
 
         self.model = TensorParallelKeras(
             model=self._original_model,
-            world_size=np.prod(self.device_mesh.shape),
+            world_size=int(np.prod(self.device_mesh.shape)),
             device_ids=self.device_mesh.devices.flatten().tolist(),
         )
 
