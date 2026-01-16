@@ -106,28 +106,20 @@ class Variable(KerasVariable):
         from keras.src.distribution import distribution_lib as high_level_dist_lib
         from keras.src.backend.torch import distribution_lib as torch_dist_lib
         
-        # Check if ModelParallel is active via global context
         dist = high_level_dist_lib.distribution()
-        layout = None
-        if dist is not None:
-            layout = dist.get_variable_layout(self)
+        layout = dist.get_variable_layout(self) if dist else None
 
         if isinstance(value, torch.nn.Parameter):
             self._value = value
         else:
             tensor_value = convert_to_tensor(value, dtype=self._dtype)
-            
-            # Apply sharding if ModelParallel layout is assigned to this weight path
             if layout is not None:
+                # Apply PyTorch DTensor sharding using the corrected placements
                 tensor_value = torch_dist_lib.distribute_tensor(tensor_value, layout)
             
-            self._value = torch.nn.Parameter(
-                tensor_value,
-                requires_grad=self.trainable,
-            ).to(get_device())
+            self._value = torch.nn.Parameter(tensor_value, requires_grad=self.trainable).to(get_device())
 
     def _convert_to_tensor(self, value, dtype=None):
-        # Override required to satisfy KerasVariable contract
         return convert_to_tensor(value, dtype=dtype)
 
     # Overload native accessor.

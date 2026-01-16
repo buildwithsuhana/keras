@@ -56,20 +56,20 @@ def _to_backend_layout(tensor_layout):
         raise ValueError("Device mesh must be set for TensorLayout.")
 
     mesh_axis_names = tensor_layout.device_mesh.axis_names
-    # PyTorch requires a placement for EACH dimension of the device mesh.
-    # We initialize all mesh dimensions to Replicate by default.
+    # Initialize all mesh dimensions to Replicate.
+    # PyTorch requires one placement per dimension of the DEVICE MESH.
     placements = [Replicate()] * len(mesh_axis_names)
 
-    # tensor_layout.axes maps tensor dimensions to mesh axis names.
+    # tensor_layout.axes contains the mesh axis names for each TENSOR dimension.
+    # e.g., for a 1D bias with axes=('model',), axis is 'model'.
     for axis in tensor_layout.axes:
         if axis is not None:
             if axis not in mesh_axis_names:
-                raise ValueError(
-                    f"Invalid axis name '{axis}'. Valid axes: {mesh_axis_names}"
-                )
-            dim_index = mesh_axis_names.index(axis)
-            # Apply sharding to the specific mesh dimension
-            placements[dim_index] = Shard(dim_index)
+                raise ValueError(f"Axis {axis} not found in {mesh_axis_names}")
+            
+            # The Shard(dim) argument is the index of the dimension of the DEVICE MESH.
+            mesh_dim_index = mesh_axis_names.index(axis)
+            placements[mesh_dim_index] = Shard(mesh_dim_index)
             
     return placements
 
