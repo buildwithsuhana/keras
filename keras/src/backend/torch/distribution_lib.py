@@ -52,32 +52,33 @@ def distribute_tensor(tensor, layout):
     """Shards a tensor across the DeviceMesh using PyTorch DTensor."""
     from keras.src.distribution import TensorLayout
     
-    # Handle the case where the tensor might already be sharded
-    if hasattr(tensor, "device_mesh"):
+    # If it's already a DTensor or sharded, return as is
+    if hasattr(tensor, "placements"):
         return tensor
 
     if isinstance(layout, TensorLayout) and layout.device_mesh is not None:
         torch_mesh = layout.device_mesh.backend_mesh
         torch_placements = _to_backend_layout(layout)
         
-        # Ensure the base tensor is on the CPU or current GPU before sharding
-        # This prevents the "found at least two devices" error
-        if isinstance(tensor, torch.Tensor):
-            # Move to CPU first if it's on a different GPU to ensure a clean shard
-            if tensor.device.type == "cuda" and tensor.get_device() != torch.cuda.current_device():
-                tensor = tensor.cpu()
-        else:
+        # 1. Convert to torch.Tensor if it's numpy/list
+        if not isinstance(tensor, torch.Tensor):
             tensor = torch.tensor(tensor)
             
-        # Move to the correct device for this rank
+        # 2. Fix device mismatch: Move to CPU before sharding if it's on the wrong GPU
+        # This is critical for Rank 1 to avoid seeing data on cuda:0
+        if tensor.device.type == "cuda" and tensor.get_device() != torch.cuda.current_device():
+            tensor = tensor.cpu()
+        
+        # 3. Move to current local device
         tensor = tensor.to(torch_mesh.device_type)
         
-        # Create the DTensor
+        # 4. Shard the tensor
+        # We disable run_check for performance, but it can be True for debugging
         return torch_distribute_tensor(
             tensor, 
             torch_mesh, 
             torch_placements,
-            run_check=False # Set to True for initial debugging of metadata sync
+            run_check=False
         )
     return tensor
 
