@@ -19,6 +19,9 @@ from keras.src.backend.common.stateless_scope import in_stateless_scope
 from keras.src.backend.common.symbolic_scope import SymbolicScope
 from keras.src.backend.config import floatx
 
+# In keras/src/backend/torch/core.py
+from keras.src.backend.torch import distribution_lib
+
 SUPPORTS_SPARSE_TENSORS = False
 SUPPORTS_RAGGED_TENSORS = False
 IS_THREAD_SAFE = True
@@ -100,21 +103,34 @@ def to_torch_dtype(dtype):
 
 class Variable(KerasVariable):
     def _initialize(self, value):
+        from keras.src.distribution import (
+            distribution_lib as high_level_dist_lib,
+        )
+
+        # Determine the device
+        device = get_device()
+
+        # Check if there is an active distribution (ModelParallel)
+        dist = high_level_dist_lib.distribution()
+        layout = None
+        if dist is not None:
+            layout = dist.get_variable_layout(self)
+
         if isinstance(value, torch.nn.Parameter):
-            # Reuse same parameter
             self._value = value
         else:
+            tensor_value = convert_to_tensor(value, dtype=self._dtype)
+
+            # If layout exists, convert to DTensor before making it a Parameter
+            if layout is not None:
+                tensor_value = distribution_lib.distribute_tensor(
+                    tensor_value, layout
+                )
+
             self._value = torch.nn.Parameter(
-                convert_to_tensor(value, dtype=self._dtype),
+                tensor_value,
                 requires_grad=self.trainable,
-            ).to(get_device())
-
-    def _direct_assign(self, value):
-        with torch.no_grad():
-            self.value.copy_(value)
-
-    def _convert_to_tensor(self, value, dtype=None):
-        return convert_to_tensor(value, dtype=dtype)
+            ).to(device)
 
     # Overload native accessor.
     @classmethod
