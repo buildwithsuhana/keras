@@ -49,20 +49,36 @@ def distribute_variable(value, layout):
     return distribute_tensor(value, layout)
 
 def distribute_tensor(tensor, layout):
-    """Convert a torch.Tensor to a DTensor based on the layout."""
+    """Shards a tensor across the DeviceMesh using PyTorch DTensor."""
     from keras.src.distribution import TensorLayout
+    
+    # Handle the case where the tensor might already be sharded
+    if hasattr(tensor, "device_mesh"):
+        return tensor
 
-    if isinstance(layout, TensorLayout):
+    if isinstance(layout, TensorLayout) and layout.device_mesh is not None:
         torch_mesh = layout.device_mesh.backend_mesh
         torch_placements = _to_backend_layout(layout)
         
-        if not isinstance(tensor, torch.Tensor):
+        # Ensure the base tensor is on the CPU or current GPU before sharding
+        # This prevents the "found at least two devices" error
+        if isinstance(tensor, torch.Tensor):
+            # Move to CPU first if it's on a different GPU to ensure a clean shard
+            if tensor.device.type == "cuda" and tensor.get_device() != torch.cuda.current_device():
+                tensor = tensor.cpu()
+        else:
             tensor = torch.tensor(tensor)
             
-        device = torch_mesh.device_type
-        tensor = tensor.to(device)
+        # Move to the correct device for this rank
+        tensor = tensor.to(torch_mesh.device_type)
         
-        return torch_distribute_tensor(tensor, torch_mesh, torch_placements)
+        # Create the DTensor
+        return torch_distribute_tensor(
+            tensor, 
+            torch_mesh, 
+            torch_placements,
+            run_check=False # Set to True for initial debugging of metadata sync
+        )
     return tensor
 
 def _to_backend_mesh(device_mesh):
