@@ -5,20 +5,19 @@ Port of the PyTorch tensor_parallel library
 
 import logging
 import re
-from typing import Collection, Optional, Sequence, Union
+from typing import Optional
+from typing import Sequence
+from typing import Union
 
 import numpy as np
-import tensorflow as tf
+
 import keras
 from keras import ops
-from keras.src.distribution.tensor_parallel.autoconfig import (
-    get_default_config,
-)
+from keras.src.distribution import list_devices
+from keras.src.distribution.tensor_parallel.autoconfig import get_default_config
 from keras.src.distribution.tensor_parallel.parameter_sharding import (
     make_parameter_sharded_model,
 )
-
-from keras.src.distribution import list_devices
 
 logger = logging.getLogger(__file__)
 
@@ -45,7 +44,7 @@ class TensorParallelKeras(Model):
         self.device_count = device_count
         self.device_ids = device_ids
         self.sharding_strategy = "auto"
-        
+
         self.tensor_parallel_config = None
         self.distributed = True
 
@@ -77,7 +76,7 @@ class TensorParallelKeras(Model):
                 device_ids = accel_devices[:device_count]
         else:
             print(
-                f"⚠️  Could not discover accelerator devices. Falling back to configuration."
+                "⚠️  Could not discover accelerator devices. Falling back to configuration."
             )
 
         if not device_ids:
@@ -97,13 +96,13 @@ class TensorParallelKeras(Model):
 
                 with device(self.devices[0]):
                     self.model_shards[0] = model
-            
+
             self.assembled_model = self._original_model
 
             if hasattr(self._original_model, "inputs"):
                 self._inputs = self._original_model.inputs
                 self._outputs = self._original_model.outputs
-            
+
             self.built = True
             return
 
@@ -145,7 +144,6 @@ class TensorParallelKeras(Model):
             )
             self.model_shards.append(shard)
             self.modified_parameters_names.update(modified_parameters_names)
-            
 
             logger.info(f"   ✅ Created shard {rank} for device {device_id}")
 
@@ -205,9 +203,7 @@ class TensorParallelKeras(Model):
     @property
     def weights(self):
         unique_vars = {
-            id(var): var
-            for shard in self.model_shards
-            for var in shard.weights
+            id(var): var for shard in self.model_shards for var in shard.weights
         }
         return list(unique_vars.values())
 
@@ -321,10 +317,10 @@ class TensorParallelKeras(Model):
                     f"Calling shard '{getattr(shard, 'name', '<shard>')}' with inputs: {list(shard_inputs.keys())}"
                 )
                 partial_outputs.append(shard(shard_inputs))
-            except Exception as e:
+            except Exception:
                 logger.exception(
                     "Exception when calling shard %s with inputs=%s",
-                    getattr(shard, 'name', '<shard>'),
+                    getattr(shard, "name", "<shard>"),
                     list(shard_inputs.keys()),
                 )
                 raise
@@ -396,7 +392,14 @@ class TensorParallelKeras(Model):
         """
         return self.assembled_model(inputs, training=training, **kwargs)
 
-    def compile(self, optimizer=None, loss=None, metrics=None, loss_weights=None, **kwargs):
+    def compile(
+        self,
+        optimizer=None,
+        loss=None,
+        metrics=None,
+        loss_weights=None,
+        **kwargs,
+    ):
         """
         Compile the tensor parallel model.
         """
@@ -405,7 +408,7 @@ class TensorParallelKeras(Model):
             loss=loss,
             metrics=metrics,
             loss_weights=loss_weights,
-            **kwargs
+            **kwargs,
         )
         logger.info(
             "Compiled TensorParallelKeras model with native Keras distribution logic."

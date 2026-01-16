@@ -1,7 +1,8 @@
 import os
+
+import numpy as np
 import pytest
 import torch
-import numpy as np
 import torch.distributed as dist
 
 # The library to be tested
@@ -9,7 +10,9 @@ from keras.src.backend import distribution_lib
 
 # We need the Keras API classes to create layouts for testing the backend
 # conversion and distribution functions.
-from keras.src.distribution import DeviceMesh, TensorLayout
+from keras.src.distribution import DeviceMesh
+from keras.src.distribution import TensorLayout
+
 
 @pytest.fixture(scope="session", autouse=True)
 def setup_torch_distributed():
@@ -22,7 +25,7 @@ def setup_torch_distributed():
         return
 
     os.environ.setdefault("MASTER_ADDR", "localhost")
-    os.environ.setdefault("MASTER_PORT", "29500") # A default free port
+    os.environ.setdefault("MASTER_PORT", "29500")  # A default free port
     os.environ.setdefault("RANK", "0")
     os.environ.setdefault("WORLD_SIZE", "1")
     dist.init_process_group(backend="gloo")
@@ -44,7 +47,7 @@ class TestTorchDistributionLibLive:
     def test_get_device_count(self):
         """Tests the get_device_count helper against the runtime environment."""
         assert distribution_lib.get_device_count("cpu") == 1
-        
+
         if torch.cuda.is_available():
             gpu_count = torch.cuda.device_count()
             assert distribution_lib.get_device_count("gpu") == gpu_count
@@ -53,8 +56,12 @@ class TestTorchDistributionLibLive:
             assert distribution_lib.get_device_count("gpu") == 0
 
         if torch.cuda.is_available():
-            assert distribution_lib.get_device_count() == torch.cuda.device_count()
-        elif hasattr(torch.backends, "mps") and torch.backends.mps.is_available():
+            assert (
+                distribution_lib.get_device_count() == torch.cuda.device_count()
+            )
+        elif (
+            hasattr(torch.backends, "mps") and torch.backends.mps.is_available()
+        ):
             assert distribution_lib.get_device_count() == 1
         else:
             assert distribution_lib.get_device_count() == 1
@@ -117,7 +124,9 @@ class TestTorchDistributionLibLive:
         # Use available devices from the library itself
         world_size = distribution_lib.num_processes()
         if world_size < 2:
-            pytest.skip("Skipping conversion tests in a single-process environment.")
+            pytest.skip(
+                "Skipping conversion tests in a single-process environment."
+            )
 
         devices = [f"cpu:{i}" for i in range(world_size)]
         shape = (world_size,)
@@ -134,7 +143,9 @@ class TestTorchDistributionLibLive:
         placements = distribution_lib._to_backend_layout(keras_layout)
         assert isinstance(placements[0], dist.Shard)
 
-        keras_layout_replicated = TensorLayout(axes=(None,), device_mesh=keras_mesh)
+        keras_layout_replicated = TensorLayout(
+            axes=(None,), device_mesh=keras_mesh
+        )
         placements_replicated = distribution_lib._to_backend_layout(
             keras_layout_replicated
         )
@@ -146,7 +157,9 @@ class TestTorchDistributionLibLive:
     def test_tensor_distribution(self):
         """Tests the distribution of a tensor into a DTensor."""
         if not dist.is_initialized() or distribution_lib.num_processes() < 2:
-            pytest.skip("Tensor distribution test requires a multi-process environment.")
+            pytest.skip(
+                "Tensor distribution test requires a multi-process environment."
+            )
 
         world_size = distribution_lib.num_processes()
         devices = np.arange(world_size)
@@ -163,14 +176,18 @@ class TestTorchDistributionLibLive:
         assert isinstance(dtensor.placements[0], dist.Shard)
 
         # Test distribute_variable (which calls distribute_tensor)
-        dvariable = distribution_lib.distribute_variable(local_tensor, keras_layout)
+        dvariable = distribution_lib.distribute_variable(
+            local_tensor, keras_layout
+        )
         assert isinstance(dvariable, torch.distributed.dtensor.DTensor)
 
     def test_distribute_data_input(self):
         """Tests the `from_local` logic for distributing input data."""
         if not dist.is_initialized() or distribution_lib.num_processes() < 2:
-            pytest.skip("Input distribution test requires a multi-process environment.")
-        
+            pytest.skip(
+                "Input distribution test requires a multi-process environment."
+            )
+
         world_size = distribution_lib.num_processes()
         devices = np.arange(world_size)
         keras_mesh = DeviceMesh((world_size,), ("batch",), devices)

@@ -1,23 +1,26 @@
-import os
 import functools
+import os
+
 import numpy as np
 import pytest
 
 # Ensure environment is set before any Keras imports
 os.environ["XLA_FLAGS"] = "--xla_force_host_platform_device_count=2"
 
-import keras
-from keras import ops
-from keras import distribution
-from keras.src import backend
-from keras.src.distribution.tensor_parallel.tensor_layout import LayoutMap, split_tensor_for_parallelism
-
 # Import your sharding implementation
-from parameter_sharding import (
-    ShardedWeight,
-    make_parameter_sharded_model,
+from parameter_sharding import ShardedWeight
+from parameter_sharding import make_parameter_sharded_model
+
+import keras
+from keras import distribution
+from keras import ops
+from keras.src import backend
+from keras.src.distribution.tensor_parallel.tensor_layout import LayoutMap
+from keras.src.distribution.tensor_parallel.tensor_layout import (
+    split_tensor_for_parallelism,
 )
 from keras.src.testing import TestCase
+
 
 def _create_simple_mlp():
     inputs = keras.Input(shape=(16,), name="input")
@@ -25,6 +28,7 @@ def _create_simple_mlp():
     x = keras.layers.Activation("relu")(x)
     outputs = keras.layers.Dense(8, use_bias=False, name="down_proj")(x)
     return keras.Model(inputs=inputs, outputs=outputs, name="simple_mlp")
+
 
 # --- BACKEND SKIP LOGIC ---
 @pytest.mark.skipif(
@@ -34,13 +38,15 @@ def _create_simple_mlp():
 class UnifiedParameterShardingTest(TestCase):
     def setUp(self):
         super().setUp()
-        
+
         # Discover devices
         self.all_devices = distribution.list_devices()
         # Adapt to whatever is actually available in the environment.
-        self.device_count = len(self.all_devices) if len(self.all_devices) > 0 else 1
+        self.device_count = (
+            len(self.all_devices) if len(self.all_devices) > 0 else 1
+        )
         self.devices = self.all_devices if self.all_devices else ["cpu"]
-            
+
         self.original_model = _create_simple_mlp()
         self.original_model.build(input_shape=(None, 16))
 
@@ -48,15 +54,17 @@ class UnifiedParameterShardingTest(TestCase):
         self.tp_config = LayoutMap(
             state_rules={
                 "up_proj/kernel": functools.partial(
-                    split_tensor_for_parallelism, device_count=self.device_count, dim=1
+                    split_tensor_for_parallelism,
+                    device_count=self.device_count,
+                    dim=1,
                 ),
                 "down_proj/kernel": functools.partial(
-                    split_tensor_for_parallelism, device_count=self.device_count, dim=0
+                    split_tensor_for_parallelism,
+                    device_count=self.device_count,
+                    dim=0,
                 ),
             },
-            output_rules={
-                "down_proj": "sum" 
-            },
+            output_rules={"down_proj": "sum"},
         )
         self.input_data = np.random.rand(4, 16).astype("float32")
 
@@ -70,14 +78,16 @@ class UnifiedParameterShardingTest(TestCase):
             device_count=self.device_count,
             device_id=self.devices[rank],
         )
-        
+
         self.assertTrue(any("up_proj/kernel" in p for p in modified_params))
-        
+
         # Map by variable name (your code replaces '/' with '_')
         sharded_weights_dict = {w.name: w for w in sharded_model.weights}
-        
+
         expected_up_dim = 32 // self.device_count
-        self.assertEqual(sharded_weights_dict["up_proj_kernel"].shape, (16, expected_up_dim))
+        self.assertEqual(
+            sharded_weights_dict["up_proj_kernel"].shape, (16, expected_up_dim)
+        )
 
     def test_forward_pass_execution(self):
         """Tests the manual execution loop in the sharded wrapper."""
@@ -91,7 +101,7 @@ class UnifiedParameterShardingTest(TestCase):
         )
 
         input_tensor = ops.convert_to_tensor(self.input_data)
-        
+
         try:
             output = sharded_model(input_tensor)
             self.assertEqual(output.shape, (4, 8))
@@ -106,7 +116,7 @@ class UnifiedParameterShardingTest(TestCase):
         """Verifies ShardedWeight respects the requested device."""
         rank = 0
         target_device = self.devices[rank]
-        
+
         sharded_model, _ = make_parameter_sharded_model(
             self.original_model,
             self.tp_config,
@@ -114,14 +124,14 @@ class UnifiedParameterShardingTest(TestCase):
             device_count=self.device_count,
             device_id=target_device,
         )
-        
+
         for w in sharded_model.weights:
             if isinstance(w, ShardedWeight):
                 # Access device via the underlying value tensor
                 val = w.variable.value
                 actual_device = str(getattr(val, "device", "cpu")).lower()
-                
+
                 # Check if the target type (e.g., 'cpu') is in the backend string
-                target_type = str(target_device).split(':')[0].lower()
+                target_type = str(target_device).split(":")[0].lower()
                 self.assertIn(target_type, actual_device)
                 break

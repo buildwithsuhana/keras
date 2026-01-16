@@ -87,6 +87,7 @@ MODEL_MAPPING = {
 # --- Dataset and Model Helpers ---
 # ----------------------------------------------------------------------
 
+
 def load_shakespeare_dataset(model_preset):
     """Loads and preprocesses the Tiny Shakespeare dataset."""
     logger.info(
@@ -146,10 +147,13 @@ def get_model_from_preset(preset_name, model_class):
 # --- Plotting Function (MODIFIED) ---
 # ----------------------------------------------------------------------
 
+
 def plot_training_graphs(tp_history, preset_name):
     """Plots and saves the loss and perplexity graphs for the TP run."""
     fig, (ax1, ax2) = plt.subplots(2, 1, figsize=(12, 10))
-    fig.suptitle(f"{preset_name} - Tensor Parallel Training Metrics", fontsize=16)
+    fig.suptitle(
+        f"{preset_name} - Tensor Parallel Training Metrics", fontsize=16
+    )
 
     # Plotting Loss
     ax1.plot(
@@ -189,6 +193,7 @@ def plot_training_graphs(tp_history, preset_name):
 # ----------------------------------------------------------------------
 # --- Main Verification Function (MODIFIED) ---
 # ----------------------------------------------------------------------
+
 
 def run_model_verification(preset_name, model_class):
     """

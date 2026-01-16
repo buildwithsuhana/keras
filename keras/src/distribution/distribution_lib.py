@@ -911,6 +911,7 @@ def set_distribution(value):
     """
     global_state.set_global_attribute(GLOBAL_ATTRIBUTE_NAME, value)
 
+
 @keras_export("keras.distribution.AutoTPDistribution")
 class AutoTPDistribution(Distribution):
     """A distribution strategy for automated tensor and data parallelism.
@@ -985,7 +986,7 @@ class AutoTPDistribution(Distribution):
         self._num_process = distribution_lib.num_processes()
         self._process_id = distribution_lib.process_id()
         self._is_multi_process = self._num_process > 1
-        
+
         from keras.src.distribution.tensor_parallel.tensor_parallel import (
             TensorParallelKeras,
         )
@@ -1042,7 +1043,7 @@ class AutoTPDistribution(Distribution):
             return dataset.prefetch(tf.data.AUTOTUNE)
 
         num_model_replicas_per_process = num_model_replicas / self._num_process
-        
+
         if num_model_replicas_per_process >= 1:
             if global_batch_size % self._num_process != 0:
                 raise ValueError(

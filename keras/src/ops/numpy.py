@@ -7612,6 +7612,7 @@ def histogram(x, bins=10, range=None):
         )
     return backend.numpy.histogram(x, bins=bins, range=range)
 
+
 class ArraySplit(Operation):
     def __init__(self, indices_or_sections, axis=0, *, name=None):
         super().__init__(name=name)

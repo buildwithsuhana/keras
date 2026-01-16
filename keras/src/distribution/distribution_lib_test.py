@@ -556,8 +556,8 @@ class LayoutMapTest(testing.TestCase):
 #         ):
 #             backend_dlib._to_dtensor_layout(layout)
 
-class AutoTPDistributionTest(testing.TestCase):
 
+class AutoTPDistributionTest(testing.TestCase):
     def setUp(self):
         super().setUp()
         self.devices = distribution_lib.list_devices()
@@ -593,7 +593,9 @@ class AutoTPDistributionTest(testing.TestCase):
         "list_devices",
         return_value=[f"cpu:{i}" for i in range(2)],
     )
-    def test_init_without_device_mesh_for_auto_creation(self, mock_list_devices):
+    def test_init_without_device_mesh_for_auto_creation(
+        self, mock_list_devices
+    ):
         """Tests the automatic creation of the DeviceMesh when none is provided."""
         distribution = AutoTPDistribution(self.model, device_mesh=None)
         mock_list_devices.assert_called_once()
@@ -610,9 +612,7 @@ class AutoTPDistributionTest(testing.TestCase):
         device_mesh = distribution_lib.DeviceMesh(
             shape=(2,), axis_names=["model"], devices=self.devices
         )
-        with self.assertRaisesRegex(
-            ValueError, "must have a 'data' axis"
-        ):
+        with self.assertRaisesRegex(ValueError, "must have a 'data' axis"):
             AutoTPDistribution(self.model, device_mesh=device_mesh)
 
     def test_get_data_layout(self):
@@ -632,15 +632,20 @@ class AutoTPDistributionTest(testing.TestCase):
         with self.assertWarns(UserWarning) as w:
             layout = distribution.get_variable_layout(dummy_variable)
 
-        self.assertIn("Variable layout is determined automatically", str(w.warnings[0].message))
-        
+        self.assertIn(
+            "Variable layout is determined automatically",
+            str(w.warnings[0].message),
+        )
+
         self.assertEqual(layout.axes, (None, None))
 
     def test_distribute_dataset_in_single_process_mode(self):
         """Tests dataset distribution in a single-process environment (the default for this test file)."""
         distribution = AutoTPDistribution(self.model)
-        dataset = tf.data.Dataset.from_tensor_slices((np.zeros((16, 4)), np.zeros((16, 1))))
-        
+        dataset = tf.data.Dataset.from_tensor_slices(
+            (np.zeros((16, 4)), np.zeros((16, 1)))
+        )
+
         distributed_dataset = distribution.distribute_dataset(dataset)
         self.assertIs(dataset, distributed_dataset)
 
@@ -656,7 +661,9 @@ class AutoTPDistributionTest(testing.TestCase):
         with distribution.scope():
             dist_model.compile(
                 optimizer=keras.optimizers.Adam(0.01),
-                loss=keras.losses.SparseCategoricalCrossentropy(from_logits=True),
+                loss=keras.losses.SparseCategoricalCrossentropy(
+                    from_logits=True
+                ),
                 metrics=["accuracy"],
             )
 

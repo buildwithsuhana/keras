@@ -1,15 +1,15 @@
+import functools
 import logging
 import re
-import functools
 
-import numpy as np
-
-from keras.src.backend import distribution_lib
-from keras.src import ops
+from keras import Variable
+from keras import device
 from keras.src import layers
-from keras import Variable, device 
-
-from keras.src.distribution.tensor_parallel.tensor_layout import LayoutMap, split_tensor_for_parallelism
+from keras.src import ops
+from keras.src.backend import distribution_lib
+from keras.src.distribution.tensor_parallel.tensor_layout import (
+    split_tensor_for_parallelism,
+)
 
 logger = logging.getLogger(__name__)
 
@@ -31,11 +31,15 @@ class ShardedWeight:
             device_id: Device identifier string for the variable placement.
         """
         dev_name = device_id if device_id else "UNKNOWN_DEVICE"
-        print(f"   [DEV: {dev_name}] 🧬 Creating Sharded Variable '{name}' shape {tensor_shard.shape}")
+        print(
+            f"   [DEV: {dev_name}] 🧬 Creating Sharded Variable '{name}' shape {tensor_shard.shape}"
+        )
 
         safe_name = name.replace("/", "_").replace(":", "_")
         with device(dev_name):
-            self._variable = Variable(initializer=tensor_shard, trainable=trainable, name=safe_name)
+            self._variable = Variable(
+                initializer=tensor_shard, trainable=trainable, name=safe_name
+            )
         self.regularizer = None
 
     @property
@@ -122,14 +126,20 @@ class ParameterShardingStrategy:
 
         for layer in model._flatten_layers(recursive=True, include_self=True):
             if "Embedding" in layer.__class__.__name__:
-                for attr in ["embeddings", "position_embeddings", "_embeddings"]:
+                for attr in [
+                    "embeddings",
+                    "position_embeddings",
+                    "_embeddings",
+                ]:
                     var = getattr(layer, attr, None)
                     if var is not None:
                         vrf_fn = getattr(var, "experimental_ref", None)
                         vid = id(vrf_fn()) if vrf_fn else id(var)
                         if vid not in config.state_rules:
                             config.state_rules[vid] = functools.partial(
-                                split_tensor_for_parallelism, device_count=self.device_count, dim=1
+                                split_tensor_for_parallelism,
+                                device_count=self.device_count,
+                                dim=1,
                             )
 
         # Normalize configuration keys to string paths
@@ -146,21 +156,30 @@ class ParameterShardingStrategy:
 
         for pattern, action in config.state_rules.items():
             if callable(action):
-                for name, param in self._find_matching_parameters(model, pattern):
+                for name, param in self._find_matching_parameters(
+                    model, pattern
+                ):
                     pr_fn = getattr(param, "experimental_ref", None)
                     pid = id(pr_fn()) if pr_fn else id(param)
 
                     if pid in self.sharded_weights_by_id:
-                        self.sharded_weights[name] = self.sharded_weights_by_id[pid]
+                        self.sharded_weights[name] = self.sharded_weights_by_id[
+                            pid
+                        ]
                         modified.add(name)
                         continue
 
                     shard = action(param, self.rank)
                     self.sharded_weights[name] = shard
                     self.sharded_weights_by_id[pid] = shard
-                    self.weight_mapping[name] = {"original": param.shape, "sharded": shard.shape}
+                    self.weight_mapping[name] = {
+                        "original": param.shape,
+                        "sharded": shard.shape,
+                    }
                     modified.add(name)
-                    print(f"   ✅ Sharded {name}: {param.shape} -> {shard.shape}")
+                    print(
+                        f"   ✅ Sharded {name}: {param.shape} -> {shard.shape}"
+                    )
 
         sharded_model = ParameterShardedModel(model, self, config, device_id)
         print(f"🎯 Sharding complete: {len(modified)} parameters sharded")
@@ -175,33 +194,42 @@ class ParameterShardingStrategy:
     def _find_matching_parameters(self, model, pattern):
         """Matches a pattern to model weights."""
         if isinstance(pattern, int):
-            return [self._id_to_param_map[pattern]] if pattern in self._id_to_param_map else []
+            return (
+                [self._id_to_param_map[pattern]]
+                if pattern in self._id_to_param_map
+                else []
+            )
         if not isinstance(pattern, str):
             return []
         if pattern in self.param_path_map:
             return [(pattern, self.param_path_map[pattern])]
         suffix = "/" + pattern
-        return [(p, w) for p, w in self.param_path_map.items() if p.endswith(suffix)]
+        return [
+            (p, w) for p, w in self.param_path_map.items() if p.endswith(suffix)
+        ]
 
 
 def _define_parameter_sharded_model():
     """Defines the wrapper model class dynamically."""
-    from keras.src.models import Model, Functional
+    from keras.src.models import Functional
+    from keras.src.models import Model
 
     class ParameterShardedModel(Model):
         """Wrapper model implementing distributed forward pass logic."""
 
-        def __init__(self, original_model, sharding_strategy, config, device_id):
+        def __init__(
+            self, original_model, sharding_strategy, config, device_id
+        ):
             """Initializes the model and caches mappings."""
             super().__init__(name=original_model.name)
             self.original_model = original_model
             self.sharding_strategy = sharding_strategy
             self.config = config
             self._device = device_id
-            
+
             if not self.original_model.built and self.original_model.inputs:
                 self.original_model.build(self.original_model.inputs[0].shape)
-            
+
             self._build_and_cache_weights()
             self._layer_rules = self._cache_layer_rules()
             print("🚀 ParameterShardedModel created successfully")
@@ -215,14 +243,23 @@ def _define_parameter_sharded_model():
                     continue
                 lp_s = str(lp)
                 for pat, rule in self.config.output_rules.items():
-                    if pat == lp_s or lp_s.endswith("/" + pat) or (isinstance(pat, str) and re.search(pat, lp_s)):
-                        rules[id(layer)] = rule.get(0) if isinstance(rule, dict) else rule
+                    if (
+                        pat == lp_s
+                        or lp_s.endswith("/" + pat)
+                        or (isinstance(pat, str) and re.search(pat, lp_s))
+                    ):
+                        rules[id(layer)] = (
+                            rule.get(0) if isinstance(rule, dict) else rule
+                        )
                         break
             return rules
 
         def _build_and_cache_weights(self):
             """Merges sharded and original weights into a definitive list."""
-            ws, sids = [], set(self.sharding_strategy.sharded_weights_by_id.keys())
+            ws, sids = (
+                [],
+                set(self.sharding_strategy.sharded_weights_by_id.keys()),
+            )
             for name, shard in self.sharding_strategy.sharded_weights.items():
                 ws.append(ShardedWeight(shard, name, device_id=self._device))
             for w in self.original_model.weights:
@@ -295,15 +332,23 @@ def _define_parameter_sharded_model():
                     nms = getattr(layer, "input_names", None)
                     if not nms:
                         in_t = getattr(layer, "inputs", [])
-                        nms = [getattr(x, "name", "").split(":")[0] for x in in_t]
-                    l_in = dict(zip(nms, recon)) if nms and len(recon) == len(nms) else recon
+                        nms = [
+                            getattr(x, "name", "").split(":")[0] for x in in_t
+                        ]
+                    l_in = (
+                        dict(zip(nms, recon))
+                        if nms and len(recon) == len(nms)
+                        else recon
+                    )
                 else:
                     l_in = recon[0] if len(recon) == 1 else recon
 
                 kwargs = {"training": training} if training is not None else {}
                 node_args = getattr(node, "arguments", None)
                 if node_args:
-                    for k, v in (getattr(node_args, "kwargs", {}) or {}).items():
+                    for k, v in (
+                        getattr(node_args, "kwargs", {}) or {}
+                    ).items():
                         if k != "training":
                             kwargs[k] = v
 
@@ -311,7 +356,11 @@ def _define_parameter_sharded_model():
 
                 rule = self._layer_rules.get(id(layer))
                 if rule:
-                    out = rule(out) if callable(rule) else self._comm(out, layer.name, rule)
+                    out = (
+                        rule(out)
+                        if callable(rule)
+                        else self._comm(out, layer.name, rule)
+                    )
 
                 for n in nodes:
                     syms = getattr(n, "output_tensors", [])
@@ -330,7 +379,14 @@ def _define_parameter_sharded_model():
                 if val is None:
                     hist = getattr(s_out, "_keras_history", None)
                     if hist and len(hist) >= 3:
-                        val = cache.get(("node", getattr(hist[0], "name", ""), hist[1], hist[2]))
+                        val = cache.get(
+                            (
+                                "node",
+                                getattr(hist[0], "name", ""),
+                                hist[1],
+                                hist[2],
+                            )
+                        )
                 if val is None:
                     raise RuntimeError(f"Missing runtime value for: {s_out}.")
                 results.append(val)
@@ -340,11 +396,19 @@ def _define_parameter_sharded_model():
         def _comm(self, val, name, rule):
             """Internal communication wrapper."""
             if "sum" in rule or "allreduce" in rule:
-                return distribution_lib.all_reduce(val, op="sum", axis_name="model")
+                return distribution_lib.all_reduce(
+                    val, op="sum", axis_name="model"
+                )
             if "gather" in rule:
                 parts = rule.split(" ")
-                dim = int(parts[-1]) if len(parts) > 1 and parts[-1].lstrip('-').isdigit() else -1
-                return distribution_lib.all_gather(val, axis=dim, axis_name="model")
+                dim = (
+                    int(parts[-1])
+                    if len(parts) > 1 and parts[-1].lstrip("-").isdigit()
+                    else -1
+                )
+                return distribution_lib.all_gather(
+                    val, axis=dim, axis_name="model"
+                )
             return val
 
         def get_config(self):

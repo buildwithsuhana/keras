@@ -29,4 +29,3 @@ from keras.src.backend.jax.rnn import cudnn_ok
 from keras.src.backend.jax.rnn import gru
 from keras.src.backend.jax.rnn import lstm
 from keras.src.backend.jax.rnn import rnn
-from keras.src.backend.jax import distribution_lib
