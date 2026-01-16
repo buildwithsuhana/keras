@@ -33,13 +33,16 @@ def process_id():
     )
 
 
+import torch
+from torch.distributed.device_mesh import init_device_mesh
+
 def _to_backend_mesh(device_mesh):
-    """Convert Keras DeviceMesh to PyTorch DeviceMesh."""
-    # init_device_mesh handles the mapping of ranks to the logical grid
+    device_type = "cuda" if torch.cuda.is_available() else "cpu"
+    
     return init_device_mesh(
-        device_type=device_mesh.devices.flatten()[0].split(":")[0],
+        device_type=device_type,
         mesh_shape=device_mesh.shape,
-        mesh_dim_names=device_mesh.axis_names,
+        mesh_dim_names=device_mesh.axis_names
     )
 
 
