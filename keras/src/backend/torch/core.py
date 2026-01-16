@@ -103,14 +103,8 @@ def to_torch_dtype(dtype):
 
 class Variable(KerasVariable):
     def _initialize(self, value):
-        from keras.src.distribution import (
-            distribution_lib as high_level_dist_lib,
-        )
-
-        # Determine the device
-        device = get_device()
-
-        # Check if there is an active distribution (ModelParallel)
+        from keras.src.distribution import distribution_lib as high_level_dist_lib
+        
         dist = high_level_dist_lib.distribution()
         layout = None
         if dist is not None:
@@ -119,18 +113,22 @@ class Variable(KerasVariable):
         if isinstance(value, torch.nn.Parameter):
             self._value = value
         else:
+            # Convert initial value to tensor
             tensor_value = convert_to_tensor(value, dtype=self._dtype)
-
-            # If layout exists, convert to DTensor before making it a Parameter
+            
+            # Apply sharding if a layout is provided by ModelParallel
             if layout is not None:
-                tensor_value = distribution_lib.distribute_tensor(
-                    tensor_value, layout
-                )
-
+                # distribution_lib is the new file created in Step 2
+                tensor_value = distribution_lib.distribute_tensor(tensor_value, layout)
+            
             self._value = torch.nn.Parameter(
                 tensor_value,
                 requires_grad=self.trainable,
-            ).to(device)
+            ).to(get_device())
+
+    def _convert_to_tensor(self, value, dtype=None):
+        # This fix resolves the NotImplementedError
+        return convert_to_tensor(value, dtype=dtype)
 
     # Overload native accessor.
     @classmethod
