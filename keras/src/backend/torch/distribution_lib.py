@@ -56,23 +56,21 @@ def _to_backend_layout(tensor_layout):
         raise ValueError("Device mesh must be set for TensorLayout.")
 
     mesh_axis_names = tensor_layout.device_mesh.axis_names
-    # Initialize all mesh dimensions to Replicate by default.
-    # PyTorch DTensor requires one placement per dimension of the DEVICE MESH.
+    # 1. Initialize all placements to Replicate. 
+    # PyTorch DTensor requires one placement per MESH dimension.
     placements = [Replicate()] * len(mesh_axis_names)
 
-    # tensor_layout.axes contains the mesh axis names for each TENSOR dimension.
-    # We must iterate over the tensor dimensions (enumerate) to get the correct index.
+    # 2. Iterate through the TENSOR dimensions (i) and their assigned mesh axes
     for i, axis in enumerate(tensor_layout.axes):
         if axis is not None:
             if axis not in mesh_axis_names:
                 raise ValueError(f"Axis {axis} not found in {mesh_axis_names}")
             
-            # Identify which dimension of the physical DEVICE MESH corresponds to 
-            # this logical axis name.
+            # 3. Find which dimension of the DEVICE MESH this axis name refers to
             mesh_dim_index = mesh_axis_names.index(axis)
             
-            # IMPORTANT: Shard(i) tells Torch to shard the i-th dimension of the TENSOR.
-            # We place this instruction at the mesh_dim_index of the placements list.
+            # 4. CORRECT LOGIC: Shard the i-th TENSOR dimension 
+            # across the mesh_dim_index-th MESH dimension.
             placements[mesh_dim_index] = Shard(i)
             
     return placements
@@ -82,6 +80,7 @@ def distribute_tensor(tensor, layout):
     from keras.src.distribution import TensorLayout
     if isinstance(layout, TensorLayout):
         # Physical sharding via PyTorch's native DTensor API
+        print(f"Distributing tensor with shape {tensor.shape} using placements {layout.backend_layout}")
         return torch_distribute_tensor(
             tensor, 
             layout.device_mesh.backend_mesh, 
