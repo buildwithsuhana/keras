@@ -37,13 +37,24 @@ import torch
 from torch.distributed.device_mesh import init_device_mesh
 
 def _to_backend_mesh(device_mesh):
-    device_type = "cuda" if torch.cuda.is_available() else "cpu"
-    
+    # This must match the actual number of processes running
+    # If running in a single process, WORLD_SIZE must be 1.
     return init_device_mesh(
-        device_type=device_type,
+        device_type="cuda",
         mesh_shape=device_mesh.shape,
         mesh_dim_names=device_mesh.axis_names
     )
+
+def distribute_tensor(tensor, layout):
+    from keras.src.distribution import TensorLayout
+    if isinstance(layout, TensorLayout):
+        # Physical sharding via PyTorch DTensor
+        return torch_distribute_tensor(
+            tensor, 
+            layout.device_mesh.backend_mesh, 
+            layout.backend_layout
+        )
+    return tensor
 
 
 def _to_backend_layout(tensor_layout):
@@ -62,12 +73,3 @@ def _to_backend_layout(tensor_layout):
     return placements
 
 
-def distribute_tensor(tensor, layout):
-    """Shard a tensor across the mesh using DTensor."""
-    from keras.src.distribution import TensorLayout
-
-    if isinstance(layout, TensorLayout):
-        torch_mesh = layout.device_mesh.backend_mesh
-        torch_placements = layout.backend_layout
-        return torch_distribute_tensor(tensor, torch_mesh, torch_placements)
-    return tensor
