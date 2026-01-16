@@ -105,7 +105,11 @@ class Variable(KerasVariable):
     def _initialize(self, value):
         from keras.src.distribution import distribution_lib as high_level_dist_lib
         from keras.src.backend.torch import distribution_lib as torch_dist_lib
-        
+        # Ensure shape is available before asking the distribution for a
+        # layout. Other backends (e.g., JAX) initialize `self._shape` first
+        # so that `distribution.get_variable_layout(self)` can inspect it.
+        self._shape = self._validate_shape(value.shape)
+
         dist = high_level_dist_lib.distribution()
         layout = dist.get_variable_layout(self) if dist else None
 
@@ -116,8 +120,10 @@ class Variable(KerasVariable):
             if layout is not None:
                 # Apply PyTorch DTensor sharding using the corrected placements
                 tensor_value = torch_dist_lib.distribute_tensor(tensor_value, layout)
-            
-            self._value = torch.nn.Parameter(tensor_value, requires_grad=self.trainable).to(get_device())
+
+            self._value = torch.nn.Parameter(
+                tensor_value, requires_grad=self.trainable
+            ).to(get_device())
 
     def _convert_to_tensor(self, value, dtype=None):
         return convert_to_tensor(value, dtype=dtype)
