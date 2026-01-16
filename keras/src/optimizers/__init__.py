@@ -88,8 +88,15 @@ def get(identifier):
     elif isinstance(identifier, dict):
         obj = deserialize(identifier)
     elif isinstance(identifier, str):
-        config = {"class_name": identifier, "config": {}}
-        obj = deserialize(config)
+        # Fast-path for built-in optimizer names to avoid deserialization
+        # issues (e.g. in multiprocessing child processes).
+        key = identifier.lower()
+        if key in ALL_OBJECTS_DICT:
+            cls = ALL_OBJECTS_DICT[key]
+            obj = cls()
+        else:
+            config = {"class_name": identifier, "config": {}}
+            obj = deserialize(config)
     else:
         obj = identifier
 
