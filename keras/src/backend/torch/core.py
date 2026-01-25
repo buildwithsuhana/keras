@@ -107,13 +107,12 @@ class Variable(KerasVariable):
 
         dist_context = frontend_dist.distribution()
         if dist_context and self.name:
-            layout = dist_context.layout_map.get(self.name)
-            if layout:
-                from keras.src.backend.torch import (
-                    distribution_lib as backend_dist,
-                )
-
-                value = backend_dist.distribute_variable(value, layout)
+            layout_map = getattr(dist_context, "_layout_map", None)
+            if layout_map:
+                layout = layout_map.get(self.name)
+                if layout:
+                    from keras.src.backend.torch import distribution_lib as backend_dist
+                    value = backend_dist.distribute_variable(value, layout)
 
         if isinstance(value, torch.nn.Parameter):
             # Reuse same parameter
