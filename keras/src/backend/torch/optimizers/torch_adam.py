@@ -29,6 +29,12 @@ class Adam(torch_parallel_optimizer.TorchParallelOptimizer, optimizers.Adam):
         for i, v in enumerate(variables[:3]):  # Check first 3
             print(f"  variables[{i}]: {type(v).__name__}, is_dtensor: {_is_dtensor(v)}")
         print(f"  grads[0]: {type(grads[0]).__name__}, is_dtensor: {_is_dtensor(grads[0])}")
+        
+        # Debug: Check all grads
+        all_grads_dtensor = all(_is_dtensor(g) for g in grads)
+        print(f"[DEBUG Adam] All grads are DTensors: {all_grads_dtensor}")
+        for i, g in enumerate(grads):
+            print(f"  grads[{i}]: is_dtensor={_is_dtensor(g)}")
 
         dtype = variables[0].dtype
         # Use ops helpers to ensure any DTensor interactions go through
@@ -82,11 +88,20 @@ class Adam(torch_parallel_optimizer.TorchParallelOptimizer, optimizers.Adam):
             torch._foreach_maximum_(v_hat_list, v_list)
             v_list = v_hat_list
 
+        # Debug: Check alpha type
+        print(f"[DEBUG Adam] alpha: {alpha}, type: {type(alpha)}")
+        
+        # Create the updates
+        updates = torch._foreach_div(
+            torch._foreach_mul(m_list, alpha),
+            torch._foreach_add(torch._foreach_sqrt(v_list), epsilon),
+        )
+        
+        # Debug: Check updates type
+        print(f"[DEBUG Adam] updates[0]: {type(updates[0]).__name__}, is_dtensor: {_is_dtensor(updates[0])}")
+
         torch._foreach_add_(
             variables,
-            torch._foreach_div(
-                torch._foreach_mul(m_list, alpha),
-                torch._foreach_add(torch._foreach_sqrt(v_list), epsilon),
-            ),
+            updates,
             alpha=-1,
         )
