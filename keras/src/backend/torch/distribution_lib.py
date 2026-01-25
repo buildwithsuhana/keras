@@ -1,11 +1,12 @@
 import torch
 import torch.distributed as dist
-from torch.distributed.tensor import DeviceMesh as TorchDeviceMesh
-from torch.distributed.tensor import Replicate
-from torch.distributed.tensor import Shard
-from torch.distributed.tensor import (
-    distribute_tensor as torch_distribute_tensor,
-)
+import numpy as np
+import re
+
+# Use the system's preferred DeviceMesh import path
+from torch.distributed.device_mesh import DeviceMesh as TorchDeviceMesh
+from torch.distributed._tensor import Replicate, Shard
+from torch.distributed._tensor import distribute_tensor as torch_distribute_tensor
 
 from keras.src.backend.torch.core import convert_to_tensor
 
@@ -39,49 +40,62 @@ def initialize(job_addresses=None, num_processes=None, process_id=None):
 
 def _to_backend_mesh(device_mesh):
     """Bridge for DeviceMesh.backend_mesh"""
-    # If devices is None or empty, let Torch handle it automatically
+    # Fix for ambiguous NumPy array check
+    # Your framework signature: DeviceMesh(device_type, mesh, mesh_dim_names=...)
+    # mesh can be a tuple (shape) or a list of ranks.
+    
     device_ids = None
     if device_mesh.devices is not None:
-        # Simple conversion if strings like ['cuda:0'] were passed
-        import re
-        device_ids = []
-        for d in device_mesh.devices:
-            if isinstance(d, str):
-                res = re.search(r'\d+', d)
-                device_ids.append(int(res.group()) if res else 0)
-            else:
-                device_ids.append(d)
+        # Convert NumPy array to list to avoid ValueError
+        if isinstance(device_mesh.devices, np.ndarray):
+            device_ids = device_mesh.devices.tolist()
+        else:
+            # Simple conversion if strings like ['cuda:0'] were passed
+            device_ids = []
+            for d in device_mesh.devices:
+                if isinstance(d, str):
+                    res = re.search(r'\d+', d)
+                    device_ids.append(int(res.group()) if res else 0)
+                else:
+                    device_ids.append(d)
 
+    # Use positional arguments as required by your system framework
     return TorchDeviceMesh(
-        device_type="cuda" if torch.cuda.is_available() else "cpu",
-        mesh_shape=device_mesh.shape,
-        mesh_dim_names=device_mesh.axis_names,
-        device_ids=device_ids
+        "cuda" if torch.cuda.is_available() else "cpu",
+        device_ids if device_ids is not None else device_mesh.shape,
+        mesh_dim_names=device_mesh.axis_names
     )
 
+
 def _to_backend_layout(layout):
+    """Convert Keras Layout to Torch placements."""
     torch_mesh = layout.device_mesh.backend_mesh
     placements = []
     for axis in layout.axes:
         if axis is None:
             placements.append(Replicate())
         else:
-            dim_index = torch_mesh.mesh_dim_names.index(axis)
+            # Find the index of the axis name in the mesh dimension names
+            dim_index = list(torch_mesh.mesh_dim_names).index(axis)
             placements.append(Shard(dim_index))
     return placements
 
 
-def distribute_variable(value, layout):
+def distribute_variable(variable, layout):
+    """Intercept variable creation to shard it immediately."""
+    # variable is a Keras Variable object. variable.value is the torch tensor.
     rank = dist.get_rank() if dist.is_initialized() else 0
-    # Log weight sharding specifically
     if rank == 0:
         print(f"[BACKEND] Sharding variable. Placements: {layout.axes}")
-    return distribute_tensor(value, layout)
+    
+    sharded_tensor = distribute_tensor(variable.value, layout)
+    # Re-wrap as a Parameter for Torch optimizer compatibility
+    variable.value = torch.nn.Parameter(sharded_tensor)
+    return variable
 
 
 def distribute_tensor(value, layout):
     """The core engine for Model Parallelism.
-
     Converts a standard torch.Tensor into a sharded DTensor.
     """
     from keras.src.distribution.distribution_lib import TensorLayout
@@ -102,11 +116,12 @@ def distribute_tensor(value, layout):
 
 
 def distribute_data_input(data, layout):
+    """Shard input data batches."""
     rank = dist.get_rank() if dist.is_initialized() else 0
-    # Log data sharding. This confirms EpochIterator is working.
     if hasattr(data, "shape"):
         print(f"[Rank {rank}] Sharding input batch. Local shape: {data.shape}")
     return distribute_tensor(data, layout)
+
 
 def num_processes():
     """Return the total number of processes in the cluster."""
@@ -114,18 +129,20 @@ def num_processes():
         return dist.get_world_size()
     return 1
 
+
 def process_id():
     """Return the rank of the current process."""
     if dist.is_initialized():
         return dist.get_rank()
     return 0
 
-# These are also often expected by various DataAdapter logic
+
 def device_id():
     """Return the local device ID."""
     if torch.cuda.is_available():
         return torch.cuda.current_device()
     return 0
+
 
 def backend_num_processes():
     return num_processes()
