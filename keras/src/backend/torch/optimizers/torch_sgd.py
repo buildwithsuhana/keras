@@ -13,6 +13,17 @@ class SGD(torch_parallel_optimizer.TorchParallelOptimizer, optimizers.SGD):
     ):
         keras_variables = variables
         variables = [v.value for v in variables]
+        # Ensure learning_rate is a Python scalar when used with foreach
+        try:
+            from keras.src.backend.torch import core as torch_core
+            import numpy as _np
+
+            _lr_val = torch_core.convert_to_numpy(learning_rate)
+            if isinstance(_lr_val, _np.ndarray):
+                _lr_val = _lr_val.item()
+            learning_rate = float(_lr_val)
+        except Exception:
+            pass
         if self.momentum != 0:
             bufs = [
                 self.momentums[self._get_variable_index(variable)].value

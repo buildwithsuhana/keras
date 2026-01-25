@@ -181,12 +181,58 @@ def distribute_tensor(value, layout):
     return torch_distribute_tensor(value, torch_mesh, placements)
 
 
-def distribute_data_input(data, layout):
-    """Shard input data batches."""
+def distribute_data_input(data, layout, batch_dim_name=None):
+    """Shard input data batches.
+
+    Args:
+        data: Input data tensor (torch.Tensor or numpy array)
+        layout: The TensorLayout specifying how to distribute the data
+        batch_dim_name: Optional name of the batch dimension for data parallelism
+
+    Returns:
+        A DTensor representation of the input data, properly distributed
+        across devices.
+    """
+    from keras.src.distribution.distribution_lib import TensorLayout
+
     rank = dist.get_rank() if dist.is_initialized() else 0
-    if hasattr(data, "shape"):
-        print(f"[Rank {rank}] Sharding input batch. Local shape: {data.shape}")
-    return distribute_tensor(data, layout)
+
+    # Convert to torch tensor first if needed
+    if not isinstance(data, torch.Tensor):
+        data = convert_to_tensor(data)
+
+    # Handle DTensor input - return as-is
+    if _is_dtensor(data):
+        return data
+
+    # If no layout provided, return data as-is (no distribution)
+    if layout is None:
+        return data
+
+    # If layout is provided, distribute the tensor
+    if isinstance(layout, TensorLayout):
+        # Get the torch mesh and placements
+        torch_mesh = layout.device_mesh.backend_mesh
+        placements = layout.backend_layout
+
+        # Check if there's a batch dimension to distribute along
+        if batch_dim_name is not None and batch_dim_name in layout.device_mesh.axis_names:
+            # Find the batch dimension index
+            batch_dim_idx = list(layout.device_mesh.axis_names).index(batch_dim_name)
+            # Update placements to shard along batch dimension
+            placements = list(placements)
+            placements[batch_dim_idx] = Shard(batch_dim_idx)
+            placements = tuple(placements)
+
+        if hasattr(data, "shape"):
+            print(f"[Rank {rank}] Distributing input batch. Local shape: {data.shape}, "
+                  f"placements: {placements}")
+
+        # Distribute the tensor (convert to DTensor)
+        return torch_distribute_tensor(data, torch_mesh, placements)
+
+    # Fallback: just return the tensor
+    return data
 
 
 def num_processes():

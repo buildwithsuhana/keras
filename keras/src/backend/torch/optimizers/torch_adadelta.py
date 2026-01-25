@@ -19,6 +19,16 @@ class Adadelta(
 
         dtype = variables[0].dtype
         lr = ops.cast(learning_rate, dtype)
+        try:
+            from keras.src.backend.torch import core as torch_core
+            import numpy as _np
+
+            _lr_val = torch_core.convert_to_numpy(lr)
+            if isinstance(_lr_val, _np.ndarray):
+                _lr_val = _lr_val.item()
+            lr = float(_lr_val)
+        except Exception:
+            pass
         rho = self.rho
 
         accumulated_grads = [

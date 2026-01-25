@@ -109,7 +109,7 @@ class EpochIterator:
         dist = distribution_lib.distribution()
         if dist:
             return backend.distribution.distribute_data_input(
-                data, dist.get_data_layout(data.shape)
+                data, dist.get_data_layout(data.shape), dist.batch_dim_name
             )
         return data
 
