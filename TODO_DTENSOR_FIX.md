@@ -49,3 +49,8 @@ Run the training script to verify the fix works.
 
 **Fix**: Changed `iter(self._dataloader)` to `iter(self.dataset)` in `_DTensorAwareDataLoader.__iter__()` method so that data fetching goes through our `_DTensorAwareDataset` wrapper which properly converts data to DTensors.
 
+## Bug Fixed (2024-01-25 - Additional Fix)
+**Root Cause**: Even with the iterator fix, PyTorch's `tree_map` may pass DTensor indices to `__getitems__` (from previous batch processing). The underlying dataset expects regular torch.Tensor indices, but receives DTensors, causing "aten.index.Tensor: got mixed torch.Tensor and DTensor" error.
+
+**Fix**: Added `_convert_indices_to_torch()` method in `_DTensorAwareDataset` that converts DTensor indices back to regular torch.Tensor using `.to_local()` before passing them to the underlying dataset's `__getitem__` and `__getitems__` methods.
+
