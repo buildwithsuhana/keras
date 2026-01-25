@@ -41,7 +41,7 @@ def _to_backend_mesh(device_mesh):
     """Bridge for DeviceMesh.backend_mesh"""
     # If devices is None or empty, let Torch handle it automatically
     device_ids = None
-    if device_mesh.devices:
+    if device_mesh.devices is not None:
         # Simple conversion if strings like ['cuda:0'] were passed
         import re
         device_ids = []
