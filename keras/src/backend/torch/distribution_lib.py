@@ -40,29 +40,28 @@ def initialize(job_addresses=None, num_processes=None, process_id=None):
 
 def _to_backend_mesh(device_mesh):
     """Bridge for DeviceMesh.backend_mesh"""
-    # Fix for ambiguous NumPy array check
     # Your framework signature: DeviceMesh(device_type, mesh, mesh_dim_names=...)
     # mesh can be a tuple (shape) or a list of ranks.
-    
-    device_ids = None
-    if device_mesh.devices is not None:
-        # Convert NumPy array to list to avoid ValueError
-        if isinstance(device_mesh.devices, np.ndarray):
-            device_ids = device_mesh.devices.tolist()
-        else:
-            # Simple conversion if strings like ['cuda:0'] were passed
-            device_ids = []
-            for d in device_mesh.devices:
-                if isinstance(d, str):
-                    res = re.search(r'\d+', d)
-                    device_ids.append(int(res.group()) if res else 0)
-                else:
-                    device_ids.append(d)
 
-    # Use positional arguments as required by your system framework
+    if device_mesh.devices is not None:
+        # Convert device names to integer device indices
+        # device_mesh.devices can be np.array(['cuda:0', 'cuda:1']) or similar
+        device_ids = []
+        for d in device_mesh.devices:
+            if isinstance(d, str):
+                # Extract device index from string like 'cuda:0' -> 0
+                res = re.search(r'\d+', d)
+                device_ids.append(int(res.group()) if res else 0)
+            else:
+                device_ids.append(int(d))
+    else:
+        # Fallback to shape if devices is None
+        device_ids = device_mesh.shape
+
+    # Use positional arguments as required by PyTorch's DeviceMesh
     return TorchDeviceMesh(
         "cuda" if torch.cuda.is_available() else "cpu",
-        device_ids if device_ids is not None else device_mesh.shape,
+        device_ids,
         mesh_dim_names=device_mesh.axis_names
     )
 
