@@ -111,3 +111,25 @@ def distribute_data_input(per_process_batch, layout, batch_dim_name):
     
     mesh = layout.device_mesh.to_backend_mesh()
     return torch_distribute_tensor(per_process_batch, mesh, [Shard(0)])
+
+def num_processes():
+    """Return the total number of processes in the cluster."""
+    if dist.is_initialized():
+        return dist.get_world_size()
+    return 1
+
+def process_id():
+    """Return the rank of the current process."""
+    if dist.is_initialized():
+        return dist.get_rank()
+    return 0
+
+# These are also often expected by various DataAdapter logic
+def device_id():
+    """Return the local device ID."""
+    if torch.cuda.is_available():
+        return torch.cuda.current_device()
+    return 0
+
+def backend_num_processes():
+    return num_processes()
