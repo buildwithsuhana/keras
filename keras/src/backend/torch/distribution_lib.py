@@ -5,10 +5,41 @@ import re
 
 # Use the system's preferred DeviceMesh import path
 from torch.distributed.device_mesh import DeviceMesh as TorchDeviceMesh
-from torch.distributed._tensor import Replicate, Shard
+from torch.distributed._tensor import DTensor, Replicate, Shard
 from torch.distributed._tensor import distribute_tensor as torch_distribute_tensor
 
 from keras.src.backend.torch.core import convert_to_tensor
+
+
+def _is_dtensor(tensor):
+    """Check if a tensor is a PyTorch DTensor."""
+    return isinstance(tensor, DTensor)
+
+
+def _ensure_dtensor(tensor, mesh, placements=None):
+    """Convert a regular torch.Tensor to DTensor if needed.
+
+    This function ensures that when operating with DTensors, all operands
+    are DTensors. If the input is already a DTensor, it is returned as-is.
+    If it's a regular tensor, it is converted to a DTensor with the given
+    mesh and placements.
+
+    Args:
+        tensor: A torch.Tensor or DTensor
+        mesh: The DeviceMesh to use for distribution
+        placements: The placements for the DTensor. If None, uses Replicate.
+
+    Returns:
+        A DTensor representation of the input
+    """
+    if _is_dtensor(tensor):
+        return tensor
+
+    # Regular tensor that needs to be converted to DTensor
+    if placements is None:
+        placements = (Replicate(),)
+
+    return torch_distribute_tensor(tensor, mesh, placements)
 
 
 def list_devices(device_type=None):

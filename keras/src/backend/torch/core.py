@@ -219,10 +219,19 @@ class Variable(KerasVariable):
 
 
 def convert_to_tensor(x, dtype=None, sparse=None, ragged=None):
+    from torch.distributed._tensor import DTensor
+
     if sparse:
         raise ValueError("`sparse=True` is not supported with torch backend")
     if ragged:
         raise ValueError("`ragged=True` is not supported with torch backend")
+
+    # Preserve DTensor instances - don't convert them
+    if isinstance(x, DTensor):
+        if dtype is not None:
+            return x.to(to_torch_dtype(dtype))
+        return x
+
     if isinstance(x, Variable) or is_tensor(x):
         if isinstance(x, Variable):
             x = x.value
