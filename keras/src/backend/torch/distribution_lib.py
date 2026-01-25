@@ -37,15 +37,14 @@ def initialize(job_addresses=None, num_processes=None, process_id=None):
         torch.cuda.set_device(local_rank)
 
 
-def to_backend_mesh(shape, axis_names):
-    """Maps to frontend DeviceMesh.to_backend_mesh().
-
-    Returns a native PyTorch DeviceMesh object.
-    """
+def _to_backend_mesh(device_mesh):
+    # Log the physical mesh creation
+    if dist.get_rank() == 0:
+        print(f"[BACKEND] Creating TorchDeviceMesh: {device_mesh.shape} axes: {device_mesh.axis_names}")
     return TorchDeviceMesh(
         device_type="cuda" if torch.cuda.is_available() else "cpu",
-        mesh_shape=shape,
-        mesh_dim_names=axis_names,
+        mesh_shape=device_mesh.shape,
+        mesh_dim_names=device_mesh.axis_names,
     )
 
 
@@ -75,10 +74,10 @@ def to_backend_layout(axes, device_mesh):
 
 
 def distribute_variable(value, layout):
-    """Internal hook used during KerasVariable initialization."""
-    rank = dist.get_rank() if dist.is_initialized() else 0
+    rank = dist.get_rank()
+    # Log weight sharding specifically
     if rank == 0:
-        print(f"[DIST] Sharding variable with layout: {layout.axes}")
+        print(f"[BACKEND] Sharding variable. Placements: {layout.axes}")
     return distribute_tensor(value, layout)
 
 
@@ -103,14 +102,13 @@ def distribute_tensor(value, layout):
     return torch_distribute_tensor(value, torch_mesh, placements)
 
 
-def distribute_data_input(per_process_batch, layout, batch_dim_name):
-    rank = dist.get_rank() if dist.is_initialized() else 0
-    local_shape = per_process_batch.shape
-    
-    print(f"[Rank {rank}] Distributing input batch. Local shape: {local_shape}")
-    
-    mesh = layout.device_mesh.to_backend_mesh()
-    return torch_distribute_tensor(per_process_batch, mesh, [Shard(0)])
+def distribute_data_input(data, layout):
+    rank = dist.get_rank()
+    # Log data sharding. This confirms EpochIterator is working.
+    # We show the local shape to prove the batch was split.
+    if hasattr(data, "shape"):
+        print(f"[Rank {rank}] Sharding input batch. Local shape: {data.shape}")
+    return distribute_tensor(data, layout)
 
 def num_processes():
     """Return the total number of processes in the cluster."""

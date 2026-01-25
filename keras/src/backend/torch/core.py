@@ -105,14 +105,32 @@ class Variable(KerasVariable):
     def _initialize(self, value):
         from keras.src.distribution import distribution_lib as frontend_dist
 
+        from keras.src.distribution import distribution_lib as frontend_dist
+        import torch.distributed as dist  # Ensure dist is available for rank checks
+
         dist_context = frontend_dist.distribution()
+        
         if dist_context and self.name:
+            # 2. Access the layout map (private attribute in ModelParallel)
             layout_map = getattr(dist_context, "_layout_map", None)
+            
             if layout_map:
                 layout = layout_map.get(self.name)
+                
                 if layout:
+                    # Log only on Rank 0 to avoid messy duplicate logs
+                    if dist.is_initialized() and dist.get_rank() == 0:
+                        print(f"[CORE] Variable '{self.name}' matched layout '{layout.axes}'. Sharding...")
+                    
                     from keras.src.backend.torch import distribution_lib as backend_dist
                     value = backend_dist.distribute_variable(value, layout)
+                else:
+                    # Useful for debugging why a specific layer isn't sharding
+                    if dist.is_initialized() and dist.get_rank() == 0:
+                        print(f"[CORE] Variable '{self.name}' had no match in LayoutMap. Defaulting to replicated.")
+            else:
+                if dist.is_initialized() and dist.get_rank() == 0:
+                    print(f"[CORE] Distribution context found but no LayoutMap available for '{self.name}'.")
 
         if isinstance(value, torch.nn.Parameter):
             # Reuse same parameter
