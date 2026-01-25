@@ -50,42 +50,27 @@ class Adam(torch_parallel_optimizer.TorchParallelOptimizer, optimizers.Adam):
         keras_variables = variables
         variables = [v.value for v in variables]
 
-        # Debug: Check tensor types
-        print(f"[DEBUG Adam] Variables type check:")
-        for i, v in enumerate(variables[:3]):  # Check first 3
-            print(f"  variables[{i}]: {type(v).__name__}, is_dtensor: {_is_dtensor(v)}")
-        print(f"  grads[0]: {type(grads[0]).__name__}, is_dtensor: {_is_dtensor(grads[0])}")
-        
-        # Debug: Check all grads
-        all_grads_dtensor = all(_is_dtensor(g) for g in grads)
-        print(f"[DEBUG Adam] All grads are DTensors: {all_grads_dtensor}")
-        for i, g in enumerate(grads):
-            print(f"  grads[{i}]: is_dtensor={_is_dtensor(g)}")
+        # Convert grads to DTensors if variables are DTensors
+        grads = _grads_to_dtensor(grads, variables)
 
         dtype = variables[0].dtype
         
-        # Convert grads to DTensors if variables are DTensors
-        grads = _grads_to_dtensor(grads, variables)
+        # Convert learning rate to native Python scalar for DTensor compatibility
+        lr = torch_parallel_optimizer._to_native_scalar(learning_rate)
+        local_step = self.iterations + 1
+
+        # Use native Python scalars for beta powers
+        beta_1 = torch_parallel_optimizer._to_native_scalar(self.beta_1)
+        beta_2 = torch_parallel_optimizer._to_native_scalar(self.beta_2)
+        beta_1_power = beta_1 ** local_step
+        beta_2_power = beta_2 ** local_step
+
+        # Use native Python scalars for all operations
+        one_minus_beta_1_power = 1.0 - beta_1_power
+        one_minus_beta_2_power = 1.0 - beta_2_power
         
-        # Debug: Check all grads after conversion
-        all_grads_dtensor_after = all(_is_dtensor(g) for g in grads)
-        print(f"[DEBUG Adam] All grads are DTensors after conversion: {all_grads_dtensor_after}")
-
-        # Use ops helpers to ensure any DTensor interactions go through
-        # the backend dispatch (avoids mixing torch.Tensor and DTensor).
-        lr = ops.cast(learning_rate, dtype)
-        local_step = ops.cast(ops.add(self.iterations, 1), dtype)
-
-        beta_1_power = ops.power(ops.cast(self.beta_1, dtype), local_step)
-        beta_2_power = ops.power(ops.cast(self.beta_2, dtype), local_step)
-
-        one = ops.cast(1, dtype)
-        numerator = ops.multiply(lr, ops.sqrt(ops.subtract(one, beta_2_power)))
-        denominator = ops.subtract(one, beta_1_power)
-        alpha = ops.divide(numerator, denominator)
-
-        # Convert alpha to native Python scalar for DTensor compatibility
-        alpha = torch_parallel_optimizer._to_native_scalar(alpha)
+        # Calculate alpha using native Python operations
+        alpha = lr * (one_minus_beta_2_power ** 0.5) / one_minus_beta_1_power
 
         m_list = [
             self._momentums[self._get_variable_index(variable)].value
@@ -96,22 +81,17 @@ class Adam(torch_parallel_optimizer.TorchParallelOptimizer, optimizers.Adam):
             for variable in keras_variables
         ]
 
-        # Debug: Check momentums and velocities types
-        print(f"[DEBUG Adam] Internal variables type check:")
-        print(f"  m_list[0]: {type(m_list[0]).__name__}, is_dtensor: {_is_dtensor(m_list[0])}")
-        print(f"  v_list[0]: {type(v_list[0]).__name__}, is_dtensor: {_is_dtensor(v_list[0])}")
-
         # Convert optimizer scalars to native Python scalars for DTensor compatibility
-        beta_1 = torch_parallel_optimizer._to_native_scalar(self.beta_1)
-        beta_2 = torch_parallel_optimizer._to_native_scalar(self.beta_2)
         epsilon = torch_parallel_optimizer._to_native_scalar(self.epsilon)
+        one_minus_beta_1 = 1.0 - beta_1
+        one_minus_beta_2 = 1.0 - beta_2
 
         torch._foreach_mul_(m_list, beta_1)
-        torch._foreach_add_(m_list, grads, alpha=1 - beta_1)
+        torch._foreach_add_(m_list, grads, alpha=one_minus_beta_1)
 
         torch._foreach_mul_(v_list, beta_2)
         torch._foreach_add_(
-            v_list, torch._foreach_mul(grads, grads), alpha=1 - beta_2
+            v_list, torch._foreach_mul(grads, grads), alpha=one_minus_beta_2
         )
 
         if self.amsgrad:
@@ -122,20 +102,11 @@ class Adam(torch_parallel_optimizer.TorchParallelOptimizer, optimizers.Adam):
             torch._foreach_maximum_(v_hat_list, v_list)
             v_list = v_hat_list
 
-        # Debug: Check alpha type
-        print(f"[DEBUG Adam] alpha: {alpha}, type: {type(alpha)}")
-        
-        # Create the updates
-        updates = torch._foreach_div(
-            torch._foreach_mul(m_list, alpha),
-            torch._foreach_add(torch._foreach_sqrt(v_list), epsilon),
-        )
-        
-        # Debug: Check updates type
-        print(f"[DEBUG Adam] updates[0]: {type(updates[0]).__name__}, is_dtensor: {_is_dtensor(updates[0])}")
-
         torch._foreach_add_(
             variables,
-            updates,
+            torch._foreach_div(
+                torch._foreach_mul(m_list, alpha),
+                torch._foreach_add(torch._foreach_sqrt(v_list), epsilon),
+            ),
             alpha=-1,
         )
