@@ -42,80 +42,24 @@ def _ensure_dtensor(tensor, mesh, placements=None):
     return torch_distribute_tensor(tensor, mesh, placements)
 
 
-# Store the original DTensor.__torch_dispatch__ if not already stored
-_original_dtensor_torch_dispatch = None
+def _convert_to_matching_dtensor(tensor, dtensor):
+    """Convert a regular tensor to a DTensor matching the reference DTensor.
 
+    This function is used to ensure that when performing operations between
+    a DTensor and a regular tensor, the regular tensor is converted to a
+    DTensor with the same mesh and placements as the reference DTensor.
 
-def _patch_dtensor_for_mixed_operations():
-    """Patch DTensor class to handle mixed DTensor/torch.Tensor operations.
+    Args:
+        tensor: A torch.Tensor or DTensor
+        dtensor: A DTensor to get mesh and placements from
 
-    This function monkey-patches the DTensor class's __torch_dispatch__ method
-    to automatically convert regular torch.Tensor operands to DTensors before
-    performing operations. This is necessary when torch.compile/dynamo intercepts
-    operations at the dispatch level.
+    Returns:
+        A DTensor with the same mesh and placements as dtensor
     """
-    global _original_dtensor_torch_dispatch
+    if _is_dtensor(tensor):
+        return tensor
 
-    if _original_dtensor_torch_dispatch is not None:
-        # Already patched
-        return
-
-    # Store the original method
-    _original_dtensor_torch_dispatch = DTensor.__torch_dispatch__
-
-    @staticmethod
-    def _patched_torch_dispatch(func, types, args, kwargs):
-        """Patched __torch_dispatch__ that handles mixed DTensor/tensor operations."""
-        from torch.distributed._tensor import DTensor as DTensorClass
-
-        # Find if any argument is a DTensor and get its mesh/placements
-        dtensor_mesh = None
-        dtensor_placements = None
-        for arg in args:
-            if isinstance(arg, DTensorClass):
-                dtensor_mesh = arg.device_mesh
-                dtensor_placements = arg.placements
-                break
-
-        # If no DTensor found, just call the original
-        if dtensor_mesh is None:
-            return func(*args, **kwargs)
-
-        # Convert all arguments
-        new_args = []
-        for arg in args:
-            if isinstance(arg, DTensorClass):
-                new_args.append(arg)
-            elif isinstance(arg, torch.Tensor):
-                # Convert regular tensor to DTensor with compatible placements
-                converted = torch_distribute_tensor(
-                    arg, dtensor_mesh, dtensor_placements
-                )
-                new_args.append(converted)
-            else:
-                new_args.append(arg)
-
-        # Handle kwargs similarly
-        new_kwargs = {}
-        if kwargs:
-            for key, value in kwargs.items():
-                if isinstance(value, DTensorClass):
-                    new_kwargs[key] = value
-                elif isinstance(value, torch.Tensor):
-                    new_kwargs[key] = torch_distribute_tensor(
-                        value, dtensor_mesh, dtensor_placements
-                    )
-                else:
-                    new_kwargs[key] = value
-
-        return func(*new_args, **new_kwargs)
-
-    # Monkey-patch the DTensor class
-    DTensor.__torch_dispatch__ = _patched_torch_dispatch
-
-
-# Patch DTensor when this module is imported
-_patch_dtensor_for_mixed_operations()
+    return torch_distribute_tensor(tensor, dtensor.device_mesh, dtensor.placements)
 
 
 def list_devices(device_type=None):

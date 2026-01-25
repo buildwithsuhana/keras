@@ -8,8 +8,8 @@ When `torch.compile`/`dynamo` is enabled, it intercepts operations at the PyTorc
 
 ## Solution Implemented
 
-### 1. Monkey-patched DTensor.__torch_dispatch__
-Instead of trying to subclass DTensor (which has a complex `__new__` method), we monkey-patch the DTensor class's `__torch_dispatch__` method when the distribution_lib module is imported. This ensures that all DTensor operations automatically handle mixed DTensor/torch.Tensor operands.
+### 1. Added _convert_to_matching_dtensor helper function
+This function converts a regular tensor to a DTensor with the same mesh and placements as a reference DTensor.
 
 ### 2. Updated numpy.py functions
 Added DTensor handling to:
@@ -19,20 +19,11 @@ Added DTensor handling to:
 - `maximum` - For consistency
 - `divide` - For consistency
 
+Each function now checks if one operand is a DTensor and the other is a regular tensor, and converts the regular tensor to a DTensor before performing the operation.
+
 ## Files Modified
 - `/Users/suhanaaa/keras/keras/src/backend/torch/distribution_lib.py`
 - `/Users/suhanaaa/keras/keras/src/backend/torch/numpy.py`
-
-## How the Monkey-Patch Works
-When the distribution_lib module is imported:
-1. `_patch_dtensor_for_mixed_operations()` is called
-2. It stores the original `DTensor.__torch_dispatch__` method
-3. It replaces it with a patched version that:
-   - Checks if any argument is a DTensor
-   - If yes, converts all regular torch.Tensor operands to DTensors with compatible mesh/placements
-   - Calls the original operation with converted operands
-
-This approach is applied globally to all DTensor operations, ensuring consistent behavior even when torch.compile/dynamo intercepts operations.
 
 ## Progress
 - [x] Fix `subtract` function in numpy.py
@@ -40,8 +31,8 @@ This approach is applied globally to all DTensor operations, ensuring consistent
 - [x] Fix `minimum` function in numpy.py
 - [x] Fix `maximum` function in numpy.py
 - [x] Fix `divide` function in numpy.py
-- [x] Monkey-patch DTensor.__torch_dispatch__ in distribution_lib.py
+- [x] Add `_convert_to_matching_dtensor` helper in distribution_lib.py
 
 ## Summary
-By monkey-patching the DTensor class's `__torch_dispatch__` method, all distributed tensor operations now automatically handle mixed DTensor/torch.Tensor operations. When torch.compile/dynamo intercepts operations at the dispatch level, the patched handler converts regular tensors to DTensors before performing the operation, preventing the "mixed torch.Tensor and DTensor" error.
+The numpy functions in the torch backend now properly handle mixed DTensor/torch.Tensor operations. When one operand is a DTensor and the other is a regular tensor, the regular tensor is automatically converted to a DTensor with compatible mesh and placements before the operation is performed. This ensures that PyTorch distributed operations work correctly with torch.compile/dynamo.
 
