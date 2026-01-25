@@ -82,16 +82,32 @@ def _to_backend_layout(layout):
 
 
 def distribute_variable(variable, layout):
-    """Intercept variable creation to shard it immediately."""
-    # variable is a Keras Variable object. variable.value is the torch tensor.
+    """Intercept variable creation to shard it immediately.
+
+    Args:
+        variable: Either a Keras Variable object or a torch.Tensor
+        layout: The TensorLayout specifying how to shard the variable
+
+    Returns:
+        A torch.nn.Parameter containing the sharded DTensor
+    """
     rank = dist.get_rank() if dist.is_initialized() else 0
     if rank == 0:
         print(f"[BACKEND] Sharding variable. Placements: {layout.axes}")
-    
-    sharded_tensor = distribute_tensor(variable.value, layout)
-    # Re-wrap as a Parameter for Torch optimizer compatibility
-    variable.value = torch.nn.Parameter(sharded_tensor)
-    return variable
+
+    # Handle both Keras Variable and torch.Tensor inputs
+    if hasattr(variable, 'value'):
+        # It's a Keras Variable - get the underlying tensor
+        tensor_value = variable.value
+    else:
+        # It's already a torch.Tensor
+        tensor_value = variable
+
+    # Distribute the tensor (convert to DTensor)
+    sharded_tensor = distribute_tensor(tensor_value, layout)
+
+    # Return as Parameter for optimizer compatibility
+    return torch.nn.Parameter(sharded_tensor)
 
 
 def distribute_tensor(value, layout):
