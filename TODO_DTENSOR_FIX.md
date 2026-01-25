@@ -4,61 +4,75 @@
 Fix the `RuntimeError: aten.sub.Tensor: got mixed torch.Tensor and DTensor` error when using Keras ModelParallel with Torch backend.
 
 ## Root Cause
-When `torch.compile`/`dynamo` is enabled, optimizer internal variables (learning_rate, iteration, etc.) interact with DTensor model weights during `torch._foreach_*` operations. If optimizer variables are still regular torch.Tensor and model weights are DTensor, PyTorch raises the mixed tensor error.
+When `torch.compile`/`dynamo` is enabled, optimizer internal variables (learning_rate, beta_1, beta_2, epsilon, etc.) interact with DTensor model weights during `torch._foreach_*` operations. If optimizer variables are still regular torch.Tensor and model weights are DTensor, PyTorch raises the mixed tensor error.
 
 ## Solution
-Convert all scalar tensors used in torch._foreach_* operations to native Python floats. This ensures that foreach operations receive compatible native scalars rather than mixing DTensor and regular tensors.
+Convert ALL scalar values used in torch._foreach_* operations to native Python floats. This ensures that foreach operations receive compatible native scalars rather than mixing DTensor and regular tensors.
 
 ## Implementation Steps
 
-### Step 1: Add helper function to torch_parallel_optimizer.py
-Add `_to_native_scalar()` helper that extracts native Python values from DTensor scalars.
+### Step 1: Update torch_adam.py
+- Convert `lr` to native scalar (already done)
+- Convert `alpha` to native scalar (already done)
+- Convert `self.beta_1`, `self.beta_2` to native scalars
+- Convert `self.epsilon` to native scalar
 
-### Step 2: Update torch_parallel_optimizer.py
-Add `_to_native_scalar()` helper and modify `_backend_update_step` to convert scalar values.
+### Step 2: Update torch_adagrad.py
+- Convert `lr` to native scalar (already done)
+- Convert `self.epsilon` to native scalar
 
-### Step 3: Update all torch optimizer parallel update methods
-- torch_adagrad.py - convert lr to native scalar
-- torch_nadam.py - convert u_t, u_t_1 to native scalars
-- torch_adam.py - convert lr, betas to native scalars
-- torch_adamax.py - convert lr to native scalars  
-- torch_adadelta.py - convert lr, rho to native scalars
-- torch_rmsprop.py - convert lr to native scalars
-- torch_sgd.py - convert lr to native scalars
-- torch_lion.py - convert lr to native scalars
-- torch_adamw.py - convert lr to native scalars (inherits from Adam)
+### Step 3: Update torch_sgd.py
+- Convert `learning_rate` to native scalar (already done)
+- Convert `self.momentum` to native scalar
 
-### Step 4: Update torch_optimizer.py
-Update `_apply_weight_decay` to convert learning_rate to native scalar.
+### Step 4: Update torch_lion.py
+- Convert `lr` to native scalar (already done)
+- Convert `self.beta_1`, `self.beta_2` to native scalars
+- Convert `self.epsilon` to native scalar
 
-### Step 5: Test the fix
-Run the unit tests to verify the fix works.
+### Step 5: Update torch_adamax.py
+- Convert `lr` to native scalar (already done)
+- Convert `den_scalar` to native scalar (already done)
+- Convert `self.beta_2` to native scalar
+- Convert `self.epsilon` to native scalar
 
-## Files Modified
-- `/Users/suhanaaa/keras/keras/src/backend/torch/optimizers/torch_parallel_optimizer.py` - Added `_to_native_scalar()` helper
-- `/Users/suhanaaa/keras/keras/src/backend/torch/optimizers/torch_optimizer.py` - Updated `_apply_weight_decay`
-- `/Users/suhanaaa/keras/keras/src/backend/torch/optimizers/torch_adagrad.py` - Simplified scalar conversion
-- `/Users/suhanaaa/keras/keras/src/backend/torch/optimizers/torch_nadam.py` - Simplified scalar conversion
-- `/Users/suhanaaa/keras/keras/src/backend/torch/optimizers/torch_adam.py` - Simplified scalar conversion
-- `/Users/suhanaaa/keras/keras/src/backend/torch/optimizers/torch_adamax.py` - Simplified scalar conversion
-- `/Users/suhanaaa/keras/keras/src/backend/torch/optimizers/torch_adadelta.py` - Simplified scalar conversion
-- `/Users/suhanaaa/keras/keras/src/backend/torch/optimizers/torch_rmsprop.py` - Simplified scalar conversion
-- `/Users/suhanaaa/keras/keras/src/backend/torch/optimizers/torch_sgd.py` - Simplified scalar conversion
-- `/Users/suhanaaa/keras/keras/src/backend/torch/optimizers/torch_lion.py` - Simplified scalar conversion
-- `/Users/suhanaaa/keras/keras/src/backend/torch/optimizers/torch_adamw.py` - Inherits from Adam, no changes needed
+### Step 6: Update torch_adadelta.py
+- Convert `lr` to native scalar (already done)
+- Convert `self.epsilon` to native scalar
+- Convert `rho` to native scalar (if used in foreach)
+
+### Step 7: Update torch_rmsprop.py
+- Convert `lr` to native scalar (already done)
+- Convert `self.epsilon` to native scalar
+- Convert `rho` to native scalar (if used in foreach)
+
+### Step 8: Update torch_nadam.py
+- Convert `lr` to native scalar (already done)
+- Convert `u_t`, `u_t_1` to native scalars (already done)
+- Convert `self.beta_1`, `self.beta_2` to native scalars
+- Convert `self.epsilon` to native scalar
+
+### Step 9: Test the fix
+Run the training script to verify the fix works.
+
+## Files to Modify
+- `/Users/suhanaaa/keras/keras/src/backend/torch/optimizers/torch_adam.py`
+- `/Users/suhanaaa/keras/keras/src/backend/torch/optimizers/torch_adagrad.py`
+- `/Users/suhanaaa/keras/keras/src/backend/torch/optimizers/torch_sgd.py`
+- `/Users/suhanaaa/keras/keras/src/backend/torch/optimizers/torch_lion.py`
+- `/Users/suhanaaa/keras/keras/src/backend/torch/optimizers/torch_adamax.py`
+- `/Users/suhanaaa/keras/keras/src/backend/torch/optimizers/torch_adadelta.py`
+- `/Users/suhanaaa/keras/keras/src/backend/torch/optimizers/torch_rmsprop.py`
+- `/Users/suhanaaa/keras/keras/src/backend/torch/optimizers/torch_nadam.py`
 
 ## Progress
-- [x] Add helper function to torch_parallel_optimizer.py
-- [x] Update torch_parallel_optimizer.py
-- [x] Update torch_adagrad.py
-- [x] Update torch_nadam.py
-- [x] Update torch_adam.py
-- [x] Update torch_adamax.py
-- [x] Update torch_adadelta.py
-- [x] Update torch_rmsprop.py
-- [x] Update torch_sgd.py
-- [x] Update torch_lion.py
-- [x] Update torch_adamw.py (inherits from Adam)
-- [x] Update torch_optimizer.py
+- [ ] Update torch_adam.py
+- [ ] Update torch_adagrad.py
+- [ ] Update torch_sgd.py
+- [ ] Update torch_lion.py
+- [ ] Update torch_adamax.py
+- [ ] Update torch_adadelta.py
+- [ ] Update torch_rmsprop.py
+- [ ] Update torch_nadam.py
 - [ ] Test the fix
 

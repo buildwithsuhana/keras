@@ -21,10 +21,14 @@ class Adamax(
         lr = ops.cast(learning_rate, dtype)
         # Convert lr to native Python scalar for DTensor compatibility
         lr = torch_parallel_optimizer._to_native_scalar(lr)
+        # Convert optimizer scalars to native Python scalars for DTensor compatibility
+        beta_1 = torch_parallel_optimizer._to_native_scalar(self.beta_1)
+        beta_2 = torch_parallel_optimizer._to_native_scalar(self.beta_2)
+        epsilon = torch_parallel_optimizer._to_native_scalar(self.epsilon)
 
         local_step = ops.cast(ops.add(self.iterations, 1), dtype)
 
-        beta_1_power = ops.power(ops.cast(self.beta_1, dtype), local_step)
+        beta_1_power = ops.power(ops.cast(beta_1, dtype), local_step)
 
         # Pre-compute scalar denominator for DTensor compatibility
         den_scalar = torch_parallel_optimizer._to_native_scalar(
@@ -40,10 +44,10 @@ class Adamax(
             for variable in keras_variables
         ]
 
-        torch._foreach_mul_(m_list, self.beta_1)
-        torch._foreach_add_(m_list, grads, alpha=1 - self.beta_1)
+        torch._foreach_mul_(m_list, beta_1)
+        torch._foreach_add_(m_list, grads, alpha=1 - beta_1)
 
-        torch._foreach_mul_(u_list, self.beta_2)
+        torch._foreach_mul_(u_list, beta_2)
         torch._foreach_maximum_(u_list, torch._foreach_abs(grads))
 
         # If we could compute a scalar denominator, use it in the foreach call;
@@ -55,7 +59,7 @@ class Adamax(
             torch._foreach_div(
                 torch._foreach_mul(m_list, lr),
                 torch._foreach_mul(
-                    torch._foreach_add(u_list, self.epsilon),
+                    torch._foreach_add(u_list, epsilon),
                     denom,
                 ),
             ),

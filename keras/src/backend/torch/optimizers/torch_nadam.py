@@ -31,6 +31,11 @@ class Nadam(torch_parallel_optimizer.TorchParallelOptimizer, optimizers.Nadam):
         # Convert to native Python scalars for DTensor compatibility
         u_t = torch_parallel_optimizer._to_native_scalar(u_t)
         u_t_1 = torch_parallel_optimizer._to_native_scalar(u_t_1)
+        # Convert optimizer scalars to native Python scalars for DTensor compatibility
+        beta_1 = torch_parallel_optimizer._to_native_scalar(self.beta_1)
+        beta_2 = torch_parallel_optimizer._to_native_scalar(self.beta_2)
+        epsilon = torch_parallel_optimizer._to_native_scalar(self.epsilon)
+
         u_product_t = self._u_product.value * u_t
         u_product_t_1 = u_product_t * u_t_1
         beta_2_power = ops.power(beta_2, local_step)
@@ -46,12 +51,12 @@ class Nadam(torch_parallel_optimizer.TorchParallelOptimizer, optimizers.Nadam):
             for variable in keras_variables
         ]
 
-        torch._foreach_mul_(m_list, self.beta_1)
-        torch._foreach_add_(m_list, grads, alpha=1 - self.beta_1)
+        torch._foreach_mul_(m_list, beta_1)
+        torch._foreach_add_(m_list, grads, alpha=1 - beta_1)
 
-        torch._foreach_mul_(v_list, self.beta_2)
+        torch._foreach_mul_(v_list, beta_2)
         torch._foreach_add_(
-            v_list, torch._foreach_mul(grads, grads), alpha=1 - self.beta_2
+            v_list, torch._foreach_mul(grads, grads), alpha=1 - beta_2
         )
 
         m_hat_list = torch._foreach_add(
@@ -72,8 +77,9 @@ class Nadam(torch_parallel_optimizer.TorchParallelOptimizer, optimizers.Nadam):
             torch._foreach_div(
                 torch._foreach_mul(m_hat_list, lr),
                 torch._foreach_add(
-                    torch._foreach_sqrt(v_hat_list), self.epsilon
+                    torch._foreach_sqrt(v_hat_list), epsilon
                 ),
             ),
             alpha=-1,
         )
+

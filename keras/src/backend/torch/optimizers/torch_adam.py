@@ -41,12 +41,17 @@ class Adam(torch_parallel_optimizer.TorchParallelOptimizer, optimizers.Adam):
             for variable in keras_variables
         ]
 
-        torch._foreach_mul_(m_list, self.beta_1)
-        torch._foreach_add_(m_list, grads, alpha=1 - self.beta_1)
+        # Convert optimizer scalars to native Python scalars for DTensor compatibility
+        beta_1 = torch_parallel_optimizer._to_native_scalar(self.beta_1)
+        beta_2 = torch_parallel_optimizer._to_native_scalar(self.beta_2)
+        epsilon = torch_parallel_optimizer._to_native_scalar(self.epsilon)
 
-        torch._foreach_mul_(v_list, self.beta_2)
+        torch._foreach_mul_(m_list, beta_1)
+        torch._foreach_add_(m_list, grads, alpha=1 - beta_1)
+
+        torch._foreach_mul_(v_list, beta_2)
         torch._foreach_add_(
-            v_list, torch._foreach_mul(grads, grads), alpha=1 - self.beta_2
+            v_list, torch._foreach_mul(grads, grads), alpha=1 - beta_2
         )
 
         if self.amsgrad:
@@ -61,7 +66,7 @@ class Adam(torch_parallel_optimizer.TorchParallelOptimizer, optimizers.Adam):
             variables,
             torch._foreach_div(
                 torch._foreach_mul(m_list, alpha),
-                torch._foreach_add(torch._foreach_sqrt(v_list), self.epsilon),
+                torch._foreach_add(torch._foreach_sqrt(v_list), epsilon),
             ),
             alpha=-1,
         )

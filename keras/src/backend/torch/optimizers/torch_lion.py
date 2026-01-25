@@ -19,14 +19,17 @@ class Lion(torch_parallel_optimizer.TorchParallelOptimizer, optimizers.Lion):
         lr = ops.cast(learning_rate, dtype)
         # Convert lr to native Python scalar for DTensor compatibility
         lr = torch_parallel_optimizer._to_native_scalar(lr)
+        # Convert optimizer scalars to native Python scalars for DTensor compatibility
+        beta_1 = torch_parallel_optimizer._to_native_scalar(self.beta_1)
+        beta_2 = torch_parallel_optimizer._to_native_scalar(self.beta_2)
 
         m_list = [
             self._momentums[self._get_variable_index(variable)].value
             for variable in keras_variables
         ]
 
-        c_t = torch._foreach_mul(m_list, self.beta_1)
-        torch._foreach_add_(c_t, grads, alpha=1 - self.beta_1)
+        c_t = torch._foreach_mul(m_list, beta_1)
+        torch._foreach_add_(c_t, grads, alpha=1 - beta_1)
         c_t = [c.sign() for c in c_t]
 
         torch._foreach_add_(
@@ -35,5 +38,5 @@ class Lion(torch_parallel_optimizer.TorchParallelOptimizer, optimizers.Lion):
             alpha=-1,
         )
 
-        torch._foreach_mul_(m_list, self.beta_2)
-        torch._foreach_add_(m_list, grads, alpha=1 - self.beta_2)
+        torch._foreach_mul_(m_list, beta_2)
+        torch._foreach_add_(m_list, grads, alpha=1 - beta_2)

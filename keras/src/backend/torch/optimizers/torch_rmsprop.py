@@ -21,20 +21,22 @@ class RMSprop(
         lr = ops.cast(learning_rate, dtype)
         # Convert lr to native Python scalar for DTensor compatibility
         lr = torch_parallel_optimizer._to_native_scalar(lr)
+        # Convert optimizer scalars to native Python scalars for DTensor compatibility
+        rho = torch_parallel_optimizer._to_native_scalar(self.rho)
+        epsilon = torch_parallel_optimizer._to_native_scalar(self.epsilon)
+        momentum = torch_parallel_optimizer._to_native_scalar(self.momentum)
 
         velocities = [
             self._velocities[self._get_variable_index(variable)].value
             for variable in keras_variables
         ]
 
-        rho = self.rho
-
         torch._foreach_mul_(velocities, rho)
         torch._foreach_add_(
             velocities, torch._foreach_mul(grads, grads), alpha=1 - rho
         )
 
-        denominators = torch._foreach_add(velocities, self.epsilon)
+        denominators = torch._foreach_add(velocities, epsilon)
         if self.centered:
             average_grads = [
                 self._average_gradients[
@@ -59,7 +61,7 @@ class RMSprop(
                 self._momentums[self._get_variable_index(variable)].value
                 for variable in keras_variables
             ]
-            torch._foreach_mul_(momentum_list, self.momentum)
+            torch._foreach_mul_(momentum_list, momentum)
             torch._foreach_add_(momentum_list, increments)
             torch._foreach_add_(variables, momentum_list, alpha=-1)
         else:

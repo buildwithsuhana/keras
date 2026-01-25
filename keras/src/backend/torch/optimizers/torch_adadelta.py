@@ -21,7 +21,9 @@ class Adadelta(
         lr = ops.cast(learning_rate, dtype)
         # Convert lr to native Python scalar for DTensor compatibility
         lr = torch_parallel_optimizer._to_native_scalar(lr)
-        rho = self.rho
+        # Convert optimizer scalars to native Python scalars for DTensor compatibility
+        rho = torch_parallel_optimizer._to_native_scalar(self.rho)
+        epsilon = torch_parallel_optimizer._to_native_scalar(self.epsilon)
 
         accumulated_grads = [
             self._accumulated_grads[self._get_variable_index(variable)].value
@@ -39,7 +41,7 @@ class Adadelta(
         )
 
         def rms(x):
-            return torch._foreach_sqrt(torch._foreach_add(x, self.epsilon))
+            return torch._foreach_sqrt(torch._foreach_add(x, epsilon))
 
         delta_vars = torch._foreach_mul(
             torch._foreach_div(

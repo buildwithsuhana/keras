@@ -15,6 +15,9 @@ class SGD(torch_parallel_optimizer.TorchParallelOptimizer, optimizers.SGD):
         variables = [v.value for v in variables]
         # Convert learning_rate to native Python scalar for DTensor compatibility
         learning_rate = torch_parallel_optimizer._to_native_scalar(learning_rate)
+        # Convert momentum to native Python scalar for DTensor compatibility
+        momentum = torch_parallel_optimizer._to_native_scalar(self.momentum)
+        
         if self.momentum != 0:
             bufs = [
                 self.momentums[self._get_variable_index(variable)].value
@@ -25,12 +28,12 @@ class SGD(torch_parallel_optimizer.TorchParallelOptimizer, optimizers.SGD):
                 if bufs[i] is None:
                     bufs[i] = torch.clone(grads[i]).detach()
 
-            torch._foreach_mul_(bufs, self.momentum)
+            torch._foreach_mul_(bufs, momentum)
             torch._foreach_add_(bufs, grads, alpha=-learning_rate)
 
             if self.nesterov:
                 torch._foreach_add_(variables, grads, alpha=-learning_rate)
-                torch._foreach_add_(variables, bufs, alpha=self.momentum)
+                torch._foreach_add_(variables, bufs, alpha=momentum)
             else:
                 torch._foreach_add_(variables, bufs)
 

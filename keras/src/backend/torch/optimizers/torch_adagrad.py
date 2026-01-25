@@ -21,6 +21,8 @@ class Adagrad(
         lr = ops.cast(learning_rate, dtype)
         # Convert lr to native Python scalar for DTensor compatibility
         lr = torch_parallel_optimizer._to_native_scalar(lr)
+        # Convert epsilon to native Python scalar for DTensor compatibility
+        epsilon = torch_parallel_optimizer._to_native_scalar(self.epsilon)
 
         accumulators = [
             self._accumulators[self._get_variable_index(variable)].value
@@ -31,8 +33,8 @@ class Adagrad(
             variables,
             torch._foreach_div(
                 torch._foreach_mul(grads, lr),
-                torch._foreach_sqrt(
-                    torch._foreach_add(accumulators, self.epsilon)
+                torch._foreach_add(
+                    torch._foreach_sqrt(accumulators), epsilon
                 ),
             ),
             alpha=-1,
