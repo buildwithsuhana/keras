@@ -157,7 +157,12 @@ class _DTensorAwareDataLoader:
         self._iterator = None
 
     def __iter__(self):
-        self._iterator = iter(self._dataloader)
+        # Use self.dataset (the _DTensorAwareDataset wrapper) instead of
+        # self._dataloader to ensure that __getitems__ calls go through
+        # our DTensor-aware wrapper. This prevents the "aten.index.Tensor:
+        # got mixed torch.Tensor and DTensor" error that occurs when
+        # PyTorch's internal tree_map in DataLoader.__next__ mixes types.
+        self._iterator = iter(self.dataset)
         return self
 
     def __next__(self):
@@ -206,4 +211,5 @@ class _DTensorAwareDataset:
         return backend_dist._convert_batch_to_dtensor(
             items, self._mesh, self._placements
         )
+
 

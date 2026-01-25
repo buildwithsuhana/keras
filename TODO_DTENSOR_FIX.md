@@ -41,5 +41,11 @@ Run the training script to verify the fix works.
 - [x] Update distribution_lib.py
 - [x] Update torch_data_loader_adapter.py (including get_numpy_iterator fix)
 - [x] Update epoch_iterator.py
+- [x] Fix _DTensorAwareDataLoader.__iter__() to use self.dataset instead of self._dataloader
 - [ ] Test the fix
+
+## Bug Fixed (2024-01-25)
+**Root Cause**: The `_DTensorAwareDataLoader.__iter__()` method was creating an iterator from `self._dataloader` instead of `self.dataset`. This caused PyTorch's internal `tree_map` in `DataLoader.__next__` to use the original dataset's `__getitems__`, which returned regular `torch.Tensor` instead of `DTensor`, leading to the mixed tensor error.
+
+**Fix**: Changed `iter(self._dataloader)` to `iter(self.dataset)` in `_DTensorAwareDataLoader.__iter__()` method so that data fetching goes through our `_DTensorAwareDataset` wrapper which properly converts data to DTensors.
 
