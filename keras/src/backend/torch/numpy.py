@@ -112,8 +112,33 @@ def einsum(subscripts, *operands, **kwargs):
 
 
 def subtract(x1, x2):
+    # Check for DTensor and handle conversion
+    # PyTorch DTensor operations require all operands to be DTensors
+    from torch.distributed._tensor import DTensor
+
     x1 = convert_to_tensor(x1)
     x2 = convert_to_tensor(x2)
+
+    x1_is_dtensor = isinstance(x1, DTensor)
+    x2_is_dtensor = isinstance(x2, DTensor)
+
+    # If one operand is DTensor and the other is not, convert the regular
+    # tensor to DTensor with compatible placements
+    if x1_is_dtensor and not x2_is_dtensor:
+        # Get the mesh and placements from x1
+        mesh = x1.device_mesh
+        # Use the same placements as x1 for the replicated tensor
+        x2 = torch.distributed._tensor.distribute_tensor(
+            x2, mesh, x1.placements
+        )
+    elif x2_is_dtensor and not x1_is_dtensor:
+        # Get the mesh and placements from x2
+        mesh = x2.device_mesh
+        # Use the same placements as x2 for the replicated tensor
+        x1 = torch.distributed._tensor.distribute_tensor(
+            x1, mesh, x2.placements
+        )
+
     # TODO: torch.subtract doesn't support bool
     if standardize_dtype(x1.dtype) == "bool":
         x1 = cast(x1, x2.dtype)
@@ -203,8 +228,33 @@ def matmul(x1, x2):
 
 
 def multiply(x1, x2):
+    # Check for DTensor and handle conversion
+    # PyTorch DTensor operations require all operands to be DTensors
+    from torch.distributed._tensor import DTensor
+
     x1 = convert_to_tensor(x1)
     x2 = convert_to_tensor(x2)
+
+    x1_is_dtensor = isinstance(x1, DTensor)
+    x2_is_dtensor = isinstance(x2, DTensor)
+
+    # If one operand is DTensor and the other is not, convert the regular
+    # tensor to DTensor with compatible placements
+    if x1_is_dtensor and not x2_is_dtensor:
+        # Get the mesh and placements from x1
+        mesh = x1.device_mesh
+        # Use the same placements as x1 for the replicated tensor
+        x2 = torch.distributed._tensor.distribute_tensor(
+            x2, mesh, x1.placements
+        )
+    elif x2_is_dtensor and not x1_is_dtensor:
+        # Get the mesh and placements from x2
+        mesh = x2.device_mesh
+        # Use the same placements as x2 for the replicated tensor
+        x1 = torch.distributed._tensor.distribute_tensor(
+            x1, mesh, x2.placements
+        )
+
     return torch.multiply(x1, x2)
 
 
@@ -1207,6 +1257,10 @@ def logspace(start, stop, num=50, endpoint=True, base=10, dtype=None, axis=0):
 
 
 def maximum(x1, x2):
+    # Check for DTensor and handle conversion
+    # PyTorch DTensor operations require all operands to be DTensors
+    from torch.distributed._tensor import DTensor
+
     if not isinstance(x1, (int, float)):
         x1 = convert_to_tensor(x1)
     if not isinstance(x2, (int, float)):
@@ -1217,6 +1271,27 @@ def maximum(x1, x2):
     )
     x1 = convert_to_tensor(x1, dtype)
     x2 = convert_to_tensor(x2, dtype)
+
+    x1_is_dtensor = isinstance(x1, DTensor)
+    x2_is_dtensor = isinstance(x2, DTensor)
+
+    # If one operand is DTensor and the other is not, convert the regular
+    # tensor to DTensor with compatible placements
+    if x1_is_dtensor and not x2_is_dtensor:
+        # Get the mesh and placements from x1
+        mesh = x1.device_mesh
+        # Use the same placements as x1 for the replicated tensor
+        x2 = torch.distributed._tensor.distribute_tensor(
+            x2, mesh, x1.placements
+        )
+    elif x2_is_dtensor and not x1_is_dtensor:
+        # Get the mesh and placements from x2
+        mesh = x2.device_mesh
+        # Use the same placements as x2 for the replicated tensor
+        x1 = torch.distributed._tensor.distribute_tensor(
+            x1, mesh, x2.placements
+        )
+
     return torch.maximum(x1, x2)
 
 
@@ -1293,6 +1368,10 @@ def min(x, axis=None, keepdims=False, initial=None):
 
 
 def minimum(x1, x2):
+    # Check for DTensor and handle conversion
+    # PyTorch DTensor operations require all operands to be DTensors
+    from torch.distributed._tensor import DTensor
+
     if not isinstance(x1, (int, float)):
         x1 = convert_to_tensor(x1)
     if not isinstance(x2, (int, float)):
@@ -1303,6 +1382,27 @@ def minimum(x1, x2):
     )
     x1 = convert_to_tensor(x1, dtype)
     x2 = convert_to_tensor(x2, dtype)
+
+    x1_is_dtensor = isinstance(x1, DTensor)
+    x2_is_dtensor = isinstance(x2, DTensor)
+
+    # If one operand is DTensor and the other is not, convert the regular
+    # tensor to DTensor with compatible placements
+    if x1_is_dtensor and not x2_is_dtensor:
+        # Get the mesh and placements from x1
+        mesh = x1.device_mesh
+        # Use the same placements as x1 for the replicated tensor
+        x2 = torch.distributed._tensor.distribute_tensor(
+            x2, mesh, x1.placements
+        )
+    elif x2_is_dtensor and not x1_is_dtensor:
+        # Get the mesh and placements from x2
+        mesh = x2.device_mesh
+        # Use the same placements as x2 for the replicated tensor
+        x1 = torch.distributed._tensor.distribute_tensor(
+            x1, mesh, x2.placements
+        )
+
     return torch.minimum(x1, x2)
 
 
@@ -1875,10 +1975,35 @@ def where(condition, x1=None, x2=None):
 
 
 def divide(x1, x2):
+    # Check for DTensor and handle conversion
+    # PyTorch DTensor operations require all operands to be DTensors
+    from torch.distributed._tensor import DTensor
+
     if not isinstance(x1, (int, float)):
         x1 = convert_to_tensor(x1)
     if not isinstance(x2, (int, float)):
         x2 = convert_to_tensor(x2)
+
+    x1_is_dtensor = isinstance(x1, DTensor)
+    x2_is_dtensor = isinstance(x2, DTensor)
+
+    # If one operand is DTensor and the other is not, convert the regular
+    # tensor to DTensor with compatible placements
+    if x1_is_dtensor and not x2_is_dtensor:
+        # Get the mesh and placements from x1
+        mesh = x1.device_mesh
+        # Use the same placements as x1 for the replicated tensor
+        x2 = torch.distributed._tensor.distribute_tensor(
+            x2, mesh, x1.placements
+        )
+    elif x2_is_dtensor and not x1_is_dtensor:
+        # Get the mesh and placements from x2
+        mesh = x2.device_mesh
+        # Use the same placements as x2 for the replicated tensor
+        x1 = torch.distributed._tensor.distribute_tensor(
+            x1, mesh, x2.placements
+        )
+
     return torch.divide(x1, x2)
 
 
