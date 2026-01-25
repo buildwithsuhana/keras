@@ -19,34 +19,17 @@ class Adamax(
 
         dtype = variables[0].dtype
         lr = ops.cast(learning_rate, dtype)
-        try:
-            from keras.src.backend.torch import core as torch_core
-            import numpy as _np
-
-            _lr_val = torch_core.convert_to_numpy(lr)
-            if isinstance(_lr_val, _np.ndarray):
-                _lr_val = _lr_val.item()
-            lr = float(_lr_val)
-        except Exception:
-            pass
+        # Convert lr to native Python scalar for DTensor compatibility
+        lr = torch_parallel_optimizer._to_native_scalar(lr)
 
         local_step = ops.cast(ops.add(self.iterations, 1), dtype)
 
         beta_1_power = ops.power(ops.cast(self.beta_1, dtype), local_step)
 
-        # Pre-compute scalar denominator for foreach calls to avoid mixing
-        # DTensor and torch.Tensor when beta_1_power is a DTensor.
-        try:
-            from keras.src.backend.torch import core as torch_core
-            import numpy as _np
-
-            _den = ops.subtract(ops.cast(1, dtype), beta_1_power)
-            _den_val = torch_core.convert_to_numpy(_den)
-            if isinstance(_den_val, _np.ndarray):
-                _den_val = _den_val.item()
-            den_scalar = float(_den_val)
-        except Exception:
-            den_scalar = None
+        # Pre-compute scalar denominator for DTensor compatibility
+        den_scalar = torch_parallel_optimizer._to_native_scalar(
+            ops.subtract(ops.cast(1, dtype), beta_1_power)
+        )
 
         m_list = [
             self._m[self._get_variable_index(variable)].value

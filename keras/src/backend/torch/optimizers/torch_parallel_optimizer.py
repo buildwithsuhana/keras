@@ -4,6 +4,32 @@ from keras.src.optimizers.base_optimizer import BaseOptimizer
 from keras.src.utils import torch_utils
 
 
+def _to_native_scalar(value):
+    """Convert a tensor/DTensor to a native Python scalar.
+
+    This helper is essential for DTensor compatibility. torch._foreach_*
+    operations require native Python scalars when interacting with DTensor
+    operands. If a DTensor scalar is passed directly, PyTorch will raise
+    "aten.sub.Tensor: got mixed torch.Tensor and DTensor" errors.
+
+    Args:
+        value: A scalar value (float, int, or torch.Tensor/DTensor)
+
+    Returns:
+        A native Python float or int
+    """
+    if isinstance(value, torch.Tensor):
+        # Use convert_to_numpy which properly handles DTensor
+        from keras.src.backend.torch.core import convert_to_numpy
+
+        numpy_val = convert_to_numpy(value)
+        # Handle numpy array scalars
+        if hasattr(numpy_val, "item"):
+            return numpy_val.item()
+        return numpy_val
+    return value
+
+
 class TorchParallelOptimizer(BaseOptimizer):
     @torch_utils.no_grad
     def _backend_update_step(self, grads, trainable_variables, learning_rate):

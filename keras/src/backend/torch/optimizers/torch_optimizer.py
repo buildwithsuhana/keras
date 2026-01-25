@@ -39,7 +39,14 @@ class TorchOptimizer(BaseOptimizer):
         if self.weight_decay is None:
             return
 
+        # Convert learning_rate to native Python scalar for DTensor compatibility
+        from keras.src.backend.torch.optimizers import torch_parallel_optimizer
+
+        lr = torch_parallel_optimizer._to_native_scalar(
+            self._get_current_learning_rate()
+        )
+
         torch._foreach_mul_(
             [v.value for v in variables if self._use_weight_decay(v)],
-            1 - self.weight_decay * self._get_current_learning_rate(),
+            1 - self.weight_decay * lr,
         )

@@ -28,24 +28,9 @@ class Nadam(torch_parallel_optimizer.TorchParallelOptimizer, optimizers.Nadam):
         u_t = ops.multiply(beta_1, ops.subtract(1.0, ops.multiply(0.5, ops.power(decay, local_step))))
         u_t_1 = ops.multiply(beta_1, ops.subtract(1.0, ops.multiply(0.5, ops.power(decay, next_step))))
 
-        # Convert u_t and u_t_1 to Python scalars when possible for foreach
-        # operations (which don't accept DTensor scalars).
-        try:
-            from keras.src.backend.torch import core as torch_core
-            import numpy as _np
-
-            _u_t_val = torch_core.convert_to_numpy(u_t)
-            if isinstance(_u_t_val, _np.ndarray):
-                _u_t_val = _u_t_val.item()
-            u_t = float(_u_t_val)
-
-            _u_t_1_val = torch_core.convert_to_numpy(u_t_1)
-            if isinstance(_u_t_1_val, _np.ndarray):
-                _u_t_1_val = _u_t_1_val.item()
-            u_t_1 = float(_u_t_1_val)
-        except Exception:
-            # If conversion fails, keep as-is and hope DTensor-aware paths are used.
-            pass
+        # Convert to native Python scalars for DTensor compatibility
+        u_t = torch_parallel_optimizer._to_native_scalar(u_t)
+        u_t_1 = torch_parallel_optimizer._to_native_scalar(u_t_1)
         u_product_t = self._u_product.value * u_t
         u_product_t_1 = u_product_t * u_t_1
         beta_2_power = ops.power(beta_2, local_step)
