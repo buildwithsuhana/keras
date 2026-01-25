@@ -1,8 +1,10 @@
+import contextlib
 import torch
 
 from keras.src import ops
 from keras.src import optimizers
 from keras.src.backend.torch.optimizers import torch_parallel_optimizer
+from keras.src.backend.torch.core import is_dtensor_mode
 
 
 def _is_dtensor(tensor):
@@ -41,7 +43,6 @@ def _grads_to_dtensor(grads, variables):
 
 
 class Adam(torch_parallel_optimizer.TorchParallelOptimizer, optimizers.Adam):
-    @torch._dynamo.disable
     def _parallel_update_step(
         self,
         grads,
@@ -87,30 +88,40 @@ class Adam(torch_parallel_optimizer.TorchParallelOptimizer, optimizers.Adam):
 
         # Convert optimizer scalars to native Python scalars for DTensor compatibility
         epsilon = torch_parallel_optimizer._to_native_scalar(self.epsilon)
-        one_minus_beta_1 = 1.0 - beta_1
-        one_minus_beta_2 = 1.0 - beta_2
 
-        torch._foreach_mul_(m_list, beta_1)
-        torch._foreach_add_(m_list, grads, alpha=one_minus_beta_1)
-
-        torch._foreach_mul_(v_list, beta_2)
-        torch._foreach_add_(
-            v_list, torch._foreach_mul(grads, grads), alpha=one_minus_beta_2
-        )
-
-        if self.amsgrad:
+        # Handle amsgrad case
+        v_hat_list = None
+        amsgrad = self.amsgrad
+        if amsgrad:
             v_hat_list = [
                 self._velocity_hats[self._get_variable_index(variable)].value
                 for variable in keras_variables
             ]
-            torch._foreach_maximum_(v_hat_list, v_list)
-            v_list = v_hat_list
 
-        torch._foreach_add_(
-            variables,
-            torch._foreach_div(
-                torch._foreach_mul(m_list, alpha),
-                torch._foreach_add(torch._foreach_sqrt(v_list), epsilon),
-            ),
-            alpha=-1.0,
-        )
+        # Disable dynamo for the foreach operations when in DTensor mode
+        # This is important because dynamo graph capture can cause issues
+        # with DTensor operations
+        disable_ctx = torch._disable_dynamo if is_dtensor_mode() else contextlib.nullcontext
+        
+        with disable_ctx():
+            with torch.no_grad():
+                torch._foreach_mul_(m_list, beta_1)
+                torch._foreach_add_(m_list, grads, alpha=1.0 - beta_1)
+
+                torch._foreach_mul_(v_list, beta_2)
+                torch._foreach_add_(
+                    v_list, torch._foreach_mul(grads, grads), alpha=1.0 - beta_2
+                )
+
+                if amsgrad:
+                    torch._foreach_maximum_(v_hat_list, v_list)
+                    v_list = v_hat_list
+
+                torch._foreach_add_(
+                    variables,
+                    torch._foreach_div(
+                        torch._foreach_mul(m_list, alpha),
+                        torch._foreach_add(torch._foreach_sqrt(v_list), epsilon),
+                    ),
+                    alpha=-1.0,
+                )

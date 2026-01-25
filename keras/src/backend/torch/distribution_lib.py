@@ -235,6 +235,38 @@ def distribute_data_input(data, layout, batch_dim_name=None):
     return data
 
 
+def distribute_data(x, y):
+    """Distribute input data for model parallelism.
+    
+    This function ensures that input tensors are converted to DTensors
+    when the model uses DTensor weights. This prevents the "aten.sub.Tensor: 
+    got mixed torch.Tensor and DTensor" error during forward/backward passes.
+    
+    Args:
+        x: Input data tensor
+        y: Target data tensor
+        
+    Returns:
+        Tuple of (distributed x, distributed y) as DTensors
+    """
+    from keras.src.distribution import distribution_lib as frontend_dist
+    
+    dist = frontend_dist.distribution()
+    if dist is None:
+        return x, y
+    
+    # Get the data layout for the input
+    if hasattr(x, 'shape'):
+        x_layout = dist.get_data_layout(x.shape)
+        x = distribute_data_input(x, x_layout, dist.batch_dim_name)
+    
+    if hasattr(y, 'shape'):
+        y_layout = dist.get_data_layout(y.shape)
+        y = distribute_data_input(y, y_layout, dist.batch_dim_name)
+    
+    return x, y
+
+
 def num_processes():
     """Return the total number of processes in the cluster."""
     if dist.is_initialized():

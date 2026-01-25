@@ -58,6 +58,26 @@ TORCH_DTYPES = {
     "complex128": torch.complex128,
 }
 
+# Global flag to track if DTensor is being used (disables dynamo)
+_DTENSOR_MODE = False
+
+
+def enable_dtensor_mode():
+    """Enable DTensor mode - this disables torch.compile/dynamo."""
+    global _DTENSOR_MODE
+    _DTENSOR_MODE = True
+
+
+def disable_dtensor_mode():
+    """Disable DTensor mode - re-enables torch.compile/dynamo."""
+    global _DTENSOR_MODE
+    _DTENSOR_MODE = False
+
+
+def is_dtensor_mode():
+    """Check if we're in DTensor mode."""
+    return _DTENSOR_MODE
+
 
 @contextlib.contextmanager
 def device_scope(device_name):
@@ -152,6 +172,9 @@ class Variable(KerasVariable):
                     layout = context_layout
                 
                 if layout:
+                    # Enable DTensor mode when distribution is active
+                    enable_dtensor_mode()
+                    
                     # Log only on Rank 0 to avoid messy duplicate logs
                     if dist.is_initialized() and dist.get_rank() == 0:
                         print(f"[CORE] Variable '{self.name}' matched layout '{layout.axes}'. Sharding...")
@@ -179,6 +202,9 @@ class Variable(KerasVariable):
         # If we have a layout (from distribution context or passed in), distribute the value
         if layout is not None:
             self._layout = layout
+            
+            # Enable DTensor mode when distribution is active
+            enable_dtensor_mode()
             
             # Check if distribution is needed (value is not already a DTensor)
             from torch.distributed._tensor import DTensor
