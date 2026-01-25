@@ -110,12 +110,19 @@ class Variable(KerasVariable):
 
         dist_context = frontend_dist.distribution()
         
+        # Check if a layout was passed directly (via layout parameter)
+        # This happens when optimizer variables are created with inherited layout
+        layout = getattr(self, "_layout", None)
+        
         if dist_context and self.name:
             # 2. Access the layout map (private attribute in ModelParallel)
             layout_map = getattr(dist_context, "_layout_map", None)
             
             if layout_map:
-                layout = layout_map.get(self.name)
+                # Layout from distribution context takes precedence
+                context_layout = layout_map.get(self.name)
+                if context_layout:
+                    layout = context_layout
                 
                 if layout:
                     # Log only on Rank 0 to avoid messy duplicate logs
@@ -141,6 +148,16 @@ class Variable(KerasVariable):
             else:
                 if dist.is_initialized() and dist.get_rank() == 0:
                     print(f"[CORE] Distribution context found but no LayoutMap available for '{self.name}'.")
+        
+        # If we have a layout (from distribution context or passed in), distribute the value
+        if layout is not None:
+            self._layout = layout
+            
+            # Check if distribution is needed (value is not already a DTensor)
+            from torch.distributed._tensor import DTensor
+            if not isinstance(value, DTensor):
+                from keras.src.backend.torch import distribution_lib as backend_dist
+                value = backend_dist.distribute_variable(value, layout)
 
         if isinstance(value, torch.nn.Parameter):
             # Reuse same parameter
@@ -288,15 +305,8 @@ def convert_to_tensor(x, dtype=None, sparse=None, ragged=None):
 
 
 def convert_to_numpy(x):
-    from torch.distributed._tensor import DTensor as TorchDTensor
-    
     def transform(x):
         if is_tensor(x):
-            # Debug: Check if tensor is DTensor
-            is_dtensor = isinstance(x, TorchDTensor)
-            if is_dtensor:
-                print(f"[CONVERT DEBUG] DTensor detected: {type(x).__name__}, spec={x._spec}, device_mesh={x._spec.mesh}")
-            
             if x.requires_grad:
                 x = x.detach()
             # Tensor has to be moved to CPU before converting to numpy.

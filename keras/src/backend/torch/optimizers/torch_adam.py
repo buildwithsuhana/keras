@@ -66,10 +66,7 @@ class Adam(torch_parallel_optimizer.TorchParallelOptimizer, optimizers.Adam):
         beta_2 = torch_parallel_optimizer._to_native_scalar(self.beta_2)
         epsilon = torch_parallel_optimizer._to_native_scalar(self.epsilon)
 
-        print(f"[DEBUG Adam] Starting torch._foreach_mul_ on m_list...")
         torch._foreach_mul_(m_list, beta_1)
-        print(f"[DEBUG Adam] torch._foreach_mul_ on m_list completed")
-
         torch._foreach_add_(m_list, grads, alpha=1 - beta_1)
 
         torch._foreach_mul_(v_list, beta_2)

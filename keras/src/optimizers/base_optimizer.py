@@ -317,9 +317,10 @@ class BaseOptimizer(KerasSaveable):
             )
             name = f"{sanitised_ref_name}_{name}"
         
-        # Debug: Check if reference variable has a layout
+        # Check if reference variable has a layout that should be inherited
         ref_layout = getattr(reference_variable, "_layout", None)
-        print(f"[OPTIMIZER DEBUG] Creating optimizer variable '{name}' for ref='{reference_variable.name}', ref_layout={ref_layout}")
+        if ref_layout is not None:
+            print(f"[OPTIMIZER] Inheriting layout {ref_layout.axes} for optimizer variable '{name}'")
         
         return self.add_variable(
             shape=reference_variable.shape,
