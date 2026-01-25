@@ -3,53 +3,38 @@
 ## Task
 Fix the `RuntimeError: aten.sub.Tensor: got mixed torch.Tensor and DTensor` error when using Keras ModelParallel with Torch backend.
 
-## Functions Fixed
-- [x] `subtract` - PRIMARY FIX (causes the current error)
-- [x] `multiply` - For consistency
-- [x] `minimum` - For consistency
-- [x] `maximum` - For consistency
-- [x] `divide` - For consistency
+## Root Cause
+When `torch.compile`/`dynamo` is enabled, it intercepts operations at the PyTorch dispatch level and calls `aten.sub.Tensor` directly, bypassing our Keras wrapper functions. The DTensor's `__torch_dispatch__` mechanism doesn't automatically convert regular tensors to DTensors when mixed in operations.
 
-## Implementation Pattern (from `add` function)
-```python
-def add(x1, x2):
-    # Check for DTensor and handle conversion
-    # PyTorch DTensor operations require all operands to be DTensors
-    from torch.distributed._tensor import DTensor
+## Solution Implemented
 
-    x1 = convert_to_tensor(x1)
-    x2 = convert_to_tensor(x2)
+### 1. Created KerasDTensor class
+A custom DTensor subclass that automatically handles mixed operations by implementing `__torch_dispatch__`. When a KerasDTensor is used in an operation with a regular torch.Tensor, it automatically converts the regular tensor to a DTensor with compatible placements.
 
-    x1_is_dtensor = isinstance(x1, DTensor)
-    x2_is_dtensor = isinstance(x2, DTensor)
+### 2. Modified distribute_tensor function
+Changed to return `KerasDTensor` instead of regular `DTensor` so that all distributed tensors automatically get the automatic mixed operation handling.
 
-    # If one operand is DTensor and the other is not, convert the regular
-    # tensor to DTensor with compatible placements
-    if x1_is_dtensor and not x2_is_dtensor:
-        # Get the mesh and placements from x1
-        mesh = x1.device_mesh
-        # Use the same placements as x1 for the replicated tensor
-        x2 = torch.distributed._tensor.distribute_tensor(
-            x2, mesh, x1.placements
-        )
-    elif x2_is_dtensor and not x1_is_dtensor:
-        # Get the mesh and placements from x2
-        mesh = x2.device_mesh
-        # Use the same placements as x2 for the replicated tensor
-        x1 = torch.distributed._tensor.distribute_tensor(
-            x1, mesh, x2.placements
-        )
+### 3. Updated numpy.py functions
+Added DTensor handling to:
+- `subtract` - PRIMARY FIX (causes the current error)
+- `multiply` - For consistency
+- `minimum` - For consistency
+- `maximum` - For consistency
+- `divide` - For consistency
 
-    return torch.add(x1, x2)
-```
+## Files Modified
+- `/Users/suhanaaa/keras/keras/src/backend/torch/distribution_lib.py`
+- `/Users/suhanaaa/keras/keras/src/backend/torch/numpy.py`
 
 ## Progress
-- [x] Fix `subtract` function
-- [x] Fix `multiply` function
-- [x] Fix `minimum` function
-- [x] Fix `maximum` function
-- [x] Fix `divide` function
+- [x] Fix `subtract` function in numpy.py
+- [x] Fix `multiply` function in numpy.py
+- [x] Fix `minimum` function in numpy.py
+- [x] Fix `maximum` function in numpy.py
+- [x] Fix `divide` function in numpy.py
+- [x] Create KerasDTensor class in distribution_lib.py
+- [x] Modify distribute_tensor to return KerasDTensor
 
 ## Summary
-All binary operations in `keras/src/backend/torch/numpy.py` now handle DTensor conversion properly. When one operand is a DTensor and the other is a regular torch.Tensor, the regular tensor is automatically converted to a DTensor with compatible placements before the operation. This ensures that PyTorch distributed operations work correctly without the "mixed torch.Tensor and DTensor" error.
+All distributed tensors now use KerasDTensor which automatically handles mixed DTensor/torch.Tensor operations. This ensures that when torch.compile/dynamo intercepts operations at the dispatch level, the __torch_dispatch__ hook will convert regular tensors to DTensors before performing the operation, preventing the "mixed torch.Tensor and DTensor" error.
 

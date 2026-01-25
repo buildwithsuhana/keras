@@ -42,6 +42,92 @@ def _ensure_dtensor(tensor, mesh, placements=None):
     return torch_distribute_tensor(tensor, mesh, placements)
 
 
+class KerasDTensor(DTensor):
+    """A custom DTensor subclass that automatically handles mixed operations.
+
+    When a KerasDTensor is used in an operation with a regular torch.Tensor,
+    this class automatically converts the regular tensor to a DTensor with
+    compatible placements before performing the operation. This ensures that
+    PyTorch DTensor operations work correctly even when torch.compile/dynamo
+    intercepts operations at the dispatch level.
+    """
+
+    @staticmethod
+    def __torch_dispatch__(func, types, args, kwargs):
+        """Intercept torch operations and handle mixed DTensor/tensor operations."""
+        from torch.distributed._tensor import DTensor as DTensorClass
+
+        # Convert all DTensor and regular tensor arguments to DTensors
+        new_args = []
+        dtensor_mesh = None
+        dtensor_placements = None
+
+        # Find if any argument is a DTensor and get its mesh/placements
+        for arg in args:
+            if isinstance(arg, DTensorClass):
+                dtensor_mesh = arg.device_mesh
+                dtensor_placements = arg.placements
+                break
+
+        # Convert all arguments
+        for arg in args:
+            if isinstance(arg, DTensorClass):
+                new_args.append(arg)
+            elif isinstance(arg, torch.Tensor) and dtensor_mesh is not None:
+                # Convert regular tensor to DTensor with compatible placements
+                converted = torch_distribute_tensor(
+                    arg, dtensor_mesh, dtensor_placements
+                )
+                new_args.append(converted)
+            else:
+                new_args.append(arg)
+
+        # Handle kwargs similarly
+        new_kwargs = {}
+        if kwargs:
+            for key, value in kwargs.items():
+                if isinstance(value, DTensorClass):
+                    new_kwargs[key] = value
+                elif isinstance(value, torch.Tensor) and dtensor_mesh is not None:
+                    new_kwargs[key] = torch_distribute_tensor(
+                        value, dtensor_mesh, dtensor_placements
+                    )
+                else:
+                    new_kwargs[key] = value
+
+        return func(*new_args, **new_kwargs)
+
+
+def _wrap_as_keras_dtensor(tensor, mesh, placements):
+    """Wrap a tensor as KerasDTensor for automatic mixed operation handling.
+
+    Args:
+        tensor: A torch.Tensor to wrap
+        mesh: The DeviceMesh for distribution
+        placements: The placements for the DTensor
+
+    Returns:
+        A KerasDTensor instance
+    """
+    # Create a local tensor and wrap it with KerasDTensor
+    # We use DTensor's internal _local_tensor to store the actual tensor
+    if not isinstance(tensor, torch.Tensor):
+        tensor = convert_to_tensor(tensor)
+
+    # Create the DTensor first
+    dtensor = torch_distribute_tensor(tensor, mesh, placements)
+
+    # Wrap it as KerasDTensor by creating a new instance
+    # We need to preserve the _local_tensor from the existing DTensor
+    result = KerasDTensor(
+        dtensor._local_tensor,
+        mesh,
+        placements,
+        requires_grad=tensor.requires_grad
+    )
+    return result
+
+
 def list_devices(device_type=None):
     """List available local devices."""
     device_type = device_type or "cuda"
@@ -142,7 +228,7 @@ def distribute_variable(variable, layout):
 
 def distribute_tensor(value, layout):
     """The core engine for Model Parallelism.
-    Converts a standard torch.Tensor into a sharded DTensor.
+    Converts a standard torch.Tensor into a sharded KerasDTensor.
     """
     from keras.src.distribution.distribution_lib import TensorLayout
 
@@ -157,8 +243,19 @@ def distribute_tensor(value, layout):
     if not isinstance(value, torch.Tensor):
         value = convert_to_tensor(value)
 
-    # Wrap the tensor in the PyTorch DTensor dispatcher
-    return torch_distribute_tensor(value, torch_mesh, placements)
+    # Create the DTensor
+    dtensor = torch_distribute_tensor(value, torch_mesh, placements)
+
+    # Wrap it as KerasDTensor for automatic mixed operation handling
+    # This ensures that when torch.compile/dynamo intercepts operations,
+    # the __torch_dispatch__ will handle mixed DTensor/tensor operations
+    result = KerasDTensor(
+        dtensor._local_tensor,
+        torch_mesh,
+        placements,
+        requires_grad=value.requires_grad
+    )
+    return result
 
 
 def distribute_data_input(data, layout):
