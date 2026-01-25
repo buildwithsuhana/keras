@@ -14,6 +14,32 @@ def _is_dtensor(tensor):
         return False
 
 
+def _ensure_dtensor(tensor, dtensor_ref):
+    """Convert a regular torch.Tensor to DTensor matching the reference DTensor."""
+    if _is_dtensor(tensor):
+        return tensor
+    
+    # Get the mesh and placements from the reference DTensor
+    if _is_dtensor(dtensor_ref):
+        from torch.distributed._tensor import distribute_tensor
+        return distribute_tensor(tensor, dtensor_ref.device_mesh, dtensor_ref.placements)
+    
+    return tensor
+
+
+def _grads_to_dtensor(grads, variables):
+    """Convert gradients to DTensors matching the variable layout."""
+    if not _is_dtensor(variables[0]):
+        return grads
+    
+    # All variables should have the same mesh and placements
+    # Use the first variable as reference
+    ref_dtensor = variables[0]
+    
+    # Convert each gradient to DTensor
+    return [_ensure_dtensor(g, ref_dtensor) for g in grads]
+
+
 class Adam(torch_parallel_optimizer.TorchParallelOptimizer, optimizers.Adam):
     def _parallel_update_step(
         self,
@@ -37,6 +63,14 @@ class Adam(torch_parallel_optimizer.TorchParallelOptimizer, optimizers.Adam):
             print(f"  grads[{i}]: is_dtensor={_is_dtensor(g)}")
 
         dtype = variables[0].dtype
+        
+        # Convert grads to DTensors if variables are DTensors
+        grads = _grads_to_dtensor(grads, variables)
+        
+        # Debug: Check all grads after conversion
+        all_grads_dtensor_after = all(_is_dtensor(g) for g in grads)
+        print(f"[DEBUG Adam] All grads are DTensors after conversion: {all_grads_dtensor_after}")
+
         # Use ops helpers to ensure any DTensor interactions go through
         # the backend dispatch (avoids mixing torch.Tensor and DTensor).
         lr = ops.cast(learning_rate, dtype)
