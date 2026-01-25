@@ -76,6 +76,9 @@ def to_backend_layout(axes, device_mesh):
 
 def distribute_variable(value, layout):
     """Internal hook used during KerasVariable initialization."""
+    rank = dist.get_rank() if dist.is_initialized() else 0
+    if rank == 0:
+        print(f"[DIST] Sharding variable with layout: {layout.axes}")
     return distribute_tensor(value, layout)
 
 
@@ -101,9 +104,10 @@ def distribute_tensor(value, layout):
 
 
 def distribute_data_input(per_process_batch, layout, batch_dim_name):
-    """The core engine for Data Parallelism.
-
-    Slices the local worker batch across the 'data' axis of the mesh.
-    """
-    torch_mesh = layout.device_mesh.to_backend_mesh()
-    return torch_distribute_tensor(per_process_batch, torch_mesh, [Shard(0)])
+    rank = dist.get_rank() if dist.is_initialized() else 0
+    local_shape = per_process_batch.shape
+    
+    print(f"[Rank {rank}] Distributing input batch. Local shape: {local_shape}")
+    
+    mesh = layout.device_mesh.to_backend_mesh()
+    return torch_distribute_tensor(per_process_batch, mesh, [Shard(0)])
