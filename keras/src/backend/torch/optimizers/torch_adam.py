@@ -29,6 +29,20 @@ class Adam(torch_parallel_optimizer.TorchParallelOptimizer, optimizers.Adam):
         denominator = ops.subtract(one, beta_1_power)
         alpha = ops.divide(numerator, denominator)
 
+        # Convert alpha to a Python scalar if it's a tensor/DTensor so it can
+        # be safely used as the scalar argument to torch._foreach_* calls.
+        try:
+            from keras.src.backend.torch import core as torch_core
+            import numpy as _np
+
+            _alpha_val = torch_core.convert_to_numpy(alpha)
+            if isinstance(_alpha_val, _np.ndarray):
+                _alpha_val = _alpha_val.item()
+            alpha = float(_alpha_val)
+        except Exception:
+            # Fall back to using alpha as-is if conversion fails.
+            pass
+
         m_list = [
             self._momentums[self._get_variable_index(variable)].value
             for variable in keras_variables
