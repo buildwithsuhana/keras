@@ -57,7 +57,7 @@ def _to_backend_layout(layout):
 
 
 def distribute_variable(value, layout):
-    rank = dist.get_rank()
+    rank = dist.get_rank() if dist.is_initialized() else 0
     # Log weight sharding specifically
     if rank == 0:
         print(f"[BACKEND] Sharding variable. Placements: {layout.axes}")
@@ -74,9 +74,10 @@ def distribute_tensor(value, layout):
     if not isinstance(layout, TensorLayout):
         return value
 
-    # layout.backend_layout contains the Placements list from to_backend_layout
+    # layout.backend_layout and layout.device_mesh.backend_mesh 
+    # trigger the _to_backend hooks automatically.
     placements = layout.backend_layout
-    torch_mesh = layout.device_mesh.to_backend_mesh()
+    torch_mesh = layout.device_mesh.backend_mesh
 
     if not isinstance(value, torch.Tensor):
         value = convert_to_tensor(value)
@@ -86,9 +87,8 @@ def distribute_tensor(value, layout):
 
 
 def distribute_data_input(data, layout):
-    rank = dist.get_rank()
+    rank = dist.get_rank() if dist.is_initialized() else 0
     # Log data sharding. This confirms EpochIterator is working.
-    # We show the local shape to prove the batch was split.
     if hasattr(data, "shape"):
         print(f"[Rank {rank}] Sharding input batch. Local shape: {data.shape}")
     return distribute_tensor(data, layout)
