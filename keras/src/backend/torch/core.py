@@ -102,6 +102,33 @@ def to_torch_dtype(dtype):
 
 
 class Variable(KerasVariable):
+    def __init__(
+        self,
+        initializer,
+        shape=None,
+        dtype=None,
+        trainable=True,
+        autocast=True,
+        aggregation="none",
+        synchronization="auto",
+        name=None,
+        layout=None,
+        **kwargs,
+    ):
+        # Store layout for DTensor distribution before calling parent init
+        self._layout = layout
+        super().__init__(
+            initializer=initializer,
+            shape=shape,
+            dtype=dtype,
+            trainable=trainable,
+            autocast=autocast,
+            aggregation=aggregation,
+            synchronization=synchronization,
+            name=name,
+            **kwargs,
+        )
+
     def _initialize(self, value):
         from keras.src.distribution import distribution_lib as frontend_dist
 
