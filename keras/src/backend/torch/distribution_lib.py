@@ -38,10 +38,25 @@ def initialize(job_addresses=None, num_processes=None, process_id=None):
 
 
 def _to_backend_mesh(device_mesh):
+    """Bridge for DeviceMesh.backend_mesh"""
+    # If devices is None or empty, let Torch handle it automatically
+    device_ids = None
+    if device_mesh.devices:
+        # Simple conversion if strings like ['cuda:0'] were passed
+        import re
+        device_ids = []
+        for d in device_mesh.devices:
+            if isinstance(d, str):
+                res = re.search(r'\d+', d)
+                device_ids.append(int(res.group()) if res else 0)
+            else:
+                device_ids.append(d)
+
     return TorchDeviceMesh(
-        "cuda" if torch.cuda.is_available() else "cpu",
-        device_mesh.shape,
+        device_type="cuda" if torch.cuda.is_available() else "cpu",
+        mesh_shape=device_mesh.shape,
         mesh_dim_names=device_mesh.axis_names,
+        device_ids=device_ids
     )
 
 def _to_backend_layout(layout):
