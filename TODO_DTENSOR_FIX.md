@@ -1,78 +1,44 @@
 # DTensor Fix Implementation Plan
 
 ## Task
-Fix the `RuntimeError: aten.sub.Tensor: got mixed torch.Tensor and DTensor` error when using Keras ModelParallel with Torch backend.
+Fix the `RuntimeError: aten.index.Tensor: got mixed torch.Tensor and DTensor` error when using Keras ModelParallel with Torch backend.
 
 ## Root Cause
-When `torch.compile`/`dynamo` is enabled, optimizer internal variables (learning_rate, beta_1, beta_2, epsilon, etc.) interact with DTensor model weights during `torch._foreach_*` operations. If optimizer variables are still regular torch.Tensor and model weights are DTensor, PyTorch raises the mixed tensor error.
+When using DTensor model weights with a torch DataLoader, PyTorch's internal `tree_map` operations in `__getitems__` fail because they mix regular `torch.Tensor` and `DTensor`. This happens because:
+1. The model weights are converted to DTensor for model parallelism
+2. But the data from DataLoader remains as regular torch.Tensor
+3. PyTorch's internal operations (like `tree_map` in DataLoader) can't handle the mix
 
 ## Solution
-Convert ALL scalar values used in torch._foreach_* operations to native Python floats. This ensures that foreach operations receive compatible native scalars rather than mixing DTensor and regular tensors.
+Convert input data to DTensors when distribution is active, before the DataLoader processes it.
 
 ## Implementation Steps
 
-### Step 1: Update torch_adam.py
-- Convert `lr` to native scalar (already done)
-- Convert `alpha` to native scalar (already done)
-- Convert `self.beta_1`, `self.beta_2` to native scalars
-- Convert `self.epsilon` to native scalar
+### Step 1: Update distribution_lib.py ✅
+- Add `_get_dtensor_mesh_and_placements()` helper function
+- Add `_convert_to_dtensor()` helper function  
+- Add `_convert_batch_to_dtensor()` helper function
 
-### Step 2: Update torch_adagrad.py
-- Convert `lr` to native scalar (already done)
-- Convert `self.epsilon` to native scalar
+### Step 2: Update torch_data_loader_adapter.py ✅
+- Modify `get_torch_dataloader()` to return a wrapper that handles DTensor conversion
+- Add `_DTensorAwareDataLoader` class
+- Add `_DTensorAwareDataset` class
 
-### Step 3: Update torch_sgd.py
-- Convert `learning_rate` to native scalar (already done)
-- Convert `self.momentum` to native scalar
+### Step 3: Update epoch_iterator.py ✅
+- Ensure `_distribute_data()` properly converts numpy arrays to tensors before distribution
+- Handle the case where distribution is active but data is numpy
 
-### Step 4: Update torch_lion.py
-- Convert `lr` to native scalar (already done)
-- Convert `self.beta_1`, `self.beta_2` to native scalars
-- Convert `self.epsilon` to native scalar
-
-### Step 5: Update torch_adamax.py
-- Convert `lr` to native scalar (already done)
-- Convert `den_scalar` to native scalar (already done)
-- Convert `self.beta_2` to native scalar
-- Convert `self.epsilon` to native scalar
-
-### Step 6: Update torch_adadelta.py
-- Convert `lr` to native scalar (already done)
-- Convert `self.epsilon` to native scalar
-- Convert `rho` to native scalar (if used in foreach)
-
-### Step 7: Update torch_rmsprop.py
-- Convert `lr` to native scalar (already done)
-- Convert `self.epsilon` to native scalar
-- Convert `rho` to native scalar (if used in foreach)
-
-### Step 8: Update torch_nadam.py
-- Convert `lr` to native scalar (already done)
-- Convert `u_t`, `u_t_1` to native scalars (already done)
-- Convert `self.beta_1`, `self.beta_2` to native scalars
-- Convert `self.epsilon` to native scalar
-
-### Step 9: Test the fix
+### Step 4: Test the fix
 Run the training script to verify the fix works.
 
-## Files to Modify
-- `/Users/suhanaaa/keras/keras/src/backend/torch/optimizers/torch_adam.py`
-- `/Users/suhanaaa/keras/keras/src/backend/torch/optimizers/torch_adagrad.py`
-- `/Users/suhanaaa/keras/keras/src/backend/torch/optimizers/torch_sgd.py`
-- `/Users/suhanaaa/keras/keras/src/backend/torch/optimizers/torch_lion.py`
-- `/Users/suhanaaa/keras/keras/src/backend/torch/optimizers/torch_adamax.py`
-- `/Users/suhanaaa/keras/keras/src/backend/torch/optimizers/torch_adadelta.py`
-- `/Users/suhanaaa/keras/keras/src/backend/torch/optimizers/torch_rmsprop.py`
-- `/Users/suhanaaa/keras/keras/src/backend/torch/optimizers/torch_nadam.py`
+## Files Modified
+- `/Users/suhanaaa/keras/keras/src/backend/torch/distribution_lib.py`
+- `/Users/suhanaaa/keras/keras/src/trainers/data_adapters/torch_data_loader_adapter.py`
+- `/Users/suhanaaa/keras/keras/src/trainers/epoch_iterator.py`
 
 ## Progress
-- [ ] Update torch_adam.py
-- [ ] Update torch_adagrad.py
-- [ ] Update torch_sgd.py
-- [ ] Update torch_lion.py
-- [ ] Update torch_adamax.py
-- [ ] Update torch_adadelta.py
-- [ ] Update torch_rmsprop.py
-- [ ] Update torch_nadam.py
+- [x] Update distribution_lib.py
+- [x] Update torch_data_loader_adapter.py
+- [x] Update epoch_iterator.py
 - [ ] Test the fix
 

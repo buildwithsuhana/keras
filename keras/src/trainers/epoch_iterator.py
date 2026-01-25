@@ -42,6 +42,8 @@ or until there is no data
 import contextlib
 import warnings
 
+import numpy as np
+
 from keras.src import backend
 from keras.src.backend import config
 from keras.src.distribution import distribution_lib
@@ -106,8 +108,23 @@ class EpochIterator:
 
     def _distribute_data(self, data):
         """Distribute data batch across devices if Distribution is active."""
+        from keras.src import tree
+        from keras.src.backend.torch import distribution_lib as backend_dist
+
         dist = distribution_lib.distribution()
         if dist:
+            # Convert numpy arrays to torch tensors before distribution
+            # This is necessary for DTensor compatibility
+            def convert_to_tensor_if_needed(x):
+                if hasattr(x, "__array__") or isinstance(x, np.ndarray):
+                    import torch
+                    return torch.from_numpy(x)
+                return x
+
+            data = tree.map_structure(
+                convert_to_tensor_if_needed, data, none_is_leaf=False
+            )
+
             return backend.distribution.distribute_data_input(
                 data, dist.get_data_layout(data.shape), dist.batch_dim_name
             )

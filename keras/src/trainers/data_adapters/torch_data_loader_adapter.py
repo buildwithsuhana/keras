@@ -63,7 +63,38 @@ class TorchDataLoaderAdapter(DataAdapter):
         )
 
     def get_torch_dataloader(self):
-        return self._dataloader
+        """Return the underlying DataLoader.
+
+        For DTensor distribution, we need to handle the case where the
+        DataLoader's internal __getitems__ uses tree_map which fails with
+        mixed DTensor and regular torch.Tensor.
+        """
+        from keras.src.distribution import distribution_lib
+        from keras.src.backend.torch import distribution_lib as backend_dist
+
+        dist = distribution_lib.distribution()
+        if dist is None:
+            return self._dataloader
+
+        # Check if we're in model parallel mode with DTensor
+        try:
+            from torch.distributed._tensor import DTensor
+        except ImportError:
+            return self._dataloader
+
+        # Get the data layout and check if we need DTensor conversion
+        x_layout = dist.get_data_layout((None,))
+        if x_layout is None:
+            return self._dataloader
+
+        mesh, placements = backend_dist._get_dtensor_mesh_and_placements(
+            x_layout
+        )
+        if mesh is None:
+            return self._dataloader
+
+        # Wrap the dataloader with DTensor conversion
+        return _DTensorAwareDataLoader(self._dataloader, mesh, placements)
 
     @property
     def builtin_prefetch(self):
@@ -91,3 +122,80 @@ class TorchDataLoaderAdapter(DataAdapter):
     @property
     def partial_batch_size(self):
         return self._partial_batch_size
+
+
+class _DTensorAwareDataLoader:
+    """A wrapper around torch DataLoader that converts data to DTensor.
+
+    This wrapper is needed because PyTorch's DataLoader internally uses
+    tree_map in __getitems__ which fails with mixed DTensor and regular
+    torch.Tensor. By converting the data to DTensor after collection,
+    we avoid this issue.
+    """
+
+    def __init__(self, dataloader, mesh, placements):
+        import torch
+
+        self._dataloader = dataloader
+        self._mesh = mesh
+        self._placements = placements
+
+        # Copy all attributes from the original dataloader
+        self.batch_size = dataloader.batch_size
+        self.num_batches = len(dataloader)
+        self.dataset = _DTensorAwareDataset(dataloader.dataset, mesh, placements)
+        self.drop_last = dataloader.drop_last
+        self.prefetch_factor = dataloader.prefetch_factor
+        self._iterator = None
+
+    def __iter__(self):
+        self._iterator = iter(self._dataloader)
+        return self
+
+    def __next__(self):
+        batch = next(self._iterator)
+        # Convert the batch to DTensor after it's collected
+        from keras.src.backend.torch import distribution_lib as backend_dist
+        return backend_dist._convert_batch_to_dtensor(
+            batch, self._mesh, self._placements
+        )
+
+    def __len__(self):
+        return len(self._dataloader)
+
+
+class _DTensorAwareDataset:
+    """A wrapper around torch Dataset that converts data to DTensor.
+
+    This wrapper handles the __getitems__ method to ensure data is
+    properly converted to DTensor when needed.
+    """
+
+    def __init__(self, dataset, mesh, placements):
+        self._dataset = dataset
+        self._mesh = mesh
+        self._placements = placements
+
+        # Copy relevant attributes
+        if hasattr(dataset, "__len__"):
+            self.__len__ = lambda: len(dataset)
+
+    def __getitem__(self, index):
+        item = self._dataset[index]
+        from keras.src.backend.torch import distribution_lib as backend_dist
+        return backend_dist._convert_batch_to_dtensor(
+            item, self._mesh, self._placements
+        )
+
+    def __getitems__(self, indices):
+        """Get multiple items at once, converting to DTensor.
+
+        This is the critical method that was causing the mixed tensor error.
+        We override it to ensure proper DTensor conversion.
+        """
+        items = self._dataset.__getitems__(indices)
+        from keras.src.backend.torch import distribution_lib as backend_dist
+        return backend_dist._convert_batch_to_dtensor(
+            items, self._mesh, self._placements
+        )
+

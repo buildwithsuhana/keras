@@ -16,6 +16,85 @@ def _is_dtensor(tensor):
     return isinstance(tensor, DTensor)
 
 
+def _get_dtensor_mesh_and_placements(layout):
+    """Extract torch mesh and placements from a Keras TensorLayout.
+    
+    Args:
+        layout: A Keras TensorLayout or None
+        
+    Returns:
+        Tuple of (torch_mesh, placements) or (None, None) if layout is None
+    """
+    if layout is None:
+        return None, None
+    
+    from keras.src.distribution.distribution_lib import TensorLayout
+    
+    if not isinstance(layout, TensorLayout):
+        return None, None
+    
+    try:
+        torch_mesh = layout.device_mesh.backend_mesh
+        placements = layout.backend_layout
+        return torch_mesh, placements
+    except AttributeError:
+        return None, None
+
+
+def _convert_to_dtensor(tensor, mesh, placements):
+    """Convert a regular torch.Tensor to DTensor.
+    
+    This function ensures that when operating with DTensors, all operands
+    are DTensors. If the input is already a DTensor, it is returned as-is.
+    If it's a regular tensor, it is converted to a DTensor with the given
+    mesh and placements.
+    
+    Args:
+        tensor: A torch.Tensor or DTensor
+        mesh: The DeviceMesh to use for distribution
+        placements: The placements for the DTensor
+        
+    Returns:
+        A DTensor representation of the input
+    """
+    if _is_dtensor(tensor):
+        return tensor
+    
+    if mesh is None or placements is None:
+        return tensor
+    
+    return torch_distribute_tensor(tensor, mesh, placements)
+
+
+def _convert_batch_to_dtensor(batch, mesh, placements):
+    """Convert all tensors in a batch to DTensors.
+    
+    This function handles nested structures (tuples, lists, dicts) and
+    converts all torch.Tensor elements to DTensors.
+    
+    Args:
+        batch: A batch of data (can be torch.Tensor, tuple, list, or dict)
+        mesh: The DeviceMesh to use for distribution
+        placements: The placements for the DTensor
+        
+    Returns:
+        The batch with all tensors converted to DTensors
+    """
+    from keras.src import tree
+    
+    if mesh is None or placements is None:
+        return batch
+    
+    def convert_single(x):
+        if _is_dtensor(x):
+            return x
+        if isinstance(x, torch.Tensor):
+            return torch_distribute_tensor(x, mesh, placements)
+        return x
+    
+    return tree.map_structure(convert_single, batch, none_is_leaf=False)
+
+
 def _ensure_dtensor(tensor, mesh, placements=None):
     """Convert a regular torch.Tensor to DTensor if needed.
 

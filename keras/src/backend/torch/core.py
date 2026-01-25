@@ -61,6 +61,9 @@ TORCH_DTYPES = {
 # Global flag to track if DTensor is being used (disables dynamo)
 _DTENSOR_MODE = False
 
+# Counter to track if we've already warned about dynamo
+_DYNAMO_WARNING_LOGGED = False
+
 
 def enable_dtensor_mode():
     """Enable DTensor mode - this disables torch.compile/dynamo."""
@@ -77,6 +80,29 @@ def disable_dtensor_mode():
 def is_dtensor_mode():
     """Check if we're in DTensor mode."""
     return _DTENSOR_MODE
+
+
+def maybe_disable_dynamo():
+    """Conditionally disable dynamo when in DTensor mode.
+    
+    This function should be called at strategic points to disable
+    dynamo when DTensor mode is active. Returns a context manager
+    that restores the previous state.
+    """
+    global _DYNAMO_WARNING_LOGGED
+    
+    if _DTENSOR_MODE and not _DYNAMO_WARNING_LOGGED:
+        _DYNAMO_WARNING_LOGGED = True
+        import logging
+        logger = logging.getLogger(__name__)
+        logger.warning(
+            "DTensor mode is active. Disabling torch.compile/dynamo. "
+            "Set TORCHDYNAMO_DISABLE=1 environment variable for better performance."
+        )
+    
+    if _DTENSOR_MODE:
+        return torch._disable_dynamo()
+    return contextlib.nullcontext()
 
 
 @contextlib.contextmanager
