@@ -103,6 +103,18 @@ def to_torch_dtype(dtype):
 
 class Variable(KerasVariable):
     def _initialize(self, value):
+        from keras.src.distribution import distribution_lib as frontend_dist
+
+        dist_context = frontend_dist.distribution()
+        if dist_context and self.name:
+            layout = dist_context.layout_map.get(self.name)
+            if layout:
+                from keras.src.backend.torch import (
+                    distribution_lib as backend_dist,
+                )
+
+                value = backend_dist.distribute_variable(value, layout)
+
         if isinstance(value, torch.nn.Parameter):
             # Reuse same parameter
             self._value = value
@@ -735,3 +747,10 @@ class CustomGradientFunction(torch.autograd.Function):
         if not isinstance(grads, tuple):
             grads = (grads,)
         return (None,) + grads
+
+
+def torch_dtype_to_str(dtype):
+    for key, value in TORCH_DTYPES.items():
+        if value == dtype:
+            return key
+    return str(dtype)

@@ -42,7 +42,9 @@ or until there is no data
 import contextlib
 import warnings
 
+from keras.src import backend
 from keras.src.backend import config
+from keras.src.distribution import distribution_lib
 from keras.src.trainers import data_adapters
 
 
@@ -102,6 +104,15 @@ class EpochIterator:
         self._epoch_iterator = None
         self.data_adapter.on_epoch_end()
 
+    def _distribute_data(self, data):
+        """Distribute data batch across devices if Distribution is active."""
+        dist = distribution_lib.distribution()
+        if dist:
+            return backend.distribution.distribute_data_input(
+                data, dist.get_data_layout(data.shape)
+            )
+        return data
+
     def _enumerate_iterator(self):
         self.data_adapter.on_epoch_begin()
         steps_per_epoch = self.steps_per_epoch or self._num_batches or -1
@@ -143,6 +154,7 @@ class EpochIterator:
         with self.catch_stop_iteration():
             for _ in range(self.steps_per_execution):
                 data = next(iterator)
+                data = self._distribute_data(data)
                 buffer.append(data)
             return begin_step, end_step, buffer
         if buffer:
