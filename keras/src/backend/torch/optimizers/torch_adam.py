@@ -41,6 +41,7 @@ def _grads_to_dtensor(grads, variables):
 
 
 class Adam(torch_parallel_optimizer.TorchParallelOptimizer, optimizers.Adam):
+    @torch._dynamo.disable
     def _parallel_update_step(
         self,
         grads,
@@ -53,11 +54,14 @@ class Adam(torch_parallel_optimizer.TorchParallelOptimizer, optimizers.Adam):
         # Convert grads to DTensors if variables are DTensors
         grads = _grads_to_dtensor(grads, variables)
 
-        dtype = variables[0].dtype
-        
         # Convert learning rate to native Python scalar for DTensor compatibility
         lr = torch_parallel_optimizer._to_native_scalar(learning_rate)
-        local_step = self.iterations + 1
+        
+        # Convert iterations to native Python scalar
+        local_step = torch_parallel_optimizer._to_native_scalar(self.iterations)
+        if hasattr(local_step, 'item'):
+            local_step = local_step.item()
+        local_step = int(local_step) + 1  # Start from 1
 
         # Use native Python scalars for beta powers
         beta_1 = torch_parallel_optimizer._to_native_scalar(self.beta_1)
@@ -108,5 +112,5 @@ class Adam(torch_parallel_optimizer.TorchParallelOptimizer, optimizers.Adam):
                 torch._foreach_mul(m_list, alpha),
                 torch._foreach_add(torch._foreach_sqrt(v_list), epsilon),
             ),
-            alpha=-1,
+            alpha=-1.0,
         )
