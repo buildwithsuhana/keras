@@ -16,12 +16,18 @@ class Adam(torch_parallel_optimizer.TorchParallelOptimizer, optimizers.Adam):
         variables = [v.value for v in variables]
 
         dtype = variables[0].dtype
+        # Use ops helpers to ensure any DTensor interactions go through
+        # the backend dispatch (avoids mixing torch.Tensor and DTensor).
         lr = ops.cast(learning_rate, dtype)
-        local_step = ops.cast(self.iterations + 1, dtype)
+        local_step = ops.cast(ops.add(self.iterations, 1), dtype)
 
         beta_1_power = ops.power(ops.cast(self.beta_1, dtype), local_step)
         beta_2_power = ops.power(ops.cast(self.beta_2, dtype), local_step)
-        alpha = lr * ops.sqrt(1 - beta_2_power) / (1 - beta_1_power)
+
+        one = ops.cast(1, dtype)
+        numerator = ops.multiply(lr, ops.sqrt(ops.subtract(one, beta_2_power)))
+        denominator = ops.subtract(one, beta_1_power)
+        alpha = ops.divide(numerator, denominator)
 
         m_list = [
             self._momentums[self._get_variable_index(variable)].value

@@ -20,7 +20,7 @@ class Adamax(
         dtype = variables[0].dtype
         lr = ops.cast(learning_rate, dtype)
 
-        local_step = ops.cast(self.iterations + 1, dtype)
+        local_step = ops.cast(ops.add(self.iterations, 1), dtype)
 
         beta_1_power = ops.power(ops.cast(self.beta_1, dtype), local_step)
 

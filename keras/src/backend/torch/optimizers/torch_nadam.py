@@ -19,13 +19,14 @@ class Nadam(torch_parallel_optimizer.TorchParallelOptimizer, optimizers.Nadam):
         dtype = variables[0].dtype
         lr = ops.cast(learning_rate, dtype)
 
-        local_step = ops.cast(self.iterations + 1, dtype)
-        next_step = ops.cast(self.iterations + 2, dtype)
+        local_step = ops.cast(ops.add(self.iterations, 1), dtype)
+        next_step = ops.cast(ops.add(self.iterations, 2), dtype)
         decay = ops.cast(0.96, dtype)
         beta_1 = ops.cast(self.beta_1, dtype)
         beta_2 = ops.cast(self.beta_2, dtype)
-        u_t = beta_1 * (1.0 - 0.5 * (ops.power(decay, local_step)))
-        u_t_1 = beta_1 * (1.0 - 0.5 * (ops.power(decay, next_step)))
+        # Use ops math to avoid mixing DTensor and torch.Tensor
+        u_t = ops.multiply(beta_1, ops.subtract(1.0, ops.multiply(0.5, ops.power(decay, local_step))))
+        u_t_1 = ops.multiply(beta_1, ops.subtract(1.0, ops.multiply(0.5, ops.power(decay, next_step))))
         u_product_t = self._u_product.value * u_t
         u_product_t_1 = u_product_t * u_t_1
         beta_2_power = ops.power(beta_2, local_step)
