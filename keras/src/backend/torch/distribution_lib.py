@@ -38,40 +38,21 @@ def initialize(job_addresses=None, num_processes=None, process_id=None):
 
 
 def _to_backend_mesh(device_mesh):
-    """Bridge for DeviceMesh.backend_mesh.
-    Called as: _to_backend_mesh(device_mesh_instance)
-    """
-    if dist.is_initialized() and dist.get_rank() == 0:
-        print(f"[BACKEND] Initializing TorchDeviceMesh with shape {device_mesh.shape}")
-    
     return TorchDeviceMesh(
-        device_type="cuda" if torch.cuda.is_available() else "cpu",
-        mesh_shape=device_mesh.shape,
+        "cuda" if torch.cuda.is_available() else "cpu",
+        device_mesh.shape,
         mesh_dim_names=device_mesh.axis_names,
     )
 
 def _to_backend_layout(layout):
-    """Bridge for TensorLayout.backend_layout.
-    Called as: _to_backend_layout(layout_instance)
-    """
-    # 1. Get the native torch mesh from the Keras DeviceMesh
-    # layout.device_mesh is a Keras DeviceMesh; .backend_mesh is the TorchDeviceMesh
     torch_mesh = layout.device_mesh.backend_mesh
-    
-    # 2. Map Keras axes to PyTorch Placements
     placements = []
     for axis in layout.axes:
         if axis is None:
             placements.append(Replicate())
         else:
-            # Look up dimension index from the named mesh axes
-            try:
-                dim_index = torch_mesh.mesh_dim_names.index(axis)
-                placements.append(Shard(dim_index))
-            except ValueError:
-                raise ValueError(
-                    f"Invalid axis name '{axis}'. Valid axes: {torch_mesh.mesh_dim_names}"
-                )
+            dim_index = torch_mesh.mesh_dim_names.index(axis)
+            placements.append(Shard(dim_index))
     return placements
 
 
