@@ -123,7 +123,17 @@ class Variable(KerasVariable):
                         print(f"[CORE] Variable '{self.name}' matched layout '{layout.axes}'. Sharding...")
                     
                     from keras.src.backend.torch import distribution_lib as backend_dist
+                    
+                    # Debug: Check the value type before distribution
+                    from torch.distributed._tensor import DTensor
+                    is_dtensor_before = isinstance(value, DTensor)
+                    print(f"[CORE DEBUG] Variable '{self.name}': is_dtensor_before={is_dtensor_before}")
+                    
                     value = backend_dist.distribute_variable(value, layout)
+                    
+                    # Debug: Check the value type after distribution
+                    is_dtensor_after = isinstance(value, DTensor)
+                    print(f"[CORE DEBUG] Variable '{self.name}': is_dtensor_after={is_dtensor_after}, type={type(value).__name__}")
                 else:
                     # Useful for debugging why a specific layer isn't sharding
                     if dist.is_initialized() and dist.get_rank() == 0:
@@ -278,8 +288,15 @@ def convert_to_tensor(x, dtype=None, sparse=None, ragged=None):
 
 
 def convert_to_numpy(x):
+    from torch.distributed._tensor import DTensor as TorchDTensor
+    
     def transform(x):
         if is_tensor(x):
+            # Debug: Check if tensor is DTensor
+            is_dtensor = isinstance(x, TorchDTensor)
+            if is_dtensor:
+                print(f"[CONVERT DEBUG] DTensor detected: {type(x).__name__}, spec={x._spec}, device_mesh={x._spec.mesh}")
+            
             if x.requires_grad:
                 x = x.detach()
             # Tensor has to be moved to CPU before converting to numpy.

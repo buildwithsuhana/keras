@@ -316,12 +316,17 @@ class BaseOptimizer(KerasSaveable):
                 str(reference_variable.name).replace("/", "_").replace(":", "_")
             )
             name = f"{sanitised_ref_name}_{name}"
+        
+        # Debug: Check if reference variable has a layout
+        ref_layout = getattr(reference_variable, "_layout", None)
+        print(f"[OPTIMIZER DEBUG] Creating optimizer variable '{name}' for ref='{reference_variable.name}', ref_layout={ref_layout}")
+        
         return self.add_variable(
             shape=reference_variable.shape,
             initializer=initializer,
             dtype=reference_variable.dtype,
             name=name,
-            layout=getattr(reference_variable, "_layout", None),
+            layout=ref_layout,
         )
 
     def add_optimizer_variables(
