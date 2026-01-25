@@ -68,31 +68,41 @@ def _convert_to_dtensor(tensor, mesh, placements):
 
 def _convert_batch_to_dtensor(batch, mesh, placements):
     """Convert all tensors in a batch to DTensors.
-    
+
     This function handles nested structures (tuples, lists, dicts) and
     converts all torch.Tensor elements to DTensors.
-    
-    Args:
-        batch: A batch of data (can be torch.Tensor, tuple, list, or dict)
-        mesh: The DeviceMesh to use for distribution
-        placements: The placements for the DTensor
-        
-    Returns:
-        The batch with all tensors converted to DTensors
+
+    IMPORTANT: This function uses recursion instead of tree.map_structure
+    because tree.map_structure internally uses PyTorch's tree_map which
+    fails when processing DTensors.
     """
-    from keras.src import tree
-    
     if mesh is None or placements is None:
         return batch
-    
+
     def convert_single(x):
         if _is_dtensor(x):
             return x
         if isinstance(x, torch.Tensor):
             return torch_distribute_tensor(x, mesh, placements)
         return x
-    
-    return tree.map_structure(convert_single, batch, none_is_leaf=False)
+
+    def _convert_recursive(item):
+        """Recursively convert tensors without using tree_map."""
+        if _is_dtensor(item):
+            return item
+        if isinstance(item, torch.Tensor):
+            return torch_distribute_tensor(item, mesh, placements)
+        elif isinstance(item, tuple):
+            return tuple(_convert_recursive(x) for x in item)
+        elif isinstance(item, list):
+            return [_convert_recursive(x) for x in item]
+        elif isinstance(item, dict):
+            return {k: _convert_recursive(v) for k, v in item.items()}
+        else:
+            return item
+
+    return _convert_recursive(batch)
+
 
 
 def _ensure_dtensor(tensor, mesh, placements=None):
@@ -367,5 +377,8 @@ def device_id():
     return 0
 
 
+
 def backend_num_processes():
     return num_processes()
+
+

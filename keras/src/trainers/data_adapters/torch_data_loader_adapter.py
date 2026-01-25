@@ -180,10 +180,13 @@ class _DTensorAwareDataLoader:
 class _DTensorAwareDataset:
     """A wrapper around torch Dataset that converts data to DTensor.
 
-    This wrapper handles the __getitems__ method to ensure data is
-    properly converted to DTensor when needed. It also handles the case
-    where indices may be DTensors by converting them back to regular
-    torch.Tensors before passing to the underlying dataset.
+    This wrapper handles the __getitem__ and __getitems__ methods to ensure
+    data is properly converted to DTensor when needed.
+
+    IMPORTANT: We override both __getitem__ and __getitems__ to convert
+    the underlying dataset's output to DTensors AFTER the original dataset
+    returns its data. This bypasses PyTorch's tree_map issue because we
+    convert the data AFTER PyTorch's internal processing.
     """
 
     def __init__(self, dataset, mesh, placements):
@@ -195,28 +198,10 @@ class _DTensorAwareDataset:
         if hasattr(dataset, "__len__"):
             self.__len__ = lambda: len(dataset)
 
-    def _convert_indices_to_torch(self, indices):
-        """Convert DTensor indices back to regular torch.Tensor.
-
-        This is necessary because PyTorch's tree_map in DataLoader
-        may pass DTensor indices, but the underlying dataset expects
-        regular torch.Tensor indices.
-        """
-        from keras.src.backend.torch import distribution_lib as backend_dist
-
-        def convert_index(idx):
-            if backend_dist._is_dtensor(idx):
-                # Get the local tensor from DTensor
-                return idx.to_local()
-            return idx
-
-        from keras.src import tree
-        return tree.map_structure(convert_index, indices, none_is_leaf=False)
-
     def __getitem__(self, index):
-        # Convert index if it's a DTensor
-        index = self._convert_indices_to_torch(index)
+        # Get item from underlying dataset first (returns regular tensors)
         item = self._dataset[index]
+        # Then convert to DTensor after retrieval
         from keras.src.backend.torch import distribution_lib as backend_dist
         return backend_dist._convert_batch_to_dtensor(
             item, self._mesh, self._placements
@@ -225,20 +210,26 @@ class _DTensorAwareDataset:
     def __getitems__(self, indices):
         """Get multiple items at once, converting to DTensor.
 
-        This is the critical method that was causing the mixed tensor error.
-        We override it to ensure proper DTensor conversion.
+        This method is called by PyTorch's DataLoader. We first get items
+        from the underlying dataset (which returns regular tensors), then
+        convert the entire result to DTensors.
 
-        We also need to convert indices from DTensor to regular torch.Tensor
-        before passing them to the underlying dataset's __getitems__, since
-        PyTorch's tree_map may pass DTensor indices.
+        This approach avoids the "aten.index.Tensor: got mixed torch.Tensor
+        and DTensor" error because we convert to DTensor AFTER the underlying
+        dataset returns its data, not before or during.
         """
-        # Convert indices from DTensor to regular torch.Tensor
-        indices = self._convert_indices_to_torch(indices)
-
+        # Get items from underlying dataset (returns regular tensors)
         items = self._dataset.__getitems__(indices)
+        # Convert entire result to DTensors after retrieval
         from keras.src.backend.torch import distribution_lib as backend_dist
         return backend_dist._convert_batch_to_dtensor(
             items, self._mesh, self._placements
         )
+
+
+
+
+
+
 
 

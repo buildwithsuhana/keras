@@ -49,8 +49,21 @@ Run the training script to verify the fix works.
 
 **Fix**: Changed `iter(self._dataloader)` to `iter(self.dataset)` in `_DTensorAwareDataLoader.__iter__()` method so that data fetching goes through our `_DTensorAwareDataset` wrapper which properly converts data to DTensors.
 
-## Bug Fixed (2024-01-25 - Additional Fix)
-**Root Cause**: Even with the iterator fix, PyTorch's `tree_map` may pass DTensor indices to `__getitems__` (from previous batch processing). The underlying dataset expects regular torch.Tensor indices, but receives DTensors, causing "aten.index.Tensor: got mixed torch.Tensor and DTensor" error.
+## Bug Fixed (2024-01-25 - Additional Fix #3)
+**Root Cause**: The `_convert_batch_to_dtensor` function also uses `tree.map_structure` which internally calls PyTorch's `tree_map`. When processing batches that contain DTensors (like the result from `__getitems__`), this triggers the same "mixed torch.Tensor and DTensor" error.
 
-**Fix**: Added `_convert_indices_to_torch()` method in `_DTensorAwareDataset` that converts DTensor indices back to regular torch.Tensor using `.to_local()` before passing them to the underlying dataset's `__getitem__` and `__getitems__` methods.
+**Fix**: Replaced `tree.map_structure` with a custom recursive `_convert_recursive()` function that directly checks `isinstance(item, torch.Tensor)` and `isinstance(item, DTensor)` and calls `torch_distribute_tensor()` directly without going through PyTorch's dispatch mechanism.
+
+## Summary of All Fixes
+
+1. **`_DTensorAwareDataLoader.__iter__`**: Changed `iter(self._dataloader)` to `iter(self.dataset)` so that data fetching goes through our `_DTensorAwareDataset` wrapper.
+
+2. **`_DTensorAwareDataset.__getitem__` and `__getitems__`**: These methods get data from the underlying dataset first (which returns regular tensors), then convert the result to DTensors AFTER retrieval.
+
+3. **`_convert_batch_to_dtensor`**: Replaced `tree.map_structure` with a custom recursive function to avoid triggering PyTorch's tree_map when converting data to DTensors.
+
+The key insight throughout: PyTorch's `tree_map` (used internally by `tree.map_structure`) fails when it encounters mixed tensor types. We must avoid using `tree.map_structure` on any data that might contain DTensors, and instead use direct type checking and recursion.
+
+
+
 
