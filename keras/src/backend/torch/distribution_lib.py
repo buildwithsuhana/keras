@@ -48,7 +48,7 @@ def _to_backend_mesh(device_mesh):
     )
 
 
-def to_backend_layout(axes, device_mesh):
+def _to_backend_layout(axes, device_mesh):
     """Maps to frontend TensorLayout.backend_layout.
 
     Translates Keras axis names into a list of PyTorch Placements.
