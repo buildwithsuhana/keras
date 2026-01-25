@@ -32,7 +32,15 @@ class TorchDataLoaderAdapter(DataAdapter):
                 )
 
     def get_numpy_iterator(self):
-        for batch in self._dataloader:
+        """Get a numpy iterator over the DataLoader batches.
+
+        When DTensor distribution is active, this uses the DTensor-aware
+        wrapper to properly handle mixed tensor types during iteration.
+        """
+        # Use get_torch_dataloader() which returns the DTensor-aware wrapper
+        # when distribution is active, preventing "aten.index.Tensor: got
+        # mixed torch.Tensor and DTensor" errors.
+        for batch in self.get_torch_dataloader():
             # shared memory using `np.asarray`
             yield tuple(
                 tree.map_structure(

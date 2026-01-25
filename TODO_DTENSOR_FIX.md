@@ -23,6 +23,7 @@ Convert input data to DTensors when distribution is active, before the DataLoade
 - Modify `get_torch_dataloader()` to return a wrapper that handles DTensor conversion
 - Add `_DTensorAwareDataLoader` class
 - Add `_DTensorAwareDataset` class
+- **FIX 2024-01-25**: Update `get_numpy_iterator()` to use the DTensor-aware wrapper
 
 ### Step 3: Update epoch_iterator.py ✅
 - Ensure `_distribute_data()` properly converts numpy arrays to tensors before distribution
@@ -38,7 +39,7 @@ Run the training script to verify the fix works.
 
 ## Progress
 - [x] Update distribution_lib.py
-- [x] Update torch_data_loader_adapter.py
+- [x] Update torch_data_loader_adapter.py (including get_numpy_iterator fix)
 - [x] Update epoch_iterator.py
 - [ ] Test the fix
 
