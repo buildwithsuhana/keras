@@ -38,37 +38,39 @@ def initialize(job_addresses=None, num_processes=None, process_id=None):
 
 
 def _to_backend_mesh(device_mesh):
-    # Log the physical mesh creation
-    if dist.get_rank() == 0:
-        print(f"[BACKEND] Creating TorchDeviceMesh: {device_mesh.shape} axes: {device_mesh.axis_names}")
+    """Bridge for DeviceMesh.backend_mesh.
+    Called as: _to_backend_mesh(device_mesh_instance)
+    """
+    if dist.is_initialized() and dist.get_rank() == 0:
+        print(f"[BACKEND] Initializing TorchDeviceMesh with shape {device_mesh.shape}")
+    
     return TorchDeviceMesh(
         device_type="cuda" if torch.cuda.is_available() else "cpu",
         mesh_shape=device_mesh.shape,
         mesh_dim_names=device_mesh.axis_names,
     )
 
-
-def _to_backend_layout(axes, device_mesh):
-    """Maps to frontend TensorLayout.backend_layout.
-
-    Translates Keras axis names into a list of PyTorch Placements.
+def _to_backend_layout(layout):
+    """Bridge for TensorLayout.backend_layout.
+    Called as: _to_backend_layout(layout_instance)
     """
-    # Get the native torch.distributed.DeviceMesh
-    torch_mesh = device_mesh.to_backend_mesh()
-
+    # 1. Get the native torch mesh from the Keras DeviceMesh
+    # layout.device_mesh is a Keras DeviceMesh; .backend_mesh is the TorchDeviceMesh
+    torch_mesh = layout.device_mesh.backend_mesh
+    
+    # 2. Map Keras axes to PyTorch Placements
     placements = []
-    for axis in axes:
+    for axis in layout.axes:
         if axis is None:
             placements.append(Replicate())
         else:
-            # Look up the integer index of the named axis within the mesh
+            # Look up dimension index from the named mesh axes
             try:
                 dim_index = torch_mesh.mesh_dim_names.index(axis)
                 placements.append(Shard(dim_index))
             except ValueError:
                 raise ValueError(
-                    f"Invalid axis name '{axis}'. Must be one of "
-                    f"{torch_mesh.mesh_dim_names}"
+                    f"Invalid axis name '{axis}'. Valid axes: {torch_mesh.mesh_dim_names}"
                 )
     return placements
 
