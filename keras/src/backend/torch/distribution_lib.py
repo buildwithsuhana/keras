@@ -18,7 +18,7 @@ from typing import List, Optional, Union
 
 import torch
 from torch.distributed import init_process_group, destroy_process_group
-from torch.distributed import DistributedSampler
+from torch.utils.data.distributed import DistributedSampler
 
 from keras.src.backend.common import global_state
 
