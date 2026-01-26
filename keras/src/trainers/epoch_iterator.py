@@ -18,7 +18,6 @@ Trainer:
     - steps_per_execution
     - validation_split
     - validation_data
-    - callbacks
     - validation_freq
     - epochs
     - initial_epoch
@@ -107,28 +106,42 @@ class EpochIterator:
         self.data_adapter.on_epoch_end()
 
     def _distribute_data(self, data):
-        """Distribute data batch across devices if Distribution is active."""
+        """Distribute data batch across devices if Distribution is active.
+        
+        This function uses native PyTorch sharding by default for better
+        compatibility with torch.compile. DTensor is only used if explicitly
+        requested via distribution settings.
+        """
         from keras.src import tree
         from keras.src.backend.torch import distribution_lib as backend_dist
 
         dist = distribution_lib.distribution()
-        if dist:
-            # Convert numpy arrays to torch tensors before distribution
-            # This is necessary for DTensor compatibility
-            def convert_to_tensor_if_needed(x):
-                if hasattr(x, "__array__") or isinstance(x, np.ndarray):
-                    import torch
-                    return torch.from_numpy(x)
-                return x
+        if dist is None:
+            return data
+        
+        # Get the data layout
+        data_layout = dist.get_data_layout(data.shape if hasattr(data, 'shape') else None)
+        if data_layout is None:
+            return data
+        
+        # Check if DTensor should be used (opt-in via distribution settings)
+        use_dtensor = getattr(dist, '_use_dtensor', False)
+        
+        # Convert numpy arrays to torch tensors if needed
+        def convert_to_tensor_if_needed(x):
+            if hasattr(x, '__array__') or isinstance(x, np.ndarray):
+                import torch
+                return torch.from_numpy(np.asarray(x))
+            return x
 
-            data = tree.map_structure(
-                convert_to_tensor_if_needed, data, none_is_leaf=False
-            )
+        data = tree.map_structure(
+            convert_to_tensor_if_needed, data, none_is_leaf=False
+        )
 
-            return backend.distribution.distribute_data_input(
-                data, dist.get_data_layout(data.shape), dist.batch_dim_name
-            )
-        return data
+        # Use native PyTorch sharding by default
+        return backend.distribution.distribute_data_input(
+            data, data_layout, dist.batch_dim_name, use_dtensor=use_dtensor
+        )
 
     def _enumerate_iterator(self):
         self.data_adapter.on_epoch_begin()
@@ -201,3 +214,4 @@ class EpochIterator:
         # Either copied from the data_adapter, or
         # inferred at the end of an iteration.
         return self._num_batches
+

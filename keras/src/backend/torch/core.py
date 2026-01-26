@@ -58,7 +58,8 @@ TORCH_DTYPES = {
     "complex128": torch.complex128,
 }
 
-# Global flag to track if DTensor is being used (disables dynamo)
+# Global flag to track if DTensor mode is explicitly enabled
+# By default, we use native PyTorch sharding which is compatible with torch.compile
 _DTENSOR_MODE = False
 
 # Counter to track if we've already warned about dynamo
@@ -66,7 +67,12 @@ _DYNAMO_WARNING_LOGGED = False
 
 
 def enable_dtensor_mode():
-    """Enable DTensor mode - this disables torch.compile/dynamo."""
+    """Enable DTensor mode - this disables torch.compile/dynamo.
+    
+    DTensor mode should only be enabled when explicitly needed for
+    advanced distribution strategies. By default, native PyTorch
+    sharding is used which is compatible with torch.compile.
+    """
     global _DTENSOR_MODE
     _DTENSOR_MODE = True
 
@@ -177,8 +183,6 @@ class Variable(KerasVariable):
 
     def _initialize(self, value):
         from keras.src.distribution import distribution_lib as frontend_dist
-
-        from keras.src.distribution import distribution_lib as frontend_dist
         import torch.distributed as dist  # Ensure dist is available for rank checks
 
         dist_context = frontend_dist.distribution()
@@ -188,7 +192,7 @@ class Variable(KerasVariable):
         layout = getattr(self, "_layout", None)
         
         if dist_context and self.name:
-            # 2. Access the layout map (private attribute in ModelParallel)
+            # Access the layout map (private attribute in ModelParallel)
             layout_map = getattr(dist_context, "_layout_map", None)
             
             if layout_map:
@@ -198,25 +202,25 @@ class Variable(KerasVariable):
                     layout = context_layout
                 
                 if layout:
-                    # Enable DTensor mode when distribution is active
-                    enable_dtensor_mode()
+                    # Get rank info for logging
+                    rank = dist.get_rank() if dist.is_initialized() else 0
                     
-                    # Log only on Rank 0 to avoid messy duplicate logs
-                    if dist.is_initialized() and dist.get_rank() == 0:
-                        print(f"[CORE] Variable '{self.name}' matched layout '{layout.axes}'. Sharding...")
+                    # Use native PyTorch sharding by default (compatible with torch.compile)
+                    # DTensor is only used if explicitly enabled
+                    use_dtensor = is_dtensor_mode()
                     
                     from keras.src.backend.torch import distribution_lib as backend_dist
                     
-                    # Debug: Check the value type before distribution
-                    from torch.distributed._tensor import DTensor
-                    is_dtensor_before = isinstance(value, DTensor)
-                    print(f"[CORE DEBUG] Variable '{self.name}': is_dtensor_before={is_dtensor_before}")
+                    if rank == 0:
+                        if use_dtensor:
+                            print(f"[CORE] Variable '{self.name}' matched layout '{layout.axes}'. "
+                                  f"Sharding with DTensor...")
+                        else:
+                            print(f"[CORE] Variable '{self.name}' matched layout '{layout.axes}'. "
+                                  f"Sharding natively (torch.compile compatible)...")
                     
-                    value = backend_dist.distribute_variable(value, layout)
-                    
-                    # Debug: Check the value type after distribution
-                    is_dtensor_after = isinstance(value, DTensor)
-                    print(f"[CORE DEBUG] Variable '{self.name}': is_dtensor_after={is_dtensor_after}, type={type(value).__name__}")
+                    # Distribute using the backend (native sharding by default)
+                    value = backend_dist.distribute_variable(value, layout, use_dtensor=use_dtensor)
                 else:
                     # Useful for debugging why a specific layer isn't sharding
                     if dist.is_initialized() and dist.get_rank() == 0:
@@ -229,14 +233,14 @@ class Variable(KerasVariable):
         if layout is not None:
             self._layout = layout
             
-            # Enable DTensor mode when distribution is active
-            enable_dtensor_mode()
+            # Only enable DTensor mode if we're actually using it
+            use_dtensor = is_dtensor_mode()
             
-            # Check if distribution is needed (value is not already a DTensor)
-            from torch.distributed._tensor import DTensor
-            if not isinstance(value, DTensor):
+            if not use_dtensor:
+                # Check if distribution is needed (value is not already a DTensor)
                 from keras.src.backend.torch import distribution_lib as backend_dist
-                value = backend_dist.distribute_variable(value, layout)
+                if not backend_dist._is_dtensor(value):
+                    value = backend_dist.distribute_variable(value, layout, use_dtensor=False)
 
         if isinstance(value, torch.nn.Parameter):
             # Reuse same parameter
@@ -325,7 +329,7 @@ class Variable(KerasVariable):
 
 
 def convert_to_tensor(x, dtype=None, sparse=None, ragged=None):
-    from torch.distributed._tensor import DTensor
+    from keras.src.backend.torch import distribution_lib as backend_dist
 
     if sparse:
         raise ValueError("`sparse=True` is not supported with torch backend")
@@ -333,7 +337,7 @@ def convert_to_tensor(x, dtype=None, sparse=None, ragged=None):
         raise ValueError("`ragged=True` is not supported with torch backend")
 
     # Preserve DTensor instances - don't convert them
-    if isinstance(x, DTensor):
+    if backend_dist._is_dtensor(x):
         if dtype is not None:
             return x.to(to_torch_dtype(dtype))
         return x
