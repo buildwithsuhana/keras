@@ -44,7 +44,9 @@ class TorchDataLoaderAdapter(DataAdapter):
             # shared memory using `np.asarray`
             yield tuple(
                 tree.map_structure(
-                    lambda x: np.asarray(x.cpu()), batch, none_is_leaf=False
+                    lambda x: np.asarray(x.cpu()) if hasattr(x, "cpu") else np.asarray(x), 
+                    batch, 
+                    none_is_leaf=False
                 )
             )
 
