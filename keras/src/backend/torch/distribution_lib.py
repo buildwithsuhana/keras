@@ -106,18 +106,25 @@ def _shard_tensor_native(tensor, mesh_axis: int, num_shards: int, rank: int) -> 
         return tensor
     
     # Calculate chunk size
-    dim_size = tensor.size(mesh_axis)
-    # Ensure chunk_size is a native Python int (not numpy.int64 or torch scalar)
+    # Ensure dim_size is a native Python int (not numpy.int64)
+    dim_size = int(tensor.size(mesh_axis))
+    # Ensure num_shards is a native Python int
+    num_shards = int(num_shards)
+    # Ensure rank is a native Python int
+    rank = int(rank)
+    
     # torch.split() requires Python ints for split_size_or_sections
-    base_chunk_size = int(dim_size // num_shards)
-    base_chunk_size = max(1, base_chunk_size)
+    base_chunk_size = max(1, dim_size // num_shards)
     
     # Handle partial chunks
     if rank == num_shards - 1:
         # Last rank gets the remainder
-        chunk_size = int(dim_size) - base_chunk_size * (num_shards - 1)
+        chunk_size = dim_size - base_chunk_size * (num_shards - 1)
     else:
         chunk_size = base_chunk_size
+    
+    # Ensure chunk_size is a native Python int
+    chunk_size = int(chunk_size)
     
     # Split the tensor
     shards = torch.split(tensor, chunk_size, dim=mesh_axis)

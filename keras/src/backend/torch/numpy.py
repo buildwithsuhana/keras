@@ -1606,7 +1606,10 @@ def split(x, indices_or_sections, axis=0):
             [start_size, torch.diff(indices_or_sections), end_size], dim=0
         )
         # torch.split doesn't support tensor input for `split_size_or_sections`
-        chunk_sizes = chunk_sizes.tolist()
+        # Convert chunk_sizes to tuple of native Python ints to avoid
+        # TypeError: split_with_sizes(): argument 'split_sizes' must be
+        # tuple of ints, not numpy.int64
+        chunk_sizes = tuple(int(c) for c in chunk_sizes.tolist())
     else:
         if dim % indices_or_sections != 0:
             raise ValueError(
@@ -1616,7 +1619,8 @@ def split(x, indices_or_sections, axis=0):
                 f"is not divisible by {indices_or_sections}. "
                 f"Full input shape: x.shape={x.shape}"
             )
-        chunk_sizes = dim // indices_or_sections
+        # Ensure chunk_size is a native Python int
+        chunk_sizes = int(dim // indices_or_sections)
     out = torch.split(
         tensor=x,
         split_size_or_sections=chunk_sizes,
