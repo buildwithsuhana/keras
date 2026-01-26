@@ -9,6 +9,7 @@ from keras.src import callbacks as callbacks_module
 from keras.src import optimizers as optimizers_module
 from keras.src import tree
 from keras.src.backend import config
+from keras.src.distribution import distribution
 from keras.src.trainers import trainer as base_trainer
 from keras.src.trainers.data_adapters import array_slicing
 from keras.src.trainers.data_adapters import data_adapter_utils
@@ -22,6 +23,37 @@ class TorchTrainer(base_trainer.Trainer):
         self.train_function = None
         self.test_function = None
         self.predict_function = None
+        self._ddp_wrapped = False
+
+    def _wrap_for_distribution(self):
+        """Wrap model with DataParallel or DistributedDataParallel if needed.
+
+        This is called during model build/compile to enable multi-GPU training.
+        """
+        if self._ddp_wrapped:
+            return
+
+        dist = distribution()
+
+        if dist is None:
+            # Check if we have multiple GPUs without explicit distribution
+            import torch
+            if torch.cuda.device_count() > 1:
+                # Use DataParallel for multi-GPU training
+                self._torch_ddp_model = torch.nn.DataParallel(self)
+                self._ddp_wrapped = True
+            return
+
+        # Handle Keras distribution API
+        from keras.src.distribution import DataParallel as DataParallelDist
+
+        if isinstance(dist, DataParallelDist):
+            import torch
+            num_gpus = torch.cuda.device_count()
+            if num_gpus > 1:
+                # Use DataParallel for single-process multi-GPU
+                self._torch_ddp_model = torch.nn.DataParallel(self)
+                self._ddp_wrapped = True
 
     def _should_torch_compile(self):
         # require torch>=2.1.0 to enable dynamo since it
@@ -40,11 +72,14 @@ class TorchTrainer(base_trainer.Trainer):
     def train_step(self, data):
         x, y, sample_weight = data_adapter_utils.unpack_x_y_sample_weight(data)
 
+        # Use wrapped model if available for distribution
+        model = getattr(self, "_torch_ddp_model", None) or self
+
         # Compute predictions
         if self._call_has_training_arg:
-            y_pred = self(x, training=True)
+            y_pred = model(x, training=True)
         else:
-            y_pred = self(x)
+            y_pred = model(x)
 
         # Call torch.nn.Module.zero_grad() to clear the leftover gradients
         # for the weights from the previous train step.
@@ -85,10 +120,14 @@ class TorchTrainer(base_trainer.Trainer):
             y,
             sample_weight,
         ) = data_adapter_utils.unpack_x_y_sample_weight(data)
+
+        # Use wrapped model if available for distribution
+        model = getattr(self, "_torch_ddp_model", None) or self
+
         if self._call_has_training_arg:
-            y_pred = self(x, training=False)
+            y_pred = model(x, training=False)
         else:
-            y_pred = self(x)
+            y_pred = model(x)
         loss = self._compute_loss(
             x=x, y=y, y_pred=y_pred, sample_weight=sample_weight, training=False
         )
@@ -102,10 +141,14 @@ class TorchTrainer(base_trainer.Trainer):
 
     def predict_step(self, data):
         x, _, _ = data_adapter_utils.unpack_x_y_sample_weight(data)
+
+        # Use wrapped model if available for distribution
+        model = getattr(self, "_torch_ddp_model", None) or self
+
         if self._call_has_training_arg:
-            y_pred = self(x, training=False)
+            y_pred = model(x, training=False)
         else:
-            y_pred = self(x)
+            y_pred = model(x)
         return y_pred
 
     def make_train_function(self, force=False):

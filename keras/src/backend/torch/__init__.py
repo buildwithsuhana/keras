@@ -16,6 +16,7 @@ we are doing the following to automate device placement if a GPU is available:
 
 from keras.src.backend.common.name_scope import name_scope
 from keras.src.backend.torch import core
+from keras.src.backend.torch import distribution_lib
 from keras.src.backend.torch import image
 from keras.src.backend.torch import linalg
 from keras.src.backend.torch import math
@@ -43,3 +44,22 @@ from keras.src.backend.torch.rnn import cudnn_ok
 from keras.src.backend.torch.rnn import gru
 from keras.src.backend.torch.rnn import lstm
 from keras.src.backend.torch.rnn import rnn
+
+# Re-export distribution_lib functions for convenience
+from keras.src.backend.torch.distribution_lib import list_devices
+from keras.src.backend.torch.distribution_lib import get_device_count
+from keras.src.backend.torch.distribution_lib import distribute_variable
+from keras.src.backend.torch.distribution_lib import distribute_tensor
+from keras.src.backend.torch.distribution_lib import initialize
+from keras.src.backend.torch.distribution_lib import num_processes
+from keras.src.backend.torch.distribution_lib import process_id
+from keras.src.backend.torch.distribution_lib import cleanup
+from keras.src.backend.torch.distribution_lib import is_distributed
+from keras.src.backend.torch.distribution_lib import get_local_rank
+from keras.src.backend.torch.distribution_lib import get_world_size
+from keras.src.backend.torch.distribution_lib import get_rank
+from keras.src.backend.torch.distribution_lib import synchronize
+from keras.src.backend.torch.distribution_lib import create_data_parallel_model
+from keras.src.backend.torch.distribution_lib import create_distributed_data_parallel_model
+from keras.src.backend.torch.distribution_lib import create_distributed_sampler
+from keras.src.backend.torch.distribution_lib import create_dataloader
