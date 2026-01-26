@@ -650,6 +650,203 @@ class DataParallel(Distribution):
         return distributed_dataset.prefetch(tf.data.AUTOTUNE)
 
 
+@keras_export("keras.distribution.FSDP")
+class FSDP(Distribution):
+    """Distribution for Fully Sharded Data Parallel (FSDP).
+
+    FSDP shards model parameters across data parallel workers, reducing memory
+    footprint per device. It is similar to DataParallel but with parameter
+    sharding instead of full replication.
+
+    For PyTorch backend, this wraps models with `FullyShardedDataParallel`.
+    For JAX backend, this uses appropriate sharding layouts for parameters.
+
+    You can create an FSDP instance by either specifying the `device_mesh`
+    or `devices` arguments (but not both).
+
+    The `device_mesh` argument is expected to be a 1D `DeviceMesh` for
+    data parallelism.
+
+    Args:
+        device_mesh: Optional `DeviceMesh` instance.
+        devices: Optional list of devices.
+        auto_shard_dataset: Automatically shard the dataset amongst
+            processes in a multi-process setting. Defaults to `True`.
+    """
+
+    def __init__(self, device_mesh=None, devices=None, auto_shard_dataset=True):
+        _dist_debug_function_entry("FSDP.__init__",
+                                 kwargs={"device_mesh": device_mesh, "devices": devices,
+                                        "auto_shard_dataset": auto_shard_dataset})
+
+        if device_mesh:
+            self._initialize_with_device_mesh(device_mesh, auto_shard_dataset)
+        elif devices:
+            self._initialize_mesh_from_devices(devices, auto_shard_dataset)
+        else:
+            self._initialize_mesh_from_list_devices(auto_shard_dataset)
+
+        # Track process information
+        self._num_process = distribution_lib.num_processes()
+        self._process_id = distribution_lib.process_id()
+        self._is_multi_process = self._num_process > 1
+
+        _dist_debug_log(f"FSDP created: device_mesh={self.device_mesh}")
+        _dist_debug_log(f"Number of processes: {self._num_process}, Process ID: {self._process_id}")
+        _dist_debug_function_exit("FSDP.__init__", result=self)
+
+    def _initialize_with_device_mesh(self, device_mesh, auto_shard_dataset):
+        if not isinstance(device_mesh, DeviceMesh):
+            raise ValueError(
+                "Expect `device_mesh` to be an instance of `DeviceMesh`. "
+                f"Received: device_mesh={device_mesh} (of type {type(device_mesh)})"
+            )
+        super().__init__(
+            device_mesh, device_mesh.axis_names[0], auto_shard_dataset
+        )
+        if self.device_mesh.devices.ndim != 1:
+            warnings.warn(
+                f"Expect the input mesh to be 1D, but received "
+                f"mesh.devices.ndim={device_mesh.devices.ndim}. "
+                f"The first axis will be used for FSDP sharding.",
+                stacklevel=2,
+            )
+
+    def _initialize_mesh_from_devices(self, devices, auto_shard_dataset):
+        devices = np.array(devices)
+        device_mesh = DeviceMesh(
+            shape=devices.shape,
+            axis_names=[DEFAULT_BATCH_DIM_NAME],
+            devices=devices,
+        )
+        super().__init__(
+            device_mesh, DEFAULT_BATCH_DIM_NAME, auto_shard_dataset
+        )
+
+    def _initialize_mesh_from_list_devices(self, auto_shard_dataset):
+        devices = np.array(list_devices())
+        device_mesh = DeviceMesh(
+            shape=devices.shape,
+            axis_names=[DEFAULT_BATCH_DIM_NAME],
+            devices=devices,
+        )
+        super().__init__(
+            device_mesh, DEFAULT_BATCH_DIM_NAME, auto_shard_dataset
+        )
+
+    def get_data_layout(self, data_shape):
+        """Get layout for sharding input data along batch dimension."""
+        data_shard_spec = [None] * len(data_shape)
+        data_shard_spec[0] = self.batch_dim_name  # Shard on the first dim
+        return TensorLayout(data_shard_spec, self.device_mesh)
+
+    def get_variable_layout(self, variable):
+        """Get layout for sharding variable parameters.
+
+        FSDP shards variables across the first dimension when possible,
+        otherwise replicates.
+        """
+        # First check if the variable already has a layout assigned.
+        if getattr(variable, "_layout", None) is not None:
+            return variable._layout
+
+        # For FSDP, shard variables on the first dimension if it has size > 1
+        if len(variable.shape) > 0 and variable.shape[0] > 1:
+            variable_shard_spec = [self.batch_dim_name] + [None] * (len(variable.shape) - 1)
+        else:
+            # Replicate small variables or scalars
+            variable_shard_spec = [None] * len(variable.shape)
+
+        return TensorLayout(variable_shard_spec, self.device_mesh)
+
+    def get_tensor_layout(self, path):
+        # For FSDP training, intermediate state is not changed by default.
+        return None
+
+    def distribute_dataset(self, dataset):
+        """Create a distributed dataset from the original global dataset."""
+        if not self._is_multi_process or not self.auto_shard_dataset:
+            return dataset
+
+        # Check for PyTorch DataLoader
+        try:
+            from torch.utils.data import DataLoader, DistributedSampler
+            if isinstance(dataset, DataLoader):
+                sampler = DistributedSampler(
+                    dataset.dataset,
+                    num_replicas=self._num_process,
+                    rank=self._process_id,
+                    shuffle=dataset.shuffle,
+                    drop_last=dataset.drop_last,
+                )
+                return DataLoader(
+                    dataset.dataset,
+                    batch_size=dataset.batch_size,
+                    sampler=sampler,
+                    num_workers=dataset.num_workers,
+                    pin_memory=dataset.pin_memory,
+                    drop_last=dataset.drop_last,
+                    persistent_workers=dataset.persistent_workers,
+                )
+        except ImportError:
+            pass
+
+        # Try to distribute a global tf.data.Dataset.
+        from keras.src.utils.module_utils import tensorflow as tf
+
+        if not tf.available or not isinstance(dataset, tf.data.Dataset):
+            raise ValueError(
+                "Only `tf.data.Dataset` and `torch.utils.data.DataLoader` "
+                f"are supported for auto-sharding, got {type(dataset)}"
+            )
+
+        from tensorflow.python.data.experimental.ops import (
+            distribute as tf_data_distribute,
+        )
+
+        batch_size = tf_data_distribute.compute_batch_size(dataset)
+        if batch_size.numpy() < 0:
+            raise ValueError(
+                "The batch size of the input dataset is "
+                "unknown. Please config the batch size for "
+                "the input dataset, e.g via `dataset.batch(batch_size)`"
+            )
+        per_worker_batch_size = tf_data_distribute.batch_sizes_for_worker(
+            global_batch_size=batch_size,
+            num_workers=self._num_process,
+            num_replicas_per_worker=1,
+            worker_index=self._process_id,
+        )
+        distributed_dataset = dataset.rebatch(per_worker_batch_size)
+        distributed_dataset = tf_data_distribute._AutoShardDataset(
+            distributed_dataset,
+            num_workers=self._num_process,
+            index=self._process_id,
+            num_replicas=self._num_process,
+        )
+        return distributed_dataset.prefetch(tf.data.AUTOTUNE)
+
+    def wrap(self, model):
+        """Wrap a model with FSDP for the current backend.
+
+        Args:
+            model: A Keras model or PyTorch nn.Module.
+
+        Returns:
+            A wrapped model ready for FSDP training.
+        """
+        # Import backend here to avoid circular imports
+        from keras.src.backend import backend
+
+        # For JAX backend, no explicit wrapping is needed - sharding is handled
+        # automatically via distribution settings (FSDP.get_variable_layout)
+        # when variables are created under the distribution scope.
+        if backend() == "jax":
+            return model
+
+        return distribution_lib.fsdp_wrap(model, self)
+
+
 @keras_export("keras.distribution.ModelParallel")
 class ModelParallel(Distribution):
     """Distribution that shards model variables.

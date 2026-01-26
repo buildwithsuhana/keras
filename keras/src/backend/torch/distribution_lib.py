@@ -586,8 +586,90 @@ def broadcast(tensor, src=0):
 
     _debug_log(f"Broadcasting tensor from source rank {src}")
     dist.broadcast(tensor, src=src)
-    
+
     _debug_tensor_info(tensor, "broadcasted_tensor")
     _debug_function_exit("broadcast", result=tensor)
     return tensor
+
+
+def fsdp_wrap(model, fsdp_config=None):
+    """Wrap a PyTorch model with FullyShardedDataParallel.
+
+    Args:
+        model: A PyTorch nn.Module to wrap.
+        fsdp_config: Optional FSDP configuration dictionary with keys:
+            - sharding_strategy: "FULL_SHARD", "SHARD_GRAD_OP", or "NO_SHARD"
+            - backward_prefetch: True/False for backward prefetch optimization
+            - cpu_offload: True/False for CPU offloading
+
+    Returns:
+        A FullyShardedDataParallel wrapped model.
+    """
+    _debug_function_entry("fsdp_wrap")
+
+    if not isinstance(model, torch.nn.Module):
+        _debug_log(f"Model is not a torch.nn.Module, returning as-is: {type(model)}")
+        _debug_function_exit("fsdp_wrap", result=model)
+        return model
+
+    # Check if torch.distributed.fsdp is available
+    try:
+        from torch.distributed.fsdp import FullyShardedDataParallel as FSDP
+    except ImportError:
+        _debug_log("torch.distributed.fsdp not available, returning model as-is")
+        _debug_function_exit("fsdp_wrap", result=model)
+        return model
+
+    if not dist.is_initialized():
+        _debug_log("torch.distributed not initialized, returning model as-is")
+        _debug_function_exit("fsdp_wrap", result=model)
+        return model
+
+    # Parse config
+    sharding_strategy = "full_shard"
+    backward_prefetch = False
+    cpu_offload = False
+
+    if fsdp_config is not None:
+        if isinstance(fsdp_config, dict):
+            strategy_map = {
+                "FULL_SHARD": "full_shard",
+                "SHARD_GRAD_OP": "shard_grad_op",
+                "NO_SHARD": "no_shard",
+            }
+            sharding_strategy = strategy_map.get(
+                fsdp_config.get("sharding_strategy", "FULL_SHARD"),
+                "full_shard"
+            )
+            backward_prefetch = fsdp_config.get("backward_prefetch", False)
+            cpu_offload = fsdp_config.get("cpu_offload", False)
+        else:
+            # Assume it's an FSDP distribution object
+            if hasattr(fsdp_config, '_sharding_strategy'):
+                sharding_strategy = fsdp_config._sharding_strategy
+            if hasattr(fsdp_config, '_backward_prefetch'):
+                backward_prefetch = fsdp_config._backward_prefetch
+
+    _debug_log(f"FSDP config: strategy={sharding_strategy}, "
+              f"backward_prefetch={backward_prefetch}, cpu_offload={cpu_offload}")
+
+    # Import sharding strategy
+    try:
+        from torch.distributed.fsdp import ShardingStrategy
+        strategy = ShardingStrategy(sharding_strategy.upper())
+    except (ImportError, AttributeError):
+        strategy = sharding_strategy  # Fallback to string
+
+    # Wrap model with FSDP
+    _debug_log("Wrapping model with FullyShardedDataParallel")
+    fsdp_model = FSDP(
+        model,
+        sharding_strategy=strategy,
+        backward_prefetch=backward_prefetch,
+        cpu_offload=cpu_offload if isinstance(cpu_offload, bool) else None,
+    )
+
+    _debug_log("Model successfully wrapped with FSDP")
+    _debug_function_exit("fsdp_wrap", result=fsdp_model)
+    return fsdp_model
 
