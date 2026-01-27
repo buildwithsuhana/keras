@@ -5,6 +5,21 @@ import torch.distributed as dist
 
 
 def list_devices(device_type=None):
+    """Return all available devices based on the device type.
+
+    In a distributed setting, returns the global list of devices.
+
+    Args:
+        device_type: Optional string specifying the device type. One of
+            `"cpu"`, `"gpu"` or `"cuda"`. If not provided, returns all
+            available GPU/MPS devices, or CPU devices if GPU is unavailable.
+
+    Returns:
+        List of device strings available for distributed computation.
+            For CUDA, returns `"cuda:{i}"` for each GPU.
+            For MPS, returns `["mps:0"]`.
+            For CPU, returns `["cpu:0"]`.
+    """
     device_type = device_type.lower() if device_type else None
 
     if torch.cuda.is_available():
@@ -23,6 +38,17 @@ def list_devices(device_type=None):
 
 
 def get_device_count(device_type=None):
+    """Return the number of available devices of the specified type.
+
+    Args:
+        device_type: Optional string specifying the device type. One of
+            `"cpu"`, `"gpu"` or `"cuda"`. If not provided, counts
+            GPU/MPS devices if available, otherwise CPU devices.
+
+    Returns:
+        int: The number of available devices of the specified type.
+            Returns 0 for GPU/MPS if no such devices are available.
+    """
     device_type = device_type.lower() if device_type else None
 
     if torch.cuda.is_available():
@@ -40,6 +66,18 @@ def get_device_count(device_type=None):
 
 
 def distribute_tensor(tensor, layout):
+    """Distribute a tensor according to the specified layout.
+
+    Args:
+        tensor: The tensor to distribute.
+        layout: The layout specification. Can be a TensorLayout object,
+            a dict with 'axes' and 'device_mesh' keys, or None.
+
+    Returns:
+        For sharded tensors, returns a list of tensor shards. For
+            non-sharded tensors or when no sharding is specified,
+            returns the original tensor unchanged.
+    """
     from keras.src.distribution import TensorLayout
 
     if isinstance(layout, TensorLayout):
@@ -84,12 +122,24 @@ def distribute_tensor(tensor, layout):
 
 
 def _get_current_rank():
+    """Get the current process rank in the distributed setting.
+
+    Returns:
+        int: The rank of the current process. Returns 0 if distributed
+            is not initialized.
+    """
     if dist.is_initialized():
         return dist.get_rank()
     return 0
 
 
 def _get_current_device():
+    """Get the current device for this process in the distributed setting.
+
+    Returns:
+        torch.device: The current device. Returns cuda device with local
+            rank for GPU, mps for Apple Silicon, or cpu otherwise.
+    """
     if torch.cuda.is_available():
         local_rank = dist.get_rank() if dist.is_initialized() else 0
         return torch.device(f"cuda:{local_rank}")
@@ -99,6 +149,19 @@ def _get_current_device():
 
 
 def _shard_tensor(tensor, layout, rank=None, device=None):
+    """Shard a tensor according to the specified layout.
+
+    Args:
+        tensor: The tensor to shard.
+        layout: The sharding layout specification.
+        rank: Optional int, the current process rank. Defaults to
+            _get_current_rank().
+        device: Optional torch.device, the target device. Defaults to
+            _get_current_device().
+
+    Returns:
+        The sharded tensor portion for the current rank and device.
+    """
     if rank is None:
         rank = _get_current_rank()
     if device is None:
@@ -161,6 +224,20 @@ def _shard_tensor(tensor, layout, rank=None, device=None):
 
 
 def distribute_variable(value, layout):
+    """Distribute a variable according to the specified layout.
+
+    Args:
+        value: The variable (torch.Tensor) to distribute.
+        layout: The layout specification. Can be a TensorLayout object,
+            a dict with 'axes' and 'device_mesh' keys, or None.
+
+    Returns:
+        The distributed variable. If sharding is not needed, returns
+            the variable on the current device. Otherwise, returns
+            the sharded tensor portion with additional attributes
+            _distributed_layout, _full_shape, _sharding_axis, and
+            _is_sharded.
+    """
     from keras.src.distribution import TensorLayout
 
     if isinstance(layout, TensorLayout):
@@ -195,6 +272,16 @@ def distribute_variable(value, layout):
 
 
 def all_gather_variable(variable):
+    """Gather all shards of a sharded variable back into a full tensor.
+
+    Args:
+        variable: The sharded variable to gather. Should have _is_sharded
+            attribute set to True.
+
+    Returns:
+        The full gathered tensor if variable is sharded and distributed
+            is initialized. Otherwise, returns the variable unchanged.
+    """
     if not getattr(variable, '_is_sharded', False):
         return variable
 
@@ -233,7 +320,18 @@ def all_gather_variable(variable):
 
 
 def distribute_data_input(per_process_batch, layout, batch_dim_name):
+    """Distribute input data according to the specified layout.
 
+    Args:
+        per_process_batch: The input batch (or tuple/list of batches) for
+            the current process.
+        layout: The data layout specification.
+        batch_dim_name: The name of the batch dimension in the device mesh.
+
+    Returns:
+        The distributed input data. For tuples/lists, applies distribution
+            recursively to each element. Returns the input unchanged otherwise.
+    """
     if isinstance(per_process_batch, (tuple, list)):
         result = type(per_process_batch)(
             distribute_data_input(x, layout, batch_dim_name) for x in per_process_batch
@@ -245,6 +343,28 @@ def distribute_data_input(per_process_batch, layout, batch_dim_name):
 
 
 def initialize(job_addresses=None, num_processes=None, process_id=None):
+    """Initialize the distributed backend for multi-process training.
+
+    Sets up the PyTorch distributed environment for multi-host/GPU training.
+    This function should be called before any distributed computations.
+
+    Parameters can be provided as arguments or via environment variables:
+    - KERAS_DISTRIBUTION_JOB_ADDRESSES: Comma-separated IP addresses
+    - KERAS_DISTRIBUTION_NUM_PROCESSES: Number of processes
+    - KERAS_DISTRIBUTION_PROCESS_ID: Current process ID
+
+    Args:
+        job_addresses: Comma-separated IP addresses of all processes in
+            the cluster. Can be just the coordinator address for some
+            backends. Defaults to KERAS_DISTRIBUTION_JOB_ADDRESSES env var.
+        num_processes: Total number of processes in the cluster. Defaults
+            to KERAS_DISTRIBUTION_NUM_PROCESSES env var.
+        process_id: ID of the current process (0 to num_processes-1).
+            Defaults to KERAS_DISTRIBUTION_PROCESS_ID env var.
+
+    Raises:
+        RuntimeError: If CUDA is requested but not available.
+    """
     if job_addresses is None and "KERAS_DISTRIBUTION_JOB_ADDRESSES" in os.environ:
         job_addresses = os.environ["KERAS_DISTRIBUTION_JOB_ADDRESSES"]
     if num_processes is None and "KERAS_DISTRIBUTION_NUM_PROCESSES" in os.environ:
@@ -283,18 +403,38 @@ def initialize(job_addresses=None, num_processes=None, process_id=None):
 
 
 def num_processes():
+    """Get the number of processes in the distributed setting.
+
+    Returns:
+        int: The world size (number of processes). Returns 1 if
+            distributed is not initialized.
+    """
     if dist.is_initialized():
         return dist.get_world_size()
     return 1
 
 
 def process_id():
+    """Get the current process ID in the distributed setting.
+
+    Returns:
+        int: The rank of the current process. Returns 0 if distributed
+            is not initialized.
+    """
     if dist.is_initialized():
         return dist.get_rank()
     return 0
 
 
 def _to_backend_mesh(device_mesh):
+    """Convert a DeviceMesh to backend-specific format.
+
+    Args:
+        device_mesh: A DeviceMesh object with devices, axis_names, and shape.
+
+    Returns:
+        dict: A dictionary with 'devices', 'axis_names', and 'shape' keys.
+    """
     return {
         "devices": device_mesh.devices,
         "axis_names": device_mesh.axis_names,
@@ -303,6 +443,17 @@ def _to_backend_mesh(device_mesh):
 
 
 def _to_backend_layout(tensor_layout):
+    """Convert a TensorLayout to backend-specific format.
+
+    Args:
+        tensor_layout: A TensorLayout object with axes and device_mesh.
+
+    Returns:
+        dict: A dictionary with 'axes' and 'mesh' keys for the backend.
+
+    Raises:
+        ValueError: If device_mesh is not set in the tensor_layout.
+    """
     if tensor_layout.device_mesh is None:
         raise ValueError(
             "Cannot create sharding when device mesh is not set "
@@ -315,13 +466,15 @@ def _to_backend_layout(tensor_layout):
     }
 
 
-def all_reduce(tensor, reduce_op="sum", axis_name=None):
-    """All-reduce a tensor across the mesh.
+def all_reduce(tensor, op="sum", axis_name="model"):
+    """Reduces a tensor across a device mesh axis using a collective.
 
     Args:
         tensor: The tensor to reduce.
-        reduce_op: The reduction operation ("sum", "product", "min", "max").
-        axis_name: Optional axis name for JAX compatibility (unused in torch).
+        op: The reduction operation. One of "sum", "product", "min",
+            "max". Defaults to "sum".
+        axis_name: The name of the mesh axis to reduce over.
+            Defaults to "model".
 
     Returns:
         The reduced tensor.
@@ -329,32 +482,41 @@ def all_reduce(tensor, reduce_op="sum", axis_name=None):
     if not dist.is_initialized():
         return tensor
 
-    if reduce_op == "sum":
-        op = dist.ReduceOp.SUM
-    elif reduce_op == "product":
-        op = dist.ReduceOp.PRODUCT
-    elif reduce_op == "min":
-        op = dist.ReduceOp.MIN
-    elif reduce_op == "max":
-        op = dist.ReduceOp.MAX
+    if op == "sum":
+        reduce_op = dist.ReduceOp.SUM
+    elif op == "product":
+        reduce_op = dist.ReduceOp.PRODUCT
+    elif op == "min":
+        reduce_op = dist.ReduceOp.MIN
+    elif op == "max":
+        reduce_op = dist.ReduceOp.MAX
     else:
-        op = dist.ReduceOp.SUM
+        reduce_op = dist.ReduceOp.SUM
 
-    dist.all_reduce(tensor, op)
+    dist.all_reduce(tensor, reduce_op)
 
     return tensor
 
 
-def all_gather(tensor, axis=0, axis_name=None):
-    """Gather tensors from all processes along the specified axis.
+def all_gather(tensor, axis=0, axis_name="model"):
+    """Gathers and concatenates tensors from all devices across a mesh axis.
+
+    This function assumes it is called within a distributed context. It takes
+    the local shard `tensor` from each device along the `axis_name` of the mesh
+    and concatenates them along the specified tensor `axis` to form a
+    single, larger tensor that is then replicated on all participating devices.
 
     Args:
-        tensor: The tensor to gather.
-        axis: The axis along which to concatenate gathered tensors.
-        axis_name: Optional axis name for JAX compatibility (unused in torch).
+        tensor: The input tensor shard on the local device.
+        axis: The tensor axis along which to concatenate the gathered shards.
+            Defaults to 0.
+        axis_name: The name of the mesh axis to gather from.
+            Defaults to "model".
 
     Returns:
-        The gathered tensor with all shards concatenated along the axis.
+        The full, gathered tensor with all shards concatenated along the axis.
+        Returns the original tensor if distributed is not initialized
+        or world_size is 1.
     """
     if not dist.is_initialized():
         return tensor
@@ -372,6 +534,16 @@ def all_gather(tensor, axis=0, axis_name=None):
 
 
 def broadcast(tensor, src=0):
+    """Broadcast a tensor from a source device to all other devices.
+
+    Args:
+        tensor: The tensor to broadcast. On non-source ranks, this should
+            be a tensor of the same shape and dtype.
+        src: The source rank to broadcast from. Defaults to 0.
+
+    Returns:
+        The broadcast tensor on all devices.
+    """
     if not dist.is_initialized():
         return tensor
 
