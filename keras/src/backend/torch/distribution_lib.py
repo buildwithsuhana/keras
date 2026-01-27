@@ -315,7 +315,17 @@ def _to_backend_layout(tensor_layout):
     }
 
 
-def all_reduce(tensor, reduce_op="sum"):
+def all_reduce(tensor, reduce_op="sum", axis_name=None):
+    """All-reduce a tensor across the mesh.
+
+    Args:
+        tensor: The tensor to reduce.
+        reduce_op: The reduction operation ("sum", "product", "min", "max").
+        axis_name: Optional axis name for JAX compatibility (unused in torch).
+
+    Returns:
+        The reduced tensor.
+    """
     if not dist.is_initialized():
         return tensor
 
@@ -335,7 +345,17 @@ def all_reduce(tensor, reduce_op="sum"):
     return tensor
 
 
-def all_gather(tensor):
+def all_gather(tensor, axis=0, axis_name=None):
+    """Gather tensors from all processes along the specified axis.
+
+    Args:
+        tensor: The tensor to gather.
+        axis: The axis along which to concatenate gathered tensors.
+        axis_name: Optional axis name for JAX compatibility (unused in torch).
+
+    Returns:
+        The gathered tensor with all shards concatenated along the axis.
+    """
     if not dist.is_initialized():
         return tensor
 
@@ -347,7 +367,7 @@ def all_gather(tensor):
     tensor_list = [torch.zeros_like(tensor) for _ in range(world_size)]
     dist.all_gather(tensor_list, tensor)
 
-    result = torch.cat(tensor_list, dim=0)
+    result = torch.cat(tensor_list, dim=axis)
     return result
 
 
