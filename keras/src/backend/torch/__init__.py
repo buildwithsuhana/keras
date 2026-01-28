@@ -43,3 +43,17 @@ from keras.src.backend.torch.rnn import cudnn_ok
 from keras.src.backend.torch.rnn import gru
 from keras.src.backend.torch.rnn import lstm
 from keras.src.backend.torch.rnn import rnn
+
+# Distribution support
+from keras.src.backend.torch.distribution_lib import distribute_tensor
+from keras.src.backend.torch.distribution_lib import distribute_variable
+from keras.src.backend.torch.distribution_lib import get_device_count
+from keras.src.backend.torch.distribution_lib import list_devices
+from keras.src.backend.torch.distribution_lib import initialize
+from keras.src.backend.torch.distribution_lib import num_processes
+from keras.src.backend.torch.distribution_lib import process_id
+from keras.src.backend.torch.distribution_lib import _to_backend_mesh
+from keras.src.backend.torch.distribution_lib import _to_backend_layout
+from keras.src.backend.torch.distribution_lib import ModelParallel
+from keras.src.backend.torch.distribution_lib import set_global_device_mesh
+from keras.src.backend.torch.distribution_lib import get_global_device_mesh
