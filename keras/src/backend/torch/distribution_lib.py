@@ -7,10 +7,25 @@ mirroring the JAX backend API for consistency. It supports:
 - CPU, GPU, and TPU devices
 """
 
+import logging
 import os
 
 import torch
 from torch.distributed.device_mesh import init_device_mesh
+
+# Set up logging
+logger = logging.getLogger(__name__)
+logger.setLevel(logging.INFO)
+
+# Create a handler if none exists
+if not logger.handlers:
+    handler = logging.StreamHandler()
+    handler.setLevel(logging.INFO)
+    formatter = logging.Formatter(
+        '%(asctime)s - %(name)s - %(levelname)s - %(message)s'
+    )
+    handler.setFormatter(formatter)
+    logger.addHandler(handler)
 
 try:
     from torch.distributed.tensor import distribute_tensor, DTensor
@@ -53,6 +68,8 @@ def list_devices(device_type=None):
     device_type = device_type.lower() if device_type else None
 
     devices = []
+    
+    logger.info(f"Looking for devices of type: {device_type}")
 
     # Check for TPU
     try:
@@ -60,26 +77,32 @@ def list_devices(device_type=None):
 
         if device_type in (None, "tpu"):
             tpu_devices = xm.get_xla_supported_devices("tpu")
+            logger.info(f"Found {len(tpu_devices)} TPU devices")
             for tpu in tpu_devices:
                 devices.append(f"tpu:{tpu}")
     except ImportError:
-        pass
+        logger.debug("torch_xla not available, skipping TPU detection")
 
     # Check for GPU
     if torch.cuda.is_available():
         if device_type in (None, "gpu"):
             for i in range(torch.cuda.device_count()):
                 devices.append(f"cuda:{i}")
+            logger.info(f"Found {torch.cuda.device_count()} GPU devices")
+    else:
+        logger.info("No CUDA GPUs available")
 
     # Check for MPS (Apple Silicon)
     if torch.backends.mps.is_available():
         if device_type in (None, "gpu"):
             devices.append("mps:0")
+            logger.info("Found MPS device (Apple Silicon)")
 
     # Check for CPU
     if device_type in (None, "cpu") or not devices:
         # Add CPU devices
         num_threads = torch.get_num_threads()
+        logger.info(f"Found {num_threads} CPU threads")
         for i in range(num_threads):
             devices.append(f"cpu:{i}")
 
@@ -89,8 +112,12 @@ def list_devices(device_type=None):
             d for d in devices if d.startswith(device_type.lower())
         ]
         if filtered_devices:
+            logger.info(f"Filtered to {len(filtered_devices)} devices of type {device_type}")
             return filtered_devices
+        else:
+            logger.warning(f"No devices found of type {device_type}")
 
+    logger.info(f"Total devices found: {len(devices)}")
     return devices if device_type is None else []
 
 
@@ -107,6 +134,8 @@ def get_device_count(device_type=None):
         int: The total number of PyTorch devices for the specified type.
     """
     device_type = device_type.lower() if device_type else None
+    
+    logger.info(f"Getting device count for type: {device_type}")
 
     if device_type in (None, "tpu"):
         try:
@@ -114,21 +143,29 @@ def get_device_count(device_type=None):
 
             tpu_devices = xm.get_xla_supported_devices("tpu")
             if tpu_devices:
+                logger.info(f"Found {len(tpu_devices)} TPU devices")
                 return len(tpu_devices)
         except ImportError:
-            pass
+            logger.debug("torch_xla not available")
 
     if device_type in (None, "gpu"):
         if torch.cuda.is_available():
-            return torch.cuda.device_count()
+            count = torch.cuda.device_count()
+            logger.info(f"Found {count} GPU devices")
+            return count
         if torch.backends.mps.is_available():
+            logger.info("Found MPS device (counting as 1)")
             return 1  # MPS doesn't report device count like CUDA
 
     if device_type == "cpu":
-        return torch.get_num_threads()
+        count = torch.get_num_threads()
+        logger.info(f"Found {count} CPU threads")
+        return count
 
     # Fallback: count from list_devices
-    return len(list_devices(device_type))
+    count = len(list_devices(device_type))
+    logger.info(f"Found {count} devices of type {device_type}")
+    return count
 
 
 def _to_backend_mesh(device_mesh):
@@ -149,6 +186,11 @@ def _to_backend_mesh(device_mesh):
     # Get axis names
     axis_names = device_mesh.axis_names
 
+    logger.info(f"Converting Keras DeviceMesh to PyTorch DeviceMesh")
+    logger.info(f"  Shape: {device_mesh.shape}")
+    logger.info(f"  Axis names: {axis_names}")
+    logger.info(f"  Devices: {devices}")
+
     # Create the mesh
     # Note: PyTorch DeviceMesh expects a device type as first argument
     torch_mesh = init_device_mesh(
@@ -156,6 +198,10 @@ def _to_backend_mesh(device_mesh):
         device_mesh.shape,
         mesh_dim_names=axis_names,
     )
+    
+    logger.info(f"Successfully created PyTorch DeviceMesh")
+    logger.info(f"  Mesh shape: {torch_mesh.shape}")
+    logger.info(f"  Mesh dimensions: {list(torch_mesh.shape.keys())}")
 
     return torch_mesh
 
@@ -181,16 +227,25 @@ def _to_backend_layout(tensor_layout):
     mesh = tensor_layout.device_mesh
     placements = []
 
+    logger.info(f"Converting TensorLayout to PyTorch placements")
+    logger.info(f"  Axes: {tensor_layout.axes}")
+    logger.info(f"  Device mesh shape: {mesh.shape}")
+    logger.info(f"  Device mesh axis names: {mesh.axis_names}")
+
     for axis in tensor_layout.axes:
         if axis is None:
             placements.append(Replicate())
+            logger.debug(f"  Axis {axis}: Replicate()")
         else:
             try:
                 axis_index = mesh.axis_names.index(axis)
                 placements.append(Shard(axis=axis_index))
+                logger.debug(f"  Axis {axis}: Shard(axis={axis_index})")
             except ValueError:
                 placements.append(Replicate())
+                logger.debug(f"  Axis {axis}: Replicate() (fallback)")
 
+    logger.info(f"Converted to placements: {placements}")
     return tuple(placements)
 
 
@@ -209,21 +264,29 @@ def distribute_tensor(tensor, layout):
 
     from keras.src.distribution import TensorLayout
 
+    logger.info(f"Distributing tensor with shape: {tensor.shape}")
+    logger.info(f"  Layout: {layout}")
+    
     if isinstance(layout, TensorLayout):
         backend_layout = layout.backend_layout
         placements = _to_backend_layout(layout)
+        logger.info(f"  Backend layout: {backend_layout}")
+        logger.info(f"  Placements: {placements}")
     elif isinstance(layout, tuple):
         # Assume it's already placements
         placements = layout
         backend_layout = None
+        logger.info(f"  Using provided placements: {placements}")
     else:
         backend_layout = layout
         placements = None
+        logger.info(f"  Using backend layout: {backend_layout}")
 
     # Get the mesh
     mesh = None
     if backend_layout is not None and hasattr(backend_layout, "_mesh"):
         mesh = backend_layout._mesh
+        logger.info(f"  Mesh from backend layout: {mesh}")
 
     if mesh is None and placements is not None:
         # Try to get mesh from placements or create one
@@ -232,16 +295,24 @@ def distribute_tensor(tensor, layout):
     if placements is not None:
         # Use DTensor directly with placements
         if hasattr(tensor, "_torch_dtensor"):
+            logger.debug("  Tensor is already a DTensor")
             return tensor
 
         # Create DTensor with placements
         device_mesh = _get_default_mesh()
+        logger.info(f"  Device mesh: {device_mesh}")
+        
         if device_mesh is not None:
             from torch.distributed.tensor import distribute_tensor as dt
 
-            return dt(tensor, device_mesh, placements)
+            logger.info(f"  Creating DTensor with placements: {placements}")
+            result = dt(tensor, device_mesh, placements)
+            logger.info(f"  Result type: {type(result)}")
+            logger.info(f"  Result shape: {result.shape if hasattr(result, 'shape') else 'N/A'}")
+            return result
 
     # Fallback: return the tensor as is
+    logger.info(f"  Returning tensor as-is (no distribution applied)")
     return tensor
 
 
@@ -299,28 +370,46 @@ def initialize(job_addresses, num_processes, process_id):
     if not _is_distributed_available():
         raise RuntimeError("torch.distributed is not available")
 
+    logger.info("Initializing PyTorch distributed training")
+    logger.info(f"  Job addresses: {job_addresses}")
+    logger.info(f"  Number of processes: {num_processes}")
+    logger.info(f"  Process ID: {process_id}")
+
     # Set environment variables
     if job_addresses:
         if "," in job_addresses:
             os.environ["MASTER_ADDR"] = job_addresses.split(",")[0]
         else:
             os.environ["MASTER_ADDR"] = job_addresses
+        logger.info(f"  Master address: {os.environ['MASTER_ADDR']}")
     if num_processes:
         os.environ["WORLD_SIZE"] = str(num_processes)
+        logger.info(f"  World size: {os.environ['WORLD_SIZE']}")
     if process_id is not None:
         os.environ["RANK"] = str(process_id)
+        logger.info(f"  Rank: {os.environ['RANK']}")
 
     # Set backend
     if torch.cuda.is_available():
         os.environ["BACKEND"] = "nccl"
+        logger.info("  Using NCCL backend (GPU)")
     else:
         os.environ["BACKEND"] = "gloo"
+        logger.info("  Using Gloo backend (CPU)")
 
     # Initialize the process group
+    logger.info("Initializing process group...")
     dist.init_process_group(
         backend=os.environ.get("BACKEND", "nccl" if torch.cuda.is_available() else "gloo"),
         init_method="env://",
     )
+    logger.info("Process group initialized successfully")
+    
+    # Log additional info
+    world_size = dist.get_world_size()
+    rank = dist.get_rank()
+    logger.info(f"  World size: {world_size}")
+    logger.info(f"  Current rank: {rank}")
 
 
 def num_processes():
