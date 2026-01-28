@@ -514,11 +514,27 @@ class DataParallel(Distribution):
 
         # Try to distribute a global tf.data.Dataset.
         from keras.src.utils.module_utils import tensorflow as tf
+        from keras.src.utils.module_utils import torch as torch_utils
 
+        # Check if it's a torch Dataset
+        if torch_utils.available and isinstance(
+            dataset, torch.utils.data.Dataset
+        ):
+            from keras.src.backend.torch import distribution_lib as torch_dist_lib
+
+            data_layout = self.get_data_layout(dataset[0][0].shape)
+            dataloader = torch_dist_lib.distribute_dataset(
+                dataset,
+                data_layout,
+                batch_dim_name=self.batch_dim_name,
+            )
+            return dataloader
+
+        # Fall back to tf.data.Dataset
         if not tf.available or not isinstance(dataset, tf.data.Dataset):
             raise ValueError(
-                "Only `tf.data.Dataset` is supported for auto-sharding, "
-                f"got {type(dataset)}"
+                "Only `tf.data.Dataset` or `torch.utils.data.Dataset` "
+                f"is supported for auto-sharding, got {type(dataset)}"
             )
 
         from tensorflow.python.data.experimental.ops import (
@@ -683,13 +699,29 @@ class ModelParallel(Distribution):
         if not self._is_multi_process or not self.auto_shard_dataset:
             return dataset
 
+        # Check if it's a torch Dataset
+        from keras.src.utils.module_utils import torch as torch_utils
+
+        if torch_utils.available and isinstance(
+            dataset, torch.utils.data.Dataset
+        ):
+            from keras.src.backend.torch import distribution_lib as torch_dist_lib
+
+            data_layout = self.get_data_layout(dataset[0][0].shape)
+            dataloader = torch_dist_lib.distribute_dataset(
+                dataset,
+                data_layout,
+                batch_dim_name=self.batch_dim_name,
+            )
+            return dataloader
+
         # Try to distribute a global tf.data.Dataset.
         from keras.src.utils.module_utils import tensorflow as tf
 
         if not tf.available or not isinstance(dataset, tf.data.Dataset):
             raise ValueError(
-                "Only `tf.data.Dataset` is supported for auto-sharding, "
-                f"got {type(dataset)}"
+                "Only `tf.data.Dataset` or `torch.utils.data.Dataset` "
+                f"is supported for auto-sharding, got {type(dataset)}"
             )
 
         from tensorflow.python.data.experimental.ops import (
@@ -817,10 +849,28 @@ class LayoutMap(collections.abc.MutableMapping):
         if key in self._layout_map:
             return self._layout_map[key]
 
+        # Try direct match first
         matching_keys = []
         for k in self._layout_map:
             if re.search(k, key):
                 matching_keys.append(k)
+        
+        # If no matches found and we're on torch backend,
+        # try converting the key to torch format and match again
+        if len(matching_keys) == 0:
+            from keras.src.utils.module_utils import torch as torch_utils
+            if torch_utils.available:
+                try:
+                    from keras.src.backend.torch.distribution_lib import (
+                        TorchPathAdapter,
+                    )
+                    torch_key = TorchPathAdapter.keras_to_torch(key)
+                    for k in self._layout_map:
+                        if re.search(k, torch_key):
+                            matching_keys.append(k)
+                except ImportError:
+                    pass
+
         if len(matching_keys) > 1:
             raise ValueError(
                 f"Path '{key}' matches multiple layout "

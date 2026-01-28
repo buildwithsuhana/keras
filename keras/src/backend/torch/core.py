@@ -103,12 +103,32 @@ def to_torch_dtype(dtype):
 
 class Variable(KerasVariable):
     def _initialize(self, value):
+        # Avoid circular imports
+        from keras.src.distribution import distribution
+
+        # Check if there's an active distribution
+        current_distribution = distribution()
+
         if isinstance(value, torch.nn.Parameter):
             # Reuse same parameter
             self._value = value
         else:
+            tensor = convert_to_tensor(value, dtype=self._dtype)
+
+            # Apply distribution if available
+            if current_distribution is not None:
+                variable_layout = current_distribution.get_variable_layout(self)
+                if variable_layout is not None:
+                    from keras.src.backend.torch import distribution_lib
+
+                    # Convert to backend layout and distribute
+                    backend_layout = variable_layout.backend_layout
+                    tensor = distribution_lib.distribute_tensor(
+                        tensor, variable_layout
+                    )
+
             self._value = torch.nn.Parameter(
-                convert_to_tensor(value, dtype=self._dtype),
+                tensor,
                 requires_grad=self.trainable,
             ).to(get_device())
 
