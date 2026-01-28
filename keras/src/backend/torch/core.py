@@ -115,17 +115,24 @@ class Variable(KerasVariable):
         else:
             tensor = convert_to_tensor(value, dtype=self._dtype)
 
-            # Apply distribution if available
+            # Apply distribution if available, but only in single-process mode
+            # In multi-process mode, each process creates variables locally
+            # and DTensor handles the distribution automatically
             if current_distribution is not None:
-                variable_layout = current_distribution.get_variable_layout(self)
-                if variable_layout is not None:
-                    from keras.src.backend.torch import distribution_lib
-
-                    # Convert to backend layout and distribute
-                    backend_layout = variable_layout.backend_layout
-                    tensor = distribution_lib.distribute_tensor(
-                        tensor, variable_layout
-                    )
+                # Check if we're in a distributed setting
+                from keras.src.backend.torch import distribution_lib as torch_dist_lib
+                
+                is_distributed = (
+                    torch_dist_lib.num_processes() > 1
+                )
+                
+                if not is_distributed:
+                    # Single-process mode: apply distribution
+                    variable_layout = current_distribution.get_variable_layout(self)
+                    if variable_layout is not None:
+                        tensor = torch_dist_lib.distribute_tensor(
+                            tensor, variable_layout
+                        )
 
             self._value = torch.nn.Parameter(
                 tensor,
@@ -754,4 +761,3 @@ class CustomGradientFunction(torch.autograd.Function):
         grads = grad_fn(*args, upstream=grad_output)
         if not isinstance(grads, tuple):
             grads = (grads,)
-        return (None,) + grads
