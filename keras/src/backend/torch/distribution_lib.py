@@ -460,3 +460,21 @@ def get_global_device_mesh():
     """Get the global DeviceMesh for PyTorch backend."""
     return global_state.get_global_attribute(GLOBAL_DEVICE_MESH)
 
+
+def log_variable_layout(variable_path, layout, matched_key=None):
+    """Log information about variable layout assignment.
+    
+    Args:
+        variable_path: The path to the variable (e.g., "dense/kernel")
+        layout: The TensorLayout that was assigned
+        matched_key: The key in LayoutMap that matched (if any)
+    """
+    logger.info(f"Variable layout assignment:")
+    logger.info(f"  Variable path: {variable_path}")
+    if matched_key:
+        logger.info(f"  Matched pattern: {matched_key}")
+    logger.info(f"  Layout axes: {layout.axes if layout else 'None'}")
+    if layout and layout.device_mesh:
+        logger.info(f"  Device mesh shape: {layout.device_mesh.shape}")
+        logger.info(f"  Device mesh axes: {layout.device_mesh.axis_names}")
+
