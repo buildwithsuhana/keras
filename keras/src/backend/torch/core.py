@@ -59,6 +59,15 @@ TORCH_DTYPES = {
 }
 
 
+def _is_dtensor_available():
+    """Check if PyTorch DTensor is available.
+
+    Returns:
+        bool: True if DTensor is available, False otherwise.
+    """
+    return hasattr(torch.distributed, "tensor")
+
+
 @contextlib.contextmanager
 def device_scope(device_name):
     previous_device = global_state.get_global_attribute("torch_device", None)
@@ -114,7 +123,15 @@ class Variable(KerasVariable):
 
     def _direct_assign(self, value):
         with torch.no_grad():
-            self.value.copy_(value)
+            if _is_dtensor_available() and isinstance(
+                value, torch.distributed.tensor.DTensor
+            ):
+                if hasattr(self._value, "_local_tensor"):
+                    self._value._local_tensor.copy_(value._local_tensor)
+                else:
+                    self.value.copy_(value)
+            else:
+                self.value.copy_(value)
 
     def _convert_to_tensor(self, value, dtype=None):
         return convert_to_tensor(value, dtype=dtype)
@@ -197,6 +214,12 @@ def convert_to_tensor(x, dtype=None, sparse=None, ragged=None):
     if isinstance(x, Variable) or is_tensor(x):
         if isinstance(x, Variable):
             x = x.value
+        if hasattr(torch.distributed, "tensor") and isinstance(
+            x, torch.distributed.tensor.DTensor
+        ):
+            if dtype is not None:
+                x = x.to(to_torch_dtype(dtype))
+            return x
         device = get_device()
         if x.device != device:
             if x.is_meta:

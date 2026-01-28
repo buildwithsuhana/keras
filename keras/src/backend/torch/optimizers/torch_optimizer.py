@@ -39,7 +39,30 @@ class TorchOptimizer(BaseOptimizer):
         if self.weight_decay is None:
             return
 
-        torch._foreach_mul_(
-            [v.value for v in variables if self._use_weight_decay(v)],
-            1 - self.weight_decay * self._get_current_learning_rate(),
-        )
+        vars_to_update = [
+            v.value for v in variables if self._use_weight_decay(v)
+        ]
+
+        dtensor_vars = []
+        regular_vars = []
+
+        if hasattr(torch.distributed, "tensor"):
+            for v in vars_to_update:
+                if isinstance(v, torch.distributed.tensor.DTensor):
+                    dtensor_vars.append(v)
+                else:
+                    regular_vars.append(v)
+        else:
+            regular_vars = vars_to_update
+
+        if regular_vars:
+            torch._foreach_mul_(
+                regular_vars,
+                1 - self.weight_decay * self._get_current_learning_rate(),
+            )
+
+        if dtensor_vars:
+            decay_factor = 1 - self.weight_decay * self._get_current_learning_rate()
+            for v in dtensor_vars:
+                if hasattr(v, "_local_tensor"):
+                    v._local_tensor.mul_(decay_factor)
