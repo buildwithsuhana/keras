@@ -4,6 +4,8 @@ import re
 import torch
 import torch.distributed as dist
 
+from keras.src.backend.torch.distribution_logger import get_logger
+
 
 def list_devices(device_type=None):
     """Return all available devices based on the device type.
@@ -249,6 +251,9 @@ def distribute_tensor(tensor, layout):
         For sharded tensors, returns a DTensor. For non-sharded tensors
         or when no sharding is specified, returns the original tensor.
     """
+    logger = get_logger()
+    rank = _get_current_rank()
+    
     from keras.src.distribution import TensorLayout
 
     if isinstance(layout, TensorLayout):
@@ -261,6 +266,8 @@ def distribute_tensor(tensor, layout):
         backend_layout = layout
 
     if backend_layout is None:
+        logger.debug(f"distribute_tensor: No layout specified, returning original tensor "
+                    f"shape={tensor.shape}", rank)
         return tensor
 
     if hasattr(backend_layout, "axes"):
@@ -277,12 +284,19 @@ def distribute_tensor(tensor, layout):
 
     sharding_axes = [ax for ax in axes if ax is not None]
     if not sharding_axes:
+        logger.debug(f"distribute_tensor: No sharding axes specified, returning original tensor "
+                    f"shape={tensor.shape}", rank)
         return tensor
+
+    logger.info(f"distribute_tensor: Starting tensor distribution - "
+                f"tensor_shape={tensor.shape}, sharding_axes={sharding_axes}, "
+                f"device_mesh_shape={device_mesh.shape if device_mesh else None}", rank)
 
     if _is_dtensor_available():
         from torch.distributed.tensor import DTensor
 
         if isinstance(tensor, DTensor):
+            logger.debug(f"distribute_tensor: Tensor is already a DTensor, returning as-is", rank)
             return tensor
 
         dtensor_mesh = _to_dtensor_mesh(device_mesh)
@@ -290,7 +304,11 @@ def distribute_tensor(tensor, layout):
 
         from torch.distributed.tensor import distribute_tensor as dtensor_dist
 
-        return dtensor_dist(tensor, dtensor_mesh, placements)
+        result = dtensor_dist(tensor, dtensor_mesh, placements)
+        logger.info(f"distribute_tensor: Distributed tensor to DTensor - "
+                    f"original_shape={tensor.shape}, "
+                    f"placements={[str(p) for p in placements]}", rank)
+        return result
     else:
         first_sharding_axis = sharding_axes[0]
 
@@ -306,13 +324,23 @@ def distribute_tensor(tensor, layout):
                         result = list(
                             torch.split(tensor, shard_size, dim=axis_idx)
                         )
+                        logger.info(f"distribute_tensor: Sharded tensor evenly - "
+                                    f"original_shape={tensor.shape}, "
+                                    f"shard_size={shard_size}, "
+                                    f"num_shards={len(result)}, "
+                                    f"axis={axis_idx}", rank)
                         return result
                     else:
                         result = list(
                             torch.chunk(tensor, mesh_dim, dim=axis_idx)
                         )
+                        logger.info(f"distribute_tensor: Chunked tensor unevenly - "
+                                    f"original_shape={tensor.shape}, "
+                                    f"num_chunks={len(result)}, "
+                                    f"axis={axis_idx}", rank)
                         return result
 
+        logger.debug(f"distribute_tensor: No sharding applied, returning original tensor", rank)
         return tensor
 
 
@@ -328,6 +356,9 @@ def distribute_variable(value, layout):
         The distributed variable. Returns DTensor if sharding is needed,
         otherwise returns the variable on the current device.
     """
+    logger = get_logger()
+    rank = _get_current_rank()
+    
     from keras.src.distribution import TensorLayout
 
     if isinstance(layout, TensorLayout):
@@ -349,12 +380,18 @@ def distribute_variable(value, layout):
         current_device = _get_current_device()
         if value.device != current_device:
             value = value.to(current_device)
+        logger.debug(f"distribute_variable: No sharding needed, moved to device - "
+                    f"shape={value.shape}, device={current_device}", rank)
         return value
+
+    logger.info(f"distribute_variable: Starting variable distribution - "
+                f"shape={value.shape}, axes={axes}", rank)
 
     if _is_dtensor_available():
         from torch.distributed.tensor import DTensor
 
         if isinstance(value, DTensor):
+            logger.debug(f"distribute_variable: Variable is already a DTensor", rank)
             return value
 
         device_mesh = getattr(backend_layout, "device_mesh", None)
@@ -368,11 +405,15 @@ def distribute_variable(value, layout):
         sharded_value._distributed_layout = backend_layout
         sharded_value._is_sharded = True
 
+        logger.info(f"distribute_variable: Distributed variable to DTensor - "
+                    f"original_shape={value.shape}, "
+                    f"placements={[str(p) for p in placements]}", rank)
         return sharded_value
     else:
         current_device = _get_current_device()
         if value.device.type in ("cuda", "mps"):
             value = value.cpu()
+            logger.debug(f"distribute_variable: Moved variable to CPU for sharding", rank)
 
         sharded_value = _shard_tensor(
             value,
@@ -388,6 +429,10 @@ def distribute_variable(value, layout):
         )[0]
         sharded_value._is_sharded = True
 
+        logger.info(f"distribute_variable: Sharded variable - "
+                    f"original_shape={value.shape}, "
+                    f"sharded_shape={sharded_value.shape}, "
+                    f"sharding_axis={sharded_value._sharding_axis}", rank)
         return sharded_value
 
 
@@ -407,6 +452,8 @@ def _shard_tensor(tensor, layout, rank=None, device=None):
     Returns:
         The sharded tensor portion for the current rank and device.
     """
+    logger = get_logger()
+    
     if rank is None:
         rank = _get_current_rank()
     if device is None:
@@ -418,6 +465,7 @@ def _shard_tensor(tensor, layout, rank=None, device=None):
         backend_layout = layout
 
     if backend_layout is None:
+        logger.debug(f"_shard_tensor: No layout, returning original tensor", rank)
         return tensor
 
     axes = getattr(backend_layout, "axes", None)
@@ -437,6 +485,7 @@ def _shard_tensor(tensor, layout, rank=None, device=None):
 
     sharding_axes = [ax for ax in axes if ax is not None]
     if not sharding_axes:
+        logger.debug(f"_shard_tensor: No sharding axes, returning original tensor", rank)
         return tensor
 
     first_sharding_axis = sharding_axes[0]
@@ -458,17 +507,28 @@ def _shard_tensor(tensor, layout, rank=None, device=None):
             shards = list(
                 torch.split(tensor, shard_size, dim=first_sharding_axis)
             )
+            logger.info(f"_shard_tensor: Even sharding - "
+                        f"tensor_shape={tensor.shape}, shard_size={shard_size}, "
+                        f"num_shards={len(shards)}, axis={first_sharding_axis}, "
+                        f"mesh_dim={mesh_dim_size}", rank)
         else:
             shards = list(
                 torch.chunk(tensor, mesh_dim_size, dim=first_sharding_axis)
             )
+            logger.info(f"_shard_tensor: Uneven chunking - "
+                        f"tensor_shape={tensor.shape}, num_chunks={len(shards)}, "
+                        f"axis={first_sharding_axis}, mesh_dim={mesh_dim_size}", rank)
 
         shard = shards[rank % len(shards)]
 
         shard = shard.to(device)
 
+        logger.debug(f"_shard_tensor: Selected shard for rank {rank} - "
+                    f"shard_index={rank % len(shards)}, shard_shape={shard.shape}", rank)
         return shard
     else:
+        logger.debug(f"_shard_tensor: No sharding needed (mesh_dim={mesh_dim_size}, "
+                    f"dim_size={dim_size}), returning original tensor", rank)
         return tensor
 
 
@@ -483,28 +543,41 @@ def all_gather_variable(variable):
         The full gathered tensor if variable is sharded and distributed
             is initialized. Otherwise, returns the variable unchanged.
     """
+    logger = get_logger()
+    rank = _get_current_rank()
+    
     if hasattr(variable, "_is_sharded") and variable._is_sharded:
         if _is_dtensor_available():
             from torch.distributed.tensor import DTensor
 
             if isinstance(variable, DTensor):
+                logger.debug(f"all_gather_variable: Gathering DTensor full tensor", rank)
                 return variable.full_tensor()
 
     if not getattr(variable, "_is_sharded", False):
+        logger.debug(f"all_gather_variable: Variable not sharded, returning as-is", rank)
         return variable
 
     if not dist.is_initialized():
+        logger.debug(f"all_gather_variable: Distributed not initialized, returning as-is", rank)
         return variable
 
     full_shape = getattr(variable, "_full_shape", None)
     sharding_axis = getattr(variable, "_sharding_axis", 0)
 
     if full_shape is None:
+        logger.debug(f"all_gather_variable: No full_shape found, returning as-is", rank)
         return variable
+
+    logger.info(f"all_gather_variable: Starting gather - "
+                f"local_shape={variable.shape}, full_shape={full_shape}, "
+                f"sharding_axis={sharding_axis}, world_size={dist.get_world_size()}", rank)
 
     local_shard = variable
     if local_shard.device.type in ("cuda", "mps"):
         local_shard = local_shard.cpu()
+        logger.debug(f"all_gather_variable: Moved local shard to CPU", rank)
+        
     if not isinstance(local_shard, (list, tuple)):
         local_shard = [local_shard]
 
@@ -517,6 +590,8 @@ def all_gather_variable(variable):
     current_device = _get_current_device()
     gathered = gathered.to(current_device)
 
+    logger.info(f"all_gather_variable: Gather complete - "
+                f"gathered_shape={gathered.shape}, original_full_shape={full_shape}", rank)
     return gathered
 
 
@@ -533,9 +608,13 @@ def distribute_data_input(per_process_batch, layout, batch_dim_name):
         The distributed input data. For tuples/lists, applies distribution
             recursively to each element. Returns the input unchanged otherwise.
     """
+    logger = get_logger()
+    rank = _get_current_rank()
+    
     from keras.src.distribution import TensorLayout
 
     if isinstance(per_process_batch, (tuple, list)):
+        logger.debug(f"distribute_data_input: Recursively distributing batch tuple/list", rank)
         result = type(per_process_batch)(
             distribute_data_input(x, layout, batch_dim_name)
             for x in per_process_batch
@@ -543,6 +622,7 @@ def distribute_data_input(per_process_batch, layout, batch_dim_name):
         return result
 
     if layout is None:
+        logger.debug(f"distribute_data_input: No layout specified, returning batch as-is", rank)
         return per_process_batch
 
     if isinstance(layout, TensorLayout):
@@ -555,28 +635,38 @@ def distribute_data_input(per_process_batch, layout, batch_dim_name):
         backend_layout = layout
 
     if backend_layout is None:
+        logger.debug(f"distribute_data_input: No backend_layout, returning batch as-is", rank)
         return per_process_batch
 
     if not _is_dtensor_available():
+        logger.debug(f"distribute_data_input: DTensor not available, returning batch as-is", rank)
         return per_process_batch
 
     from torch.distributed.tensor import DTensor
 
     if isinstance(per_process_batch, DTensor):
+        logger.debug(f"distribute_data_input: Batch is already a DTensor, returning as-is", rank)
         return per_process_batch
 
     axes = getattr(backend_layout, "axes", [])
     device_mesh = getattr(backend_layout, "device_mesh", None)
 
     if device_mesh is None or axes is None:
+        logger.debug(f"distribute_data_input: No device_mesh or axes, returning batch as-is", rank)
         return per_process_batch
+
+    logger.info(f"distribute_data_input: Distributing input data - "
+                f"batch_shape={per_process_batch.shape}, axes={axes}, "
+                f"batch_dim_name={batch_dim_name}", rank)
 
     dtensor_mesh = _to_dtensor_mesh(device_mesh)
     placements = _to_dtensor_placements(axes, device_mesh)
 
     from torch.distributed.tensor import distribute_tensor as dtensor_dist
 
-    return dtensor_dist(per_process_batch, dtensor_mesh, placements)
+    result = dtensor_dist(per_process_batch, dtensor_mesh, placements)
+    logger.debug(f"distribute_data_input: Distributed batch to DTensor", rank)
+    return result
 
 
 def initialize(job_addresses=None, num_processes=None, process_id=None):
@@ -602,6 +692,8 @@ def initialize(job_addresses=None, num_processes=None, process_id=None):
     Raises:
         RuntimeError: If CUDA is requested but not available.
     """
+    logger = get_logger()
+    
     if (
         job_addresses is None
         and "KERAS_DISTRIBUTION_JOB_ADDRESSES" in os.environ
@@ -616,7 +708,12 @@ def initialize(job_addresses=None, num_processes=None, process_id=None):
         process_id = int(os.environ["KERAS_DISTRIBUTION_PROCESS_ID"])
 
     if num_processes is None or num_processes <= 1:
+        logger.debug("initialize: Single process mode, skipping distributed initialization")
         return
+
+    logger.info(f"initialize: Starting distributed initialization - "
+                f"job_addresses={job_addresses}, num_processes={num_processes}, "
+                f"process_id={process_id}")
 
     if job_addresses and "," in job_addresses:
         job_addresses = job_addresses.split(",")
@@ -638,6 +735,10 @@ def initialize(job_addresses=None, num_processes=None, process_id=None):
 
     if not dist.is_initialized():
         backend = "nccl" if torch.cuda.is_available() else "gloo"
+        
+        logger.info(f"initialize: Initializing process group with backend={backend}, "
+                    f"rank={process_id if process_id is not None else 0}, "
+                    f"world_size={num_processes}")
 
         dist.init_process_group(
             backend=backend,
@@ -645,6 +746,9 @@ def initialize(job_addresses=None, num_processes=None, process_id=None):
             rank=process_id if process_id is not None else 0,
             world_size=num_processes,
         )
+        
+        logger.info(f"initialize: Distributed initialization complete - "
+                    f"rank={dist.get_rank()}, world_size={dist.get_world_size()}")
 
 
 def num_processes():
@@ -724,8 +828,16 @@ def all_reduce(tensor, op="sum", axis_name="model"):
     Returns:
         The reduced tensor.
     """
+    logger = get_logger()
+    rank = _get_current_rank()
+    
     if not dist.is_initialized():
+        logger.debug(f"all_reduce: Distributed not initialized, returning tensor as-is", rank)
         return tensor
+
+    logger.info(f"all_reduce: Starting reduce operation - "
+                f"tensor_shape={tensor.shape}, op={op}, axis_name={axis_name}, "
+                f"world_size={dist.get_world_size()}", rank)
 
     if op == "sum":
         reduce_op = dist.ReduceOp.SUM
@@ -740,6 +852,7 @@ def all_reduce(tensor, op="sum", axis_name="model"):
 
     dist.all_reduce(tensor, reduce_op)
 
+    logger.debug(f"all_reduce: Reduce complete", rank)
     return tensor
 
 
@@ -761,18 +874,31 @@ def all_gather(tensor, axis=0, axis_name="model"):
     Returns:
         The full, gathered tensor with all shards concatenated along the axis.
     """
+    logger = get_logger()
+    rank = _get_current_rank()
+    
     if not dist.is_initialized():
+        logger.debug(f"all_gather: Distributed not initialized, returning tensor as-is", rank)
         return tensor
 
     world_size = dist.get_world_size()
 
     if world_size == 1:
+        logger.debug(f"all_gather: Single process, returning tensor as-is", rank)
         return tensor
+
+    logger.info(f"all_gather: Starting gather operation - "
+                f"tensor_shape={tensor.shape}, axis={axis}, axis_name={axis_name}, "
+                f"world_size={world_size}", rank)
 
     tensor_list = [torch.zeros_like(tensor) for _ in range(world_size)]
     dist.all_gather(tensor_list, tensor)
 
     result = torch.cat(tensor_list, dim=axis)
+
+    logger.info(f"all_gather: Gather complete - "
+                f"local_shape={tensor.shape}, gathered_shape={result.shape}, "
+                f"concat_axis={axis}", rank)
     return result
 
 
@@ -787,14 +913,24 @@ def broadcast(tensor, src=0):
     Returns:
         The broadcast tensor on all devices.
     """
+    logger = get_logger()
+    rank = _get_current_rank()
+    
     if not dist.is_initialized():
+        logger.debug(f"broadcast: Distributed not initialized, returning tensor as-is", rank)
         return tensor
 
-    rank = dist.get_rank()
+    logger.info(f"broadcast: Starting broadcast - "
+                f"tensor_shape={tensor.shape}, src={src}, "
+                f"current_rank={dist.get_rank()}", rank)
 
-    if rank != src:
+    current_rank = dist.get_rank()
+
+    if current_rank != src:
         tensor = torch.zeros_like(tensor)
+        logger.debug(f"broadcast: Non-source rank {current_rank}, zeroing tensor", rank)
 
     dist.broadcast(tensor, src=src)
 
+    logger.debug(f"broadcast: Broadcast complete", rank)
     return tensor
