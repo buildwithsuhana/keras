@@ -792,6 +792,10 @@ class LayoutMap(collections.abc.MutableMapping):
     layout_8 = layout_map['my_model/conv3d_1/bias']     # layout_8 == None
     ```
 
+    For PyTorch backend, the adapter automatically converts Keras-style paths
+    (using `/` separators) to PyTorch-style paths (using `.` separators).
+    This allows Keras regex patterns to work with PyTorch parameter naming.
+
     Args:
         device_mesh: `keras.distribution.DeviceMesh` instance.
     """
@@ -800,6 +804,17 @@ class LayoutMap(collections.abc.MutableMapping):
         self._layout_map = collections.OrderedDict()
         self._device_mesh = device_mesh
 
+    def _get_path_adapter(self):
+        """Get the path adapter for the current backend if available."""
+        try:
+            from keras.src.backend import config
+            if config.backend() == "torch":
+                from keras.src.backend.torch.distribution_lib import TorchPathAdapter
+                return TorchPathAdapter
+        except ImportError:
+            pass
+        return None
+
     def __getitem__(self, key):
         """Retrieves the corresponding layout by the string key.
 
@@ -807,6 +822,9 @@ class LayoutMap(collections.abc.MutableMapping):
         will be treated as a regex and map against the input key again. When
         there are multiple matches for the regex, an `ValueError` will be
         raised. Returns `None` if there isn't any match found.
+
+        For PyTorch backend, the lookup also tries converting the key to
+        PyTorch-style paths (with `.` separators) and matching against those.
 
         Args:
             key: String key to query a layout.
@@ -817,19 +835,29 @@ class LayoutMap(collections.abc.MutableMapping):
         if key in self._layout_map:
             return self._layout_map[key]
 
+        # Get path adapter for PyTorch backend
+        path_adapter = self._get_path_adapter()
+        
         matching_keys = []
         for k in self._layout_map:
+            # Try matching with original key (Keras style)
             if re.search(k, key):
-                matching_keys.append(k)
+                matching_keys.append((k, "keras"))
+            # If PyTorch backend and key differs from original, also try PyTorch path
+            elif path_adapter is not None:
+                torch_key = path_adapter.keras_to_torch(key)
+                if torch_key != key and re.search(k, torch_key):
+                    matching_keys.append((k, "torch"))
+        
         if len(matching_keys) > 1:
             raise ValueError(
                 f"Path '{key}' matches multiple layout "
-                f"specification keys: {matching_keys}. Please make "
+                f"specification keys: {[k[0] for k in matching_keys]}. Please make "
                 "sure each tensor/variable path only matches at most "
                 "one layout specification key in the LayoutMap."
             )
         elif len(matching_keys) == 1:
-            return self._layout_map[matching_keys[0]]
+            return self._layout_map[matching_keys[0][0]]
         return None
 
     def __setitem__(self, key, layout):
