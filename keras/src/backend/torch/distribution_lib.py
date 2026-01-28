@@ -43,13 +43,56 @@ def _to_backend_mesh(device_mesh):
     )
     
     if is_distributed:
-        # In distributed mode, each process should only use its local device
-        # to avoid "Duplicate GPU detected" errors
-        # The mesh shape (1,) indicates a single device per process
+        # In distributed mode, each process should only use its local devices
+        # to avoid "Duplicate GPU detected" errors.
+        #
+        # In PyTorch DTensor, each process creates its own device mesh that
+        # represents only the devices available to that process.
+        # When using torch.distributed.run or similar launchers, each process
+        # typically runs on a specific GPU (local_rank).
+        #
+        # For multi-dimensional Keras meshes, we handle them as follows:
+        # - The first axis (typically batch/data parallel) is split across processes
+        # - Other axes (model parallel) remain local to each process
+        #
+        # Example: (2, 4) mesh with 2 processes and 4 GPUs per process:
+        # - Process 0 gets shape (4,) with devices [cuda:0,1,2,3]
+        # - Process 1 gets shape (4,) with devices [cuda:4,5,6,7]
+        
+        # Get world size and current rank to determine process index
+        world_size_int = int(world_size)
+        
+        # Determine the local device count per process
+        # This is calculated based on the global mesh shape and world size
+        # Assuming the first axis is split across processes
+        global_shape = device_mesh.shape
+        if len(global_shape) > 1:
+            # Multi-dimensional mesh: split first axis across processes
+            # Keep other axes local to each process
+            local_shape = list(global_shape[1:])  # Other dimensions remain local
+            # First dimension is split - calculate local devices per process
+            dim_per_process = global_shape[0] // world_size_int
+            if dim_per_process > 0:
+                local_shape.insert(0, dim_per_process)
+            else:
+                # If first dimension doesn't divide evenly, each process gets 1
+                local_shape.insert(0, 1)
+        else:
+            # Single-dimensional mesh: each process gets 1 device
+            local_shape = [1]
+        
+        # Get the corresponding axis names
+        # For multi-dimensional meshes, use all axis names
+        # But adjust for the split first axis
+        if device_mesh.axis_names:
+            local_axis_names = list(device_mesh.axis_names)
+        else:
+            local_axis_names = None
+        
         return init_device_mesh(
             device_type,
-            (1,),
-            mesh_dim_names=device_mesh.axis_names
+            tuple(local_shape),
+            mesh_dim_names=local_axis_names
         )
     
     return init_device_mesh(
