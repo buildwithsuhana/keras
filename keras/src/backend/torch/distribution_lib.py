@@ -45,17 +45,11 @@ def _to_backend_mesh(device_mesh):
     if is_distributed:
         # In distributed mode, each process should only use its local device
         # to avoid "Duplicate GPU detected" errors
-        local_rank_int = int(local_rank)
-        if torch.cuda.is_available():
-            local_device = f"cuda:{local_rank_int}"
-        else:
-            local_device = "cpu"
-        
+        # The mesh shape (1,) indicates a single device per process
         return init_device_mesh(
             device_type,
             (1,),
-            mesh_dim_names=device_mesh.axis_names,
-            devices=[local_device]
+            mesh_dim_names=device_mesh.axis_names
         )
     
     return init_device_mesh(
