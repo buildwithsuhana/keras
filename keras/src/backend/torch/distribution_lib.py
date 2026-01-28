@@ -448,14 +448,14 @@ def initialize(job_addresses=None, num_processes=None, process_id=None):
 
 def num_processes():
     """Return the number of processes for the current distribution setting."""
-    if not dist.is_available():
+    if not dist.is_available() or not dist.is_initialized():
         return 1
     return dist.get_world_size()
 
 
 def process_id():
     """Return the current process ID for the distribution setting."""
-    if not dist.is_available():
+    if not dist.is_available() or not dist.is_initialized():
         return 0
     return dist.get_rank()
 
