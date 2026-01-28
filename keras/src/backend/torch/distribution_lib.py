@@ -21,8 +21,43 @@ def get_device_count(device_type=None):
     return 1
 
 def _to_backend_mesh(device_mesh):
-    """Convert Keras DeviceMesh to PyTorch DeviceMesh."""
+    """Convert Keras DeviceMesh to PyTorch DeviceMesh.
+    
+    In a distributed setting, each process should only see its local device
+    to avoid GPU conflicts. When running with torch.distributed.run or similar
+    launchers, each process has a LOCAL_RANK environment variable that indicates
+    which GPU it should use.
+    """
     device_type = "cuda" if torch.cuda.is_available() else "cpu"
+    
+    # Check if we're running in a distributed context
+    local_rank = os.environ.get("LOCAL_RANK")
+    rank = os.environ.get("RANK")
+    world_size = os.environ.get("WORLD_SIZE")
+    
+    is_distributed = (
+        local_rank is not None and 
+        rank is not None and 
+        world_size is not None and
+        int(world_size) > 1
+    )
+    
+    if is_distributed:
+        # In distributed mode, each process should only use its local device
+        # to avoid "Duplicate GPU detected" errors
+        local_rank_int = int(local_rank)
+        if torch.cuda.is_available():
+            local_device = f"cuda:{local_rank_int}"
+        else:
+            local_device = "cpu"
+        
+        return init_device_mesh(
+            device_type,
+            (1,),
+            mesh_dim_names=device_mesh.axis_names,
+            devices=[local_device]
+        )
+    
     return init_device_mesh(
         device_type, 
         device_mesh.shape, 
