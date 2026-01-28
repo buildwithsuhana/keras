@@ -54,6 +54,5 @@ from keras.src.backend.torch.distribution_lib import num_processes
 from keras.src.backend.torch.distribution_lib import process_id
 from keras.src.backend.torch.distribution_lib import _to_backend_mesh
 from keras.src.backend.torch.distribution_lib import _to_backend_layout
-from keras.src.backend.torch.distribution_lib import ModelParallel
 from keras.src.backend.torch.distribution_lib import set_global_device_mesh
 from keras.src.backend.torch.distribution_lib import get_global_device_mesh
