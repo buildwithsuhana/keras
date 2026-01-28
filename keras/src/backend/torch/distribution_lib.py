@@ -389,6 +389,35 @@ def _to_backend_mesh(device_mesh) -> torch.distributed.device_mesh.DeviceMesh:
     shape = device_mesh.shape
     axis_names = device_mesh.axis_names
 
+    # In multi-process PyTorch, each process only has access to its local GPU(s)
+    # We need to create a DeviceMesh that only includes the local devices
+    # to avoid "Duplicate GPU detected" errors
+    if dist.is_available() and dist.is_initialized() and torch.cuda.is_available():
+        # Get the number of local GPUs for this process
+        num_local_gpus = torch.cuda.device_count()
+
+        # Get the axis name for data parallelism (usually first axis)
+        if len(axis_names) > 0:
+            data_axis_name = axis_names[0]
+        else:
+            data_axis_name = "batch"
+
+        # Create a local mesh for this process
+        # Each process only sees its local GPUs
+        local_shape = (num_local_gpus,)
+
+        # Create PyTorch DeviceMesh with only local devices
+        # Note: In PyTorch DTensor, each rank only needs to know about its local devices
+        torch_mesh = init_device_mesh(
+            "cuda",
+            local_shape,
+            mesh_dim_names=(data_axis_name,),
+        )
+
+        _device_mesh_cache[cache_key] = torch_mesh
+        return torch_mesh
+
+    # For single-process or CPU case, use all devices
     # Convert device strings to actual devices
     devices = []
     for device_str in device_mesh.devices.flatten():
