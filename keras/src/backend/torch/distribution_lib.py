@@ -18,7 +18,7 @@ from typing import Dict, List, Optional, Tuple, Union
 import torch
 import torch.distributed as dist
 from torch.distributed.device_mesh import init_device_mesh
-from torch.distributed.tensor import distribute_tensor
+from torch.distributed.tensor import distribute_tensor as torch_distribute_tensor
 from torch.distributed.tensor.parallel import (
     ColwiseParallel,
     RowwiseParallel,
@@ -154,7 +154,7 @@ def distribute_variable(value: torch.Tensor, layout) -> torch.Tensor:
         placements = _tensor_layout_to_placements(layout)
 
     # Use DTensor to distribute the variable
-    return distribute_tensor(value, device_mesh, placements)
+    return torch_distribute_tensor(value, device_mesh, placements)
 
 
 def distribute_tensor(tensor: torch.Tensor, layout) -> torch.Tensor:
@@ -183,7 +183,7 @@ def distribute_tensor(tensor: torch.Tensor, layout) -> torch.Tensor:
         device_mesh = layout.device_mesh.backend_mesh
         placements = _tensor_layout_to_placements(layout)
 
-    return distribute_tensor(tensor, device_mesh, placements)
+    return torch_distribute_tensor(tensor, device_mesh, placements)
 
 
 def _tensor_layout_to_placements(layout) -> List[Placement]:
@@ -271,7 +271,7 @@ def distribute_data_input(
         device_mesh = layout.device_mesh.backend_mesh
         placements = _tensor_layout_to_placements(layout)
 
-    return distribute_tensor(per_process_batch, device_mesh, placements)
+    return torch_distribute_tensor(per_process_batch, device_mesh, placements)
 
 
 def initialize(
@@ -581,7 +581,7 @@ def get_sharded_tensor(
     Returns:
         A DTensor distributed according to the placements.
     """
-    return distribute_tensor(tensor, device_mesh, placements)
+    return torch_distribute_tensor(tensor, device_mesh, placements)
 
 
 def get_replicated_tensor(tensor: torch.Tensor, device_mesh) -> torch.Tensor:
@@ -594,7 +594,7 @@ def get_replicated_tensor(tensor: torch.Tensor, device_mesh) -> torch.Tensor:
     Returns:
         A replicated DTensor.
     """
-    return distribute_tensor(tensor, device_mesh, [Replicate()] * len(device_mesh.shape))
+    return torch_distribute_tensor(tensor, device_mesh, [Replicate()] * len(device_mesh.shape))
 
 
 # Model Parallelism Support
@@ -788,4 +788,3 @@ def cleanup_distributed() -> None:
 
     _distributed_initialized = False
     _device_mesh_cache = {}
-
