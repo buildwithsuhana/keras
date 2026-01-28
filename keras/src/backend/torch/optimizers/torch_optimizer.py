@@ -62,7 +62,9 @@ class TorchOptimizer(BaseOptimizer):
             )
 
         if dtensor_vars:
-            decay_factor = 1 - self.weight_decay * self._get_current_learning_rate()
+            decay_factor = (
+                1 - self.weight_decay * self._get_current_learning_rate()
+            )
             for v in dtensor_vars:
                 if hasattr(v, "_local_tensor"):
                     v._local_tensor.mul_(decay_factor)

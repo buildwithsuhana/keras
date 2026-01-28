@@ -148,7 +148,8 @@ def _to_dtensor_placements(axes, device_mesh):
     Returns:
         tuple: DTensor placements (Shard, Replicate, or Partial).
     """
-    from torch.distributed.tensor import Partial, Replicate, Shard
+    from torch.distributed.tensor import Replicate
+    from torch.distributed.tensor import Shard
 
     placements = []
     for axis in axes:
@@ -302,10 +303,14 @@ def distribute_tensor(tensor, layout):
                 if tensor.shape[axis_idx] >= mesh_dim:
                     if tensor.shape[axis_idx] % mesh_dim == 0:
                         shard_size = tensor.shape[axis_idx] // mesh_dim
-                        result = list(torch.split(tensor, shard_size, dim=axis_idx))
+                        result = list(
+                            torch.split(tensor, shard_size, dim=axis_idx)
+                        )
                         return result
                     else:
-                        result = list(torch.chunk(tensor, mesh_dim, dim=axis_idx))
+                        result = list(
+                            torch.chunk(tensor, mesh_dim, dim=axis_idx)
+                        )
                         return result
 
         return tensor
@@ -370,7 +375,10 @@ def distribute_variable(value, layout):
             value = value.cpu()
 
         sharded_value = _shard_tensor(
-            value, backend_layout, rank=_get_current_rank(), device=current_device
+            value,
+            backend_layout,
+            rank=_get_current_rank(),
+            device=current_device,
         )
 
         sharded_value._distributed_layout = backend_layout
@@ -752,8 +760,6 @@ def all_gather(tensor, axis=0, axis_name="model"):
 
     Returns:
         The full, gathered tensor with all shards concatenated along the axis.
-        Returns the original tensor if distributed is not initialized
-        or world_size is 1.
     """
     if not dist.is_initialized():
         return tensor
