@@ -46,6 +46,15 @@ _distributed_initialized = False
 _device_mesh_cache = {}
 
 
+def _is_multi_process_mode():
+    """Check if we're in multi-process distributed mode."""
+    return (
+        dist.is_available()
+        and dist.is_initialized()
+        and dist.get_world_size() > 1
+    )
+
+
 def list_devices(device_type: Optional[str] = None) -> List[str]:
     """Return all available devices based on device type.
 
@@ -68,8 +77,7 @@ def list_devices(device_type: Optional[str] = None) -> List[str]:
             devices.extend([f"cuda:{i}" for i in range(num_gpus)])
     elif device_type == "cpu":
         # For CPU, we need distributed context
-        if dist.is_available() and dist.is_initialized():
-            local_rank = dist.get_rank()
+        if _is_multi_process_mode():
             num_procs = dist.get_world_size()
             for i in range(num_procs):
                 devices.append(f"cpu:{i}")
@@ -79,7 +87,6 @@ def list_devices(device_type: Optional[str] = None) -> List[str]:
 
     if device_type == "tpu":
         # PyTorch doesn't have native TPU support like JAX
-        # Could potentially integrate with libtpu in the future
         pass
 
     # If no devices found and device_type was specified, return empty list
@@ -114,12 +121,11 @@ def get_device_count(device_type: Optional[str] = None) -> int:
             return torch.xpu.device_count()
 
     if device_type == "cpu":
-        if dist.is_available() and dist.is_initialized():
+        if _is_multi_process_mode():
             return dist.get_world_size()
         return 1
 
     if device_type == "tpu":
-        # TPU support would require additional integration
         return 0
 
     return 0
@@ -143,6 +149,11 @@ def distribute_variable(value: torch.Tensor, layout) -> torch.Tensor:
     from keras.src.distribution import TensorLayout
 
     if layout is None:
+        return value
+
+    # In multi-process mode, skip DTensor distribution
+    # Each process creates variables locally and uses DDP for gradient sync
+    if _is_multi_process_mode():
         return value
 
     if isinstance(layout, TensorLayout):
@@ -176,6 +187,11 @@ def distribute_tensor(tensor: torch.Tensor, layout) -> torch.Tensor:
     if layout is None:
         return tensor
 
+    # In multi-process mode, skip DTensor distribution
+    # Each process handles tensors locally
+    if _is_multi_process_mode():
+        return tensor
+
     if isinstance(layout, TensorLayout):
         device_mesh = layout.device_mesh.backend_mesh
         placements = _tensor_layout_to_placements(layout)
@@ -206,7 +222,6 @@ def _tensor_layout_to_placements(layout) -> List[Placement]:
                 placements.append(Shard(0))
             elif axis_lower == "model":
                 # For model parallelism, use Shard on appropriate dim
-                # The actual dimension depends on the variable shape
                 placements.append(Shard(-1))
             elif axis_lower == "data":
                 placements.append(Shard(0))
@@ -263,6 +278,9 @@ def distribute_data_input(
     """
     # Avoid circular imports
     from keras.src.distribution import TensorLayout
+
+    if _is_multi_process_mode():
+        return per_process_batch
 
     if isinstance(layout, TensorLayout):
         device_mesh = layout.device_mesh.backend_mesh
@@ -341,14 +359,14 @@ def initialize(
 
 def num_processes() -> int:
     """Return the number of processes for the current distribution setting."""
-    if dist.is_available() and dist.is_initialized():
+    if _is_multi_process_mode():
         return dist.get_world_size()
     return 1
 
 
 def process_id() -> int:
     """Return the current process ID for the distribution setting."""
-    if dist.is_available() and dist.is_initialized():
+    if _is_multi_process_mode():
         return dist.get_rank()
     return 0
 
@@ -392,7 +410,7 @@ def _to_backend_mesh(device_mesh) -> torch.distributed.device_mesh.DeviceMesh:
     # In multi-process PyTorch, each process only has access to its local GPU(s)
     # We need to create a DeviceMesh that only includes the local devices
     # to avoid "Duplicate GPU detected" errors
-    if dist.is_available() and dist.is_initialized() and torch.cuda.is_available():
+    if _is_multi_process_mode() and torch.cuda.is_available():
         # Get the number of local GPUs for this process
         num_local_gpus = torch.cuda.device_count()
 
@@ -511,13 +529,16 @@ class TorchPathAdapter:
         # Handle wildcards
         if "*" in keras_path:
             # Replace * with regex pattern that matches both formats
-            # e.g., 'dense.*kernel' -> 'dense\\..*(weight|kernel)'
             pattern = keras_path.replace(".", "\\.")
             for torch_name, keras_names in TorchPathAdapter.PARAM_NAME_MAPPINGS.items():
                 for keras_name in keras_names:
                     if keras_name in pattern:
                         # Create regex that matches both
-                        alternatives = "|".join(TorchPathAdapter.PARAM_NAME_MAPPINGS.get(torch_name, [torch_name]))
+                        alternatives = "|".join(
+                            TorchPathAdapter.PARAM_NAME_MAPPINGS.get(
+                                torch_name, [torch_name]
+                            )
+                        )
                         pattern = pattern.replace(
                             f"*{keras_name}",
                             f"\\.({alternatives})"
@@ -526,7 +547,6 @@ class TorchPathAdapter:
             return pattern
 
         # Direct path conversion without wildcards
-        # e.g., 'dense/kernel' -> 'dense.weight'
         if len(parts) >= 2:
             # Use the first alternative for direct mapping
             torch_param = TorchPathAdapter._convert_param_name(parts[-1])
@@ -623,7 +643,9 @@ def get_replicated_tensor(tensor: torch.Tensor, device_mesh) -> torch.Tensor:
     Returns:
         A replicated DTensor.
     """
-    return torch_distribute_tensor(tensor, device_mesh, [Replicate()] * len(device_mesh.shape))
+    return torch_distribute_tensor(
+        tensor, device_mesh, [Replicate()] * len(device_mesh.shape)
+    )
 
 
 # Model Parallelism Support
@@ -661,24 +683,18 @@ def infer_parallel_style(
     # Check if module is a Linear layer
     if isinstance(module, torch.nn.Linear):
         # Case A: Sharding the 2nd dim of the weight (Output Features)
-        # Keras: (None, 'model') implies Input is replicated, Output is sharded
         if model_axis == 1:
             return "colwise"
 
         # Case B: Sharding the 1st dim of the weight (Input Features)
-        # Keras: ('model', None) implies Input is sharded, Output is replicated
         elif model_axis == 0:
             return "rowwise"
 
     # For Conv2D, similar logic applies to weight dimensions
     if isinstance(module, torch.nn.Conv2d):
-        # Conv2D weight shape: (out_channels, in_channels, height, width)
-        # Keras spec targets the WEIGHT dimensions
         if model_axis == 0:
-            # Sharding output channels
             return "colwise"
         elif model_axis == 1:
-            # Sharding input channels
             return "rowwise"
 
     return None
@@ -739,13 +755,10 @@ def apply_tensor_parallelism(
                     module = parallelize_module(
                         module,
                         device_mesh,
-                        {
-                            param_name: parallel_style_fn
-                        }
+                        {param_name: parallel_style_fn}
                     )
                 except Exception:
                     # Parallelization may fail for some modules
-                    # Fall back to non-parallelized version
                     pass
 
         return module
@@ -791,7 +804,6 @@ def distribute_dataset(
     )
 
     # Determine batch size per replica
-    # This should match the global batch size divided by number of replicas
     batch_size = getattr(dataset, "batch_size", 32)
     batch_size_per_replica = max(1, batch_size // num_replicas)
 
@@ -800,7 +812,7 @@ def distribute_dataset(
         dataset,
         sampler=sampler,
         batch_size=batch_size_per_replica,
-        shuffle=False,  # Sampler handles shuffling
+        shuffle=False,
         pin_memory=torch.cuda.is_available(),
         drop_last=False,
     )
