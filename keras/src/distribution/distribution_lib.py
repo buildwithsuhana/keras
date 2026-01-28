@@ -690,8 +690,10 @@ class ModelParallel(Distribution):
         # First check if the variable already has a layout assigned.
         if getattr(variable, "_layout", None) is not None:
             return variable._layout
-        # Check the layout map.
-        variable_layout = self._layout_map[variable.path]
+        
+        path = variable.path.replace("/", ".")
+        
+        variable_layout = self._layout_map[path]
         if variable_layout is not None:
             return variable_layout
         variable_shard_spec = [None] * len(variable.shape)
@@ -858,10 +860,12 @@ class LayoutMap(collections.abc.MutableMapping):
         """
         if key in self._layout_map:
             return self._layout_map[key]
+        
+        normalized_key = key.replace("/", ".")
 
         matching_keys = []
         for k in self._layout_map:
-            if re.search(k, key):
+            if re.search(k, normalized_key):
                 matching_keys.append(k)
         if len(matching_keys) > 1:
             raise ValueError(

@@ -107,10 +107,18 @@ class Variable(KerasVariable):
             # Reuse same parameter
             self._value = value
         else:
-            self._value = torch.nn.Parameter(
-                convert_to_tensor(value, dtype=self._dtype),
-                requires_grad=self.trainable,
-            ).to(get_device())
+            t = convert_to_tensor(value, dtype=self._dtype)
+            from keras.src.distribution import distribution_lib as dist_lib
+            current_dist = dist_lib.distribution()
+            
+            if current_dist is not None:
+                layout = current_dist.get_variable_layout(self)
+                t = dist_lib.distribute_tensor(t, layout)
+            
+            if not hasattr(t, "device_mesh"):
+                t = t.to(get_device())
+                
+            self._value = torch.nn.Parameter(t, requires_grad=self.trainable)
 
     def _direct_assign(self, value):
         with torch.no_grad():
@@ -197,6 +205,10 @@ def convert_to_tensor(x, dtype=None, sparse=None, ragged=None):
     if isinstance(x, Variable) or is_tensor(x):
         if isinstance(x, Variable):
             x = x.value
+        if hasattr(x, "device_mesh"):
+            if dtype is not None:
+                x = x.to(to_torch_dtype(dtype))
+            return x
         device = get_device()
         if x.device != device:
             if x.is_meta:

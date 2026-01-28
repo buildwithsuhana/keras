@@ -1,6 +1,8 @@
 import torch
+from torch.distributed.tensor.parallel import parallelize_module
 
 from keras.src.backend.common.stateless_scope import in_stateless_scope
+from keras.src.distribution import distribution_lib
 from keras.src.ops.operation import Operation
 
 
@@ -18,11 +20,20 @@ class TorchLayer(torch.nn.Module):
             return
         self._track_variables()
 
+        current_dist = distribution_lib.distribution()
+        if isinstance(current_dist, distribution_lib.ModelParallel):
+            parallelize_module(
+                self,
+                device_mesh=current_dist.device_mesh.backend_mesh,
+                parallelize_plan=current_dist._layout_map,
+            )
+
     def _track_variables(self):
         # set torch_params attribute will have module automatically track
         # parameters.
         self._torch_params = torch.nn.ParameterDict(
-            {variable.path: variable.value for variable in self.variables}
+            {variable.path.replace("/", "."): variable.value 
+             for variable in self.variables}
         )
 
     def named_parameters(
@@ -56,10 +67,12 @@ class TorchLayer(torch.nn.Module):
 
     def _post_track_variable(self, variable):
         if hasattr(self, "_torch_params"):
-            if variable.path not in self.torch_params:
-                self.torch_params[variable.path] = variable.value
+            path = variable.path.replace("/", ".")
+            if path not in self.torch_params:
+                self.torch_params[path] = variable.value
 
     def _post_untrack_variable(self, variable):
         if hasattr(self, "_torch_params"):
-            if variable.path in self.torch_params:
-                self.torch_params.pop(variable.path)
+            path = variable.path.replace("/", ".")
+            if path in self.torch_params:
+                self.torch_params.pop(path)
