@@ -75,13 +75,17 @@ def initialize(job_addresses=None, num_processes=None, process_id=None):
     if job_addresses:
         coordinator_address = job_addresses.split(",")[0]
         os.environ["MASTER_ADDR"] = coordinator_address.split(":")[0]
-        os.environ["MASTER_PORT"] = "29500"
+        os.environ["MASTER_PORT"] = os.environ.get("MASTER_PORT", "29500")
+
+    if torch.cuda.is_available():
+        local_rank = int(os.environ.get("LOCAL_RANK", 0))
+        torch.cuda.set_device(local_rank)
 
     if not dist.is_initialized():
         backend = "nccl" if torch.cuda.is_available() else "gloo"
         dist.init_process_group(
             backend=backend,
-            rank=process_id if process_id is not None else 0,
+            rank=process_id if process_id is not None else int(os.environ.get("RANK", 0)),
             world_size=num_processes,
         )
 
