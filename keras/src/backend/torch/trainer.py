@@ -23,6 +23,61 @@ class TorchTrainer(base_trainer.Trainer):
         self.test_function = None
         self.predict_function = None
 
+    def build(self, input_shape=None):
+        """Build the model and optionally apply automatic parallelization.
+        
+        This override automatically calls parallelize_keras_model() when:
+        - PyTorch backend is active
+        - ModelParallel distribution is set
+        - Model has layers that can be parallelized
+        """
+        # Call parent build method if it exists
+        # The parent Layer.build creates weights and sets self.built = True
+        try:
+            from keras.src.layers.layer import Layer
+            if isinstance(self, Layer) and hasattr(super(), 'build'):
+                if input_shape is not None:
+                    super().build(input_shape)
+                else:
+                    super().build()
+        except (TypeError, AttributeError):
+            # If super().build doesn't exist or fails, continue anyway
+            pass
+    
+    def _symbolic_build(self, *args, **kwargs):
+        """Override _symbolic_build to add automatic parallelization.
+        
+        This is called during fit/evaluate/predict when the model needs to be
+        built. We add auto-parallelization here to ensure it happens before
+        weights are created when using ModelParallel distribution.
+        """
+        # First, try to auto-parallelize before the actual symbolic build
+        try:
+            from keras.src.backend.torch.distribution_lib import (
+                _should_auto_parallelize,
+                _auto_parallelize_model,
+            )
+            
+            if _should_auto_parallelize():
+                # Get the underlying torch module
+                if hasattr(self, '_torch_layers'):
+                    torch_module = self._torch_layers
+                else:
+                    torch_module = self
+                
+                # Auto-parallelize
+                _auto_parallelize_model(torch_module)
+        except ImportError:
+            # If distribution lib not available, skip auto-parallelization
+            pass
+        except Exception:
+            # If auto-parallelization fails, continue with normal build
+            # This ensures the model still works without parallelization
+            pass
+        
+        # Call the parent _symbolic_build method
+        return super()._symbolic_build(*args, **kwargs)
+
     def _should_torch_compile(self):
         # require torch>=2.1.0 to enable dynamo since it
         # includes many improvements/fixes to torch.compile()

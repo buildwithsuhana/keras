@@ -70,6 +70,9 @@ from keras.src.backend.torch.core import convert_to_tensor
 # Global variable to track if distribution is initialized
 _DISTRIBUTION_INITIALIZED = False
 
+# Global variable to track if model has been parallelized
+_MODEL_PARALLELIZED = False
+
 
 def _get_debug_setting() -> bool:
     """Get debug setting from environment variable."""
@@ -1418,6 +1421,87 @@ def create_replicate_dtensor(tensor, device_mesh=None):
         return tensor
     
     return DTensor.from_local(tensor, device_mesh, [Replicate()])
+
+
+def _should_auto_parallelize():
+    """Check if automatic model parallelization should be performed.
+    
+    Returns:
+        bool: True if auto-parallelization should happen
+    """
+    global _MODEL_PARALLELIZED
+    
+    # Skip if already parallelized
+    if _MODEL_PARALLELIZED:
+        return False
+    
+    # Skip if tensor parallel not available
+    if not TENSOR_PARALLEL_AVAILABLE:
+        return False
+    
+    # Check if ModelParallel distribution is active
+    from keras.src.distribution.distribution_lib import distribution as get_dist
+    dist = get_dist()
+    
+    if dist is None:
+        return False
+    
+    # Check if it's a ModelParallel distribution
+    from keras.src.distribution.distribution_lib import ModelParallel
+    if not isinstance(dist, ModelParallel):
+        return False
+    
+    # Check if there's a layout map with actual sharding
+    if not hasattr(dist, '_layout_map') or not dist._layout_map:
+        return False
+    
+    return True
+
+
+def _auto_parallelize_model(model):
+    """Automatically parallelize a model if conditions are met.
+    
+    This function is called during model build to automatically
+    apply tensor parallelism when a ModelParallel distribution is active.
+    
+    Args:
+        model: The Keras model to potentially parallelize
+        
+    Returns:
+        The original model, possibly parallelized
+    """
+    global _MODEL_PARALLELIZED
+    
+    if not _should_auto_parallelize():
+        return model
+    
+    try:
+        parallelized = parallelize_keras_model(model)
+        _MODEL_PARALLELIZED = True
+        
+        debug_mode = _get_debug_setting()
+        if debug_mode:
+            rank = torch.distributed.get_rank() if torch.distributed.is_initialized() else 0
+            print(f"DEBUG | [Rank {rank:02d}] Auto-parallelized model successfully")
+        
+        return parallelized
+    except Exception as e:
+        # Don't fail if auto-parallelization fails
+        # User can still use model without parallelism
+        debug_mode = _get_debug_setting()
+        if debug_mode:
+            rank = torch.distributed.get_rank() if torch.distributed.is_initialized() else 0
+            print(f"DEBUG | [Rank {rank:02d}] Auto-parallelization failed: {e}")
+        return model
+
+
+def reset_model_parallelization_state():
+    """Reset the model parallelization state.
+    
+    This can be used to force re-parallelization of a model.
+    """
+    global _MODEL_PARALLELIZED
+    _MODEL_PARALLELIZED = False
 
 
 def parallelize_keras_model(
