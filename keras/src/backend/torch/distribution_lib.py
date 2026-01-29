@@ -1757,23 +1757,23 @@ def parallelize_keras_model(
     
     This function uses PyTorch's `torch.distributed.tensor.parallel.parallelize_module`
     to automatically handle DTensor conversions and weight sharding for the entire model.
-    
+
     This is the recommended approach for distributed training as it:
     - Automatically converts inputs to DTensors
     - Automatically converts outputs back to local tensors
     - Handles all weight sharding according to the layout
     - Prevents "mixed torch.Tensor and DTensor" errors
-    
+
     Args:
         model: A Keras model (must have a ._torch_layers attribute for PyTorch backend)
         device_mesh: A PyTorch DeviceMesh for distributed execution. If None, uses default.
         layout_map: A dict mapping parameter patterns to Keras sharding specs.
             Example: {'dense.*kernel': (None, 'model'), 'dense.*bias': ('model',)}
             If None, the layout_map from the distribution context is used.
-    
+
     Returns:
         A parallelized module that handles DTensor operations automatically.
-    
+
     Raises:
         ImportError: If tensor parallel is not available
         ValueError: If model or layout_map is not provided
@@ -1791,7 +1791,40 @@ def parallelize_keras_model(
     debug_mode = _get_debug_setting()
     rank = torch.distributed.get_rank() if torch.distributed.is_initialized() else 0
     
-    # Get device mesh
+    # =====================================================================
+    # GUARD: Skip parallelize_module for ModelParallel!
+    #
+    # When using ModelParallel with a 2D mesh (batch, model) and a layout_map,
+    # we use our DTensor-based approach in distribute_variable() instead of
+    # PyTorch's parallelize_module(). parallelize_module() conflicts with
+    # DTensor-based weight creation.
+    #
+    # Detection: If device_mesh is 2D AND we have a layout_map, this is
+    # ModelParallel mode, which we handle differently.
+    # =====================================================================
+    
+    # Get layout map from distribution context if not provided
+    if layout_map is None:
+        from keras.src.distribution import distribution
+        dist = distribution()
+        if dist is not None and hasattr(dist, '_layout_map'):
+            layout_map = dict(dist._layout_map)
+    
+    # Check if this is ModelParallel mode (2D mesh with layout_map)
+    # If so, skip parallelize_module and let distribute_variable handle it
+    if device_mesh is not None and layout_map:
+        if len(device_mesh.mesh_dim_names) >= 2:
+            if debug_mode:
+                print(
+                    f"DEBUG | [Rank {rank:02d}] Skipping parallelize_module for "
+                    f"ModelParallel (2D mesh with layout_map). "
+                    f"Using DTensor-based weight distribution instead."
+                )
+            # Mark as parallelized to prevent re-entry
+            global _MODEL_PARALLELIZED
+            _MODEL_PARALLELIZED = True
+            return model
+    
     if device_mesh is None:
         device_mesh = _get_default_device_mesh()
     
