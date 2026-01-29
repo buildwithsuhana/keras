@@ -400,7 +400,8 @@ def test_gradient_flow():
             
             if hasattr(kernel_tensor, 'grad') and kernel_tensor.grad is not None:
                 grad_tensor = kernel_tensor.grad
-                grad_norm = float(torch.norm(grad_tensor).numpy())
+                # Move to CPU before computing norm for numpy conversion
+                grad_norm = float(torch.norm(grad_tensor.cpu()).numpy())
                 log(f"  {layer.name}.kernel:")
                 log(f"    - gradient_norm: {grad_norm:.6f}")
                 log(f"    - gradient_shape: {tuple(grad_tensor.shape)}")
