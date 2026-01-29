@@ -507,7 +507,36 @@ def distribute_variable(tensor, layout=None, module_name=None):
             f"world_size={world_size}"
         )
 
+    # Check if ModelParallel distribution is active (for tensor parallelism)
+    is_model_parallel = False
     current_distribution = distribution()
+    if current_distribution is not None:
+        from keras.src.distribution.distribution_lib import ModelParallel
+        is_model_parallel = isinstance(current_distribution, ModelParallel)
+    
+    if debug_mode:
+        print(
+            f"DEBUG | [Rank {rank:02d}] distribute_variable: "
+            f"is_model_parallel={is_model_parallel}"
+        )
+    
+    # If ModelParallel is active, we DON'T create DTensor weights here.
+    # Instead, we use regular torch.nn.Parameter and let parallelize_module
+    # handle weight sharding automatically.
+    if is_model_parallel:
+        if not is_float_or_complex:
+            if debug_mode:
+                print(
+                    f"DEBUG | [Rank {rank:02d}] ModelParallel mode, non-floating tensor: "
+                    f"shape={converted_tensor.shape}, dtype={converted_tensor.dtype}"
+                )
+            return converted_tensor
+        if debug_mode:
+            print(
+                f"DEBUG | [Rank {rank:02d}] ModelParallel mode, creating regular Parameter: "
+                f"shape={converted_tensor.shape}, dtype={converted_tensor.dtype}"
+            )
+        return torch.nn.Parameter(converted_tensor)
     
     if debug_mode:
         print(
