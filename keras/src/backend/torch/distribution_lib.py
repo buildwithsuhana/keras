@@ -473,11 +473,10 @@ def distribute_variable(value, layout) -> torch.Tensor:
     # Distribute the tensor
     distributed_tensor = distribute_tensor(tensor, layout)
     
-    # Wrap as parameter
+    # Wrap as parameter WITHOUT calling to_local()
     if isinstance(distributed_tensor, DTensor):
-        # Convert DTensor to local tensor for Parameter
-        local_tensor = distributed_tensor.to_local()
-        return torch.nn.Parameter(local_tensor, requires_grad=tensor.requires_grad)
+        # PyTorch now supports Parameters wrapping DTensors directly
+        return torch.nn.Parameter(distributed_tensor, requires_grad=tensor.requires_grad)
     else:
         return torch.nn.Parameter(tensor, requires_grad=tensor.requires_grad)
 
