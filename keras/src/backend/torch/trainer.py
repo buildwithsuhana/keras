@@ -174,9 +174,6 @@ class TorchTrainer(base_trainer.Trainer):
                     rank = torch.distributed.get_rank() if torch.distributed.is_initialized() else 0
                     print(f"DEBUG | [Rank {rank:02d}] All-gathering sharded DTensor output")
                 
-                # Get the device mesh from the DTensor
-                device_mesh = x.device_mesh
-                
                 # Find the shard dimension (the dimension being sharded)
                 shard_dim = None
                 for i, placement in enumerate(x.placements):
@@ -198,15 +195,16 @@ class TorchTrainer(base_trainer.Trainer):
                         print(f"DEBUG | [Rank {rank:02d}] Local shape: {local_shape}, Global shape: {global_shape}")
                         print(f"DEBUG | [Rank {rank:02d}] Shard dim: {shard_dim}, World size: {world_size}")
                     
-                    # Use PyTorch's all_gather to combine shards
-                    # Create a list to hold gathered tensors
-                    gathered_tensors = [torch.zeros_like(local_tensor) for _ in range(world_size)]
+                    # Use list to hold tensors for all_gather
+                    # Each tensor needs to be properly cloned to preserve gradients
+                    tensor_list = [torch.empty_like(local_tensor) for _ in range(world_size)]
                     
                     # Allgather: each process provides its local tensor
-                    torch.distributed.all_gather(gathered_tensors, local_tensor)
+                    # This preserves gradients properly
+                    torch.distributed.all_gather(tensor_list, local_tensor.contiguous())
                     
                     # Concatenate along the shard dimension
-                    full_tensor = torch.cat(gathered_tensors, dim=shard_dim)
+                    full_tensor = torch.cat(tensor_list, dim=shard_dim)
                     
                     if _get_debug_setting():
                         rank = torch.distributed.get_rank()
