@@ -560,6 +560,17 @@ def distribute_variable(tensor, layout):
                 placements.append(Replicate())
         else:
             placements.append(Replicate())
+    
+    # Ensure placements match mesh dimensions - pad with Replicate if needed
+    # PyTorch DTensor requires placements length == device_mesh.ndim
+    mesh_ndim = len(device_mesh.mesh_dim_names)
+    if len(placements) < mesh_ndim:
+        if debug_mode:
+            print(
+                f"DEBUG | [Rank {rank:02d}] Padding placements from {len(placements)} to {mesh_ndim} "
+                f"for mesh_dim_names={device_mesh.mesh_dim_names}"
+            )
+        placements.extend([Replicate()] * (mesh_ndim - len(placements)))
 
     if debug_mode:
         print(
@@ -894,6 +905,7 @@ def convert_path_for_regex(path: str, source_format: str = "keras") -> str:
 
 # Utility to get the backend distribution_lib module
 def get_distribution_lib():
+    import sys
     """Get the torch backend distribution_lib module."""
     return sys.modules[__name__]
 
