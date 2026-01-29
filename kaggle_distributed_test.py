@@ -333,11 +333,11 @@ def test_model_parallel(epochs=3):
                         if local_shape[0] < global_shape[0]:
                             log(f"  ✓ Verified: Bias is sharded across the 'model' axis.")
                 else:
-                    # It's a regular Parameter/tensor (no DTensor wrapping)
+                    # It's a regular Parameter/tensor (sharding applied via Parameter creation)
+                    local_shape = kernel_value.shape
                     log(f"Layer {i} ({layer.name}):")
-                    log(f"  - Shape: {tuple(kernel_value.shape)}")
-                    log(f"  - Note: DTensor not available, using local tensor directly")
-                    log(f"  - (Sharding is applied via Parameter creation, not DTensor wrapping)")
+                    log(f"  - Local Shape (Actual on Rank {rank}): {tuple(local_shape)}")
+                    log(f"  - Note: DTensor not available, sharding via Parameter creation")
 
         model.compile(optimizer="adam", loss="mse")
     
