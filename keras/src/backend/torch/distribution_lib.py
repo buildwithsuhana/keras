@@ -1544,13 +1544,13 @@ def reset_model_parallelization_state():
 
 
 def _get_tensor_parallel_mesh(device_mesh):
-    """Extract a 1D DeviceMesh for tensor parallelism from a potentially 2D mesh.
+    """Extract a 1D DeviceMesh for tensor parallelism from a 2D mesh.
     
     PyTorch's parallelize_module requires a 1D DeviceMesh for tensor parallelism.
-    According to PyTorch docs: "If you are using a 2-D or N-D DeviceMesh for complex 
-    parallelism (e.g., combining tensor and data parallelism), you must slice the 
-    DeviceMesh to a 1-D sub-mesh (e.g., device_mesh["tp"]) before passing it to the 
-    parallelize_module API."
+    According to PyTorch docs: "If you are using a 2-D or N-D DeviceMesh for 
+    complex parallelism (e.g., combining tensor and data parallelism), you must 
+    slice the DeviceMesh to a 1-D sub-mesh (e.g., device_mesh['tp']) before 
+    passing it to the parallelize_module API."
     
     Args:
         device_mesh: PyTorch DeviceMesh (can be 1D or 2D)
@@ -1572,50 +1572,15 @@ def _get_tensor_parallel_mesh(device_mesh):
     # This is the RECOMMENDED approach from PyTorch docs
     if hasattr(device_mesh, '__getitem__'):
         try:
-            # Try device_mesh["tp"] first (PyTorch recommended way)
             tp_mesh = device_mesh["tp"]
             if debug_mode:
                 print(f"DEBUG | [Rank {rank:02d}] Extracted TP mesh using device_mesh['tp']: shape={tp_mesh.shape}, mesh_dim_names={tp_mesh.mesh_dim_names}")
             return tp_mesh
         except (KeyError, TypeError, IndexError):
-            # "tp" key doesn't exist, try manual extraction
             pass
     
-    # Fallback: manual extraction if "tp" key doesn't exist
-    if 'model' in device_mesh.mesh_dim_names:
-        model_dim = device_mesh.mesh_dim_names.index('model')
-        
-        try:
-            mesh_shape = device_mesh.shape
-            axis_names = device_mesh.axis_names
-            
-            # Get the size along the model dimension
-            tp_size = mesh_shape[model_dim]
-            
-            # Create a list of device IDs for the model dimension
-            device_ids = []
-            for idx in range(tp_size):
-                device_ids.append(device_mesh.mesh[idx].item())
-            
-            # Create 1D mesh for tensor parallelism
-            tp_mesh_array = np.array(device_ids)
-            tp_mesh = TorchDeviceMesh(
-                device_type=device_mesh.device_type,
-                mesh=tp_mesh_array,
-                mesh_dim_names=[axis_names[model_dim]]
-            )
-            
-            if debug_mode:
-                print(f"DEBUG | [Rank {rank:02d}] Created TP sub-mesh manually: shape={tp_mesh.shape}, mesh_dim_names={tp_mesh.mesh_dim_names}")
-            
-            return tp_mesh
-            
-        except Exception as e:
-            if debug_mode:
-                print(f"DEBUG | [Rank {rank:02d}] Failed to extract TP mesh manually: {e}")
-    
     if debug_mode:
-        print(f"DEBUG | [Rank {rank:02d}] No 'model' axis found, cannot extract TP mesh")
+        print(f"DEBUG | [Rank {rank:02d}] Cannot extract TP mesh via device_mesh['tp']")
     
     return None
 
