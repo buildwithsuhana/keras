@@ -317,8 +317,10 @@ class TorchTrainer(base_trainer.Trainer):
         else:
             y_pred = self(x)
         
-        # Convert DTensor outputs to local tensors for loss computation
+        # Convert DTensor outputs and labels to local tensors for loss computation
         y_pred = self._convert_dtensor_output(y_pred)
+        y = self._convert_dtensor_output(y)
+        x = self._convert_dtensor_output(x)
 
         # Call torch.nn.Module.zero_grad() to clear the leftover gradients
         # for the weights from the previous train step.
@@ -369,8 +371,10 @@ class TorchTrainer(base_trainer.Trainer):
         else:
             y_pred = self(x)
         
-        # Convert DTensor outputs to local tensors for loss computation
+        # Convert DTensor outputs and labels to local tensors for loss computation
         y_pred = self._convert_dtensor_output(y_pred)
+        y = self._convert_dtensor_output(y)
+        x = self._convert_dtensor_output(x)
         
         loss = self._compute_loss(
             x=x, y=y, y_pred=y_pred, sample_weight=sample_weight, training=False
