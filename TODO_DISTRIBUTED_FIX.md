@@ -1,30 +1,30 @@
-# TODO List for Fixing Distributed Training Error
+# TODO: Distributed Training Fix
 
-## Problem
-RuntimeError: element 0 of tensors does not require grad and does not have a grad_fn
+## Error Analysis
+```
+RuntimeError: Only Tensors of floating point and complex dtype can require gradients
+```
 
-## Root Cause
-The `_distribute_parameter` method in `keras/src/backend/torch/core.py` is not correctly detecting and using the distribution context when creating distributed parameters.
+**Root Cause:** The `distribute_variable` function in `keras/src/backend/torch/distribution_lib.py` wraps ALL tensors in `torch.nn.Parameter`, but PyTorch requires floating-point tensors for parameters that track gradients. The `iterations` variable in the optimizer has `dtype="int"` and `trainable=False`, but it's still being wrapped in a `torch.nn.Parameter`.
 
-## Fix Plan
+## Fix Applied
 
-### 1. Fix `_distribute_parameter` in `core.py`
-- Check if distribution context exists (via global state or distribution())
-- If distribution exists but self._layout is None, get layout from distribution
-- Ensure device mesh is properly retrieved and used
-- Create properly configured Parameters with requires_grad=True
+### 1. Modified `distribute_variable` in `keras/src/backend/torch/distribution_lib.py`
+- Check if the tensor is floating-point or complex before wrapping in `torch.nn.Parameter`
+- Non-floating point tensors (like integer iterations counter) are returned as regular tensors
+- Added debug logging to show tensor shapes on each rank
 
-### 2. Fix `_initialize_layout` in `core.py`
-- Improve layout extraction from distribution context
-- Handle edge cases where variable shape is not yet known
+### Key Changes:
+- Convert tensor first and check `is_floating_point` or `is_complex` dtype
+- Return non-floating point tensors as-is without wrapping in `torch.nn.Parameter`
+- Added `[Rank XX]` prefix to debug logs for distributed context
+- Added logging for distributed tensor shapes after sharding
 
-### 3. Test the fix
-- Run the kaggle_distributed_test.py script
-- Verify no more grad_fn errors
-- Verify training completes successfully
-
-## Files to Modify
-1. `keras/src/backend/torch/core.py` - Variable class methods
-
-## Status: IN PROGRESS
+## Implementation Steps
+- [x] Analyze error and understand root cause
+- [x] Modify `distribute_variable` to handle non-floating point tensors
+- [x] Add debug logging for tensor shapes
+- [ ] Test the fix
+- [ ] Verify the fix resolves the RuntimeError
+- [ ] Test with both DataParallel and ModelParallel scenarios
 

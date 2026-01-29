@@ -472,31 +472,62 @@ def distribute_tensor(tensor: torch.Tensor, layout) -> torch.Tensor:
 def distribute_variable(tensor, layout):
     """Distributes a Keras variable using PyTorch DTensor or manual sharding."""
     from keras.src.distribution.distribution_lib import distribution
-    
+
+    # Convert tensor first to check its dtype
+    converted_tensor = convert_to_tensor(tensor)
+
+    # Check if tensor is floating-point or complex
+    # PyTorch requires floating point or complex dtype for requires_grad
+    is_float_or_complex = converted_tensor.dtype.is_floating_point or converted_tensor.dtype.is_complex
+
+    # Log tensor info for debugging
+    debug_mode = _get_debug_setting()
+    rank = torch.distributed.get_rank() if torch.distributed.is_initialized() else 0
+    world_size = torch.distributed.get_world_size() if torch.distributed.is_initialized() else 1
+
+    if debug_mode:
+        print(
+            f"DEBUG | [Rank {rank:02d}] distribute_variable: "
+            f"shape={converted_tensor.shape}, dtype={converted_tensor.dtype}, "
+            f"is_float_or_complex={is_float_or_complex}, layout={layout}, "
+            f"world_size={world_size}"
+        )
+
     current_distribution = distribution()
     if not current_distribution or layout is None:
-        return torch.nn.Parameter(convert_to_tensor(tensor))
+        # For non-floating point tensors (e.g., integer iterations counter),
+        # don't wrap in Parameter since PyTorch requires float/complex for grads
+        if not is_float_or_complex:
+            if debug_mode:
+                print(
+                    f"DEBUG | [Rank {rank:02d}] Non-floating tensor, returning as-is: "
+                    f"shape={converted_tensor.shape}, dtype={converted_tensor.dtype}"
+                )
+            return converted_tensor
+        return torch.nn.Parameter(converted_tensor)
 
     # Use the distribution object
     distribution = current_distribution
 
     # Retrieve the mesh
     device_mesh = _to_backend_mesh(distribution.device_mesh)
-    
-    # Log state for debugging
-    debug_mode = get_global_attribute("keras_distribution_debug", False)
-    if debug_mode:
-        print(f"DEBUG | distribute_variable: shape={tensor.shape}, layout={layout}, mesh_found={device_mesh is not None}")
 
     if device_mesh is None:
         # Fallback if DTensor/Mesh not available
-        return torch.nn.Parameter(convert_to_tensor(tensor))
+        if not is_float_or_complex:
+            if debug_mode:
+                print(
+                    f"DEBUG | [Rank {rank:02d}] Non-floating tensor, no mesh: "
+                    f"shape={converted_tensor.shape}, dtype={converted_tensor.dtype}"
+                )
+            return converted_tensor
+        return torch.nn.Parameter(converted_tensor)
 
     # Check which axes need sharding
     # layout is typically a tuple of axis names, e.g., (None, 'model')
     placements = []
     needs_sharding = False
-    
+
     for axis in layout:
         if axis is not None:
             # Find the dimension index in the mesh for this axis name
@@ -510,25 +541,68 @@ def distribute_variable(tensor, layout):
             placements.append(Replicate())
 
     if not needs_sharding:
-        return torch.nn.Parameter(convert_to_tensor(tensor))
+        # No sharding needed, replicate the tensor
+        if not is_float_or_complex:
+            if debug_mode:
+                print(
+                    f"DEBUG | [Rank {rank:02d}] Non-floating tensor, no sharding needed: "
+                    f"shape={converted_tensor.shape}, dtype={converted_tensor.dtype}"
+                )
+            return converted_tensor
+
+        if debug_mode:
+            print(
+                f"DEBUG | [Rank {rank:02d}] No sharding needed, replicating: "
+                f"shape={converted_tensor.shape}, dtype={converted_tensor.dtype}"
+            )
+        return torch.nn.Parameter(converted_tensor)
 
     if DTENSOR_AVAILABLE:
         # Create DTensor-based Parameter
         dtensor = distribute_tensor(
-            convert_to_tensor(tensor),
+            converted_tensor,
             device_mesh,
             placements
         )
+
+        # Log the distributed tensor shape
+        if debug_mode:
+            local_shape = getattr(dtensor, 'to_local', lambda: dtensor)().shape
+            print(
+                f"DEBUG | [Rank {rank:02d}] Distributed tensor: "
+                f"local_shape={local_shape}, full_shape={dtensor.shape}, "
+                f"dtype={converted_tensor.dtype}"
+            )
+
+        # For non-floating point tensors, don't wrap in Parameter
+        if not is_float_or_complex:
+            if debug_mode:
+                print(
+                    f"DEBUG | [Rank {rank:02d}] Non-floating tensor, returning DTensor without Parameter: "
+                    f"shape={dtensor.shape}, dtype={converted_tensor.dtype}"
+                )
+            return dtensor
+
         # Wrap as Parameter so it stays on device and tracks grads
         param = torch.nn.Parameter(dtensor)
         return param
     else:
         # Manual sharding fallback (Slicing)
-        # This is what happened in your logs; we want to avoid this if DTENSOR is available
-        rank = torch.distributed.get_rank()
-        # Simple heuristic for 1D/2D sharding logic
-        # (Implementation of manual slicing would go here)
-        return torch.nn.Parameter(convert_to_tensor(tensor))
+        # For non-floating point tensors, don't wrap in Parameter
+        if not is_float_or_complex:
+            if debug_mode:
+                print(
+                    f"DEBUG | [Rank {rank:02d}] Non-floating tensor, manual sharding without Parameter: "
+                    f"shape={converted_tensor.shape}, dtype={converted_tensor.dtype}"
+                )
+            return converted_tensor
+
+        if debug_mode:
+            print(
+                f"DEBUG | [Rank {rank:02d}] Manual sharding fallback: "
+                f"shape={converted_tensor.shape}, dtype={converted_tensor.dtype}"
+            )
+        return torch.nn.Parameter(converted_tensor)
 
 
 def _get_default_device_mesh() -> Optional[DeviceMesh]:
