@@ -1579,8 +1579,45 @@ def _get_tensor_parallel_mesh(device_mesh):
         except (KeyError, TypeError, IndexError):
             pass
     
+    # Fallback: manual extraction using mesh_dim_names
+    # Check if 'model' axis exists in mesh_dim_names
+    if 'model' in device_mesh.mesh_dim_names:
+        model_dim = device_mesh.mesh_dim_names.index('model')
+        
+        try:
+            mesh_shape = device_mesh.shape
+            mesh_dim_names = device_mesh.mesh_dim_names
+            
+            # Get the size along the model dimension
+            tp_size = mesh_shape[model_dim]
+            
+            # Create a list of device IDs for the model dimension
+            # For a 2D mesh like (1, 2) with mesh_dim_names ('batch', 'model'),
+            # we need to flatten the batch dimension and extract model dimension devices
+            device_ids = []
+            mesh_flat = device_mesh.mesh.flatten()
+            for idx in range(tp_size):
+                device_ids.append(mesh_flat[idx].item())
+            
+            # Create 1D mesh for tensor parallelism
+            tp_mesh_array = np.array(device_ids)
+            tp_mesh = TorchDeviceMesh(
+                device_type=device_mesh.device_type,
+                mesh=tp_mesh_array,
+                mesh_dim_names=[mesh_dim_names[model_dim]]
+            )
+            
+            if debug_mode:
+                print(f"DEBUG | [Rank {rank:02d}] Created TP sub-mesh manually: shape={tp_mesh.shape}, mesh_dim_names={tp_mesh.mesh_dim_names}")
+            
+            return tp_mesh
+            
+        except Exception as e:
+            if debug_mode:
+                print(f"DEBUG | [Rank {rank:02d}] Failed to extract TP mesh manually: {e}")
+    
     if debug_mode:
-        print(f"DEBUG | [Rank {rank:02d}] Cannot extract TP mesh via device_mesh['tp']")
+        print(f"DEBUG | [Rank {rank:02d}] No 'model' axis found in mesh_dim_names={device_mesh.mesh_dim_names}")
     
     return None
 
