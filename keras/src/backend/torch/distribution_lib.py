@@ -299,20 +299,9 @@ def initialize(
             f"num_processes={num_processes}, process_id={process_id}"
         )
     
-    # Check for environment variables
-    if job_addresses is None:
-        job_addresses = os.environ.get("KERAS_DISTRIBUTION_JOB_ADDRESSES")
-    if num_processes is None:
-        num_processes_str = os.environ.get("KERAS_DISTRIBUTION_NUM_PROCESSES")
-        if num_processes_str:
-            num_processes = int(num_processes_str)
-    if process_id is None:
-        process_id_str = os.environ.get("KERAS_DISTRIBUTION_PROCESS_ID")
-        if process_id_str:
-            process_id = int(process_id_str)
-    
-    # Check if running with torchrun (common in multi-GPU training)
-    # torchrun sets LOCAL_RANK and WORLD_SIZE environment variables
+    # FIRST: Check if running with torchrun (common in multi-GPU training)
+    # torchrun sets LOCAL_RANK and WORLD_SIZE environment variables BEFORE
+    # the script starts, and also initializes torch.distributed
     local_rank = os.environ.get("LOCAL_RANK")
     world_size_env = os.environ.get("WORLD_SIZE")
     
@@ -328,11 +317,34 @@ def initialize(
                 f"WORLD_SIZE={world_size_env}"
             )
     
+    # Check for environment variables (Keras-specific)
+    if job_addresses is None:
+        job_addresses = os.environ.get("KERAS_DISTRIBUTION_JOB_ADDRESSES")
+    if num_processes is None:
+        num_processes_str = os.environ.get("KERAS_DISTRIBUTION_NUM_PROCESSES")
+        if num_processes_str:
+            num_processes = int(num_processes_str)
+    if process_id is None:
+        process_id_str = os.environ.get("KERAS_DISTRIBUTION_PROCESS_ID")
+        if process_id_str:
+            process_id = int(process_id_str)
+    
     # For single-process multi-device, no special initialization needed
+    # But first check if torchrun has already initialized torch.distributed
     if num_processes is None or num_processes == 1:
-        _DISTRIBUTION_INITIALIZED = True
-        if _get_debug_setting():
-            logger.debug("Single-process mode - no distributed initialization needed")
+        # Check if torchrun already initialized distributed
+        if torch.distributed.is_initialized():
+            _DISTRIBUTION_INITIALIZED = True
+            if _get_debug_setting():
+                logger.debug(
+                    f"torch.distributed already initialized by torchrun: "
+                    f"rank={torch.distributed.get_rank()}, "
+                    f"world_size={torch.distributed.get_world_size()}"
+                )
+        else:
+            _DISTRIBUTION_INITIALIZED = True
+            if _get_debug_setting():
+                logger.debug("Single-process mode - no distributed initialization needed")
         return
     
     # For multi-process, initialize PyTorch distributed
@@ -470,15 +482,87 @@ def distribute_variable(value, layout) -> torch.Tensor:
     
     tensor = torch.as_tensor(value)
     
-    # Distribute the tensor
-    distributed_tensor = distribute_tensor(tensor, layout)
+    # Check if we need to shard (not replicate)
+    needs_sharding = False
+    shard_dim = 0
     
-    # Wrap as parameter WITHOUT calling to_local()
-    if isinstance(distributed_tensor, DTensor):
-        # PyTorch now supports Parameters wrapping DTensors directly
-        return torch.nn.Parameter(distributed_tensor, requires_grad=tensor.requires_grad)
-    else:
-        return torch.nn.Parameter(tensor, requires_grad=tensor.requires_grad)
+    # Parse the layout to check if sharding is requested
+    if layout is not None:
+        if hasattr(layout, 'backend_layout'):
+            backend_layout = layout.backend_layout
+        else:
+            backend_layout = layout
+        
+        if isinstance(backend_layout, tuple):
+            for axis in backend_layout:
+                if axis is not None and axis != 'batch':
+                    needs_sharding = True
+                    # Get the mesh dimension for this axis
+                    device_mesh = _get_default_device_mesh()
+                    if device_mesh is not None and axis in device_mesh.mesh_dim_names:
+                        shard_dim = device_mesh.mesh_dim_names.index(axis)
+                    break
+    
+    # If DTensor is available, use it
+    if DTENSOR_AVAILABLE and needs_sharding:
+        # Distribute the tensor
+        distributed_tensor = distribute_tensor(tensor, layout)
+        
+        # Wrap as parameter WITHOUT calling to_local()
+        if isinstance(distributed_tensor, DTensor):
+            # PyTorch now supports Parameters wrapping DTensors directly
+            return torch.nn.Parameter(distributed_tensor, requires_grad=tensor.requires_grad)
+    
+    # Manual sharding when DTensor is not available
+    if DTENSOR_AVAILABLE and needs_sharding and _DISTRIBUTION_INITIALIZED:
+        device_mesh = _get_default_device_mesh()
+        if device_mesh is not None:
+            # Parse the layout to find the sharding dimension
+            if hasattr(layout, 'backend_layout'):
+                backend_layout = layout.backend_layout
+            else:
+                backend_layout = layout
+            
+            if isinstance(backend_layout, tuple):
+                for axis in backend_layout:
+                    if axis is not None and axis != 'batch':
+                        shard_dim = device_mesh.mesh_dim_names.index(axis)
+                        break
+            
+            # Get current rank and world size
+            rank = torch.distributed.get_rank()
+            world_size = torch.distributed.get_world_size()
+            
+            # Calculate the shard size
+            dim_size = tensor.shape[shard_dim]
+            shard_size = (dim_size + world_size - 1) // world_size
+            
+            # Calculate start and end indices for this rank
+            start_idx = rank * shard_size
+            end_idx = min(start_idx + shard_size, dim_size)
+            
+            # Slice the tensor for this rank
+            if shard_dim == 0:
+                local_tensor = tensor[start_idx:end_idx].contiguous().clone()
+            elif shard_dim == 1:
+                local_tensor = tensor[:, start_idx:end_idx].contiguous().clone()
+            else:
+                # For higher dimensions, handle generically
+                slices = [slice(None)] * len(tensor.shape)
+                slices[shard_dim] = slice(start_idx, end_idx)
+                local_tensor = tensor[tuple(slices)].contiguous().clone()
+            
+            if _get_debug_setting():
+                logger.debug(
+                    f"Manual sharding: rank={rank}, world_size={world_size}, "
+                    f"dim={shard_dim}, original_shape={tensor.shape}, "
+                    f"local_shape={local_tensor.shape}"
+                )
+            
+            return torch.nn.Parameter(local_tensor, requires_grad=tensor.requires_grad)
+    
+    # Fallback: return non-distributed parameter
+    return torch.nn.Parameter(tensor, requires_grad=tensor.requires_grad)
 
 
 def _get_default_device_mesh() -> Optional[DeviceMesh]:
