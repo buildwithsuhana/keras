@@ -394,7 +394,7 @@ def test_gradient_flow():
             layers.Dense(32, activation="relu"),
             layers.Dense(8)
         ])
-        model.compile(optimizer=optimizer, loss="mse")
+        model.compile(optimizer="adam", loss="mse")
     
     # Create data
     x = np.random.random((16, 32)).astype("float32")

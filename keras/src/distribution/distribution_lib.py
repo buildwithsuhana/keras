@@ -644,21 +644,34 @@ class DataParallel(Distribution):
         return TensorLayout(data_shard_spec, self.device_mesh)
 
     def get_variable_layout(self, variable):
+        """Retrieves the layout for a given variable within the distribution."""
         # First check if the variable already has a layout assigned.
         if getattr(variable, "_layout", None) is not None:
             return variable._layout
+            
+        # Get the shape, default to None if not present.
+        # Note: Keras Variables with Torch backend might have uninitialized 
+        # shapes during early init phases.
+        variable_shape = getattr(variable, "shape", None)
+
         # Return None if variable shape is not yet known (e.g., uninitialized
         # optimizer variables). This prevents TypeError when calling len()
         # on a None shape.
-        if variable.shape is None:
+        if variable_shape is None:
             return None
-        # Handle scalar variables (empty shape tuple like optimizer iteration
-        # counters). Scalar variables are replicated (no sharding) and should
-        # return an empty axes list.
-        if len(variable.shape) == 0:
+
+        # Handle scalar variables (empty shape tuple () or shape with 0 rank).
+        # Scalar variables (like optimizer iteration counters) are replicated 
+        # across the mesh and should return an empty axes list.
+        if len(variable_shape) == 0:
+            from keras.src.distribution.distribution_lib import TensorLayout
             return TensorLayout([], self.device_mesh)
-        # Otherwise, replicate variable.
-        variable_shard_spec = [None] * len(variable.shape)
+
+        # Otherwise, create a replicated layout (shard spec of [None, None, ...]).
+        # This ensures variables are mirrored across devices rather than sharded.
+        variable_shard_spec = [None] * len(variable_shape)
+        
+        from keras.src.distribution.distribution_lib import TensorLayout
         return TensorLayout(variable_shard_spec, self.device_mesh)
 
     def get_tensor_layout(self, path):
