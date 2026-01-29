@@ -512,12 +512,38 @@ class Distribution:
     @contextlib.contextmanager
     def scope(self):
         """Context manager to make the `Distribution` current."""
-        original_scope = distribution()
-        set_distribution(self)
+        from keras.src.distribution.distribution_lib import distribution as get_dist
+        from keras.src.distribution.distribution_lib import set_distribution as set_dist
+        
+        debug_mode = os.environ.get("KERAS_DISTRIBUTION_DEBUG", "0") == "1"
+        if debug_mode:
+            rank = 0
+            world_size = 1
+            try:
+                import torch.distributed as dist
+                if dist.is_available() and dist.is_initialized():
+                    rank = dist.get_rank()
+                    world_size = dist.get_world_size()
+            except:
+                pass
+            print(f"DEBUG | [Rank {rank:02d}] scope() entering with distribution={self}")
+        
+        original_scope = get_dist()
+        if debug_mode:
+            print(f"DEBUG | [Rank {rank:02d}] scope() original_scope={original_scope}")
+        
+        set_dist(self)
+        
+        if debug_mode:
+            new_scope = get_dist()
+            print(f"DEBUG | [Rank {rank:02d}] scope() after set_distribution, distribution()={new_scope}")
+        
         try:
             yield
         finally:
-            set_distribution(original_scope)
+            if debug_mode:
+                print(f"DEBUG | [Rank {rank:02d}] scope() exiting, restoring original_scope={original_scope}")
+            set_dist(original_scope)
 
     @property
     def device_mesh(self):
@@ -1105,7 +1131,21 @@ def distribute_tensor(tensor, layout):
 @keras_export("keras.distribution.distribution")
 def distribution():
     """Retrieve the current distribution from global context."""
-    return global_state.get_global_attribute(GLOBAL_ATTRIBUTE_NAME)
+    result = global_state.get_global_attribute(GLOBAL_ATTRIBUTE_NAME)
+    # Add debug logging
+    debug_mode = os.environ.get("KERAS_DISTRIBUTION_DEBUG", "0") == "1"
+    if debug_mode:
+        rank = 0
+        world_size = 1
+        try:
+            import torch.distributed as dist
+            if dist.is_available() and dist.is_initialized():
+                rank = dist.get_rank()
+                world_size = dist.get_world_size()
+        except:
+            pass
+        print(f"DEBUG | [Rank {rank:02d}] distribution() called, returning: {result}")
+    return result
 
 
 @keras_export("keras.distribution.set_distribution")
@@ -1115,4 +1155,17 @@ def set_distribution(value):
     Args:
         value: a `Distribution` instance.
     """
+    # Add debug logging
+    debug_mode = os.environ.get("KERAS_DISTRIBUTION_DEBUG", "0") == "1"
+    if debug_mode:
+        rank = 0
+        world_size = 1
+        try:
+            import torch.distributed as dist
+            if dist.is_available() and dist.is_initialized():
+                rank = dist.get_rank()
+                world_size = dist.get_world_size()
+        except:
+            pass
+        print(f"DEBUG | [Rank {rank:02d}] set_distribution({value}) called")
     global_state.set_global_attribute(GLOBAL_ATTRIBUTE_NAME, value)

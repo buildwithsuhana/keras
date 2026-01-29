@@ -494,6 +494,14 @@ def distribute_variable(tensor, layout):
         )
 
     current_distribution = distribution()
+    
+    if debug_mode:
+        print(
+            f"DEBUG | [Rank {rank:02d}] distribute_variable: "
+            f"current_distribution={current_distribution}, "
+            f"layout is None={layout is None}"
+        )
+    
     if not current_distribution or layout is None:
         # For non-floating point tensors (e.g., integer iterations counter),
         # don't wrap in Parameter since PyTorch requires float/complex for grads
@@ -507,11 +515,18 @@ def distribute_variable(tensor, layout):
         return torch.nn.Parameter(converted_tensor)
 
     # Use the distribution object
-    distribution = current_distribution
+    distribution_obj = current_distribution
 
     # Retrieve the mesh
-    device_mesh = _to_backend_mesh(distribution.device_mesh)
+    device_mesh = _to_backend_mesh(distribution_obj.device_mesh)
 
+    if debug_mode:
+        print(
+            f"DEBUG | [Rank {rank:02d}] distribute_variable: "
+            f"device_mesh={device_mesh}, "
+            f"mesh_dim_names={getattr(device_mesh, 'mesh_dim_names', None) if device_mesh else None}"
+        )
+    
     if device_mesh is None:
         # Fallback if DTensor/Mesh not available
         if not is_float_or_complex:
@@ -536,9 +551,20 @@ def distribute_variable(tensor, layout):
                 placements.append(Shard(mesh_dim))
                 needs_sharding = True
             except ValueError:
+                if debug_mode:
+                    print(
+                        f"DEBUG | [Rank {rank:02d}] Axis '{axis}' not found in mesh_dim_names "
+                        f"{device_mesh.mesh_dim_names}, replicating"
+                    )
                 placements.append(Replicate())
         else:
             placements.append(Replicate())
+
+    if debug_mode:
+        print(
+            f"DEBUG | [Rank {rank:02d}] distribute_variable: "
+            f"placements={placements}, needs_sharding={needs_sharding}"
+        )
 
     if not needs_sharding:
         # No sharding needed, replicate the tensor
@@ -695,13 +721,23 @@ def _to_backend_device(device_name):
 
 def _to_backend_mesh(device_mesh):
     """Converts a Keras DeviceMesh to a PyTorch DeviceMesh."""
+    debug_mode = _get_debug_setting()
+    
     if not DTENSOR_AVAILABLE:
+        if debug_mode:
+            print(f"DEBUG | DTENSOR not available, _to_backend_mesh returning None")
         return None
     
     # Check if already cached
     existing_mesh = get_global_attribute("torch_device_mesh")
     if existing_mesh is not None:
+        if debug_mode:
+            print(f"DEBUG | Found cached mesh in global state: {existing_mesh}")
         return existing_mesh
+
+    if debug_mode:
+        print(f"DEBUG | Creating new backend mesh from device_mesh: shape={device_mesh.shape}, axis_names={device_mesh.axis_names}")
+        print(f"DEBUG | device_mesh.devices = {device_mesh.devices}")
 
     # Flatten devices to list of indices
     device_ids = []
@@ -713,17 +749,26 @@ def _to_backend_mesh(device_mesh):
             # Default to 0 if no index (e.g. "cpu")
             device_ids.append(0)
     
+    if debug_mode:
+        print(f"DEBUG | device_ids = {device_ids}")
+    
     mesh_shape = device_mesh.shape
     axis_names = device_mesh.axis_names
     
     # PyTorch expects a numpy array for the mesh structure
     mesh_array = np.array(device_ids).reshape(mesh_shape)
     
+    if debug_mode:
+        print(f"DEBUG | mesh_array.shape = {mesh_array.shape}, mesh_array = {mesh_array}")
+    
     backend_mesh = TorchDeviceMesh(
         device_type="cuda" if torch.cuda.is_available() else "cpu",
         mesh=mesh_array,
         mesh_dim_names=axis_names
     )
+    
+    if debug_mode:
+        print(f"DEBUG | Created TorchDeviceMesh: shape={backend_mesh.shape}, mesh_dim_names={backend_mesh.mesh_dim_names}")
     
     set_global_attribute("torch_device_mesh", backend_mesh)
     return backend_mesh
