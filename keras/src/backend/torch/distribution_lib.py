@@ -543,13 +543,38 @@ def distribute_variable(tensor, layout):
     # layout is typically a tuple of axis names, e.g., (None, 'model')
     placements = []
     needs_sharding = False
+    
+    # Get tensor rank (number of dimensions)
+    tensor_rank = converted_tensor.dim()
+    mesh_ndim = len(device_mesh.mesh_dim_names)
 
-    for axis in layout:
+    for i, axis in enumerate(layout):
         if axis is not None:
             # Find the dimension index in the mesh for this axis name
             try:
                 mesh_dim = device_mesh.mesh_dim_names.index(axis)
-                placements.append(Shard(mesh_dim))
+                
+                # Map mesh dimension to tensor dimension
+                # For tensors with fewer dimensions than the mesh, we need to adjust
+                if tensor_rank <= mesh_ndim:
+                    # Map: mesh_dim -> tensor_dim (adjust for shorter tensors)
+                    # e.g., for 1D tensor with mesh_ndim=2 and mesh_dim=1,
+                    # we use tensor_dim=0 (last dimension)
+                    tensor_dim = tensor_rank - mesh_ndim + i
+                    if tensor_dim < 0:
+                        # This shouldn't happen if tensor_rank >= len(layout)
+                        tensor_dim = i
+                else:
+                    # For tensors with more dimensions than the mesh
+                    # layout axes map to the last len(layout) tensor dimensions
+                    tensor_dim = tensor_rank - len(layout) + i
+                
+                # For 1D tensors, shard on the only dimension (dim 0)
+                # regardless of which mesh dimension 'model' maps to
+                if tensor_rank == 1:
+                    tensor_dim = 0
+                
+                placements.append(Shard(tensor_dim))
                 needs_sharding = True
             except ValueError:
                 if debug_mode:
@@ -563,7 +588,6 @@ def distribute_variable(tensor, layout):
     
     # Ensure placements match mesh dimensions - pad with Replicate if needed
     # PyTorch DTensor requires placements length == device_mesh.ndim
-    mesh_ndim = len(device_mesh.mesh_dim_names)
     if len(placements) < mesh_ndim:
         if debug_mode:
             print(
@@ -905,7 +929,7 @@ def convert_path_for_regex(path: str, source_format: str = "keras") -> str:
 
 # Utility to get the backend distribution_lib module
 def get_distribution_lib():
-    import sys
     """Get the torch backend distribution_lib module."""
+    import sys
     return sys.modules[__name__]
 
