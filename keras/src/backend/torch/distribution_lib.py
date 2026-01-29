@@ -890,6 +890,8 @@ def _to_backend_mesh(device_mesh):
     if existing_mesh is not None:
         if debug_mode:
             print(f"DEBUG | Found cached mesh for config {cache_key}: {existing_mesh}")
+        # Also update the default mesh for _get_default_device_mesh to find
+        global_state.set_global_attribute("torch_device_mesh", existing_mesh)
         return existing_mesh
 
     if debug_mode:
@@ -927,8 +929,9 @@ def _to_backend_mesh(device_mesh):
     if debug_mode:
         print(f"DEBUG | Created TorchDeviceMesh: shape={backend_mesh.shape}, mesh_dim_names={backend_mesh.mesh_dim_names}")
     
-    # Cache on the DeviceMesh object itself, not globally
+    # Cache both with the specific key AND as the default mesh for _get_default_device_mesh
     set_global_attribute(cache_key, backend_mesh)
+    global_state.set_global_attribute("torch_device_mesh", backend_mesh)
     return backend_mesh
 
 
