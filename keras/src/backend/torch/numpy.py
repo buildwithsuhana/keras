@@ -24,6 +24,13 @@ TORCH_INT_TYPES = (
     torch.int64,
 )
 
+# Import DTensor components for distributed tensor support
+try:
+    from torch.distributed._tensor import DTensor, Replicate
+except ImportError:
+    DTensor = None
+    Replicate = None
+
 
 def rot90(array, k=1, axes=(0, 1)):
     """Rotate an array by 90 degrees in the specified plane using PyTorch.
@@ -100,6 +107,21 @@ def subtract(x1, x2):
 def matmul(x1, x2):
     x1 = convert_to_tensor(x1)
     x2 = convert_to_tensor(x2)
+
+    # Check if either tensor is a DTensor (PyTorch distributed tensor)
+    # If so, the other tensor also needs to be a DTensor for DTensor operations
+    if DTensor is not None:
+        x1_is_dtensor = isinstance(x1, DTensor)
+        x2_is_dtensor = isinstance(x2, DTensor)
+
+        if x1_is_dtensor and not x2_is_dtensor and Replicate is not None:
+            # Convert x2 to DTensor with replicated placement
+            device_mesh = x1.device_mesh
+            x2 = DTensor.from_local(x2, device_mesh, [Replicate()])
+        elif x2_is_dtensor and not x1_is_dtensor and Replicate is not None:
+            # Convert x1 to DTensor with replicated placement
+            device_mesh = x2.device_mesh
+            x1 = DTensor.from_local(x1, device_mesh, [Replicate()])
 
     def can_use_int_matmul(x1, x2):
         # torch._int_mm only accepts the following conditions:

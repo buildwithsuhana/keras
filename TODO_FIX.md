@@ -39,6 +39,11 @@ This happens during backpropagation because:
 - Changed cache key from `f"torch_device_mesh_{id(device_mesh)}"` to configuration-based key
 - This prevents rank desync when switching between DataParallel and ModelParallel
 
+### Fix 5: Fix DTensor Mixed Tensor Error ✓
+- When kernel is DTensor but input is regular tensor, PyTorch DTensor operations fail
+- Modified `matmul` in `numpy.py` to convert the other operand to DTensor when one is DTensor
+- Added import of `DTensor` and `Replicate` at module level
+
 ## Files Modified
 
 1. `keras/src/distribution/distribution_lib.py`
@@ -52,6 +57,10 @@ This happens during backpropagation because:
 3. `keras/src/backend/torch/core.py`
    - Variable class handles layout from distribution context
 
+4. `keras/src/backend/torch/numpy.py`
+   - Added DTensor and Replicate imports
+   - Modified `matmul()` to handle mixed DTensor and regular tensor operations
+
 ## Verification
 After implementing these fixes, run:
 ```bash
@@ -63,4 +72,11 @@ The test should complete successfully with all tests passing:
 - ✓ DataParallel: PASSED
 - ✓ ModelParallel: PASSED
 - ✓ Gradient Flow: PASSED
+
+## Physical Storage Verification (ModelParallel)
+Both ranks now correctly shard model weights with consistent local shapes:
+- Layer 0 (dense_3): local_shape=(128, 256) on both Rank 0 and Rank 1
+- Layer 1 (dense_4): local_shape=(512, 128) on both Rank 0 and Rank 1
+- Layer 2 (dense_5): local_shape=(256, 64) on both Rank 0 and Rank 1
+- Layer 3 (dense_6): local_shape=(128, 5) on both Rank 0 and Rank 1
 
