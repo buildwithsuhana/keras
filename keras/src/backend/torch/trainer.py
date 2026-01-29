@@ -45,7 +45,8 @@ class TorchTrainer(base_trainer.Trainer):
         from keras.src.distribution.distribution_lib import distribution
         from keras.src.distribution.distribution_lib import ModelParallel
         from keras.src.backend.torch.distribution_lib import (
-            convert_tensors_to_dtensor,
+            DTensor,
+            Replicate,
             _get_default_device_mesh,
             DTENSOR_AVAILABLE,
         )
@@ -64,23 +65,19 @@ class TorchTrainer(base_trainer.Trainer):
         if device_mesh is None:
             return x
         
-        # Check if any weights are DTensors by looking at trainable_weights
+        # Check if any weights are DTensors by checking if they have a layout attribute
+        # that indicates DTensor sharding
         has_dtensor_weights = False
         for var in self.trainable_weights:
-            # Check if it's a torch.nn.Parameter wrapping a DTensor
             if isinstance(var, torch.nn.Parameter):
-                # The value is the DTensor
-                if hasattr(var, 'value') and hasattr(var.value, 'to_local'):
+                # Check if it's a DTensor Parameter (has _tensor_attrs or similar)
+                if hasattr(var, '_tensor_attrs') or hasattr(var, '_spec'):
                     has_dtensor_weights = True
                     break
-                # Also check _value for PyTorch DTensor
-                if hasattr(var, '_value') and hasattr(var._value, 'to_local'):
+                # Also check if the data is a DTensor
+                if hasattr(var, 'data') and isinstance(var.data, DTensor):
                     has_dtensor_weights = True
                     break
-            # Check if it's a raw DTensor
-            elif hasattr(var, 'to_local'):
-                has_dtensor_weights = True
-                break
         
         if not has_dtensor_weights:
             return x
@@ -145,7 +142,7 @@ class TorchTrainer(base_trainer.Trainer):
         from keras.src.distribution.distribution_lib import ModelParallel
         from keras.src.backend.torch.distribution_lib import (
             dtensor_to_local,
-            _get_default_device_mesh,
+            DTensor,
             DTENSOR_AVAILABLE,
         )
         
@@ -158,38 +155,39 @@ class TorchTrainer(base_trainer.Trainer):
         if not isinstance(dist, ModelParallel):
             return x
         
-        # Get device mesh
-        device_mesh = _get_default_device_mesh()
-        if device_mesh is None:
+        # If x is not a DTensor, return as-is
+        if x is None:
             return x
         
-        # Check if any weights are DTensors
-        has_dtensor_weights = False
-        for var in self.trainable_weights:
-            # Check if it's a torch.nn.Parameter wrapping a DTensor
-            if isinstance(var, torch.nn.Parameter):
-                # The value is the DTensor
-                if hasattr(var, 'value') and hasattr(var.value, 'to_local'):
-                    has_dtensor_weights = True
-                    break
-                # Also check _value for PyTorch DTensor
-                if hasattr(var, '_value') and hasattr(var._value, 'to_local'):
-                    has_dtensor_weights = True
-                    break
-            # Check if it's a raw DTensor
-            elif hasattr(var, 'to_local'):
-                has_dtensor_weights = True
-                break
+        # Check if it's a DTensor
+        if isinstance(x, DTensor):
+            if _get_debug_setting():
+                rank = torch.distributed.get_rank() if torch.distributed.is_initialized() else 0
+                print(f"DEBUG | [Rank {rank:02d}] Converting DTensor to local tensor")
+            return dtensor_to_local(x)
         
-        if not has_dtensor_weights:
-            return x
+        # For nested structures, check if any element is a DTensor
+        if isinstance(x, (dict, list, tuple)):
+            # Check if any element is a DTensor
+            has_dtensor = False
+            def check_for_dtensor(item):
+                if isinstance(item, DTensor):
+                    return True
+                if isinstance(item, (dict, list, tuple)):
+                    for v in item.values() if isinstance(item, dict) else item:
+                        if check_for_dtensor(v):
+                            return True
+                return False
+            
+            has_dtensor = check_for_dtensor(x)
+            
+            if has_dtensor:
+                if _get_debug_setting():
+                    rank = torch.distributed.get_rank() if torch.distributed.is_initialized() else 0
+                    print(f"DEBUG | [Rank {rank:02d}] Converting nested structure with DTensors to local")
+                return dtensor_to_local(x)
         
-        # Convert DTensor outputs to local tensors
-        if _get_debug_setting():
-            rank = torch.distributed.get_rank() if torch.distributed.is_initialized() else 0
-            print(f"DEBUG | [Rank {rank:02d}] Converting DTensor outputs to local tensors")
-        
-        return dtensor_to_local(x)
+        return x
 
     def _parallelize_if_needed(self):
         """Parallelize the model if ModelParallel distribution is active.
@@ -306,21 +304,52 @@ class TorchTrainer(base_trainer.Trainer):
     def train_step(self, data):
         x, y, sample_weight = data_adapter_utils.unpack_x_y_sample_weight(data)
 
+        # Debug logging for tensor types
+        if _get_debug_setting():
+            rank = torch.distributed.get_rank() if torch.distributed.is_initialized() else 0
+            print(f"DEBUG | [Rank {rank:02d}] train_step: x type={type(x).__name__}, y type={type(y).__name__}")
+            if hasattr(x, 'to_local'):
+                print(f"DEBUG | [Rank {rank:02d}]   x is DTensor: shape={x.shape}")
+            if hasattr(y, 'to_local'):
+                print(f"DEBUG | [Rank {rank:02d}]   y is DTensor: shape={y.shape}")
+
         # Convert inputs to DTensors if needed for ModelParallel training
         # This ensures that when model has DTensor weights, inputs are also DTensors
         x = self._ensure_dtensor_input(x)
         y = self._ensure_dtensor_input(y)
+
+        if _get_debug_setting():
+            rank = torch.distributed.get_rank() if torch.distributed.is_initialized() else 0
+            print(f"DEBUG | [Rank {rank:02d}] after _ensure_dtensor_input: x type={type(x).__name__}, y type={type(y).__name__}")
+            if hasattr(x, 'to_local'):
+                print(f"DEBUG | [Rank {rank:02d}]   x is DTensor: shape={x.shape}")
+            if hasattr(y, 'to_local'):
+                print(f"DEBUG | [Rank {rank:02d}]   y is DTensor: shape={y.shape}")
 
         # Compute predictions
         if self._call_has_training_arg:
             y_pred = self(x, training=True)
         else:
             y_pred = self(x)
+
+        if _get_debug_setting():
+            rank = torch.distributed.get_rank() if torch.distributed.is_initialized() else 0
+            print(f"DEBUG | [Rank {rank:02d}] after forward: y_pred type={type(y_pred).__name__}")
+            if hasattr(y_pred, 'to_local'):
+                print(f"DEBUG | [Rank {rank:02d}]   y_pred is DTensor: shape={y_pred.shape}")
         
         # Convert DTensor outputs and labels to local tensors for loss computation
         y_pred = self._convert_dtensor_output(y_pred)
         y = self._convert_dtensor_output(y)
         x = self._convert_dtensor_output(x)
+
+        if _get_debug_setting():
+            rank = torch.distributed.get_rank() if torch.distributed.is_initialized() else 0
+            print(f"DEBUG | [Rank {rank:02d}] after _convert_dtensor_output: y_pred type={type(y_pred).__name__}, y type={type(y).__name__}")
+            if hasattr(y_pred, 'to_local'):
+                print(f"DEBUG | [Rank {rank:02d}]   y_pred is still DTensor!")
+            if hasattr(y, 'to_local'):
+                print(f"DEBUG | [Rank {rank:02d}]   y is still DTensor!")
 
         # Call torch.nn.Module.zero_grad() to clear the leftover gradients
         # for the weights from the previous train step.
