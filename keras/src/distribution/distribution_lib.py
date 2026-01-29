@@ -652,6 +652,11 @@ class DataParallel(Distribution):
         # on a None shape.
         if variable.shape is None:
             return None
+        # Handle scalar variables (empty shape tuple like optimizer iteration
+        # counters). Scalar variables are replicated (no sharding) and should
+        # return an empty axes list.
+        if len(variable.shape) == 0:
+            return TensorLayout([], self.device_mesh)
         # Otherwise, replicate variable.
         variable_shard_spec = [None] * len(variable.shape)
         return TensorLayout(variable_shard_spec, self.device_mesh)
@@ -842,6 +847,11 @@ class ModelParallel(Distribution):
         # on a None shape.
         if variable.shape is None:
             return None
+        # Handle scalar variables (empty shape tuple like optimizer iteration
+        # counters). Scalar variables are replicated (no sharding) and should
+        # return an empty axes list.
+        if len(variable.shape) == 0:
+            return TensorLayout([], self.device_mesh)
         variable_shard_spec = [None] * len(variable.shape)
         return TensorLayout(variable_shard_spec, self.device_mesh)
 

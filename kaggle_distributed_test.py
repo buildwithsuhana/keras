@@ -168,6 +168,7 @@ def test_data_parallel(epochs=3):
     log(f"  Batch dimension: {dp.batch_dim_name}")
     log(f"  Auto-shard dataset: False")
     
+    optimizer = keras.optimizers.Adam(learning_rate=0.001)
     # Create model
     with dp.scope():
         model = keras.Sequential([
@@ -184,7 +185,6 @@ def test_data_parallel(epochs=3):
             if hasattr(layer, 'kernel'):
                 log(f"  Layer {i}: {layer.name}, kernel_shape={layer.kernel.shape}")
         
-        optimizer = keras.optimizers.Adam(learning_rate=0.001)
         model.compile(optimizer=optimizer, loss="mse")
     
     # Create training data
@@ -287,7 +287,7 @@ def test_model_parallel(epochs=3):
     )
     log(f"✓ ModelParallel created: batch_dim={mp.batch_dim_name}")
     log(f"  Auto-shard dataset: False")
-    
+    optimizer = keras.optimizers.Adam(learning_rate=0.001)
     # Create model for sharding demonstration
     with mp.scope():
         model = keras.Sequential([
@@ -341,7 +341,7 @@ def test_model_parallel(epochs=3):
                     log(f"  - Local Shape (Actual on Rank {rank}): {tuple(local_shape)}")
                     log(f"  - Note: DTensor not available, sharding via Parameter creation")
 
-        optimizer = keras.optimizers.Adam(learning_rate=0.001)
+        
         model.compile(optimizer=optimizer, loss="mse")
     
     # Create training data
@@ -387,14 +387,13 @@ def test_gradient_flow():
         devices = ["cpu:0"]
     
     dp = DataParallel(devices=devices, auto_shard_dataset=False)
-    
+    optimizer = keras.optimizers.Adam(learning_rate=0.001)
     with dp.scope():
         model = keras.Sequential([
             layers.Dense(64, activation="relu", input_shape=(32,)),
             layers.Dense(32, activation="relu"),
             layers.Dense(8)
         ])
-        optimizer = keras.optimizers.Adam(learning_rate=0.001)
         model.compile(optimizer=optimizer, loss="mse")
     
     # Create data

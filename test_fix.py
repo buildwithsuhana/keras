@@ -1,32 +1,31 @@
 #!/usr/bin/env python3
-"""Test script to verify the fix for the None shape TypeError in distributed training."""
+"""Test script to verify the scalar variable fix for DataParallel."""
 
 import os
-# Set torch backend before any other keras imports
+# Set the backend before importing keras
 os.environ["KERAS_BACKEND"] = "torch"
-os.environ["KERAS_DISTRIBUTION_DEBUG"] = "1"
 
 import keras
 from keras import layers
 from keras.src.distribution import DataParallel, list_devices
 import numpy as np
 
-def test_optimizer_creation_with_distribution():
-    """Test that optimizer creation works within a distribution scope."""
-    print("Testing optimizer creation within DataParallel scope...")
+def test_scalar_variable_handling():
+    """Test that scalar variables (like optimizer iterations) work with DataParallel."""
+    
+    print("=" * 60)
+    print("Testing Scalar Variable Handling with DataParallel")
+    print("=" * 60)
     
     # Get devices
     devices = list_devices("gpu")
-    if not devices:
-        devices = ["cpu:0"]
-    
     print(f"Using devices: {devices}")
     
     # Create DataParallel distribution
     dp = DataParallel(devices=devices, auto_shard_dataset=False)
     print(f"✓ DataParallel created with mesh_shape={dp.device_mesh.shape}")
     
-    # Create model and optimizer within distribution scope
+    # Create model inside DataParallel scope
     with dp.scope():
         model = keras.Sequential([
             layers.Dense(128, activation="relu", input_shape=(64,)),
@@ -34,35 +33,40 @@ def test_optimizer_creation_with_distribution():
             layers.Dense(10)
         ])
         
-        total_params = model.count_params()
-        print(f"✓ Model created with {total_params:,} parameters")
-        
-        # This should now work without TypeError
         optimizer = keras.optimizers.Adam(learning_rate=0.001)
-        print(f"✓ Optimizer created: {optimizer.name}")
-        
         model.compile(optimizer=optimizer, loss="mse")
     
-    # Quick training test
+    print(f"✓ Model created and compiled with {model.count_params()} parameters")
+    
+    # Check the iterations variable shape
+    print(f"\nOptimizer iterations variable:")
+    print(f"  - Name: {optimizer._iterations.name}")
+    print(f"  - Shape: {optimizer._iterations.shape}")
+    print(f"  - Value: {optimizer._iterations.value}")
+    
+    # Create training data
     batch_size = 32
     x = np.random.random((batch_size, 64)).astype("float32")
     y = np.random.random((batch_size, 10)).astype("float32")
     
-    print("Running one training step...")
+    # Training
+    print(f"\nTraining for 1 epoch...")
     with dp.scope():
-        history = model.fit(x, y, epochs=1, verbose=0)
-        loss = history.history['loss'][0]
+        history = model.fit(x, y, epochs=1, verbose=1)
     
-    print(f"✓ Training step completed. Loss: {loss:.6f}")
-    print("\n✓ All tests PASSED!")
+    print(f"\n✓ Training completed successfully!")
+    print(f"  - Initial loss: {history.history['loss'][0]:.6f}")
+    
+    # Verify iterations counter was updated
+    print(f"\nIterations counter after training: {optimizer._iterations.value}")
+    
+    print("\n" + "=" * 60)
+    print("✓ All tests passed! Scalar variable handling works correctly.")
+    print("=" * 60)
+    
     return True
 
+
 if __name__ == "__main__":
-    try:
-        test_optimizer_creation_with_distribution()
-    except Exception as e:
-        print(f"\n✗ Test FAILED with error: {type(e).__name__}: {e}")
-        import traceback
-        traceback.print_exc()
-        exit(1)
+    test_scalar_variable_handling()
 

@@ -154,11 +154,15 @@ class BaseOptimizer(KerasSaveable):
         # Create iteration variable
         # Note: dtype="int" will resolve to int32 in JAX
         # (since int64 is disallowed in JAX) and to int64 in TF.
+        # The explicit shape=() ensures this scalar variable is properly
+        # recognized by all backends, including PyTorch DTensor, which
+        # prevents issues when using DataParallel/ModelParallel.
         with backend.name_scope(self.name, caller=self):
             iterations = backend.Variable(
                 0,
                 name="iteration",
                 dtype="int",
+                shape=(),
                 trainable=False,
                 aggregation="only_first_replica",
             )
