@@ -1170,3 +1170,170 @@ def ensure_dtensor_input(input_tensor, device_mesh):
     
     return DTensor.from_local(input_tensor, device_mesh, [Replicate()])
 
+
+def ensure_dtensor(tensor, device_mesh=None, placements=None):
+    """Convert a tensor to DTensor if it isn't already.
+    
+    This is a comprehensive helper that ensures all tensors in DTensor
+    operations are properly converted, preventing the "mixed torch.Tensor
+    and DTensor" error.
+    
+    Args:
+        tensor: torch.Tensor or DTensor to convert
+        device_mesh: DeviceMesh to use for conversion. If None, uses default mesh.
+        placements: Placements for the DTensor. If None, uses Replicate.
+    
+    Returns:
+        DTensor (or original if already a DTensor)
+    """
+    if not DTENSOR_AVAILABLE:
+        return tensor
+    
+    if tensor is None:
+        return tensor
+    
+    # Already a DTensor, just return
+    if isinstance(tensor, DTensor):
+        return tensor
+    
+    # Get device mesh
+    if device_mesh is None:
+        device_mesh = _get_default_device_mesh()
+    
+    if device_mesh is None:
+        return tensor
+    
+    # Default placements to replicate
+    if placements is None:
+        placements = [Replicate()]
+    elif not isinstance(placements, list):
+        placements = [placements]
+    
+    debug_mode = _get_debug_setting()
+    rank = torch.distributed.get_rank() if torch.distributed.is_initialized() else 0
+    
+    if debug_mode:
+        print(f"DEBUG | [Rank {rank:02d}] ensure_dtensor: converting tensor to DTensor")
+        print(f"DEBUG | [Rank {rank:02d}]   input shape: {tensor.shape}, dtype: {tensor.dtype}")
+        print(f"DEBUG | [Rank {rank:02d}]   device_mesh: {device_mesh}")
+        print(f"DEBUG | [Rank {rank:02d}]   placements: {placements}")
+    
+    # Convert to DTensor
+    result = DTensor.from_local(tensor, device_mesh, placements)
+    
+    if debug_mode:
+        local_shape = result.to_local().shape
+        print(f"DEBUG | [Rank {rank:02d}]   output: DTensor with local_shape={local_shape}, global_shape={result.shape}")
+    
+    return result
+
+
+def convert_tensors_to_dtensor(*tensors, device_mesh=None):
+    """Convert multiple tensors to DTensors, handling mixed types.
+    
+    This function ensures all tensors in a collection are DTensors,
+    converting regular tensors to replicated DTensors. This prevents
+    the "mixed torch.Tensor and DTensor" error during operations.
+    
+    Args:
+        *tensors: Variable number of torch.Tensor or DTensor objects
+        device_mesh: DeviceMesh to use for conversion
+    
+    Returns:
+        Tuple of converted tensors (all DTensors or original if not available)
+    """
+    if not DTENSOR_AVAILABLE:
+        return tensors
+    
+    # Get device mesh
+    if device_mesh is None:
+        device_mesh = _get_default_device_mesh()
+    
+    if device_mesh is None:
+        return tensors
+    
+    result = []
+    for tensor in tensors:
+        if tensor is None:
+            result.append(None)
+        elif isinstance(tensor, DTensor):
+            result.append(tensor)
+        else:
+            # Convert regular tensor to replicated DTensor
+            result.append(DTensor.from_local(tensor, device_mesh, [Replicate()]))
+    
+    return tuple(result)
+
+
+def get_dtensor_local(tensor):
+    """Get the local tensor from a DTensor, or return the tensor as-is.
+    
+    This helper extracts the local tensor data from a DTensor, which is
+    useful when you need to work with the actual data on the current device.
+    
+    Args:
+        tensor: torch.Tensor or DTensor
+    
+    Returns:
+        torch.Tensor (the local tensor if input was DTensor, else original tensor)
+    """
+    if isinstance(tensor, DTensor):
+        return tensor.to_local()
+    return tensor
+
+
+def is_dtensor(tensor) -> bool:
+    """Check if a tensor is a DTensor.
+    
+    Args:
+        tensor: torch.Tensor or DTensor
+    
+    Returns:
+        True if tensor is a DTensor, False otherwise
+    """
+    if not DTENSOR_AVAILABLE:
+        return False
+    return isinstance(tensor, DTensor)
+
+
+def get_dtensor_spec(tensor):
+    """Get the DTensor spec (placements) from a tensor.
+    
+    Args:
+        tensor: A DTensor or regular tensor
+    
+    Returns:
+        The DTensor spec if input is DTensor, None otherwise
+    """
+    if isinstance(tensor, DTensor):
+        return tensor.placements
+    return None
+
+
+def create_replicate_dtensor(tensor, device_mesh=None):
+    """Create a replicated DTensor from a regular tensor.
+    
+    This is a convenience function for creating replicated DTensors
+    for operations that need consistent tensor types.
+    
+    Args:
+        tensor: torch.Tensor to convert
+        device_mesh: DeviceMesh to use
+    
+    Returns:
+        DTensor with Replicate placement
+    """
+    if not DTENSOR_AVAILABLE:
+        return tensor
+    
+    if isinstance(tensor, DTensor):
+        return tensor
+    
+    if device_mesh is None:
+        device_mesh = _get_default_device_mesh()
+    
+    if device_mesh is None:
+        return tensor
+    
+    return DTensor.from_local(tensor, device_mesh, [Replicate()])
+

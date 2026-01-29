@@ -349,6 +349,11 @@ def convert_to_tensor(x, dtype=None, sparse=None, ragged=None):
 def convert_to_numpy(x):
     def transform(x):
         if is_tensor(x):
+            # Handle DTensor - get local tensor first
+            from keras.src.backend.torch.distribution_lib import is_dtensor, get_dtensor_local
+            if is_dtensor(x):
+                x = get_dtensor_local(x)
+            
             if x.requires_grad:
                 x = x.detach()
             # Tensor has to be moved to CPU before converting to numpy.
@@ -368,6 +373,11 @@ def convert_to_numpy(x):
 
 
 def is_tensor(x):
+    # Handle DTensor - it should also be considered as a tensor
+    from keras.src.backend.torch.distribution_lib import is_dtensor as _is_dtensor
+    if _is_dtensor(x):
+        return True
+    
     # Using the built-in `isinstance` is recommended by pytorch
     # over using torch.is_tensor
     # see: https://pytorch.org/docs/stable/generated/torch.is_tensor.html
@@ -380,6 +390,12 @@ def is_tensor(x):
 
 
 def shape(x):
+    # Handle DTensor - get global shape
+    from keras.src.backend.torch.distribution_lib import is_dtensor as _is_dtensor
+    if _is_dtensor(x):
+        # DTensor has a shape attribute that gives the global shape
+        return tuple(x.shape)
+    
     # Convert from `torch.Size` to plain tuple.
     return tuple(x.shape)
 
@@ -388,6 +404,16 @@ def cast(x, dtype):
     dtype = to_torch_dtype(dtype)
     if isinstance(x, Variable):
         x = x.value
+    # Handle DTensor - cast the local tensor
+    from keras.src.backend.torch.distribution_lib import is_dtensor as _is_dtensor, get_dtensor_local
+    if _is_dtensor(x):
+        # Cast the local tensor and wrap back in DTensor
+        local_x = get_dtensor_local(x)
+        local_x = local_x.to(dtype)
+        # Get device mesh from original DTensor
+        device_mesh = x.device_mesh
+        from keras.src.backend.torch.distribution_lib import DTensor, Replicate
+        return DTensor.from_local(local_x, device_mesh, x.placements)
     if is_tensor(x):
         if x.dtype == dtype:
             return x

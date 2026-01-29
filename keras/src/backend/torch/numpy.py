@@ -25,11 +25,15 @@ TORCH_INT_TYPES = (
 )
 
 # Import DTensor components for distributed tensor support
-try:
-    from torch.distributed._tensor import DTensor, Replicate
-except ImportError:
-    DTensor = None
-    Replicate = None
+# Use centralized functions from distribution_lib for consistent handling
+from keras.src.backend.torch.distribution_lib import (
+    DTENSOR_AVAILABLE,
+    DTensor,
+    Replicate,
+    is_dtensor,
+    ensure_dtensor,
+    create_replicate_dtensor,
+)
 
 
 def rot90(array, k=1, axes=(0, 1)):
@@ -77,16 +81,10 @@ def add(x1, x2):
 
     # Check if either tensor is a DTensor (PyTorch distributed tensor)
     # If so, the other tensor also needs to be a DTensor for DTensor operations
-    if DTensor is not None and Replicate is not None:
-        x1_is_dtensor = isinstance(x1, DTensor)
-        x2_is_dtensor = isinstance(x2, DTensor)
-
-        if x1_is_dtensor and not x2_is_dtensor:
-            device_mesh = x1.device_mesh
-            x2 = DTensor.from_local(x2, device_mesh, [Replicate()])
-        elif x2_is_dtensor and not x1_is_dtensor:
-            device_mesh = x2.device_mesh
-            x1 = DTensor.from_local(x1, device_mesh, [Replicate()])
+    if DTENSOR_AVAILABLE and is_dtensor(x1) and not is_dtensor(x2):
+        x2 = create_replicate_dtensor(x2, device_mesh=x1.device_mesh)
+    elif DTENSOR_AVAILABLE and is_dtensor(x2) and not is_dtensor(x1):
+        x1 = create_replicate_dtensor(x1, device_mesh=x2.device_mesh)
 
     return torch.add(x1, x2)
 
@@ -113,16 +111,10 @@ def subtract(x1, x2):
 
     # Check if either tensor is a DTensor (PyTorch distributed tensor)
     # If so, the other tensor also needs to be a DTensor for DTensor operations
-    if DTensor is not None and Replicate is not None:
-        x1_is_dtensor = isinstance(x1, DTensor)
-        x2_is_dtensor = isinstance(x2, DTensor)
-
-        if x1_is_dtensor and not x2_is_dtensor:
-            device_mesh = x1.device_mesh
-            x2 = DTensor.from_local(x2, device_mesh, [Replicate()])
-        elif x2_is_dtensor and not x1_is_dtensor:
-            device_mesh = x2.device_mesh
-            x1 = DTensor.from_local(x1, device_mesh, [Replicate()])
+    if DTENSOR_AVAILABLE and is_dtensor(x1) and not is_dtensor(x2):
+        x2 = create_replicate_dtensor(x2, device_mesh=x1.device_mesh)
+    elif DTENSOR_AVAILABLE and is_dtensor(x2) and not is_dtensor(x1):
+        x1 = create_replicate_dtensor(x1, device_mesh=x2.device_mesh)
 
     # TODO: torch.subtract doesn't support bool
     if standardize_dtype(x1.dtype) == "bool":
@@ -138,18 +130,10 @@ def matmul(x1, x2):
 
     # Check if either tensor is a DTensor (PyTorch distributed tensor)
     # If so, the other tensor also needs to be a DTensor for DTensor operations
-    if DTensor is not None and Replicate is not None:
-        x1_is_dtensor = isinstance(x1, DTensor)
-        x2_is_dtensor = isinstance(x2, DTensor)
-
-        if x1_is_dtensor and not x2_is_dtensor:
-            # Convert x2 to DTensor with replicated placement
-            device_mesh = x1.device_mesh
-            x2 = DTensor.from_local(x2, device_mesh, [Replicate()])
-        elif x2_is_dtensor and not x1_is_dtensor:
-            # Convert x1 to DTensor with replicated placement
-            device_mesh = x2.device_mesh
-            x1 = DTensor.from_local(x1, device_mesh, [Replicate()])
+    if DTENSOR_AVAILABLE and is_dtensor(x1) and not is_dtensor(x2):
+        x2 = create_replicate_dtensor(x2, device_mesh=x1.device_mesh)
+    elif DTENSOR_AVAILABLE and is_dtensor(x2) and not is_dtensor(x1):
+        x1 = create_replicate_dtensor(x1, device_mesh=x2.device_mesh)
 
     def can_use_int_matmul(x1, x2):
         # torch._int_mm only accepts the following conditions:
@@ -209,16 +193,10 @@ def multiply(x1, x2):
 
     # Check if either tensor is a DTensor (PyTorch distributed tensor)
     # If so, the other tensor also needs to be a DTensor for DTensor operations
-    if DTensor is not None and Replicate is not None:
-        x1_is_dtensor = isinstance(x1, DTensor)
-        x2_is_dtensor = isinstance(x2, DTensor)
-
-        if x1_is_dtensor and not x2_is_dtensor:
-            device_mesh = x1.device_mesh
-            x2 = DTensor.from_local(x2, device_mesh, [Replicate()])
-        elif x2_is_dtensor and not x1_is_dtensor:
-            device_mesh = x2.device_mesh
-            x1 = DTensor.from_local(x1, device_mesh, [Replicate()])
+    if DTENSOR_AVAILABLE and is_dtensor(x1) and not is_dtensor(x2):
+        x2 = create_replicate_dtensor(x2, device_mesh=x1.device_mesh)
+    elif DTENSOR_AVAILABLE and is_dtensor(x2) and not is_dtensor(x1):
+        x1 = create_replicate_dtensor(x1, device_mesh=x2.device_mesh)
 
     return torch.multiply(x1, x2)
 
