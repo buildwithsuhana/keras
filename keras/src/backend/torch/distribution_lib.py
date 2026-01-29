@@ -1193,6 +1193,13 @@ def create_tp_plan_from_layout_map(
             # No sharding specified
             continue
         
+        # Handle TensorLayout objects (extract axes)
+        if hasattr(sharding_spec, 'axes'):
+            # It's a TensorLayout object, extract the axes tuple
+            sharding_spec = sharding_spec.axes
+            if debug_mode:
+                print(f"DEBUG | [Rank {rank:02d}] Extracted axes from TensorLayout: {sharding_spec}")
+        
         if isinstance(sharding_spec, tuple):
             # Keras spec like (None, 'model') or ('model',)
             # For a weight matrix (input_dim, output_dim):
