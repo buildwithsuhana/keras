@@ -291,7 +291,10 @@ def test_model_parallel(epochs=3):
     # Create model for sharding demonstration
     with mp.scope():
         model = keras.Sequential([
-            layers.Dense(512, activation="relu", input_shape=(128,)),
+            # Using Input layer delays weight initialization of the first Dense layer
+            # so that it can be properly captured by the ModelParallel sharding plan.
+            layers.Input(shape=(128,)),
+            layers.Dense(512, activation="relu"),
             layers.Dense(256, activation="relu"),
             layers.Dense(128, activation="relu"),
             layers.Dense(10)
