@@ -1,7 +1,12 @@
 """Unified high-level distribution APIs across backends.
 
-Currently only the JAX backend is supported. The TensorFlow backend
-will be supported in the future (via tf.dtensor API).
+This module provides distribution strategies for data parallelism and model
+parallelism across different backends (JAX, PyTorch, TensorFlow).
+
+Supported backends:
+- JAX: Full support via `jax.sharding`
+- PyTorch: Full support via `torch.distributed._tensor` (DTensor)
+- TensorFlow: Limited support (TF Dataset sharding only)
 """
 
 import collections
@@ -19,6 +24,148 @@ from keras.src.backend.common import global_state
 
 DEFAULT_BATCH_DIM_NAME = "batch"
 GLOBAL_ATTRIBUTE_NAME = "distribution"
+
+# Backend detection
+_BACKEND = None
+
+
+def _get_backend():
+    """Get the current backend type."""
+    global _BACKEND
+    if _BACKEND is None:
+        try:
+            from keras.src.backend import config
+            _BACKEND = config.backend()
+        except ImportError:
+            _BACKEND = "unknown"
+    return _BACKEND
+
+
+def _is_torch_backend():
+    """Check if using PyTorch backend."""
+    return _get_backend() == "torch"
+
+
+# Path adapter utilities for converting between Keras and PyTorch naming conventions
+# Keras uses: "dense/kernel" (forward slashes)
+# PyTorch uses: "dense.weight" (dots)
+
+
+def keras_to_pytorch_path(keras_path: str) -> str:
+    """Convert a Keras variable path to PyTorch format.
+
+    Args:
+        keras_path: Path like "dense/kernel" or "my_model/dense_1/bias"
+
+    Returns:
+        PyTorch-style path like "dense.weight" or "my_model.dense_1.bias"
+
+    Example:
+        >>> keras_to_pytorch_path("dense/kernel")
+        'dense.weight'
+        >>> keras_to_pytorch_path("conv2d/bias")
+        'conv2d.bias'
+    """
+    # Replace forward slashes with dots
+    pytorch_path = keras_path.replace('/', '.')
+    return pytorch_path
+
+
+def pytorch_to_keras_path(pytorch_path: str) -> str:
+    """Convert a PyTorch variable path to Keras format.
+
+    Args:
+        pytorch_path: Path like "dense.weight" or "my_model.dense_1.bias"
+
+    Returns:
+        Keras-style path like "dense/kernel" or "my_model/dense_1/bias"
+
+    Example:
+        >>> pytorch_to_keras_path("dense.weight")
+        'dense/kernel'
+        >>> pytorch_to_keras_path("conv2d.bias")
+        'conv2d/bias'
+    """
+    # Replace dots with forward slashes
+    keras_path = pytorch_path.replace('.', '/')
+    return keras_path
+
+
+def convert_path_for_matching(
+    path: str,
+    source_format: str = "keras",
+) -> tuple:
+    """Convert a path to work with regex patterns from the other format.
+
+    This is useful when you have regex patterns in Keras format but need
+    to match against PyTorch paths (and vice versa).
+
+    Args:
+        path: The path to convert
+        source_format: "keras" if path is in Keras format, "pytorch" if in PyTorch
+
+    Returns:
+        Tuple of (keras_path, pytorch_path)
+    """
+    if source_format == "keras":
+        keras_path = path
+        pytorch_path = keras_to_pytorch_path(path)
+    else:
+        pytorch_path = path
+        keras_path = pytorch_to_keras_path(path)
+
+    return keras_path, pytorch_path
+
+
+def _check_path_for_layout_map(
+    path: str,
+    layout_map: "LayoutMap",
+) -> "TensorLayout":
+    """Check a path against a LayoutMap, handling both Keras and PyTorch formats.
+
+    This function is used when the backend is PyTorch to ensure that
+    Keras-style regex patterns still work correctly.
+
+    Args:
+        path: The variable path to check (usually in Keras format)
+        layout_map: The LayoutMap to query
+
+    Returns:
+        The matching TensorLayout or None
+    """
+    # For non-PyTorch backends, just use the standard lookup
+    if not _is_torch_backend():
+        return layout_map[path]
+
+    # For PyTorch backend, check both formats
+    keras_path, pytorch_path = convert_path_for_matching(path, source_format="keras")
+
+    # First try exact match with the original path
+    if keras_path in layout_map:
+        return layout_map[keras_path]
+
+    # Try exact match with converted path
+    if pytorch_path in layout_map:
+        return layout_map[pytorch_path]
+
+    # Try regex matches
+    matching_keys = []
+    for k in layout_map:
+        # Check against both path formats
+        if re.search(k, keras_path) or re.search(k, pytorch_path):
+            matching_keys.append(k)
+
+    if len(matching_keys) > 1:
+        raise ValueError(
+            f"Path '{path}' matches multiple layout "
+            f"specification keys: {matching_keys}. Please make "
+            "sure each tensor/variable path only matches at most "
+            "one layout specification key in the LayoutMap."
+        )
+    elif len(matching_keys) == 1:
+        return layout_map[matching_keys[0]]
+
+    return None
 
 
 @keras_export("keras.distribution.list_devices")
@@ -669,15 +816,16 @@ class ModelParallel(Distribution):
         # First check if the variable already has a layout assigned.
         if getattr(variable, "_layout", None) is not None:
             return variable._layout
-        # Check the layout map.
-        variable_layout = self._layout_map[variable.path]
+        # Check the layout map with path adapter support for PyTorch.
+        variable_layout = _check_path_for_layout_map(variable.path, self._layout_map)
         if variable_layout is not None:
             return variable_layout
         variable_shard_spec = [None] * len(variable.shape)
         return TensorLayout(variable_shard_spec, self.device_mesh)
 
     def get_tensor_layout(self, path):
-        return self._layout_map[path]
+        # Use path adapter support for PyTorch backend
+        return _check_path_for_layout_map(path, self._layout_map)
 
     def distribute_dataset(self, dataset):
         if not self._is_multi_process or not self.auto_shard_dataset:
