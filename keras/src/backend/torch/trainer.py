@@ -130,7 +130,8 @@ class TorchTrainer(base_trainer.Trainer):
         """Convert DTensor outputs to local tensors.
         
         When model has DTensor weights, the forward pass returns DTensors.
-        Subsequent operations (like loss computation) need local tensors.
+        For sharded outputs, we need to ALL_GATHER to reconstruct the full tensor.
+        For loss computation, we need the full global shape, not just the local shard.
         
         Args:
             x: Output tensor (can be torch.Tensor, DTensor, or nested structure)
@@ -143,6 +144,8 @@ class TorchTrainer(base_trainer.Trainer):
         from keras.src.backend.torch.distribution_lib import (
             dtensor_to_local,
             DTensor,
+            Replicate,
+            Shard,
             DTENSOR_AVAILABLE,
         )
         
@@ -161,30 +164,84 @@ class TorchTrainer(base_trainer.Trainer):
         
         # Check if it's a DTensor
         if isinstance(x, DTensor):
+            # Check if the DTensor is sharded (has non-Replicate placements)
+            is_sharded = not all(isinstance(p, Replicate) for p in x.placements)
+            
+            if is_sharded:
+                # Need to ALL_GATHER to reconstruct the full tensor
+                # This is critical for loss computation to work correctly
+                if _get_debug_setting():
+                    rank = torch.distributed.get_rank() if torch.distributed.is_initialized() else 0
+                    print(f"DEBUG | [Rank {rank:02d}] All-gathering sharded DTensor output")
+                
+                # Get the device mesh from the DTensor
+                device_mesh = x.device_mesh
+                
+                # Find the shard dimension (the dimension being sharded)
+                shard_dim = None
+                for i, placement in enumerate(x.placements):
+                    if isinstance(placement, Shard):
+                        shard_dim = i
+                        break
+                
+                if shard_dim is not None and torch.distributed.is_initialized():
+                    # Perform all_gather along the shard dimension
+                    world_size = torch.distributed.get_world_size()
+                    
+                    # Get local tensor
+                    local_tensor = x.to_local()
+                    local_shape = list(local_tensor.shape)
+                    global_shape = list(x.shape)
+                    
+                    if _get_debug_setting():
+                        rank = torch.distributed.get_rank()
+                        print(f"DEBUG | [Rank {rank:02d}] Local shape: {local_shape}, Global shape: {global_shape}")
+                        print(f"DEBUG | [Rank {rank:02d}] Shard dim: {shard_dim}, World size: {world_size}")
+                    
+                    # Use PyTorch's all_gather to combine shards
+                    # Create a list to hold gathered tensors
+                    gathered_tensors = [torch.zeros_like(local_tensor) for _ in range(world_size)]
+                    
+                    # Allgather: each process provides its local tensor
+                    torch.distributed.all_gather(gathered_tensors, local_tensor)
+                    
+                    # Concatenate along the shard dimension
+                    full_tensor = torch.cat(gathered_tensors, dim=shard_dim)
+                    
+                    if _get_debug_setting():
+                        rank = torch.distributed.get_rank()
+                        print(f"DEBUG | [Rank {rank:02d}] All-gathered tensor shape: {full_tensor.shape}")
+                    
+                    return full_tensor
+            
+            # Not sharded or no distributed, just convert to local
             if _get_debug_setting():
                 rank = torch.distributed.get_rank() if torch.distributed.is_initialized() else 0
-                print(f"DEBUG | [Rank {rank:02d}] Converting DTensor to local tensor")
+                print(f"DEBUG | [Rank {rank:02d}] Converting DTensor to local tensor (no sharding)")
             return dtensor_to_local(x)
         
         # For nested structures, check if any element is a DTensor
         if isinstance(x, (dict, list, tuple)):
-            # Check if any element is a DTensor
-            has_dtensor = False
-            def check_for_dtensor(item):
+            # Check if any element is a sharded DTensor
+            has_sharded_dtensor = False
+            def check_for_sharded_dtensor(item):
                 if isinstance(item, DTensor):
-                    return True
+                    # Check if it's sharded
+                    is_sharded = not all(isinstance(p, Replicate) for p in item.placements)
+                    if is_sharded:
+                        return True
                 if isinstance(item, (dict, list, tuple)):
                     for v in item.values() if isinstance(item, dict) else item:
-                        if check_for_dtensor(v):
+                        if check_for_sharded_dtensor(v):
                             return True
                 return False
             
-            has_dtensor = check_for_dtensor(x)
+            has_sharded_dtensor = check_for_sharded_dtensor(x)
             
-            if has_dtensor:
+            if has_sharded_dtensor:
                 if _get_debug_setting():
                     rank = torch.distributed.get_rank() if torch.distributed.is_initialized() else 0
-                    print(f"DEBUG | [Rank {rank:02d}] Converting nested structure with DTensors to local")
+                    print(f"DEBUG | [Rank {rank:02d}] All-gathering nested structure with sharded DTensors")
                 return dtensor_to_local(x)
         
         return x
