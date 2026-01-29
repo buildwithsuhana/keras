@@ -84,20 +84,24 @@ def setup_environment():
         local_rank = int(os.environ["LOCAL_RANK"])
         world_size = int(os.environ.get("WORLD_SIZE", 1))
         
-        # Setup device for this process
-        if torch.cuda.is_available():
+        # Get number of available GPUs
+        gpu_count = torch.cuda.device_count() if torch.cuda.is_available() else 0
+        
+        # For multi-process training, ensure we don't exceed available GPUs
+        # If world_size > gpu_count, only the first gpu_count processes can use GPUs
+        # Other processes should use CPU
+        if torch.cuda.is_available() and local_rank < gpu_count:
+            # This process has a GPU
             torch.cuda.set_device(local_rank)
-        
-        # Initialize PyTorch distributed
-        if not dist.is_initialized():
-            dist.init_process_group(
-                backend="nccl" if torch.cuda.is_available() else "gloo",
-                init_method="env://"
-            )
-        
-        log(f"✓ PyTorch distributed initialized via torchrun")
-        log(f"  Local rank: {local_rank}, World size: {world_size}")
-        log(f"  Device: cuda:{local_rank}")
+            log(f"✓ PyTorch distributed initialized via torchrun")
+            log(f"  Local rank: {local_rank}, World size: {world_size}")
+            log(f"  Device: cuda:{local_rank}")
+        else:
+            # This process will use CPU (no GPU available for this rank)
+            log(f"✓ PyTorch distributed initialized via torchrun (CPU mode)")
+            log(f"  Local rank: {local_rank}, World size: {world_size}")
+            log(f"  Device: CPU (no GPU available for this rank)")
+            log(f"  Note: Only {gpu_count} GPUs available for {world_size} processes")
     else:
         log("Running in single-process mode")
     

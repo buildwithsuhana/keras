@@ -69,10 +69,13 @@ def check_tpu_available():
         
         # Check if TPU is available
         devices = xm.get_xla_supported_devices()
-        if devices and any('tpu' in d for d in devices):
-            return True, xm, devices
+        tpu_devices = [d for d in devices if 'tpu' in d]
+        if tpu_devices:
+            return True, xm, tpu_devices
         return False, None, None
     except ImportError:
+        # torch-xla not installed
+        print("ERROR: torch-xla not installed. Run: pip install torch-xla")
         return False, None, None
 
 
@@ -91,9 +94,9 @@ def setup_environment():
     
     if tpu_available:
         log("✓ TPU detected via PyTorch XLA!")
-        tpu_count = len([d for d in devices if 'tpu' in d])
+        tpu_count = len(devices)
         log(f"  Number of TPUs: {tpu_count}")
-        log(f"  TPU devices: {devices[:4]}..." if len(devices) > 4 else f"  TPU devices: {devices}")
+        log(f"  TPU devices: {devices}")
     else:
         # Check for GPU
         if torch.cuda.is_available():
@@ -104,6 +107,11 @@ def setup_environment():
                 log(f"    GPU {i}: {props.name}")
         else:
             log("⚠ No TPU or GPU detected, using CPU")
+            log("  To enable TPU on Kaggle:")
+            log("    1. Settings → Accelerator → Select TPU")
+            log("    2. Restart session")
+            log("  Or check if torch-xla is installed:")
+            log("    !pip list | grep torch-xla")
     
     # Check distributed
     try:
