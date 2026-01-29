@@ -311,6 +311,23 @@ def initialize(
         if process_id_str:
             process_id = int(process_id_str)
     
+    # Check if running with torchrun (common in multi-GPU training)
+    # torchrun sets LOCAL_RANK and WORLD_SIZE environment variables
+    local_rank = os.environ.get("LOCAL_RANK")
+    world_size_env = os.environ.get("WORLD_SIZE")
+    
+    if local_rank is not None and world_size_env is not None:
+        # Running with torchrun or similar distributed launcher
+        if num_processes is None:
+            num_processes = int(world_size_env)
+        if process_id is None:
+            process_id = int(local_rank)
+        if _get_debug_setting():
+            logger.debug(
+                f"Detected torchrun environment: LOCAL_RANK={local_rank}, "
+                f"WORLD_SIZE={world_size_env}"
+            )
+    
     # For single-process multi-device, no special initialization needed
     if num_processes is None or num_processes == 1:
         _DISTRIBUTION_INITIALIZED = True
@@ -319,7 +336,16 @@ def initialize(
         return
     
     # For multi-process, initialize PyTorch distributed
-    if not torch.distributed.is_initialized():
+    # First check if torchrun has already initialized it
+    if torch.distributed.is_initialized():
+        _DISTRIBUTION_INITIALIZED = True
+        if _get_debug_setting():
+            logger.debug(
+                f"Torch distributed already initialized: "
+                f"rank={torch.distributed.get_rank()}, "
+                f"world_size={torch.distributed.get_world_size()}"
+            )
+    else:
         if job_addresses and "," in job_addresses:
             # Multiple addresses provided
             addresses = job_addresses.split(",")

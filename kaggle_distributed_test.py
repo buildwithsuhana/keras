@@ -468,11 +468,12 @@ def main():
     import torch.distributed as dist
     from keras.src.distribution import initialize
     
+    # Initialize Keras distribution system FIRST
+    # This detects torchrun and sets up the distributed state
+    initialize()
+    
     # Setup environment (this now handles torch distributed init)
     setup_environment()
-    
-    # Initialize Keras distribution system
-    initialize()
     
     # Run tests
     test_device_detection()
