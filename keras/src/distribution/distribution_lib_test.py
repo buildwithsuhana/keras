@@ -477,6 +477,224 @@ class LayoutMapTest(testing.TestCase):
         self.assertEqual(values, [self.sharded_2d, self.sharded_1d])
 
 
+class PathSeparatorAdapterTest(testing.TestCase):
+    """Tests for the path separator adapter between Keras and PyTorch formats."""
+
+    def test_convert_keras_to_pytorch_kernel(self):
+        """Test converting Keras kernel path to PyTorch format."""
+        from keras.src.backend.torch.distribution_lib import (
+            convert_keras_path_to_pytorch,
+        )
+
+        self.assertEqual(
+            convert_keras_path_to_pytorch("dense/kernel"), "dense.weight"
+        )
+        self.assertEqual(
+            convert_keras_path_to_pytorch("conv2d/kernel"), "conv2d.weight"
+        )
+        self.assertEqual(
+            convert_keras_path_to_pytorch("layer_norm/gamma"),
+            "layer_norm.weight",
+        )
+
+    def test_convert_keras_to_pytorch_bias(self):
+        """Test converting Keras bias path to PyTorch format."""
+        from keras.src.backend.torch.distribution_lib import (
+            convert_keras_path_to_pytorch,
+        )
+
+        self.assertEqual(
+            convert_keras_path_to_pytorch("dense/bias"), "dense.bias"
+        )
+        self.assertEqual(
+            convert_keras_path_to_pytorch("conv2d/bias"), "conv2d.bias"
+        )
+
+    def test_convert_pytorch_to_keras_kernel(self):
+        """Test converting PyTorch kernel path to Keras format."""
+        from keras.src.backend.torch.distribution_lib import (
+            convert_pytorch_path_to_keras,
+        )
+
+        self.assertEqual(
+            convert_pytorch_path_to_keras("dense.weight"), "dense/kernel"
+        )
+        self.assertEqual(
+            convert_pytorch_path_to_keras("conv2d.weight"), "conv2d/kernel"
+        )
+
+    def test_convert_pytorch_to_keras_bias(self):
+        """Test converting PyTorch bias path to Keras format."""
+        from keras.src.backend.torch.distribution_lib import (
+            convert_pytorch_path_to_keras,
+        )
+
+        self.assertEqual(
+            convert_pytorch_path_to_keras("dense.bias"), "dense/bias"
+        )
+        self.assertEqual(
+            convert_pytorch_path_to_keras("conv2d.bias"), "conv2d/bias"
+        )
+
+    def test_path_separator_adapter_match(self):
+        """Test that patterns work with both path formats."""
+        from keras.src.backend.torch.distribution_lib import (
+            PathSeparatorAdapter,
+        )
+
+        # Keras pattern should match PyTorch path
+        pattern = r"dense.*kernel"
+        self.assertTrue(
+            PathSeparatorAdapter.match_pattern(pattern, "dense.weight")
+        )
+        self.assertTrue(
+            PathSeparatorAdapter.match_pattern(pattern, "dense/kernel")
+        )
+
+        # PyTorch pattern should match Keras path
+        pattern = r"dense.*weight"
+        self.assertTrue(
+            PathSeparatorAdapter.match_pattern(pattern, "dense/kernel")
+        )
+
+
+@pytest.mark.skipif(
+    backend.backend() != "torch",
+    reason="PyTorch-specific test",
+)
+class TorchDistributionLibTest(testing.TestCase):
+    """PyTorch-specific distribution tests."""
+
+    def test_list_devices_cpu(self):
+        """Test listing CPU devices."""
+        devices = distribution_lib.list_devices("cpu")
+        self.assertIsInstance(devices, list)
+        self.assertGreater(len(devices), 0)
+        for device in devices:
+            self.assertIn("cpu", device)
+
+    def test_get_device_count_cpu(self):
+        """Test getting CPU device count."""
+        count = distribution_lib.get_device_count("cpu")
+        self.assertIsInstance(count, int)
+        self.assertGreaterEqual(count, 1)
+
+    def test_convert_keras_to_pytorch_path(self):
+        """Test path conversion in PyTorch backend."""
+        from keras.src.backend.torch.distribution_lib import (
+            convert_keras_path_to_pytorch,
+        )
+
+        self.assertEqual(
+            convert_keras_path_to_pytorch("dense/kernel"), "dense.weight"
+        )
+        self.assertEqual(
+            convert_keras_path_to_pytorch("conv2d/bias"), "conv2d.bias"
+        )
+
+    def test_convert_pytorch_to_keras_path(self):
+        """Test path conversion from PyTorch to Keras format."""
+        from keras.src.backend.torch.distribution_lib import (
+            convert_pytorch_path_to_keras,
+        )
+
+        self.assertEqual(
+            convert_pytorch_path_to_keras("dense.weight"), "dense/kernel"
+        )
+        self.assertEqual(
+            convert_pytorch_path_to_keras("conv2d.bias"), "conv2d/bias"
+        )
+
+
+@pytest.mark.skipif(
+    backend.backend() != "torch",
+    reason="PyTorch-specific test",
+)
+class TorchDataParallelTest(testing.TestCase):
+    """Test DataParallel distribution with PyTorch backend."""
+
+    def setUp(self):
+        super().setUp()
+        self.devices = distribution_lib.list_devices("cpu")
+        if len(self.devices) > 4:
+            self.devices = self.devices[:4]
+        shape = (len(self.devices),)
+        axis_names = ["batch"]
+
+        self.device_mesh = distribution_lib.DeviceMesh(
+            shape, axis_names, self.devices
+        )
+
+    def test_create_data_parallel(self):
+        """Test creating DataParallel distribution."""
+        distribution = distribution_lib.DataParallel(
+            device_mesh=self.device_mesh
+        )
+        self.assertIsNotNone(distribution)
+        self.assertEqual(distribution.batch_dim_name, "batch")
+
+    def test_get_data_layout(self):
+        """Test getting data layout for DataParallel."""
+        distribution = distribution_lib.DataParallel(
+            device_mesh=self.device_mesh
+        )
+        import numpy as np
+
+        data = np.arange(16).reshape((4, 2, 2))
+        data_layout = distribution.get_data_layout(data.shape)
+        self.assertIs(data_layout.device_mesh, self.device_mesh)
+        self.assertEqual(data_layout.axes, ("batch", None, None))
+
+
+@pytest.mark.skipif(
+    backend.backend() != "torch",
+    reason="PyTorch-specific test",
+)
+class TorchModelParallelTest(testing.TestCase):
+    """Test ModelParallel distribution with PyTorch backend."""
+
+    def setUp(self):
+        super().setUp()
+        self.devices = distribution_lib.list_devices("cpu")
+        if len(self.devices) > 4:
+            self.devices = self.devices[:4]
+        shape = (2, 2)
+        axis_names = ["data", "model"]
+
+        self.device_mesh = distribution_lib.DeviceMesh(
+            shape, axis_names, self.devices
+        )
+
+    def test_create_model_parallel(self):
+        """Test creating ModelParallel distribution."""
+        layout_map = distribution_lib.LayoutMap(self.device_mesh)
+        layout_map[".*kernel"] = distribution_lib.TensorLayout(
+            [None, "model"], self.device_mesh
+        )
+        layout_map[".*bias"] = distribution_lib.TensorLayout(
+            ["model"], self.device_mesh
+        )
+
+        distribution = distribution_lib.ModelParallel(
+            layout_map=layout_map, batch_dim_name="data"
+        )
+        self.assertIsNotNone(distribution)
+
+    def test_layout_map_with_pytorch_paths(self):
+        """Test that LayoutMap works with PyTorch-style paths."""
+        layout_map = distribution_lib.LayoutMap(self.device_mesh)
+
+        # Add layout with Keras-style path
+        layout_map["dense/kernel"] = distribution_lib.TensorLayout(
+            [None, "model"], self.device_mesh
+        )
+
+        # Should match PyTorch-style path too
+        kernel_layout = layout_map["dense.weight"]
+        self.assertIsNotNone(kernel_layout)
+        self.assertEqual(kernel_layout.axes, (None, "model"))
+
+
 # @pytest.mark.skipif(
 #     backend.backend() != "tensorflow",
 #     reason="Backend specific test",

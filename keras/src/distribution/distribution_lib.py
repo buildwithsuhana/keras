@@ -821,6 +821,13 @@ class LayoutMap(collections.abc.MutableMapping):
         for k in self._layout_map:
             if re.search(k, key):
                 matching_keys.append(k)
+            else:
+                # Also try matching with path separator conversion
+                # This handles PyTorch paths (dense.weight) vs Keras paths (dense/kernel)
+                converted_key = self._convert_path_separator(key)
+                if re.search(k, converted_key):
+                    matching_keys.append(k)
+
         if len(matching_keys) > 1:
             raise ValueError(
                 f"Path '{key}' matches multiple layout "
@@ -831,6 +838,43 @@ class LayoutMap(collections.abc.MutableMapping):
         elif len(matching_keys) == 1:
             return self._layout_map[matching_keys[0]]
         return None
+
+    def _convert_path_separator(self, path):
+        """Convert path separator between formats.
+
+        Keras uses '/' separators (e.g., 'dense/kernel') while PyTorch uses
+        '.' separators (e.g., 'dense.weight'). This method converts between
+        the two formats.
+
+        Args:
+            path: Path string to convert.
+
+        Returns:
+            Path string with converted separators.
+        """
+        # Import here to avoid circular imports
+        try:
+            from keras.src.backend.torch.distribution_lib import (
+                convert_keras_path_to_pytorch,
+                convert_pytorch_path_to_keras,
+            )
+
+            # If path has /, convert to . format (PyTorch style)
+            if "/" in path:
+                return convert_keras_path_to_pytorch(path)
+            # If path has ., convert to / format (Keras style)
+            elif "." in path:
+                return convert_pytorch_path_to_keras(path)
+        except ImportError:
+            pass
+
+        # Fallback: just replace separators
+        if "/" in path:
+            return path.replace("/", ".")
+        elif "." in path:
+            return path.replace(".", "/")
+
+        return path
 
     def __setitem__(self, key, layout):
         """Insert TensorLayout to the LayoutMap.
