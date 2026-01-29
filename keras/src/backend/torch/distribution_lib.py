@@ -728,11 +728,14 @@ def _to_backend_mesh(device_mesh):
             print(f"DEBUG | DTENSOR not available, _to_backend_mesh returning None")
         return None
     
-    # Check if already cached
-    existing_mesh = get_global_attribute("torch_device_mesh")
+    # Check if already cached on this specific DeviceMesh object
+    # Use the DeviceMesh object's id as part of the cache key
+    # This prevents different DeviceMesh instances from sharing the same cache
+    cache_key = f"torch_device_mesh_{id(device_mesh)}"
+    existing_mesh = get_global_attribute(cache_key)
     if existing_mesh is not None:
         if debug_mode:
-            print(f"DEBUG | Found cached mesh in global state: {existing_mesh}")
+            print(f"DEBUG | Found cached mesh for this DeviceMesh: {existing_mesh}")
         return existing_mesh
 
     if debug_mode:
@@ -770,7 +773,8 @@ def _to_backend_mesh(device_mesh):
     if debug_mode:
         print(f"DEBUG | Created TorchDeviceMesh: shape={backend_mesh.shape}, mesh_dim_names={backend_mesh.mesh_dim_names}")
     
-    set_global_attribute("torch_device_mesh", backend_mesh)
+    # Cache on the DeviceMesh object itself, not globally
+    set_global_attribute(cache_key, backend_mesh)
     return backend_mesh
 
 
