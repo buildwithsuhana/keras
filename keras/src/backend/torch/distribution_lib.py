@@ -467,9 +467,9 @@ def distribute_tensor(tensor: torch.Tensor, layout) -> torch.Tensor:
                     return redistribute_dtensor(tensor, device_mesh, placements)
                 return distribute_tensor(tensor, device_mesh, placements)
     
-    # Fallback: return tensor as-is (no distribution)
+    # No layout specified and DTensor not available, returning as-is (normal behavior)
     if _get_debug_setting():
-        logger.debug("DTensor not available, returning tensor as-is")
+        logger.debug("No layout specified, returning tensor as-is")
     return tensor
 
 
@@ -550,7 +550,7 @@ def distribute_variable(tensor, layout=None, module_name=None):
         if not is_float_or_complex:
             if debug_mode:
                 print(
-                    f"DEBUG | [Rank {rank:02d}] Non-floating tensor, returning as-is: "
+                    f"DEBUG | [Rank {rank:02d}] Non-floating tensor returned as-is (no grad tracking): "
                     f"shape={converted_tensor.shape}, dtype={converted_tensor.dtype}"
                 )
             return converted_tensor
@@ -570,14 +570,19 @@ def distribute_variable(tensor, layout=None, module_name=None):
         )
     
     if device_mesh is None:
-        # Fallback if DTensor/Mesh not available
+        # No device mesh available, using regular Parameter (replicated)
         if not is_float_or_complex:
             if debug_mode:
                 print(
-                    f"DEBUG | [Rank {rank:02d}] Non-floating tensor, no mesh: "
+                    f"DEBUG | [Rank {rank:02d}] No device mesh, non-floating tensor returned as-is: "
                     f"shape={converted_tensor.shape}, dtype={converted_tensor.dtype}"
                 )
             return converted_tensor
+        if debug_mode:
+            print(
+                f"DEBUG | [Rank {rank:02d}] No device mesh, creating regular Parameter (replicated): "
+                f"shape={converted_tensor.shape}, dtype={converted_tensor.dtype}"
+            )
         return torch.nn.Parameter(converted_tensor)
 
     # Check which axes need sharding
@@ -642,7 +647,7 @@ def distribute_variable(tensor, layout=None, module_name=None):
         if not is_float_or_complex:
             if debug_mode:
                 print(
-                    f"DEBUG | [Rank {rank:02d}] Non-floating tensor, no sharding needed: "
+                    f"DEBUG | [Rank {rank:02d}] Non-floating tensor, no sharding needed (replicated): "
                     f"shape={converted_tensor.shape}, dtype={converted_tensor.dtype}"
                 )
             return converted_tensor
@@ -704,7 +709,7 @@ def distribute_variable(tensor, layout=None, module_name=None):
         if not is_float_or_complex:
             if debug_mode:
                 print(
-                    f"DEBUG | [Rank {rank:02d}] Non-floating tensor, returning DTensor without Parameter: "
+                    f"DEBUG | [Rank {rank:02d}] Non-floating DTensor returned without Parameter wrapper: "
                     f"shape={dtensor.shape}, dtype={converted_tensor.dtype}"
                 )
             return dtensor
@@ -717,14 +722,14 @@ def distribute_variable(tensor, layout=None, module_name=None):
         if not is_float_or_complex:
             if debug_mode:
                 print(
-                    f"DEBUG | [Rank {rank:02d}] Non-floating tensor, manual sharding without Parameter: "
+                    f"DEBUG | [Rank {rank:02d}] Non-floating tensor returned without Parameter (no grad tracking): "
                     f"shape={converted_tensor.shape}, dtype={converted_tensor.dtype}"
                 )
             return converted_tensor
 
         if debug_mode:
             print(
-                f"DEBUG | [Rank {rank:02d}] Manual sharding fallback: "
+                f"DEBUG | [Rank {rank:02d}] Using regular Parameter (no DTensor available): "
                 f"shape={converted_tensor.shape}, dtype={converted_tensor.dtype}"
             )
         return torch.nn.Parameter(converted_tensor)
@@ -875,7 +880,7 @@ def _to_backend_mesh(device_mesh):
     
     if not DTENSOR_AVAILABLE:
         if debug_mode:
-            print(f"DEBUG | DTENSOR not available, _to_backend_mesh returning None")
+            print(f"DEBUG | DTensor not available, using non-distributed mode")
         return None
     
     # Create a unique cache key based on the mesh configuration (shape and axis_names)
