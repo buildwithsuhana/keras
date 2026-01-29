@@ -482,8 +482,19 @@ def distribute_variable(value, layout) -> torch.Tensor:
     
     tensor = torch.as_tensor(value)
     
+    # Get the device mesh from global state
+    device_mesh = _get_default_device_mesh()
+    
+    if _get_debug_setting():
+        logger.debug(
+            f"distribute_variable: tensor.shape={tensor.shape}, "
+            f"layout={layout}, device_mesh={device_mesh is not None}, "
+            f"DTENSOR_AVAILABLE={DTENSOR_AVAILABLE}"
+        )
+    
     # Check if we need to shard (not replicate)
     needs_sharding = False
+    shard_axis_name = None
     shard_dim = 0
     
     # Parse the layout to check if sharding is requested
@@ -495,73 +506,107 @@ def distribute_variable(value, layout) -> torch.Tensor:
         
         if isinstance(backend_layout, tuple):
             for axis in backend_layout:
-                if axis is not None and axis != 'batch':
+                if axis is not None:
                     needs_sharding = True
+                    shard_axis_name = axis
                     # Get the mesh dimension for this axis
-                    device_mesh = _get_default_device_mesh()
                     if device_mesh is not None and axis in device_mesh.mesh_dim_names:
                         shard_dim = device_mesh.mesh_dim_names.index(axis)
+                    if _get_debug_setting():
+                        logger.debug(
+                            f"Sharding requested on axis '{axis}' "
+                            f"(mesh dim {shard_dim})"
+                        )
                     break
     
-    # If DTensor is available, use it
-    if DTENSOR_AVAILABLE and needs_sharding:
-        # Distribute the tensor
-        distributed_tensor = distribute_tensor(tensor, layout)
+    # If DTensor is available and we have a device mesh, use it
+    if DTENSOR_AVAILABLE and device_mesh is not None:
+        if _get_debug_setting():
+            logger.debug(
+                f"Using DTensor: needs_sharding={needs_sharding}, "
+                f"shard_axis={shard_axis_name}"
+            )
         
-        # Wrap as parameter WITHOUT calling to_local()
-        if isinstance(distributed_tensor, DTensor):
-            # PyTorch now supports Parameters wrapping DTensors directly
-            return torch.nn.Parameter(distributed_tensor, requires_grad=tensor.requires_grad)
-    
-    # Manual sharding when DTensor is not available
-    if DTENSOR_AVAILABLE and needs_sharding and _DISTRIBUTION_INITIALIZED:
-        device_mesh = _get_default_device_mesh()
-        if device_mesh is not None:
-            # Parse the layout to find the sharding dimension
-            if hasattr(layout, 'backend_layout'):
-                backend_layout = layout.backend_layout
-            else:
-                backend_layout = layout
-            
-            if isinstance(backend_layout, tuple):
-                for axis in backend_layout:
-                    if axis is not None and axis != 'batch':
-                        shard_dim = device_mesh.mesh_dim_names.index(axis)
-                        break
-            
-            # Get current rank and world size
-            rank = torch.distributed.get_rank()
-            world_size = torch.distributed.get_world_size()
-            
-            # Calculate the shard size
-            dim_size = tensor.shape[shard_dim]
-            shard_size = (dim_size + world_size - 1) // world_size
-            
-            # Calculate start and end indices for this rank
-            start_idx = rank * shard_size
-            end_idx = min(start_idx + shard_size, dim_size)
-            
-            # Slice the tensor for this rank
-            if shard_dim == 0:
-                local_tensor = tensor[start_idx:end_idx].contiguous().clone()
-            elif shard_dim == 1:
-                local_tensor = tensor[:, start_idx:end_idx].contiguous().clone()
-            else:
-                # For higher dimensions, handle generically
-                slices = [slice(None)] * len(tensor.shape)
-                slices[shard_dim] = slice(start_idx, end_idx)
-                local_tensor = tensor[tuple(slices)].contiguous().clone()
+        if needs_sharding:
+            # Distribute the tensor with sharding
+            placements = _axis_names_to_placements(
+                backend_layout if isinstance(backend_layout, tuple) else (None,) * len(tensor.shape),
+                device_mesh
+            )
             
             if _get_debug_setting():
                 logger.debug(
-                    f"Manual sharding: rank={rank}, world_size={world_size}, "
-                    f"dim={shard_dim}, original_shape={tensor.shape}, "
-                    f"local_shape={local_tensor.shape}"
+                    f"Distributing tensor with placements: {placements}"
                 )
             
-            return torch.nn.Parameter(local_tensor, requires_grad=tensor.requires_grad)
+            # Use distribute_tensor to create a DTensor
+            distributed_tensor = distribute_tensor(tensor, placements)
+            
+            if isinstance(distributed_tensor, DTensor):
+                if _get_debug_setting():
+                    logger.debug(
+                        f"Created DTensor: global_shape={distributed_tensor.shape}, "
+                        f"local_shape={distributed_tensor.to_local().shape}"
+                    )
+                # PyTorch supports Parameters wrapping DTensors directly
+                return torch.nn.Parameter(distributed_tensor, requires_grad=tensor.requires_grad)
+            else:
+                if _get_debug_setting():
+                    logger.debug(
+                        f"distribute_tensor returned non-DTensor: {type(distributed_tensor)}"
+                    )
+        else:
+            # Replicate the tensor
+            replicated_tensor = distribute_tensor(tensor, None)
+            if isinstance(replicated_tensor, DTensor):
+                return torch.nn.Parameter(replicated_tensor, requires_grad=tensor.requires_grad)
+    
+    # Manual sharding fallback when DTensor is not available or failed
+    if needs_sharding and _DISTRIBUTION_INITIALIZED and device_mesh is not None:
+        if _get_debug_setting():
+            logger.debug("Falling back to manual sharding")
+        
+        # Get current rank and world size
+        rank = torch.distributed.get_rank()
+        world_size = torch.distributed.get_world_size()
+        
+        # Calculate the shard size
+        dim_size = tensor.shape[shard_dim]
+        shard_size = (dim_size + world_size - 1) // world_size
+        
+        # Calculate start and end indices for this rank
+        start_idx = rank * shard_size
+        end_idx = min(start_idx + shard_size, dim_size)
+        
+        # Slice the tensor for this rank
+        if shard_dim == 0:
+            local_tensor = tensor[start_idx:end_idx].contiguous().clone()
+        elif shard_dim == 1:
+            local_tensor = tensor[:, start_idx:end_idx].contiguous().clone()
+        else:
+            # For higher dimensions, handle generically
+            slices = [slice(None)] * len(tensor.shape)
+            slices[shard_dim] = slice(start_idx, end_idx)
+            local_tensor = tensor[tuple(slices)].contiguous().clone()
+        
+        if _get_debug_setting():
+            logger.debug(
+                f"Manual sharding: rank={rank}, world_size={world_size}, "
+                f"dim={shard_dim}, original_shape={tensor.shape}, "
+                f"local_shape={local_tensor.shape}"
+            )
+        
+        return torch.nn.Parameter(local_tensor, requires_grad=tensor.requires_grad)
     
     # Fallback: return non-distributed parameter
+    if _get_debug_setting():
+        logger.debug(
+            f"Returning non-distributed parameter: "
+            f"DTENSOR_AVAILABLE={DTENSOR_AVAILABLE}, "
+            f"needs_sharding={needs_sharding}, "
+            f"device_mesh={device_mesh is not None}"
+        )
+    
     return torch.nn.Parameter(tensor, requires_grad=tensor.requires_grad)
 
 
@@ -574,6 +619,23 @@ def _get_default_device_mesh() -> Optional[DeviceMesh]:
 def _set_default_device_mesh(mesh: DeviceMesh) -> None:
     """Set the default device mesh in global state."""
     global_state.set_global_attribute("torch_device_mesh", mesh)
+
+
+def _get_mesh_info() -> Optional[dict]:
+    """Get information about the current device mesh for debugging.
+    
+    Returns:
+        Dict with mesh information or None if no mesh is set.
+    """
+    mesh = _get_default_device_mesh()
+    if mesh is None:
+        return None
+    
+    return {
+        "shape": mesh.shape if hasattr(mesh, 'shape') else None,
+        "dim_names": mesh.mesh_dim_names if hasattr(mesh, 'mesh_dim_names') else None,
+        "devices": [str(d) for d in mesh.device.tolist()] if hasattr(mesh, 'device') else None,
+    }
 
 
 def _axis_names_to_placements(
@@ -651,6 +713,9 @@ def _to_backend_mesh(device_mesh) -> DeviceMesh:
     """
     if _get_debug_setting():
         logger.debug(f"_to_backend_mesh called with device_mesh={device_mesh}")
+        logger.debug(f"  - shape: {device_mesh.shape}")
+        logger.debug(f"  - axis_names: {device_mesh.axis_names}")
+        logger.debug(f"  - devices shape: {device_mesh.devices.shape}")
     
     if not DTENSOR_AVAILABLE:
         raise RuntimeError(
@@ -659,6 +724,9 @@ def _to_backend_mesh(device_mesh) -> DeviceMesh:
     
     shape = device_mesh.devices.shape
     devices = device_mesh.devices.flatten().tolist()
+    
+    if _get_debug_setting():
+        logger.debug(f"  - devices: {devices}")
     
     # Convert device names to torch devices
     torch_devices = [_to_backend_device(d) for d in devices]
@@ -669,21 +737,33 @@ def _to_backend_mesh(device_mesh) -> DeviceMesh:
     # Create DeviceMesh with proper device handling
     # For single process, we use the local devices
     if len(torch_devices) > 0:
-        # For CPU or single GPU, create a simple mesh
-        if all(str(d) == 'cpu' or d.type == 'cpu' for d in torch_devices):
+        # Check if all devices are CPU
+        all_cpu = all(str(d) == 'cpu' or d.type == 'cpu' for d in torch_devices)
+        
+        if all_cpu:
             # CPU mesh
             backend_mesh = DeviceMesh(
                 device="cpu",
                 mesh=np.array(torch_devices).reshape(shape),
                 dim_names=dim_names,
             )
+            if _get_debug_setting():
+                logger.debug("  - Created CPU mesh")
         else:
-            # GPU/CUDA mesh
+            # GPU/CUDA mesh - use device indices
+            device_indices = [
+                d.index if hasattr(d, 'index') else (
+                    d.cuda_index if hasattr(d, 'cuda_index') else 0
+                )
+                for d in torch_devices
+            ]
             backend_mesh = DeviceMesh(
                 device="cuda",
-                mesh=np.array([d.index if hasattr(d, 'index') else 0 for d in torch_devices]).reshape(shape),
+                mesh=np.array(device_indices).reshape(shape),
                 dim_names=dim_names,
             )
+            if _get_debug_setting():
+                logger.debug(f"  - Created CUDA mesh with indices: {device_indices}")
     else:
         # Fallback: create mesh with default device
         if torch.cuda.is_available():
@@ -695,9 +775,16 @@ def _to_backend_mesh(device_mesh) -> DeviceMesh:
             mesh=np.arange(np.prod(shape)).reshape(shape),
             dim_names=dim_names,
         )
+        if _get_debug_setting():
+            logger.debug(f"  - Created fallback mesh with device: {default_device}")
     
     # Store the mesh in global state
     _set_default_device_mesh(backend_mesh)
+    
+    if _get_debug_setting():
+        logger.debug(f"  - Backend mesh created and stored in global state")
+        logger.debug(f"  - mesh.shape: {backend_mesh.shape}")
+        logger.debug(f"  - mesh.mesh_dim_names: {backend_mesh.mesh_dim_names}")
     
     return backend_mesh
 
