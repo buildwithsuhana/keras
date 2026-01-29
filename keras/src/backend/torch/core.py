@@ -123,7 +123,8 @@ class Variable(KerasVariable):
                 import logging
                 logger = logging.getLogger(__name__)
                 logger.debug(
-                    f"_initialize_layout: distribution()={dist is not None}"
+                    f"_initialize_layout: distribution()={dist is not None}, "
+                    f"type={type(dist).__name__ if dist else None}"
                 )
             
             if dist is not None:
@@ -134,12 +135,19 @@ class Variable(KerasVariable):
                     )
                 if tensor_layout is not None:
                     # Capture backend-specific sharding axes
+                    # IMPORTANT: For ModelParallel, we want to capture the layout
+                    # so that distribute_variable knows how to shard the variable
                     if hasattr(tensor_layout, 'axes'):
                         self._layout = tensor_layout.axes
                     elif hasattr(tensor_layout, 'backend_layout'):
                         self._layout = tensor_layout.backend_layout
                     else:
                         self._layout = tensor_layout
+                    
+                    if _get_debug_setting():
+                        logger.debug(
+                            f"_initialize_layout: Set self._layout={self._layout}"
+                        )
 
     def _initialize(self, value):
         # Initialize layout from distribution context

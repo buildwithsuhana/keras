@@ -302,26 +302,40 @@ def test_model_parallel(epochs=3):
         
         log_section("PHYSICAL STORAGE VERIFICATION")
         # Inspect the actual sharded tensors
+        # We need to access the underlying torch layer to see DTensor weights
+        
+        # For Sequential models, _torch_layers is the Sequential container
+        # We need to iterate through it to check each layer's weights
+        if hasattr(model, '_torch_layers'):
+            torch_layers = model._torch_layers
+            if hasattr(torch_layers, 'layers'):
+                # torch.nn.Sequential has a 'layers' or we iterate by index
+                torch_submodules = torch_layers
+            else:
+                torch_submodules = torch_layers
+        else:
+            torch_submodules = []
+        
+        # Iterate through layers (both Keras layers and their torch counterparts)
         for i, layer in enumerate(model.layers):
-            if hasattr(layer, 'kernel'):
-                # Get the kernel value - could be DTensor or Parameter
-                kernel_var = layer.kernel
+            # Get the corresponding torch layer
+            torch_layer = None
+            if hasattr(torch_submodules, '__iter__'):
+                # Get torch layer at same index
+                if hasattr(torch_submodules, '__getitem__'):
+                    try:
+                        torch_layer = torch_submodules[i]
+                    except (IndexError, TypeError):
+                        pass
+            
+            # Check torch layer weights
+            if torch_layer is not None and hasattr(torch_layer, 'weight'):
+                weight_tensor = torch_layer.weight
                 
-                # Check if the kernel value has to_local() method (DTensor)
-                if hasattr(kernel_var, 'value'):
-                    kernel_value = kernel_var.value
-                else:
-                    kernel_value = kernel_var
-                
-                # Check if it's a DTensor (has to_local method) or a Parameter
-                if hasattr(kernel_value, 'to_local'):
+                if hasattr(weight_tensor, 'to_local'):
                     # It's a DTensor
-                    dtensor = kernel_value
-                    
-                    # Theoretical shape (Global view)
+                    dtensor = weight_tensor
                     global_shape = dtensor.shape 
-                    
-                    # Actual physical storage on THIS GPU
                     local_tensor = dtensor.to_local() 
                     local_shape = local_tensor.shape
                     
@@ -329,20 +343,42 @@ def test_model_parallel(epochs=3):
                     log(f"  - Global Shape (Theoretical): {tuple(global_shape)}")
                     log(f"  - Local Shape (Actual on Rank {rank}): {tuple(local_shape)}")
                     
-                    # Verify that sharding actually happened
                     if len(global_shape) > 1 and len(local_shape) > 1:
                         if local_shape[1] < global_shape[1]:
                             log(f"  ✓ Verified: Kernel is sharded across the 'model' axis.")
                     elif len(global_shape) == 1:
-                        # Bias vector - check if sharded
                         if local_shape[0] < global_shape[0]:
                             log(f"  ✓ Verified: Bias is sharded across the 'model' axis.")
                 else:
-                    # It's a regular Parameter/tensor (sharding applied via Parameter creation)
+                    # Regular tensor/Parameter
+                    local_shape = weight_tensor.shape
+                    log(f"Layer {i} ({layer.name}):")
+                    log(f"  - Shape (Actual on Rank {rank}): {tuple(local_shape)}")
+                    log(f"  - Note: Weights are standard tensors (DTensor path not triggered)")
+            
+            # Fallback: check Keras Variable wrapper
+            elif hasattr(layer, 'kernel'):
+                kernel_var = layer.kernel
+                if hasattr(kernel_var, '_value'):
+                    kernel_value = kernel_var._value
+                elif hasattr(kernel_var, 'value'):
+                    kernel_value = kernel_var.value
+                else:
+                    kernel_value = kernel_var
+                
+                if hasattr(kernel_value, 'to_local'):
+                    local_shape = kernel_value.to_local().shape
+                    global_shape = kernel_value.shape
+                    log(f"Layer {i} ({layer.name}):")
+                    log(f"  - Global Shape: {tuple(global_shape)}")
+                    log(f"  - Local Shape (Actual on Rank {rank}): {tuple(local_shape)}")
+                    if len(global_shape) > 1 and local_shape[1] < global_shape[1]:
+                        log(f"  ✓ Verified: Kernel is sharded across the 'model' axis.")
+                else:
                     local_shape = kernel_value.shape
                     log(f"Layer {i} ({layer.name}):")
-                    log(f"  - Local Shape (Actual on Rank {rank}): {tuple(local_shape)}")
-                    log(f"  - Note: DTensor not available, sharding via Parameter creation")
+                    log(f"  - Shape (Actual on Rank {rank}): {tuple(local_shape)}")
+                    log(f"  - Note: DTensor not yet available (will be created after parallelize_module)")
 
         optimizer = keras.optimizers.Adam(learning_rate=0.001)
         model.compile(optimizer=optimizer, loss="mse")

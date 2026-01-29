@@ -1753,5 +1753,21 @@ def parallelize_keras_model(
     if debug_mode:
         print(f"DEBUG | [Rank {rank:02d}] Module parallelized successfully")
     
+    # Update the Keras model's internal reference to the parallelized module
+    # This ensures that subsequent operations use the parallelized version
+    if hasattr(model, '_torch_layers'):
+        model._torch_layers = parallelized_module
+    
+    # Also update the model reference if it's a Sequential/Functional model
+    # that wraps the torch layers
+    if hasattr(model, '_layers'):
+        # For Sequential models, _layers contains references to internal layers
+        # We need to find and update the layer that owns torch_module
+        for i, layer in enumerate(model._layers):
+            if hasattr(layer, '_torch_layers') and layer._torch_layers is torch_module:
+                layer._torch_layers = parallelized_module
+            elif hasattr(layer, '_torch_module') and layer._torch_module is torch_module:
+                layer._torch_module = parallelized_module
+    
     return parallelized_module
 
