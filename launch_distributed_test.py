@@ -86,7 +86,7 @@ def main():
     # Import keras after setup
     import keras
     from keras import layers
-    from keras.distribution import (
+    from keras.src.distribution import (
         DataParallel, ModelParallel, DeviceMesh, LayoutMap,
         list_devices, initialize, distribution
     )
@@ -97,7 +97,7 @@ def main():
     
     # Get rank info
     rank = 0
-    world_size = 1
+    world_size = 2
     if dist.is_initialized():
         rank = dist.get_rank()
         world_size = dist.get_world_size()
