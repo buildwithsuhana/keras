@@ -67,10 +67,18 @@ class TorchTrainer(base_trainer.Trainer):
         # Check if any weights are DTensors by looking at trainable_weights
         has_dtensor_weights = False
         for var in self.trainable_weights:
-            if hasattr(var, '_value') and hasattr(var._value, 'to_local'):
-                has_dtensor_weights = True
-                break
-            elif hasattr(var, 'value') and hasattr(var.value, 'to_local'):
+            # Check if it's a torch.nn.Parameter wrapping a DTensor
+            if isinstance(var, torch.nn.Parameter):
+                # The value is the DTensor
+                if hasattr(var, 'value') and hasattr(var.value, 'to_local'):
+                    has_dtensor_weights = True
+                    break
+                # Also check _value for PyTorch DTensor
+                if hasattr(var, '_value') and hasattr(var._value, 'to_local'):
+                    has_dtensor_weights = True
+                    break
+            # Check if it's a raw DTensor
+            elif hasattr(var, 'to_local'):
                 has_dtensor_weights = True
                 break
         
@@ -82,7 +90,44 @@ class TorchTrainer(base_trainer.Trainer):
             rank = torch.distributed.get_rank() if torch.distributed.is_initialized() else 0
             print(f"DEBUG | [Rank {rank:02d}] Converting inputs to DTensors")
         
-        return convert_tensors_to_dtensor(x, device_mesh=device_mesh)
+        # Handle nested structures (tuple, list, dict)
+        return self._convert_to_dtensor_structure(x, device_mesh)
+
+    def _convert_to_dtensor_structure(self, x, device_mesh):
+        """Convert nested structures to DTensors recursively.
+        
+        Args:
+            x: Input structure (can be tensor, tuple, list, dict)
+            device_mesh: DeviceMesh for DTensor conversion
+            
+        Returns:
+            Same structure with tensors converted to DTensors
+        """
+        from keras.src.backend.torch.distribution_lib import (
+            DTensor,
+            Replicate,
+        )
+        
+        if x is None:
+            return x
+        
+        if isinstance(x, DTensor):
+            return x
+        
+        if isinstance(x, torch.Tensor):
+            return DTensor.from_local(x, device_mesh, [Replicate()])
+        
+        if isinstance(x, dict):
+            return {k: self._convert_to_dtensor_structure(v, device_mesh) for k, v in x.items()}
+        
+        if isinstance(x, list):
+            return [self._convert_to_dtensor_structure(v, device_mesh) for v in x]
+        
+        if isinstance(x, tuple):
+            return tuple(self._convert_to_dtensor_structure(v, device_mesh) for v in x)
+        
+        # For other types, return as-is
+        return x
 
     def _convert_dtensor_output(self, x):
         """Convert DTensor outputs to local tensors.
@@ -121,10 +166,18 @@ class TorchTrainer(base_trainer.Trainer):
         # Check if any weights are DTensors
         has_dtensor_weights = False
         for var in self.trainable_weights:
-            if hasattr(var, '_value') and hasattr(var._value, 'to_local'):
-                has_dtensor_weights = True
-                break
-            elif hasattr(var, 'value') and hasattr(var.value, 'to_local'):
+            # Check if it's a torch.nn.Parameter wrapping a DTensor
+            if isinstance(var, torch.nn.Parameter):
+                # The value is the DTensor
+                if hasattr(var, 'value') and hasattr(var.value, 'to_local'):
+                    has_dtensor_weights = True
+                    break
+                # Also check _value for PyTorch DTensor
+                if hasattr(var, '_value') and hasattr(var._value, 'to_local'):
+                    has_dtensor_weights = True
+                    break
+            # Check if it's a raw DTensor
+            elif hasattr(var, 'to_local'):
                 has_dtensor_weights = True
                 break
         
