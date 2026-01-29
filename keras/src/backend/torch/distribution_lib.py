@@ -520,9 +520,73 @@ def distribute_variable(tensor, layout=None, module_name=None):
             f"is_model_parallel={is_model_parallel}"
         )
     
-    # If ModelParallel is active, we DON'T create DTensor weights here.
-    # Instead, we use regular torch.nn.Parameter and let parallelize_module
-    # handle weight sharding automatically.
+    # =====================================================================
+    # KEY FIX: For ModelParallel, create SHARDED DTensor directly
+    # to avoid OOM - full weights should NEVER exist in memory
+    # =====================================================================
+    if is_model_parallel and layout is not None:
+        # Get device mesh for sharding
+        distribution_obj = current_distribution
+        device_mesh = _to_backend_mesh(distribution_obj.device_mesh)
+        
+        if device_mesh is not None and DTENSOR_AVAILABLE:
+            # Calculate sharding placements from layout
+            placements = []
+            needs_sharding = False
+            tensor_rank = converted_tensor.dim()
+            mesh_ndim = len(device_mesh.mesh_dim_names)
+            
+            for i, axis in enumerate(layout):
+                if axis is not None:
+                    try:
+                        mesh_dim = device_mesh.mesh_dim_names.index(axis)
+                        # For 2D weight (out_dim, in_dim), shard on output dim
+                        tensor_dim = tensor_rank - len(layout) + i
+                        if tensor_rank == 1:
+                            tensor_dim = 0
+                        placements.append(Shard(tensor_dim))
+                        needs_sharding = True
+                    except ValueError:
+                        placements.append(Replicate())
+                else:
+                    placements.append(Replicate())
+            
+            # Pad placements if needed
+            if len(placements) < mesh_ndim:
+                placements.extend([Replicate()] * (mesh_ndim - len(placements)))
+            
+            if needs_sharding and DTENSOR_AVAILABLE:
+                if debug_mode:
+                    print(
+                        f"DEBUG | [Rank {rank:02d}] ModelParallel SHARDED creation: "
+                        f"global_shape={converted_tensor.shape}, placements={placements}"
+                    )
+                
+                # Create DTensor directly - ONLY local shard exists on each device
+                # Full tensor NEVER exists in memory
+                if torch_distribute_tensor is not None:
+                    dtensor = torch_distribute_tensor(
+                        converted_tensor,
+                        device_mesh,
+                        placements
+                    )
+                    
+                    if debug_mode:
+                        local_shape = dtensor.to_local().shape
+                        print(
+                            f"DEBUG | [Rank {rank:02d}] Sharded DTensor created: "
+                            f"global={dtensor.shape}, local={local_shape}"
+                        )
+                    
+                    # Return as Parameter for gradient tracking
+                    return torch.nn.Parameter(dtensor)
+            
+            if debug_mode:
+                print(
+                    f"DEBUG | [Rank {rank:02d}] ModelParallel: no sharding needed, replicating"
+                )
+    
+    # If ModelParallel is active but no sharding layout, create regular Parameter
     if is_model_parallel:
         if not is_float_or_complex:
             if debug_mode:
