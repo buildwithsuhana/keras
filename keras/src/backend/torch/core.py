@@ -59,6 +59,11 @@ TORCH_DTYPES = {
 }
 
 
+def _get_debug_setting():
+    """Check if distribution debug mode is enabled."""
+    return os.environ.get("KERAS_DISTRIBUTION_DEBUG", "0") == "1"
+
+
 @contextlib.contextmanager
 def device_scope(device_name):
     previous_device = global_state.get_global_attribute("torch_device", None)
@@ -102,19 +107,78 @@ def to_torch_dtype(dtype):
 
 
 class Variable(KerasVariable):
+    def __init__(self, *args, layout=None, **kwargs):
+        # Intercept layout parameter so that it is available
+        # during initialization.
+        self._layout = layout
+        super().__init__(*args, **kwargs)
+
+    def _initialize_layout(self):
+        # Get layout from distribution context if not explicitly set
+        if self._layout is None:
+            from keras.src.distribution import distribution
+
+            dist = distribution()
+            if dist is not None:
+                tensor_layout = dist.get_variable_layout(self)
+                if tensor_layout is not None:
+                    # Get the backend layout (tuple of axis names for PyTorch)
+                    if hasattr(tensor_layout, 'backend_layout'):
+                        self._layout = tensor_layout.backend_layout
+                    else:
+                        self._layout = tensor_layout
+
     def _initialize(self, value):
+        # Initialize layout from distribution context
+        self._initialize_layout()
         if isinstance(value, torch.nn.Parameter):
             # Reuse same parameter
             self._value = value
         else:
-            self._value = torch.nn.Parameter(
-                convert_to_tensor(value, dtype=self._dtype),
-                requires_grad=self.trainable,
-            ).to(get_device())
+            tensor = convert_to_tensor(value, dtype=self._dtype)
+            self._value = self._distribute_parameter(tensor)
+
+    def _distribute_parameter(self, tensor):
+        """Create a distributed Parameter if distribution is configured."""
+        if self._layout is not None:
+            # Import here to avoid circular dependency
+            from keras.src.backend.torch import distribution_lib
+
+            distributed = distribution_lib.distribute_variable(
+                tensor, self._layout
+            )
+            if _get_debug_setting():
+                import logging
+                logger = logging.getLogger(__name__)
+                logger.debug(
+                    f"Distributed parameter created: "
+                    f"shape={tensor.shape}, layout={self._layout}, "
+                    f"result_type={type(distributed)}"
+                )
+            return distributed
+        return torch.nn.Parameter(
+            tensor, requires_grad=self.trainable
+        ).to(get_device())
 
     def _direct_assign(self, value):
         with torch.no_grad():
-            self.value.copy_(value)
+            if self._layout is not None:
+                # Distribute the value before assigning
+                from keras.src.backend.torch import distribution_lib
+
+                value = distribution_lib.distribute_variable(
+                    value, self._layout
+                )
+                if isinstance(value, torch.nn.Parameter):
+                    self._value.copy_(value)
+                else:
+                    # It's a DTensor, handle accordingly
+                    if hasattr(value, 'to_local'):
+                        self._value.copy_(value.to_local())
+                    else:
+                        self._value.copy_(value)
+            else:
+                self.value.copy_(value)
 
     def _convert_to_tensor(self, value, dtype=None):
         return convert_to_tensor(value, dtype=dtype)
