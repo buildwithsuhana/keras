@@ -50,24 +50,18 @@ class TorchTrainer(base_trainer.Trainer):
                 is_dtensor,
                 DTensor,
                 Replicate,
-                _get_default_device_mesh,
             )
+            from keras.src.distribution import distribution
         except ImportError:
             return x
         
         if not DTENSOR_AVAILABLE:
             return x
         
-        # Check if we have an active device mesh
-        device_mesh = _get_default_device_mesh()
-        if device_mesh is None:
-            if _get_debug_setting():
-                rank = torch.distributed.get_rank() if torch.distributed.is_initialized() else 0
-                print(f"DEBUG | [Rank {rank:02d}] _ensure_dtensor_input: no device_mesh, skipping conversion")
-            return x
-        
         # Check if any model weights are DTensors
         has_dtensor_weights = False
+        device_mesh = None
+        
         for layer in self.layers:
             if hasattr(layer, 'kernel') and layer.kernel is not None:
                 kernel = layer.kernel
@@ -81,12 +75,18 @@ class TorchTrainer(base_trainer.Trainer):
                 
                 if is_dtensor(kernel_value):
                     has_dtensor_weights = True
+                    # Get device mesh from the DTensor
+                    if device_mesh is None:
+                        device_mesh = getattr(kernel_value, 'device_mesh', None)
                     if _get_debug_setting():
                         rank = torch.distributed.get_rank() if torch.distributed.is_initialized() else 0
                         print(f"DEBUG | [Rank {rank:02d}] _ensure_dtensor_input: found DTensor weight in {layer.name}")
                     break
         
-        if not has_dtensor_weights:
+        if not has_dtensor_weights or device_mesh is None:
+            if _get_debug_setting():
+                rank = torch.distributed.get_rank() if torch.distributed.is_initialized() else 0
+                print(f"DEBUG | [Rank {rank:02d}] _ensure_dtensor_input: no DTensor weights or no device_mesh, skipping conversion")
             return x
         
         # Convert inputs to replicated DTensors
