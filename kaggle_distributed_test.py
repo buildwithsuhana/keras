@@ -156,10 +156,12 @@ def test_data_parallel(epochs=3):
     log(f"Using {len(devices)} device(s): {devices}")
     log(f"World size: {world_size}, Rank: {rank}")
     
-    # Create DataParallel distribution
-    dp = DataParallel(devices=devices)
+    # Create DataParallel distribution with auto_shard_dataset=False
+    # This is needed for multi-process training with numpy arrays
+    dp = DataParallel(devices=devices, auto_shard_dataset=False)
     log(f"✓ DataParallel created: mesh_shape={dp.device_mesh.shape}")
     log(f"  Batch dimension: {dp.batch_dim_name}")
+    log(f"  Auto-shard dataset: False")
     
     # Create model
     with dp.scope():
@@ -270,12 +272,15 @@ def test_model_parallel(epochs=3):
         layout = layout_map[key]
         log(f"  - {key}: axes={layout.axes}")
     
-    # Create ModelParallel distribution
+    # Create ModelParallel distribution with auto_shard_dataset=False
+    # This is needed for multi-process training with numpy arrays
     mp = ModelParallel(
         layout_map=layout_map,
-        batch_dim_name="batch"
+        batch_dim_name="batch",
+        auto_shard_dataset=False
     )
     log(f"✓ ModelParallel created: batch_dim={mp.batch_dim_name}")
+    log(f"  Auto-shard dataset: False")
     
     # Create larger model for sharding demonstration
     with mp.scope():
@@ -359,7 +364,7 @@ def test_gradient_flow():
     if not devices:
         devices = ["cpu:0"]
     
-    dp = DataParallel(devices=devices)
+    dp = DataParallel(devices=devices, auto_shard_dataset=False)
     
     with dp.scope():
         model = keras.Sequential([
