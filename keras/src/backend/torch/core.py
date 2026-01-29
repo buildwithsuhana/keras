@@ -133,20 +133,13 @@ class Variable(KerasVariable):
                         f"_initialize_layout: tensor_layout={tensor_layout}"
                     )
                 if tensor_layout is not None:
-                    # Get the backend layout (tuple of axis names for PyTorch)
-                    if hasattr(tensor_layout, 'backend_layout'):
+                    # Capture backend-specific sharding axes
+                    if hasattr(tensor_layout, 'axes'):
+                        self._layout = tensor_layout.axes
+                    elif hasattr(tensor_layout, 'backend_layout'):
                         self._layout = tensor_layout.backend_layout
                     else:
                         self._layout = tensor_layout
-                    if _get_debug_setting():
-                        logger.debug(
-                            f"_initialize_layout: set layout to {self._layout}"
-                        )
-                # Skip layout assignment if variable shape is not yet known
-                # (this can happen for uninitialized variables like optimizer
-                # iteration counters)
-                elif self.shape is None:
-                    pass
 
     def _initialize(self, value):
         # Initialize layout from distribution context
@@ -162,8 +155,13 @@ class Variable(KerasVariable):
         """Create a distributed Parameter if distribution is configured."""
         from keras.src.backend.torch import distribution_lib
         
-        # First check if we have an explicit layout
-        if self._layout is not None:
+        # Check if we are in a distribution context (mesh is active)
+        active_mesh = distribution_lib._get_default_device_mesh()
+        
+        if self._layout is not None or active_mesh is not None:
+            # Import here to avoid circular dependency
+            from keras.src.backend.torch import distribution_lib
+
             distributed = distribution_lib.distribute_variable(
                 tensor, self._layout
             )
@@ -176,6 +174,11 @@ class Variable(KerasVariable):
                     f"result_type={type(distributed)}"
                 )
             return distributed
+            
+        # Default non-distributed fallback
+        return torch.nn.Parameter(
+            tensor, requires_grad=self.trainable
+        ).to(get_device())
         
         # If no explicit layout, check if there's a distribution context
         # This handles the case where variables are created inside a 
