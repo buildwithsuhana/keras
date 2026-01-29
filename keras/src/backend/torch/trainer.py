@@ -16,12 +16,93 @@ from keras.src.trainers.epoch_iterator import EpochIterator
 from keras.src.utils import traceback_utils
 
 
+def _get_debug_setting():
+    """Check if distribution debug mode is enabled."""
+    import os
+    return os.environ.get("KERAS_DISTRIBUTION_DEBUG", "0") == "1"
+
+
 class TorchTrainer(base_trainer.Trainer):
     def __init__(self):
         super().__init__()
         self.train_function = None
         self.test_function = None
         self.predict_function = None
+        self._torch_module_parallelized = False
+
+    def _ensure_dtensor_input(self, x):
+        """Convert input tensor to DTensor if model has DTensor weights.
+        
+        This prevents "mixed torch.Tensor and DTensor" errors during ModelParallel
+        training by ensuring that when model weights are DTensors, inputs are also
+        converted to replicated DTensors.
+        
+        Args:
+            x: Input tensor (can be torch.Tensor, DTensor, or nested structure)
+            
+        Returns:
+            Same structure with tensors converted to DTensors if needed
+        """
+        # Skip if DTensor not available
+        try:
+            from keras.src.backend.torch.distribution_lib import (
+                DTENSOR_AVAILABLE,
+                is_dtensor,
+                DTensor,
+                Replicate,
+                _get_default_device_mesh,
+            )
+        except ImportError:
+            return x
+        
+        if not DTENSOR_AVAILABLE:
+            return x
+        
+        # Check if we have an active device mesh
+        device_mesh = _get_default_device_mesh()
+        if device_mesh is None:
+            if _get_debug_setting():
+                rank = torch.distributed.get_rank() if torch.distributed.is_initialized() else 0
+                print(f"DEBUG | [Rank {rank:02d}] _ensure_dtensor_input: no device_mesh, skipping conversion")
+            return x
+        
+        # Check if any model weights are DTensors
+        has_dtensor_weights = False
+        for layer in self.layers:
+            if hasattr(layer, 'kernel') and layer.kernel is not None:
+                kernel = layer.kernel
+                # Check if kernel value is a DTensor
+                if hasattr(kernel, 'value'):
+                    kernel_value = kernel.value
+                elif hasattr(kernel, '_value'):
+                    kernel_value = kernel._value
+                else:
+                    kernel_value = kernel
+                
+                if is_dtensor(kernel_value):
+                    has_dtensor_weights = True
+                    if _get_debug_setting():
+                        rank = torch.distributed.get_rank() if torch.distributed.is_initialized() else 0
+                        print(f"DEBUG | [Rank {rank:02d}] _ensure_dtensor_input: found DTensor weight in {layer.name}")
+                    break
+        
+        if not has_dtensor_weights:
+            return x
+        
+        # Convert inputs to replicated DTensors
+        def convert_tensor(t):
+            if t is None:
+                return t
+            if is_dtensor(t):
+                return t
+            # Convert regular tensor to replicated DTensor
+            return DTensor.from_local(t, device_mesh, [Replicate()])
+        
+        if _get_debug_setting():
+            rank = torch.distributed.get_rank() if torch.distributed.is_initialized() else 0
+            print(f"DEBUG | [Rank {rank:02d}] _ensure_dtensor_input: converting inputs to DTensors")
+        
+        return tree.map_structure(convert_tensor, x)
 
     def build(self, input_shape=None):
         """Build the model and optionally apply automatic parallelization.
@@ -95,6 +176,11 @@ class TorchTrainer(base_trainer.Trainer):
     def train_step(self, data):
         x, y, sample_weight = data_adapter_utils.unpack_x_y_sample_weight(data)
 
+        # Convert inputs to DTensors if needed for ModelParallel training
+        # This ensures that when model has DTensor weights, inputs are also DTensors
+        x = self._ensure_dtensor_input(x)
+        y = self._ensure_dtensor_input(y)
+
         # Compute predictions
         if self._call_has_training_arg:
             y_pred = self(x, training=True)
@@ -140,6 +226,11 @@ class TorchTrainer(base_trainer.Trainer):
             y,
             sample_weight,
         ) = data_adapter_utils.unpack_x_y_sample_weight(data)
+        
+        # Convert inputs to DTensors if needed for ModelParallel training
+        x = self._ensure_dtensor_input(x)
+        y = self._ensure_dtensor_input(y)
+        
         if self._call_has_training_arg:
             y_pred = self(x, training=False)
         else:
@@ -157,6 +248,10 @@ class TorchTrainer(base_trainer.Trainer):
 
     def predict_step(self, data):
         x, _, _ = data_adapter_utils.unpack_x_y_sample_weight(data)
+        
+        # Convert inputs to DTensors if needed for ModelParallel training
+        x = self._ensure_dtensor_input(x)
+        
         if self._call_has_training_arg:
             y_pred = self(x, training=False)
         else:
