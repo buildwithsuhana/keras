@@ -537,8 +537,8 @@ def _get_default_device_mesh() -> Optional[DeviceMesh]:
 def _set_default_device_mesh(mesh: DeviceMesh) -> None:
     """Set the default device mesh in global state."""
     global_state.set_global_attribute("torch_device_mesh", mesh)
-from keras.src.backend.common import get_global_attribute
-from keras.src.backend.common import set_global_attribute
+from keras.src.backend.common.global_state import get_global_attribute
+from keras.src.backend.common.global_state import set_global_attribute
 
 def _get_mesh_info():
     """Internal helper to get the current backend mesh info."""
