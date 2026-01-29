@@ -25,25 +25,22 @@ axes_str = str(device_mesh.axis_names)
 cache_key = f"torch_mesh_{shape_str}_{axes_str}"
 ```
 
-This ensures:
-- DP with shape=(2,) and axes=['batch'] → key: `torch_mesh_(2,)_['batch']`
-- MP with shape=(1, 2) and axes=['batch', 'model'] → key: `torch_mesh_(1, 2)_['batch', 'model']`
-
 ## Issue 3: DTensor Mixed Tensor Error (Fixed)
 **Problem:** 
 ```
-RuntimeError: aten.mm.default: got mixed torch.Tensor and DTensor, 
-need to convert all torch.Tensor to DTensor before calling distributed operators!
+RuntimeError: aten.mm.default: got mixed torch.Tensor and DTensor
+RuntimeError: aten.sub.Tensor: got mixed torch.Tensor and DTensor
 ```
 
 ### Root Cause:
-When the kernel is a DTensor (due to model parallel sharding) but the input is a regular tensor, PyTorch's DTensor operations fail because they require both operands to be DTensors.
+When kernel is a DTensor (due to model parallel sharding) but input is a regular tensor, PyTorch's DTensor operations fail because they require both operands to be DTensors.
 
 ### Fix Applied:
-Modified `matmul` function in `keras/src/backend/torch/numpy.py` to:
-1. Import `DTensor` and `Replicate` at module level
-2. Check if either operand is a DTensor
-3. Convert the other operand to a replicated DTensor if needed
+Modified multiple functions in `keras/src/backend/torch/numpy.py` to convert regular tensors to replicated DTensors when the other operand is a DTensor:
+- `matmul()` 
+- `add()`
+- `subtract()`
+- `multiply()`
 
 ## Implementation Steps
 - [x] Analyze error and understand root cause
@@ -51,6 +48,9 @@ Modified `matmul` function in `keras/src/backend/torch/numpy.py` to:
 - [x] Add debug logging for tensor shapes
 - [x] Fix cache key in `_to_backend_mesh` for rank synchronization
 - [x] Fix `matmul` to handle DTensor mixed tensor error
+- [x] Fix `add` to handle DTensor mixed tensor error
+- [x] Fix `subtract` to handle DTensor mixed tensor error
+- [x] Fix `multiply` to handle DTensor mixed tensor error
 - [x] Test the fix - All tests PASSED
 
 ## Test Results

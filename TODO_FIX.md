@@ -39,10 +39,14 @@ This happens during backpropagation because:
 - Changed cache key from `f"torch_device_mesh_{id(device_mesh)}"` to configuration-based key
 - This prevents rank desync when switching between DataParallel and ModelParallel
 
-### Fix 5: Fix DTensor Mixed Tensor Error ✓
+### Fix 5: Fix DTensor Mixed Tensor Error in matmul ✓
 - When kernel is DTensor but input is regular tensor, PyTorch DTensor operations fail
-- Modified `matmul` in `numpy.py` to convert the other operand to DTensor when one is DTensor
+- Modified `matmul()` in `numpy.py` to convert the other operand to DTensor when one is DTensor
 - Added import of `DTensor` and `Replicate` at module level
+
+### Fix 6: Fix DTensor Mixed Tensor Error in add, subtract, multiply ✓
+- Error `aten.sub.Tensor: got mixed torch.Tensor and DTensor` indicates more operations need fixing
+- Added DTensor conversion logic to `add()`, `subtract()`, and `multiply()` functions
 
 ## Files Modified
 
@@ -58,8 +62,11 @@ This happens during backpropagation because:
    - Variable class handles layout from distribution context
 
 4. `keras/src/backend/torch/numpy.py`
-   - Added DTensor and Replicate imports
+   - Added DTensor and Replicate imports at module level
    - Modified `matmul()` to handle mixed DTensor and regular tensor operations
+   - Modified `add()` to handle mixed DTensor and regular tensor operations
+   - Modified `subtract()` to handle mixed DTensor and regular tensor operations
+   - Modified `multiply()` to handle mixed DTensor and regular tensor operations
 
 ## Verification
 After implementing these fixes, run:
