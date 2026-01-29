@@ -364,7 +364,7 @@ def test_model_parallel(epochs=3):
         log(f"  Epoch {epoch+1}/{epochs}: loss={loss:.6f} (time={epoch_time:.3f}s)")
     
     total_time = time.time() - start_time
-    log(f"✓ ModelParallel test PASSED in {total_time:.3s}")
+    log(f"✓ ModelParallel test PASSED in {total_time:.3f}s")
     return True
 
 
