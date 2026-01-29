@@ -84,6 +84,60 @@ class TorchTrainer(base_trainer.Trainer):
         
         return convert_tensors_to_dtensor(x, device_mesh=device_mesh)
 
+    def _convert_dtensor_output(self, x):
+        """Convert DTensor outputs to local tensors.
+        
+        When model has DTensor weights, the forward pass returns DTensors.
+        Subsequent operations (like loss computation) need local tensors.
+        
+        Args:
+            x: Output tensor (can be torch.Tensor, DTensor, or nested structure)
+            
+        Returns:
+            Same structure, with DTensors converted to local tensors
+        """
+        from keras.src.distribution.distribution_lib import distribution
+        from keras.src.distribution.distribution_lib import ModelParallel
+        from keras.src.backend.torch.distribution_lib import (
+            dtensor_to_local,
+            _get_default_device_mesh,
+            DTENSOR_AVAILABLE,
+        )
+        
+        # If DTensor not available, return as-is
+        if not DTENSOR_AVAILABLE:
+            return x
+        
+        # Check if ModelParallel distribution is active
+        dist = distribution()
+        if not isinstance(dist, ModelParallel):
+            return x
+        
+        # Get device mesh
+        device_mesh = _get_default_device_mesh()
+        if device_mesh is None:
+            return x
+        
+        # Check if any weights are DTensors
+        has_dtensor_weights = False
+        for var in self.trainable_weights:
+            if hasattr(var, '_value') and hasattr(var._value, 'to_local'):
+                has_dtensor_weights = True
+                break
+            elif hasattr(var, 'value') and hasattr(var.value, 'to_local'):
+                has_dtensor_weights = True
+                break
+        
+        if not has_dtensor_weights:
+            return x
+        
+        # Convert DTensor outputs to local tensors
+        if _get_debug_setting():
+            rank = torch.distributed.get_rank() if torch.distributed.is_initialized() else 0
+            print(f"DEBUG | [Rank {rank:02d}] Converting DTensor outputs to local tensors")
+        
+        return dtensor_to_local(x)
+
     def _parallelize_if_needed(self):
         """Parallelize the model if ModelParallel distribution is active.
         
@@ -209,6 +263,9 @@ class TorchTrainer(base_trainer.Trainer):
             y_pred = self(x, training=True)
         else:
             y_pred = self(x)
+        
+        # Convert DTensor outputs to local tensors for loss computation
+        y_pred = self._convert_dtensor_output(y_pred)
 
         # Call torch.nn.Module.zero_grad() to clear the leftover gradients
         # for the weights from the previous train step.
@@ -258,6 +315,10 @@ class TorchTrainer(base_trainer.Trainer):
             y_pred = self(x, training=False)
         else:
             y_pred = self(x)
+        
+        # Convert DTensor outputs to local tensors for loss computation
+        y_pred = self._convert_dtensor_output(y_pred)
+        
         loss = self._compute_loss(
             x=x, y=y, y_pred=y_pred, sample_weight=sample_weight, training=False
         )
@@ -279,6 +340,10 @@ class TorchTrainer(base_trainer.Trainer):
             y_pred = self(x, training=False)
         else:
             y_pred = self(x)
+        
+        # Convert DTensor outputs to local tensors
+        y_pred = self._convert_dtensor_output(y_pred)
+        
         return y_pred
 
     def make_train_function(self, force=False):

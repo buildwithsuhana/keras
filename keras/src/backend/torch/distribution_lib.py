@@ -73,6 +73,10 @@ _DISTRIBUTION_INITIALIZED = False
 # Global variable to track if model has been parallelized
 _MODEL_PARALLELIZED = False
 
+# Global variable to track if sharded DTensor weights were created
+# When this is True, we should NOT call parallelize_module()
+_DISTRIBUTED_WEIGHTS_CREATED = False
+
 
 def _get_debug_setting() -> bool:
     """Get debug setting from environment variable."""
@@ -570,6 +574,11 @@ def distribute_variable(tensor, layout=None, module_name=None):
                         device_mesh,
                         placements
                     )
+                    
+                    # Mark that distributed weights were created
+                    # This prevents parallelize_module from being called
+                    global _DISTRIBUTED_WEIGHTS_CREATED
+                    _DISTRIBUTED_WEIGHTS_CREATED = True
                     
                     if debug_mode:
                         local_shape = dtensor.to_local().shape
@@ -1475,6 +1484,34 @@ def get_dtensor_local(tensor):
     return tensor
 
 
+def dtensor_to_local(tensor):
+    """Convert a DTensor to local tensor format.
+    
+    This function handles the conversion needed when using sharded DTensors.
+    When a layer has DTensor weights, the output will be a DTensor that needs
+    to be converted back to a local tensor for subsequent operations.
+    
+    Args:
+        tensor: torch.Tensor, DTensor, or nested structure
+    
+    Returns:
+        Same structure with DTensors converted to local tensors
+    """
+    if tensor is None:
+        return tensor
+    
+    if isinstance(tensor, DTensor):
+        return tensor.to_local()
+    
+    if isinstance(tensor, dict):
+        return {k: dtensor_to_local(v) for k, v in tensor.items()}
+    
+    if isinstance(tensor, (list, tuple)):
+        return type(tensor)(dtensor_to_local(v) for v in tensor)
+    
+    return tensor
+
+
 def is_dtensor(tensor) -> bool:
     """Check if a tensor is a DTensor.
     
@@ -1547,6 +1584,17 @@ def _should_auto_parallelize():
     if not TENSOR_PARALLEL_AVAILABLE:
         return False
     
+    # =====================================================================
+    # KEY FIX: Skip parallelize_module for ModelParallel!
+    # 
+    # When using ModelParallel with DTensor weights:
+    # 1. distribute_variable() creates sharded DTensors for weights
+    # 2. We should NOT call parallelize_module() as it causes conflicts
+    #
+    # Solution: For ModelParallel with a valid layout_map, skip
+    # parallelize_module entirely and let distribute_variable handle it.
+    # =====================================================================
+    
     # Check if ModelParallel distribution is active
     from keras.src.distribution.distribution_lib import distribution as get_dist
     dist = get_dist()
@@ -1556,39 +1604,19 @@ def _should_auto_parallelize():
     
     # Check if it's a ModelParallel distribution
     from keras.src.distribution.distribution_lib import ModelParallel
-    if not isinstance(dist, ModelParallel):
+    if isinstance(dist, ModelParallel):
+        # For ModelParallel, we use our DTensor-based approach in distribute_variable
+        # NOT PyTorch's parallelize_module (which causes conflicts)
+        debug_mode = _get_debug_setting()
+        if debug_mode:
+            rank = torch.distributed.get_rank() if torch.distributed.is_initialized() else 0
+            print(f"DEBUG | [Rank {rank:02d}] Skipping parallelize_module for ModelParallel - using DTensor-based distribution")
         return False
     
+    # For non-ModelParallel distributions (DataParallel), check layout map
     # Check if there's a layout map with actual sharding
     if not hasattr(dist, '_layout_map') or not dist._layout_map:
         return False
-    
-    # =====================================================================
-    # KEY FIX: Skip parallelize_module if weights are already DTensors!
-    # When distribute_variable() creates sharded DTensor weights directly,
-    # we should NOT call parallelize_module() to avoid double-wrapping.
-    # parallelize_module() will fail with "mixed torch.Tensor and DTensor"
-    # if weights are already DTensors.
-    # =====================================================================
-    
-    # Check if model already has DTensor weights
-    # If so, skip parallelize_module and just return True to indicate
-    # that model parallelism IS active (just handled differently)
-    from keras.src.distribution.distribution_lib import distribution
-    current_dist = distribution()
-    if current_dist is not None:
-        from keras.src.distribution.distribution_lib import ModelParallel
-        if isinstance(current_dist, ModelParallel):
-            # Check if any weight is already a DTensor (sharded)
-            if hasattr(current_dist, '_layout_map') and current_dist._layout_map:
-                # Try to get the device mesh and check for DTensor weights
-                from keras.src.backend.torch.distribution_lib import _get_default_device_mesh
-                device_mesh = _get_default_device_mesh()
-                if device_mesh is not None and DTENSOR_AVAILABLE:
-                    # Get model weights and check if they're DTensors
-                    # If weights are already DTensors, skip parallelize_module
-                    # The sharding is already done in distribute_variable()
-                    return False  # Skip parallelize_module - weights already sharded!
     
     return True
 
@@ -1636,7 +1664,9 @@ def reset_model_parallelization_state():
     This can be used to force re-parallelization of a model.
     """
     global _MODEL_PARALLELIZED
+    global _DISTRIBUTED_WEIGHTS_CREATED
     _MODEL_PARALLELIZED = False
+    _DISTRIBUTED_WEIGHTS_CREATED = False
 
 
 def _get_tensor_parallel_mesh(device_mesh):
