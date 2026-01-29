@@ -55,11 +55,12 @@ try:
         Replicate,
         Shard,
     )
-    from torch.distributed._tensor.api import distribute_tensor
+    from torch.distributed._tensor.api import distribute_tensor as torch_distribute_tensor
     from torch.distributed._tensor import DeviceMesh as TorchDeviceMesh
     DTENSOR_AVAILABLE = True
 except ImportError:
     DTENSOR_AVAILABLE = False
+    torch_distribute_tensor = None
     logger.warning(
         "PyTorch DTensor is not available. Distribution support will be limited. "
         "Please install PyTorch with DTensor support (torch>=2.1.0)."
@@ -455,7 +456,7 @@ def distribute_tensor(tensor: torch.Tensor, layout) -> torch.Tensor:
                     return redistribute_dtensor(tensor, device_mesh, backend_layout)
                 else:
                     # Convert to DTensor
-                    return distribute_tensor(tensor, device_mesh, backend_layout.placements)
+                    return torch_distribute_tensor(tensor, device_mesh, backend_layout.placements)
             elif isinstance(backend_layout, tuple):
                 # Tuple of axis names
                 placements = _axis_names_to_placements(backend_layout, device_mesh)
@@ -583,9 +584,9 @@ def distribute_variable(tensor, layout):
             )
         return torch.nn.Parameter(converted_tensor)
 
-    if DTENSOR_AVAILABLE:
+    if DTENSOR_AVAILABLE and torch_distribute_tensor is not None:
         # Create DTensor-based Parameter
-        dtensor = distribute_tensor(
+        dtensor = torch_distribute_tensor(
             converted_tensor,
             device_mesh,
             placements
@@ -895,8 +896,4 @@ def convert_path_for_regex(path: str, source_format: str = "keras") -> str:
 def get_distribution_lib():
     """Get the torch backend distribution_lib module."""
     return sys.modules[__name__]
-
-
-# Import sys for module access
-import sys
 
