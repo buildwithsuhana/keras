@@ -154,7 +154,7 @@ def train_with_keras_hub_opt(epochs=1, seq_length=512):
         
         # Load OPT-125M pre-trained model
         log("Loading OPT-125M from keras_hub...")
-        opt_model = keras_hub.models.OptCausalLM.from_preset("opt_125m_en")
+        opt_model = keras_hub.models.OPTCausalLM.from_preset("opt_125m_en")
         
         total_params = opt_model.count_params()
         log(f"✓ OPT-125M loaded: {total_params:,} parameters")
