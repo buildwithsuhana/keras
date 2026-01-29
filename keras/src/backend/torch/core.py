@@ -127,6 +127,11 @@ class Variable(KerasVariable):
                         self._layout = tensor_layout.backend_layout
                     else:
                         self._layout = tensor_layout
+                # Skip layout assignment if variable shape is not yet known
+                # (this can happen for uninitialized variables like optimizer
+                # iteration counters)
+                elif self.shape is None:
+                    pass
 
     def _initialize(self, value):
         # Initialize layout from distribution context

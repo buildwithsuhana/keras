@@ -647,6 +647,11 @@ class DataParallel(Distribution):
         # First check if the variable already has a layout assigned.
         if getattr(variable, "_layout", None) is not None:
             return variable._layout
+        # Return None if variable shape is not yet known (e.g., uninitialized
+        # optimizer variables). This prevents TypeError when calling len()
+        # on a None shape.
+        if variable.shape is None:
+            return None
         # Otherwise, replicate variable.
         variable_shard_spec = [None] * len(variable.shape)
         return TensorLayout(variable_shard_spec, self.device_mesh)
@@ -832,6 +837,11 @@ class ModelParallel(Distribution):
         variable_layout = _check_path_for_layout_map(variable.path, self._layout_map)
         if variable_layout is not None:
             return variable_layout
+        # Return None if variable shape is not yet known (e.g., uninitialized
+        # optimizer variables). This prevents TypeError when calling len()
+        # on a None shape.
+        if variable.shape is None:
+            return None
         variable_shard_spec = [None] * len(variable.shape)
         return TensorLayout(variable_shard_spec, self.device_mesh)
 
