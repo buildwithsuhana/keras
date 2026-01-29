@@ -1130,3 +1130,43 @@ def create_tp_plan_from_layout_map(
     
     return plan
 
+
+def ensure_dtensor_input(input_tensor, device_mesh):
+    """Ensure input tensor is a DTensor for DTensor operations.
+    
+    When a layer has DTensor weights but receives regular tensor inputs,
+    PyTorch DTensor operations will fail. This helper function converts
+    regular tensors to replicated DTensors.
+    
+    Args:
+        input_tensor: A torch.Tensor (can be regular or DTensor)
+        device_mesh: A DeviceMesh to use for DTensor conversion
+    
+    Returns:
+        A DTensor (if input was a DTensor or needs conversion) or original tensor
+    """
+    if not DTENSOR_AVAILABLE:
+        return input_tensor
+    
+    if input_tensor is None:
+        return input_tensor
+    
+    # Check if input is already a DTensor
+    if isinstance(input_tensor, DTensor):
+        return input_tensor
+    
+    # Check if there's an active device mesh
+    if device_mesh is None:
+        device_mesh = _get_default_device_mesh()
+    
+    if device_mesh is None:
+        return input_tensor
+    
+    # Convert regular tensor to replicated DTensor
+    # This ensures DTensor operations work correctly
+    if _get_debug_setting():
+        rank = torch.distributed.get_rank() if torch.distributed.is_initialized() else 0
+        print(f"DEBUG | [Rank {rank:02d}] Converting regular tensor to DTensor: shape={input_tensor.shape}")
+    
+    return DTensor.from_local(input_tensor, device_mesh, [Replicate()])
+
