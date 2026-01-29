@@ -426,6 +426,12 @@ def distribute_tensor(tensor: torch.Tensor, layout) -> torch.Tensor:
             device_mesh = _get_default_device_mesh()
             if device_mesh is not None:
                 return DTensor.from_local(tensor, device_mesh, [Replicate()])
+        # Return tensor with requires_grad preserved for gradient computation
+        if tensor.requires_grad:
+            return tensor
+        # Enable gradients for floating point tensors (for training)
+        if tensor.dtype.is_floating_point:
+            return tensor.requires_grad_(True)
         return tensor
     
     # Handle TensorLayout
@@ -480,7 +486,15 @@ def distribute_variable(value, layout) -> torch.Tensor:
     if isinstance(value, torch.nn.Parameter):
         return value
     
-    tensor = torch.as_tensor(value)
+    # Convert to tensor - note: we need requires_grad=True for training
+    # torch.as_tensor creates a tensor without requires_grad by default
+    if hasattr(value, 'requires_grad'):
+        tensor = value.detach().requires_grad_(True)
+    else:
+        tensor = torch.as_tensor(value)
+        # Enable gradients for training - this is critical for backprop
+        if tensor.dtype.is_floating_point:
+            tensor = tensor.requires_grad_(True)
     
     # Get the device mesh from global state
     device_mesh = _get_default_device_mesh()

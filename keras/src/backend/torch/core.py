@@ -153,73 +153,52 @@ class Variable(KerasVariable):
 
     def _distribute_parameter(self, tensor):
         """Create a distributed Parameter if distribution is configured."""
+        # Import here to avoid circular dependency
         from keras.src.backend.torch import distribution_lib
-        
+
         # Check if we are in a distribution context (mesh is active)
         active_mesh = distribution_lib._get_default_device_mesh()
-        
-        if self._layout is not None or active_mesh is not None:
-            # Import here to avoid circular dependency
-            from keras.src.backend.torch import distribution_lib
 
+        # If no explicit layout, check if there's a distribution context
+        # This handles the case where variables are created inside a
+        # distribution scope but layout wasn't set during __init__
+        layout = self._layout
+        if layout is None and active_mesh is not None:
+            from keras.src.distribution import distribution
+
+            dist = distribution()
+            if dist is not None:
+                tensor_layout = dist.get_variable_layout(self)
+                if tensor_layout is not None:
+                    # Extract the layout for distribute_variable
+                    if hasattr(tensor_layout, 'backend_layout'):
+                        layout = tensor_layout.backend_layout
+                    else:
+                        layout = tensor_layout
+
+        if layout is not None or active_mesh is not None:
             distributed = distribution_lib.distribute_variable(
-                tensor, self._layout
+                tensor, layout
             )
             if _get_debug_setting():
                 import logging
                 logger = logging.getLogger(__name__)
                 logger.debug(
-                    f"Distributed parameter created with explicit layout: "
-                    f"shape={tensor.shape}, layout={self._layout}, "
+                    f"Distributed parameter created with layout: "
+                    f"shape={tensor.shape}, layout={layout}, "
                     f"result_type={type(distributed)}"
                 )
             return distributed
-            
+
         # Default non-distributed fallback
-        return torch.nn.Parameter(
-            tensor, requires_grad=self.trainable
-        ).to(get_device())
-        
-        # If no explicit layout, check if there's a distribution context
-        # This handles the case where variables are created inside a 
-        # distribution scope but layout wasn't set during __init__
-        from keras.src.distribution import distribution
-        dist = distribution()
-        
         if _get_debug_setting():
             import logging
             logger = logging.getLogger(__name__)
             logger.debug(
-                f"_distribute_parameter: distribution()={dist is not None}, "
-                f"self._layout={self._layout}"
-            )
-        
-        if dist is not None:
-            # Get the layout from distribution context
-            tensor_layout = dist.get_variable_layout(self)
-            if tensor_layout is not None:
-                # Extract the layout for distribute_variable
-                if hasattr(tensor_layout, 'backend_layout'):
-                    layout = tensor_layout.backend_layout
-                else:
-                    layout = tensor_layout
-                
-                if _get_debug_setting():
-                    logger.debug(
-                        f"Creating distributed parameter from distribution context: "
-                        f"shape={tensor.shape}, layout={layout}"
-                    )
-                
-                distributed = distribution_lib.distribute_variable(tensor, layout)
-                return distributed
-        
-        # Fallback: return non-distributed parameter with requires_grad
-        if _get_debug_setting():
-            logger.debug(
                 f"Returning non-distributed parameter: "
                 f"shape={tensor.shape}, trainable={self.trainable}"
             )
-        
+
         return torch.nn.Parameter(
             tensor, requires_grad=self.trainable
         ).to(get_device())
