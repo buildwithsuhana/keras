@@ -31,19 +31,58 @@ class TorchTrainer(base_trainer.Trainer):
         self._torch_module_parallelized = False
 
     def _ensure_dtensor_input(self, x):
-        """Keep inputs as regular tensors for ModelParallel.
+        """Convert inputs to DTensors when model has DTensor weights.
         
-        For ModelParallel training, inputs should NOT be converted to DTensors.
-        The parallelize_module function handles input/output conversion automatically.
-        This method is kept for compatibility but does nothing.
+        For ModelParallel training with DTensor weights, inputs must also be
+        DTensors to avoid the "mixed torch.Tensor and DTensor" error.
         
         Args:
             x: Input tensor (can be torch.Tensor, DTensor, or nested structure)
             
         Returns:
-            Same structure, inputs unchanged
+            Same structure, with inputs converted to DTensors if needed
         """
-        return x
+        from keras.src.distribution.distribution_lib import distribution
+        from keras.src.distribution.distribution_lib import ModelParallel
+        from keras.src.backend.torch.distribution_lib import (
+            convert_tensors_to_dtensor,
+            _get_default_device_mesh,
+            DTENSOR_AVAILABLE,
+        )
+        
+        # If DTensor not available, return as-is
+        if not DTENSOR_AVAILABLE:
+            return x
+        
+        # Check if ModelParallel distribution is active
+        dist = distribution()
+        if not isinstance(dist, ModelParallel):
+            return x
+        
+        # Get device mesh
+        device_mesh = _get_default_device_mesh()
+        if device_mesh is None:
+            return x
+        
+        # Check if any weights are DTensors by looking at trainable_weights
+        has_dtensor_weights = False
+        for var in self.trainable_weights:
+            if hasattr(var, '_value') and hasattr(var._value, 'to_local'):
+                has_dtensor_weights = True
+                break
+            elif hasattr(var, 'value') and hasattr(var.value, 'to_local'):
+                has_dtensor_weights = True
+                break
+        
+        if not has_dtensor_weights:
+            return x
+        
+        # Convert inputs to DTensors
+        if _get_debug_setting():
+            rank = torch.distributed.get_rank() if torch.distributed.is_initialized() else 0
+            print(f"DEBUG | [Rank {rank:02d}] Converting inputs to DTensors")
+        
+        return convert_tensors_to_dtensor(x, device_mesh=device_mesh)
 
     def _parallelize_if_needed(self):
         """Parallelize the model if ModelParallel distribution is active.

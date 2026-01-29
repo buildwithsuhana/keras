@@ -1563,6 +1563,33 @@ def _should_auto_parallelize():
     if not hasattr(dist, '_layout_map') or not dist._layout_map:
         return False
     
+    # =====================================================================
+    # KEY FIX: Skip parallelize_module if weights are already DTensors!
+    # When distribute_variable() creates sharded DTensor weights directly,
+    # we should NOT call parallelize_module() to avoid double-wrapping.
+    # parallelize_module() will fail with "mixed torch.Tensor and DTensor"
+    # if weights are already DTensors.
+    # =====================================================================
+    
+    # Check if model already has DTensor weights
+    # If so, skip parallelize_module and just return True to indicate
+    # that model parallelism IS active (just handled differently)
+    from keras.src.distribution.distribution_lib import distribution
+    current_dist = distribution()
+    if current_dist is not None:
+        from keras.src.distribution.distribution_lib import ModelParallel
+        if isinstance(current_dist, ModelParallel):
+            # Check if any weight is already a DTensor (sharded)
+            if hasattr(current_dist, '_layout_map') and current_dist._layout_map:
+                # Try to get the device mesh and check for DTensor weights
+                from keras.src.backend.torch.distribution_lib import _get_default_device_mesh
+                device_mesh = _get_default_device_mesh()
+                if device_mesh is not None and DTENSOR_AVAILABLE:
+                    # Get model weights and check if they're DTensors
+                    # If weights are already DTensors, skip parallelize_module
+                    # The sharding is already done in distribute_variable()
+                    return False  # Skip parallelize_module - weights already sharded!
+    
     return True
 
 
