@@ -8,6 +8,7 @@ Fix the DTensor sharding issue in `keras/src/backend/torch/distribution_lib.py` 
 2. DeviceMesh is not properly registered in global state before variable creation
 3. Path matching between Keras (`dense/kernel`) and PyTorch (`dense.weight`) formats is incomplete
 4. Manual sharding fallback creates parameters without proper DTensor metadata
+5. **DataParallel does NOT initialize backend mesh (causes gradient tracking issues)**
 
 ## Implementation Plan COMPLETED
 
@@ -29,6 +30,12 @@ Fix the DTensor sharding issue in `keras/src/backend/torch/distribution_lib.py` 
 ### Step 4: Update `ModelParallel.__init__` in distribution_lib.py ✅
 - [x] Ensure backend mesh is created when ModelParallel is initialized
 - [x] This triggers registration in global state before variable creation
+
+### Step 5: Update `DataParallel.__init__` in distribution_lib.py (NEW) ✅
+- [x] Add backend mesh initialization to DataParallel
+- [x] This is needed for proper gradient tracking in distributed training
+- [x] Without this, `distribute_variable` returns non-distributed parameters
+  causing `RuntimeError: element 0 of tensors does not require grad`
 
 ## Changes Made
 

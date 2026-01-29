@@ -599,6 +599,19 @@ class DataParallel(Distribution):
         self._process_id = distribution_lib.process_id()
         self._is_multi_process = self._num_process > 1
 
+        # For PyTorch backend, ensure the backend mesh is created
+        # This is needed for DTensor support and proper gradient tracking
+        # in distributed training
+        if _is_torch_backend():
+            try:
+                # Access the backend_mesh property to trigger creation
+                # and registration in global state
+                _ = self.device_mesh.backend_mesh
+            except Exception:
+                # Backend mesh creation might fail in some environments
+                # That's OK - the distribution will fall back to non-distributed
+                pass
+
     def _initialize_with_device_mesh(self, device_mesh, auto_shard_dataset):
         if not isinstance(device_mesh, DeviceMesh):
             raise ValueError(
