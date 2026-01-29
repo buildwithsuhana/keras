@@ -2,10 +2,8 @@
 """
 OPT-125M Training on Tiny Shakespeare Dataset with Distributed Training
 
-This script demonstrates:
-1. Loading Tiny Shakespeare dataset
-2. Creating an OPT-style transformer model
-3. Training with DataParallel and ModelParallel distributions
+This script trains an OPT-125M style transformer model on Tiny Shakespeare
+dataset with DataParallel and ModelParallel distributions.
 
 Usage:
     python opt_tiny_shakespeare.py
@@ -15,16 +13,14 @@ Usage:
 """
 
 import os
-# MUST be set before any other imports
 os.environ["KERAS_BACKEND"] = "torch"
-os.environ["KERAS_DISTRIBUTION_DEBUG"] = "0"  # Set to 1 for debug logs
+os.environ["KERAS_DISTRIBUTION_DEBUG"] = "0"
 os.environ["TOKENIZERS_PARALLELISM"] = "false"
 
 import sys
 import time
 import logging
 
-# Setup logging
 logging.basicConfig(
     level=logging.INFO,
     format='%(asctime)s | %(levelname)-8s | %(message)s',
@@ -58,7 +54,7 @@ def log_section(title):
 
 
 def download_tiny_shakespeare():
-    """Download and prepare Tiny Shakespeare dataset."""
+    """Download Tiny Shakespeare dataset."""
     import urllib.request
     import os
     
@@ -78,22 +74,16 @@ def download_tiny_shakespeare():
 
 
 def prepare_text_dataset(text, seq_length=128):
-    """Prepare character-level text dataset for training."""
+    """Prepare character-level text dataset."""
     import numpy as np
     
-    # Create character vocabulary
     chars = sorted(set(text))
     vocab_size = len(chars)
     log(f"Vocabulary size: {vocab_size}")
     
-    # Create character to index mapping
     char_to_idx = {c: i for i, c in enumerate(chars)}
-    idx_to_char = {i: c for i, c in enumerate(chars)}
-    
-    # Convert text to indices
     indices = np.array([char_to_idx[c] for c in text])
     
-    # Create sequences with 50% overlap for more training data
     sequences = []
     targets = []
     
@@ -108,16 +98,27 @@ def prepare_text_dataset(text, seq_length=128):
     return sequences, targets, vocab_size, char_to_idx, idx_to_char
 
 
-def create_opt_style_model(
+def create_opt_model(
     vocab_size: int,
     seq_length: int = 128,
     hidden_dim: int = 768,
-    num_layers: int = 4,
-    num_heads: int = 8,
+    num_layers: int = 12,
+    num_heads: int = 12,
     intermediate_dim: int = 3072
 ):
     """
-    Create an OPT-style transformer model for text generation.
+    Create OPT-style transformer model.
+    
+    OPT-125M Architecture:
+    - hidden_dim: 768
+    - intermediate_dim: 3072 (4x hidden_dim)
+    - num_layers: 12
+    - num_heads: 12
+    - vocab_size: 50264 (BPE) or 65 (char-level)
+    
+    Parameter count for 125M:
+    - With char vocab (65): ~85M parameters
+    - With BPE vocab (50264): ~125M parameters
     """
     import keras
     from keras import layers
@@ -133,49 +134,51 @@ def create_opt_style_model(
         name='token_embedding'
     )(inputs)
     
-    # Positional encoding
-    positions = np.arange(seq_length)[np.newaxis, :, np.newaxis]
-    position_embeddings = np.zeros((1, seq_length, hidden_dim))
-    position_embeddings[:, :, :hidden_dim] = positions
-    position_embeddings = keras.ops.convert_to_numpy(position_embeddings)
-    x = x + position_embeddings
+    # Positional encoding (learned)
+    pos_emb = layers.Embedding(
+        input_dim=seq_length,
+        output_dim=hidden_dim,
+        name='position_embedding'
+    )(layers.Range(start=0, dtype='int32', limit=seq_length))
+    x = x + pos_emb
     
     # Transformer blocks
     for i in range(num_layers):
-        attention_output = layers.MultiHeadAttention(
+        # Multi-head self-attention
+        attn = layers.MultiHeadAttention(
             num_heads=num_heads,
             key_dim=hidden_dim // num_heads,
             name=f'attention_{i}'
         )(x, x)
         
-        attention_output = layers.Dropout(0.1)(attention_output)
-        x = layers.Add()([x, attention_output])
+        attn = layers.Dropout(0.1)(attn)
+        x = layers.Add()([x, attn])
         x = layers.LayerNormalization(epsilon=1e-5)(x)
         
+        # Feed-forward network
         ffn = keras.Sequential([
             layers.Dense(intermediate_dim, activation='gelu', name=f'ffn_dense1_{i}'),
             layers.Dense(hidden_dim, name=f'ffn_dense2_{i}')
         ], name=f'ffn_{i}')
         
-        ffn_output = ffn(x)
-        ffn_output = layers.Dropout(0.1)(ffn_output)
+        ffn_out = ffn(x)
+        ffn_out = layers.Dropout(0.1)(ffn_out)
         
-        x = layers.Add()([x, ffn_output])
+        x = layers.Add()([x, ffn_out])
         x = layers.LayerNormalization(epsilon=1e-5)(x)
     
     # Output layer
     x = layers.Dense(hidden_dim, activation='gelu', name='output_dense')(x)
-    outputs = layers.Dense(vocab_size, activation='softmax', name='logits')(x)
+    outputs = layers.Dense(vocab_size, name='logits')(x)
     
-    model = keras.Model(inputs=inputs, outputs=outputs, name='OPT_style_model')
+    model = keras.Model(inputs=inputs, outputs=outputs, name='OPT_model')
     
     return model
 
 
 def setup_environment():
-    """Setup and log environment information."""
+    """Setup environment."""
     import torch
-    import torch.distributed as dist
     
     log_section("ENVIRONMENT SETUP")
     
@@ -184,270 +187,220 @@ def setup_environment():
     log(f"CUDA available: {torch.cuda.is_available()}")
     
     if torch.cuda.is_available():
-        log(f"CUDA version: {torch.version.cuda}")
         log(f"Number of GPUs: {torch.cuda.device_count()}")
         for i in range(torch.cuda.device_count()):
             props = torch.cuda.get_device_properties(i)
-            memory_gb = props.total_memory / (1024**3)
-            log(f"  GPU {i}: {props.name} ({memory_gb:.1f} GB)")
+            log(f"  GPU {i}: {props.name}")
     
-    # Check if we're running with torchrun
     if "LOCAL_RANK" in os.environ:
         local_rank = int(os.environ["LOCAL_RANK"])
         world_size = int(os.environ.get("WORLD_SIZE", 1))
-        
-        gpu_count = torch.cuda.device_count() if torch.cuda.is_available() else 0
-        
-        if torch.cuda.is_available() and local_rank < gpu_count:
-            torch.cuda.set_device(local_rank)
-            log(f"✓ PyTorch distributed: rank={local_rank}, world_size={world_size}, device=cuda:{local_rank}")
-        else:
-            log(f"✓ PyTorch distributed: rank={local_rank}, world_size={world_size}, device=CPU")
-    else:
-        log("Running in single-process mode")
+        log(f"Distributed: rank={local_rank}, world_size={world_size}")
     
     log("")
 
 
-def train_opt_data_parallel(
-    epochs: int = 3,
-    seq_length: int = 128,
-    batch_size: int = 32,
-    learning_rate: float = 0.0001
-):
-    """Train OPT-style model with DataParallel on Tiny Shakespeare dataset."""
+def train_data_parallel(epochs=3, seq_length=128):
+    """Train OPT model with DataParallel."""
     log_section("OPT-125M DATA PARALLEL TRAINING")
     
     import keras
-    from keras import layers
-    from keras.src.distribution import DataParallel, list_devices
+    from keras.distribution import DataParallel, list_devices
     import numpy as np
     
-    # Get devices
     devices = list_devices("gpu")
     if not devices:
         devices = ["cpu:0"]
     
     log(f"Using devices: {devices}")
     
-    # Download and prepare dataset
-    log("Loading Tiny Shakespeare dataset...")
+    # Load dataset
     text = download_tiny_shakespeare()
-    sequences, targets, vocab_size, char_to_idx, idx_to_char = prepare_text_dataset(
-        text, seq_length=seq_length
-    )
-    
+    sequences, targets, vocab_size, _, _, _ = prepare_text_dataset(text, seq_length)
     x_train = np.array(sequences, dtype=np.int32)
     y_train = np.array(targets, dtype=np.int32)
     
-    log(f"Training data shapes: x={x_train.shape}, y={y_train.shape}")
+    log(f"Data shapes: x={x_train.shape}, y={y_train.shape}")
     
-    # Create DataParallel distribution
+    # Create distribution
     dp = DataParallel(devices=devices, auto_shard_dataset=False)
-    log(f"✓ DataParallel created: mesh_shape={dp.device_mesh.shape}")
+    log(f"DataParallel: mesh_shape={dp.device_mesh.shape}")
     
-    # Create OPT-style model
+    # OPT-125M architecture
     hidden_dim = 768
-    num_layers = 4
-    num_heads = 8
+    num_layers = 12
+    num_heads = 12
+    intermediate_dim = 3072
     
-    log(f"Creating OPT-style model...")
-    log(f"  - Hidden dimension: {hidden_dim}")
-    log(f"  - Number of layers: {num_layers}")
-    log(f"  - Number of attention heads: {num_heads}")
+    log(f"")
+    log(f"OPT-125M Model Configuration:")
+    log(f"  - hidden_dim: {hidden_dim}")
+    log(f"  - intermediate_dim: {intermediate_dim}")
+    log(f"  - num_layers: {num_layers}")
+    log(f"  - num_heads: {num_heads}")
+    log(f"  - vocab_size: {vocab_size} (character-level)")
     
     with dp.scope():
-        model = create_opt_style_model(
+        model = create_opt_model(
             vocab_size=vocab_size,
             seq_length=seq_length,
             hidden_dim=hidden_dim,
             num_layers=num_layers,
-            num_heads=num_heads
+            num_heads=num_heads,
+            intermediate_dim=intermediate_dim
         )
         
         total_params = model.count_params()
+        log(f"")
         log(f"✓ Model created with {total_params:,} parameters")
         
+        # Parameter breakdown
+        log(f"")
+        log(f"Parameter Breakdown:")
+        log(f"  - Token embedding: {vocab_size * hidden_dim:,}")
+        log(f"  - Position embedding: {seq_length * hidden_dim:,}")
+        log(f"  - Per layer (attention): {3 * hidden_dim * hidden_dim + hidden_dim:,}")
+        log(f"  - Per layer (FFN): {2 * hidden_dim * intermediate_dim + intermediate_dim:,}")
+        log(f"  - {num_layers} layers: ~{(3 * hidden_dim * hidden_dim + hidden_dim + 2 * hidden_dim * intermediate_dim + intermediate_dim) * num_layers:,}")
+        log(f"  - Output layer: {hidden_dim * vocab_size:,}")
+        log(f"")
+        log(f"  Note: Full OPT-125M uses BPE vocab (50264), giving ~125M params")
+        log(f"  Character-level (65) gives ~85M params")
+        log(f"  To match 125M, add more layers or use BPE tokenization")
+        
         model.compile(
-            optimizer=keras.optimizers.Adam(learning_rate=learning_rate),
+            optimizer=keras.optimizers.Adam(learning_rate=0.0001),
             loss='sparse_categorical_crossentropy',
             metrics=['accuracy']
         )
     
     log(f"")
-    log(f"Starting DataParallel training for {epochs} epochs...")
+    log(f"Training for {epochs} epochs...")
     log(f"")
     
     start_time = time.time()
     
     for epoch in range(epochs):
-        epoch_start = time.time()
-        
         with dp.scope():
             history = model.fit(
                 x_train, y_train,
                 epochs=1,
-                batch_size=batch_size,
+                batch_size=32,
                 validation_split=0.1,
                 verbose=1
             )
         
-        epoch_time = time.time() - epoch_start
-        loss = history.history['loss'][0]
-        val_loss = history.history['val_loss'][0]
-        
-        log(f"  Epoch {epoch+1}/{epochs}: loss={loss:.4f}, val_loss={val_loss:.4f} (time={epoch_time:.1f}s)")
+        log(f"  Epoch {epoch+1}/{epochs}: "
+            f"loss={history.history['loss'][0]:.4f}, "
+            f"val_loss={history.history['val_loss'][0]:.4f}")
     
-    total_time = time.time() - start_time
-    
-    log("")
-    log(f"✓ DataParallel Training Complete!")
-    log(f"  - Parameters: {total_params:,}")
-    log(f"  - Final loss: {history.history['loss'][-1]:.4f}")
-    log(f"  - Total time: {total_time:.1f}s")
-    log("")
+    log(f"")
+    log(f"✓ DataParallel Complete: {total_params:,} params, "
+        f"final_loss={history.history['loss'][-1]:.4f}")
+    log(f"")
     
     return True
 
 
-def train_opt_model_parallel(
-    epochs: int = 3,
-    seq_length: int = 128,
-    batch_size: int = 32,
-    learning_rate: float = 0.0001
-):
-    """Train OPT-style model with ModelParallel on Tiny Shakespeare dataset."""
+def train_model_parallel(epochs=3, seq_length=128):
+    """Train OPT model with ModelParallel."""
     log_section("OPT-125M MODEL PARALLEL TRAINING")
     
     import torch
-    import keras
-    from keras import layers
-    from keras.src.distribution import ModelParallel, DeviceMesh, LayoutMap, list_devices
-    import numpy as np
+    from keras.distribution import ModelParallel, DeviceMesh, LayoutMap, list_devices
     
-    # Check GPU count
     if torch.cuda.device_count() < 2:
-        log("⚠ Skipping ModelParallel: Need >= 2 GPUs")
-        log(f"  Available GPUs: {torch.cuda.device_count()}")
+        log("Skipping: Need >= 2 GPUs for ModelParallel")
         return False
     
-    # Get devices
     devices = list_devices("gpu")
     log(f"Using devices: {devices}")
     
-    # Download and prepare dataset
-    log("Loading Tiny Shakespeare dataset...")
+    # Load dataset
     text = download_tiny_shakespeare()
-    sequences, targets, vocab_size, char_to_idx, idx_to_char = prepare_text_dataset(
-        text, seq_length=seq_length
-    )
-    
+    sequences, targets, vocab_size, _, _, _ = prepare_text_dataset(text, seq_length)
+    import numpy as np
     x_train = np.array(sequences, dtype=np.int32)
     y_train = np.array(targets, dtype=np.int32)
     
-    log(f"Training data shapes: x={x_train.shape}, y={y_train.shape}")
-    
-    # Create 2D device mesh for model parallelism
+    # Create device mesh
     mesh = DeviceMesh(
         shape=(1, len(devices)),
         axis_names=["batch", "model"],
         devices=devices
     )
-    log(f"✓ DeviceMesh created: shape={mesh.shape}, axes={mesh.axis_names}")
+    log(f"DeviceMesh: shape={mesh.shape}")
     
-    # Create layout map for sharding
+    # Create layout map for weight sharding
     layout_map = LayoutMap(mesh)
-    
-    # Shard weights on model axis
     layout_map[".*token_embedding"] = (None, "model")
+    layout_map[".*position_embedding"] = (None, "model")
     layout_map[".*attention.*kernel"] = (None, "model")
     layout_map[".*ffn.*kernel"] = (None, "model")
     layout_map[".*output_dense.*kernel"] = (None, "model")
     layout_map[".*bias"] = ("model",)
     
-    log("✓ LayoutMap configured for weight sharding:")
-    for key in list(layout_map.keys())[:3]:
-        layout = layout_map[key]
-        log(f"  - {key}: axes={layout.axes}")
-    log("  - ... (more patterns)")
+    log("LayoutMap configured for weight sharding")
     
-    # Create ModelParallel distribution
+    # Create distribution
     mp = ModelParallel(
         layout_map=layout_map,
         batch_dim_name="batch",
         auto_shard_dataset=False
     )
-    log(f"✓ ModelParallel created: batch_dim={mp.batch_dim_name}")
+    log(f"ModelParallel: batch_dim={mp.batch_dim_name}")
     
-    # Create larger model to benefit from sharding
+    # Larger model for sharding demo
     hidden_dim = 1024
-    num_layers = 6
-    num_heads = 8
+    num_layers = 12
+    num_heads = 16
+    intermediate_dim = 4096
     
-    log(f"Creating OPT-style model for sharding...")
-    log(f"  - Hidden dimension: {hidden_dim}")
-    log(f"  - Number of layers: {num_layers}")
+    log(f"")
+    log(f"OPT-style Model with Weight Sharding:")
+    log(f"  - hidden_dim: {hidden_dim}")
+    log(f"  - num_layers: {num_layers}")
     log(f"  - Sharding: weights split across {len(devices)} GPUs")
     
     with mp.scope():
-        model = create_opt_style_model(
+        import keras
+        model = create_opt_model(
             vocab_size=vocab_size,
             seq_length=seq_length,
             hidden_dim=hidden_dim,
             num_layers=num_layers,
-            num_heads=num_heads
+            num_heads=num_heads,
+            intermediate_dim=intermediate_dim
         )
         
         total_params = model.count_params()
-        log(f"✓ Model created with {total_params:,} parameters")
-        log(f"  (Weight sharding across {len(devices)} GPUs)")
-        
-        # Show sharding info
-        for i, layer in enumerate(model.layers):
-            if hasattr(layer, 'kernel') and layer.kernel is not None:
-                log(f"  Layer {i}: {layer.name}, kernel_shape={layer.kernel.shape}")
+        log(f"✓ Model: {total_params:,} parameters (sharded)")
         
         model.compile(
-            optimizer=keras.optimizers.Adam(learning_rate=learning_rate),
+            optimizer=keras.optimizers.Adam(learning_rate=0.0001),
             loss='sparse_categorical_crossentropy',
             metrics=['accuracy']
         )
     
     log(f"")
-    log(f"Starting ModelParallel training for {epochs} epochs...")
-    log(f"  - Sharding: weights split across {len(devices)} GPUs")
+    log(f"Training for {epochs} epochs...")
     log(f"")
     
-    start_time = time.time()
-    
     for epoch in range(epochs):
-        epoch_start = time.time()
-        
         with mp.scope():
             history = model.fit(
                 x_train, y_train,
                 epochs=1,
-                batch_size=batch_size,
+                batch_size=32,
                 validation_split=0.1,
                 verbose=1
             )
         
-        epoch_time = time.time() - epoch_start
-        loss = history.history['loss'][0]
-        val_loss = history.history['val_loss'][0]
-        
-        log(f"  Epoch {epoch+1}/{epochs}: loss={loss:.4f}, val_loss={val_loss:.4f} (time={epoch_time:.1f}s)")
+        log(f"  Epoch {epoch+1}/{epochs}: loss={history.history['loss'][0]:.4f}")
     
-    total_time = time.time() - start_time
-    
-    log("")
-    log(f"✓ ModelParallel Training Complete!")
-    log(f"  - Parameters: {total_params:,}")
-    log(f"  - Device mesh: {mesh.shape}")
-    log(f"  - Final loss: {history.history['loss'][-1]:.4f}")
-    log(f"  - Total time: {total_time:.1f}s")
-    log(f"  - Sharding: weights split across {len(devices)} GPUs")
-    log("")
+    log(f"")
+    log(f"✓ ModelParallel Complete: {total_params:,} params (sharded)")
+    log(f"")
     
     return True
 
@@ -456,42 +409,27 @@ def main():
     """Main entry point."""
     import torch
     import torch.distributed as dist
-    from keras.src.distribution import initialize
+    from keras.distribution import initialize
     
-    # Setup environment
     setup_environment()
-    
-    # Initialize Keras distribution
     initialize()
     
-    # Run DataParallel test (always runs)
-    train_opt_data_parallel(
-        epochs=3,
-        seq_length=128,
-        batch_size=32,
-        learning_rate=0.0001
-    )
+    # DataParallel (always runs)
+    train_data_parallel(epochs=3)
     
-    # Run ModelParallel test (only if >= 2 GPUs)
+    # ModelParallel (if 2+ GPUs)
     if torch.cuda.device_count() >= 2:
-        train_opt_model_parallel(
-            epochs=3,
-            seq_length=128,
-            batch_size=32,
-            learning_rate=0.0001
-        )
+        train_model_parallel(epochs=3)
     else:
-        log_section("MODEL PARALLEL TEST (SKIPPED)")
-        log("Need >= 2 GPUs for ModelParallel test")
-        log("Run on a machine with 2+ GPUs to test ModelParallel")
+        log_section("MODEL PARALLEL SKIPPED")
+        log("Need 2+ GPUs")
         log("")
     
-    # Cleanup
-    if dist.is_available() and dist.is_initialized():
+    if dist.is_initialized():
         dist.destroy_process_group()
     
-    log_section("ALL TESTS COMPLETED")
-    log("✓ OPT-125M distributed training verification complete!")
+    log_section("COMPLETE")
+    log("OPT-125M distributed training verification done!")
     
     return 0
 

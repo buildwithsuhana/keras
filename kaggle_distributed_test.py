@@ -232,13 +232,14 @@ def test_data_parallel(epochs=3):
 
 
 def test_model_parallel(epochs=3):
-    """Test ModelParallel functionality."""
+    """Test ModelParallel functionality with physical storage verification."""
     import torch
     import torch.distributed as dist
     import keras
     from keras import layers
     from keras.src.distribution import ModelParallel, DeviceMesh, LayoutMap, list_devices
     import numpy as np
+    import time
     
     log_section("TEST 3: MODEL PARALLEL (MP)")
     
@@ -276,8 +277,7 @@ def test_model_parallel(epochs=3):
         layout = layout_map[key]
         log(f"  - {key}: axes={layout.axes}")
     
-    # Create ModelParallel distribution with auto_shard_dataset=False
-    # This is needed for multi-process training with numpy arrays
+    # Create ModelParallel distribution
     mp = ModelParallel(
         layout_map=layout_map,
         batch_dim_name="batch",
@@ -286,7 +286,7 @@ def test_model_parallel(epochs=3):
     log(f"✓ ModelParallel created: batch_dim={mp.batch_dim_name}")
     log(f"  Auto-shard dataset: False")
     
-    # Create larger model for sharding demonstration
+    # Create model for sharding demonstration
     with mp.scope():
         model = keras.Sequential([
             layers.Dense(512, activation="relu", input_shape=(128,)),
@@ -295,30 +295,37 @@ def test_model_parallel(epochs=3):
             layers.Dense(10)
         ])
         
-        total_params = model.count_params()
-        log(f"✓ Model created with {total_params:,} parameters")
-        
-        # Log layer details with sharding info
+        log_section("PHYSICAL STORAGE VERIFICATION")
+        # Inspect the actual sharded tensors
         for i, layer in enumerate(model.layers):
             if hasattr(layer, 'kernel'):
-                kernel_shape = layer.kernel.shape
-                shard_dim = kernel_shape[1] // len(devices) if len(devices) > 1 else kernel_shape[1]
-                log(f"  Layer {i}: {layer.name}")
-                log(f"    - kernel_shape={kernel_shape}")
-                log(f"    - expected_shard={shard_dim} on dim 1 (model axis)")
-        
+                # In your PyTorch backend, layer.kernel.value returns the DTensor
+                dtensor = layer.kernel.value 
+                
+                # Theoretical shape (Global view)
+                global_shape = dtensor.shape 
+                
+                # Actual physical storage on THIS GPU
+                local_tensor = dtensor.to_local() 
+                local_shape = local_tensor.shape
+                
+                log(f"Layer {i} ({layer.name}):")
+                log(f"  - Global Shape (Theoretical): {tuple(global_shape)}")
+                log(f"  - Local Shape (Actual on Rank {rank}): {tuple(local_shape)}")
+                
+                # Verify that sharding actually happened
+                if local_shape[1] < global_shape[1]:
+                    log(f"  ✓ Verified: Kernel is sharded across the 'model' axis.")
+
         model.compile(optimizer="adam", loss="mse")
     
     # Create training data
     batch_size = 32
     x = np.random.random((batch_size, 128)).astype("float32")
     y = np.random.random((batch_size, 10)).astype("float32")
-    log(f"Training data: input_shape={x.shape}, target_shape={y.shape}")
     
     # Training loop
     log(f"Training for {epochs} epochs...")
-    log("", rank_0_only=True)
-    
     start_time = time.time()
     losses = []
     
@@ -335,21 +342,7 @@ def test_model_parallel(epochs=3):
         log(f"  Epoch {epoch+1}/{epochs}: loss={loss:.6f} (time={epoch_time:.3f}s)")
     
     total_time = time.time() - start_time
-    
-    # Log summary
-    log("", rank_0_only=True)
-    log(f"✓ ModelParallel Training Summary:")
-    log(f"  - Total parameters: {total_params:,}")
-    log(f"  - Mesh shape: {mesh.shape} ({mesh.axis_names})")
-    log(f"  - Epochs completed: {epochs}")
-    log(f"  - Initial loss: {losses[0]:.6f}")
-    log(f"  - Final loss: {losses[-1]:.6f}")
-    log(f"  - Total time: {total_time:.3f}s")
-    log(f"  - Loss improvement: {losses[0] - losses[-1]:.6f} ({(losses[0] - losses[-1])/losses[0]*100:.1f}%)")
-    
-    log("✓ ModelParallel test PASSED")
-    log("")
-    
+    log(f"✓ ModelParallel test PASSED in {total_time:.3s}")
     return True
 
 
