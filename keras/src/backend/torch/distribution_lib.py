@@ -471,11 +471,14 @@ def distribute_tensor(tensor: torch.Tensor, layout) -> torch.Tensor:
 
 def distribute_variable(tensor, layout):
     """Distributes a Keras variable using PyTorch DTensor or manual sharding."""
-    from keras.src.distribution.distribution_lib import get_distribution
+    from keras.src.distribution.distribution_lib import distribution
     
-    distribution = get_distribution()
-    if not distribution or layout is None:
+    current_distribution = distribution()
+    if not current_distribution or layout is None:
         return torch.nn.Parameter(convert_to_tensor(tensor))
+
+    # Use the distribution object
+    distribution = current_distribution
 
     # Retrieve the mesh
     device_mesh = _to_backend_mesh(distribution.device_mesh)
