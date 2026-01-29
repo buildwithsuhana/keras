@@ -63,6 +63,7 @@ def get_timestamp():
 def setup_environment():
     """Setup and log environment information."""
     import torch
+    import torch.distributed as dist
     
     log_section("ENVIRONMENT SETUP")
     
@@ -78,8 +79,29 @@ def setup_environment():
             memory_gb = props.total_memory / (1024**3)
             log(f"  GPU {i}: {props.name} ({memory_gb:.1f} GB)")
     
-    # Check distributed
-    import torch.distributed as dist
+    # Check if we're running with torchrun
+    if "LOCAL_RANK" in os.environ:
+        local_rank = int(os.environ["LOCAL_RANK"])
+        world_size = int(os.environ.get("WORLD_SIZE", 1))
+        
+        # Setup device for this process
+        if torch.cuda.is_available():
+            torch.cuda.set_device(local_rank)
+        
+        # Initialize PyTorch distributed
+        if not dist.is_initialized():
+            dist.init_process_group(
+                backend="nccl" if torch.cuda.is_available() else "gloo",
+                init_method="env://"
+            )
+        
+        log(f"✓ PyTorch distributed initialized via torchrun")
+        log(f"  Local rank: {local_rank}, World size: {world_size}")
+        log(f"  Device: cuda:{local_rank}")
+    else:
+        log("Running in single-process mode")
+    
+    # Check distributed status
     is_dist = dist.is_available() and dist.is_initialized()
     log(f"Distributed initialized: {is_dist}")
     if is_dist:
@@ -118,10 +140,8 @@ def test_data_parallel(epochs=3):
     import torch.distributed as dist
     import keras
     from keras import layers
-    from keras.distribution import DataParallel, list_devices, initialize
+    from keras.src.distribution import DataParallel, list_devices
     import numpy as np
-    
-    initialize()
     
     log_section("TEST 2: DATA PARALLEL (DP)")
     
@@ -184,14 +204,6 @@ def test_data_parallel(epochs=3):
         
         # All ranks log their loss
         log(f"  Epoch {epoch+1}/{epochs}: loss={loss:.6f} (time={epoch_time:.3f}s)")
-        
-        # Verify weights changed
-        if epoch > 0:
-            weight_change = sum(
-                float(torch.abs(w - w_prev).sum().numpy())
-                for w, w_prev in zip(model.weights, model.weights_prev)
-                if hasattr(model, 'weights_prev')
-            )
     
     total_time = time.time() - start_time
     
@@ -203,7 +215,9 @@ def test_data_parallel(epochs=3):
     log(f"  - Initial loss: {losses[0]:.6f}")
     log(f"  - Final loss: {losses[-1]:.6f}")
     log(f"  - Total time: {total_time:.3f}s")
-    log(f"  - Loss improvement: {losses[0] - losses[-1]:.6f} ({(losses[0] - losses[-1])/losses[0]*100:.1f}%)")
+    if losses[0] > 0:
+        improvement = (losses[0] - losses[-1]) / losses[0] * 100
+        log(f"  - Loss improvement: {improvement:.1f}%")
     
     log("✓ DataParallel test PASSED")
     log("")
@@ -217,10 +231,8 @@ def test_model_parallel(epochs=3):
     import torch.distributed as dist
     import keras
     from keras import layers
-    from keras.distribution import ModelParallel, DeviceMesh, LayoutMap, list_devices, initialize
+    from keras.src.distribution import ModelParallel, DeviceMesh, LayoutMap, list_devices
     import numpy as np
-    
-    initialize()
     
     log_section("TEST 3: MODEL PARALLEL (MP)")
     
@@ -338,10 +350,8 @@ def test_gradient_flow():
     import torch.distributed as dist
     import keras
     from keras import layers
-    from keras.distribution import DataParallel, list_devices, initialize
+    from keras.src.distribution import DataParallel, list_devices
     import numpy as np
-    
-    initialize()
     
     log_section("TEST 4: GRADIENT FLOW")
     
@@ -420,9 +430,13 @@ def main():
     """Main entry point."""
     import torch
     import torch.distributed as dist
+    from keras.src.distribution import initialize
     
-    # Setup environment
+    # Setup environment (this now handles torch distributed init)
     setup_environment()
+    
+    # Initialize Keras distribution system
+    initialize()
     
     # Run tests
     test_device_detection()
