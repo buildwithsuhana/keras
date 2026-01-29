@@ -13,6 +13,7 @@ Or with torchrun:
 """
 
 import os
+from xml.parsers.expat import model
 # MUST be set before any other imports
 os.environ["KERAS_BACKEND"] = "torch"
 os.environ["KERAS_DISTRIBUTION_DEBUG"] = "1"
@@ -183,7 +184,8 @@ def test_data_parallel(epochs=3):
             if hasattr(layer, 'kernel'):
                 log(f"  Layer {i}: {layer.name}, kernel_shape={layer.kernel.shape}")
         
-        model.compile(optimizer="adam", loss="mse")
+        optimizer = keras.optimizers.Adam(learning_rate=0.001)
+        model.compile(optimizer=optimizer, loss="mse")
     
     # Create training data
     batch_size = 32
@@ -339,7 +341,8 @@ def test_model_parallel(epochs=3):
                     log(f"  - Local Shape (Actual on Rank {rank}): {tuple(local_shape)}")
                     log(f"  - Note: DTensor not available, sharding via Parameter creation")
 
-        model.compile(optimizer="adam", loss="mse")
+        optimizer = keras.optimizers.Adam(learning_rate=0.001)
+        model.compile(optimizer=optimizer, loss="mse")
     
     # Create training data
     batch_size = 32
@@ -391,7 +394,8 @@ def test_gradient_flow():
             layers.Dense(32, activation="relu"),
             layers.Dense(8)
         ])
-        model.compile(optimizer="adam", loss="mse")
+        optimizer = keras.optimizers.Adam(learning_rate=0.001)
+        model.compile(optimizer=optimizer, loss="mse")
     
     # Create data
     x = np.random.random((16, 32)).astype("float32")
