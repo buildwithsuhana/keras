@@ -31,78 +31,81 @@ class TorchTrainer(base_trainer.Trainer):
         self._torch_module_parallelized = False
 
     def _ensure_dtensor_input(self, x):
-        """Convert input tensor to DTensor if model has DTensor weights.
+        """Keep inputs as regular tensors for ModelParallel.
         
-        This prevents "mixed torch.Tensor and DTensor" errors during ModelParallel
-        training by ensuring that when model weights are DTensors, inputs are also
-        converted to replicated DTensors.
+        For ModelParallel training, inputs should NOT be converted to DTensors.
+        The parallelize_module function handles input/output conversion automatically.
+        This method is kept for compatibility but does nothing.
         
         Args:
             x: Input tensor (can be torch.Tensor, DTensor, or nested structure)
             
         Returns:
-            Same structure with tensors converted to DTensors if needed
+            Same structure, inputs unchanged
         """
-        # Skip if DTensor not available
+        return x
+
+    def _parallelize_if_needed(self):
+        """Parallelize the model if ModelParallel distribution is active.
+        
+        This method checks if the model should be parallelized and applies
+        parallelize_keras_model if needed. It should be called during fit/evaluate.
+        """
+        if self._torch_module_parallelized:
+            return
+        
         try:
             from keras.src.backend.torch.distribution_lib import (
-                DTENSOR_AVAILABLE,
-                is_dtensor,
-                DTensor,
-                Replicate,
+                parallelize_keras_model,
+                _get_default_device_mesh,
+                TENSOR_PARALLEL_AVAILABLE,
             )
-            from keras.src.distribution import distribution
+            from keras.src.distribution.distribution_lib import (
+                distribution,
+                ModelParallel,
+            )
         except ImportError:
-            return x
+            return
         
-        if not DTENSOR_AVAILABLE:
-            return x
+        if not TENSOR_PARALLEL_AVAILABLE:
+            return
         
-        # Check if any model weights are DTensors
-        has_dtensor_weights = False
-        device_mesh = None
+        # Check if ModelParallel distribution is active
+        dist = distribution()
+        if not isinstance(dist, ModelParallel):
+            return
         
-        for layer in self.layers:
-            if hasattr(layer, 'kernel') and layer.kernel is not None:
-                kernel = layer.kernel
-                # Check if kernel value is a DTensor
-                if hasattr(kernel, 'value'):
-                    kernel_value = kernel.value
-                elif hasattr(kernel, '_value'):
-                    kernel_value = kernel._value
-                else:
-                    kernel_value = kernel
-                
-                if is_dtensor(kernel_value):
-                    has_dtensor_weights = True
-                    # Get device mesh from the DTensor
-                    if device_mesh is None:
-                        device_mesh = getattr(kernel_value, 'device_mesh', None)
-                    if _get_debug_setting():
-                        rank = torch.distributed.get_rank() if torch.distributed.is_initialized() else 0
-                        print(f"DEBUG | [Rank {rank:02d}] _ensure_dtensor_input: found DTensor weight in {layer.name}")
-                    break
+        # Check if we have a layout map
+        if not hasattr(dist, '_layout_map') or not dist._layout_map:
+            return
         
-        if not has_dtensor_weights or device_mesh is None:
-            if _get_debug_setting():
-                rank = torch.distributed.get_rank() if torch.distributed.is_initialized() else 0
-                print(f"DEBUG | [Rank {rank:02d}] _ensure_dtensor_input: no DTensor weights or no device_mesh, skipping conversion")
-            return x
+        # Get device mesh
+        device_mesh = _get_default_device_mesh()
+        if device_mesh is None:
+            return
         
-        # Convert inputs to replicated DTensors
-        def convert_tensor(t):
-            if t is None:
-                return t
-            if is_dtensor(t):
-                return t
-            # Convert regular tensor to replicated DTensor
-            return DTensor.from_local(t, device_mesh, [Replicate()])
+        # Get the underlying torch module
+        if hasattr(self, '_torch_layers'):
+            torch_module = self._torch_layers
+        else:
+            torch_module = self
         
         if _get_debug_setting():
             rank = torch.distributed.get_rank() if torch.distributed.is_initialized() else 0
-            print(f"DEBUG | [Rank {rank:02d}] _ensure_dtensor_input: converting inputs to DTensors")
+            print(f"DEBUG | [Rank {rank:02d}] _parallelize_if_needed: parallelizing model")
         
-        return tree.map_structure(convert_tensor, x)
+        # Parallelize the model
+        try:
+            parallelize_keras_model(
+                torch_module,
+                device_mesh=device_mesh,
+                layout_map=dist._layout_map
+            )
+            self._torch_module_parallelized = True
+        except Exception as e:
+            if _get_debug_setting():
+                rank = torch.distributed.get_rank() if torch.distributed.is_initialized() else 0
+                print(f"DEBUG | [Rank {rank:02d}] _parallelize_if_needed: parallelization failed: {e}")
 
     def build(self, input_shape=None):
         """Build the model and optionally apply automatic parallelization.
@@ -370,6 +373,9 @@ class TorchTrainer(base_trainer.Trainer):
                 val_sample_weight,
             ) = data_adapter_utils.unpack_x_y_sample_weight(validation_data)
 
+        # Parallelize model if ModelParallel distribution is active
+        self._parallelize_if_needed()
+
         # Create an iterator that yields batches for one epoch.
         epoch_iterator = TorchEpochIterator(
             x=x,
@@ -508,6 +514,9 @@ class TorchTrainer(base_trainer.Trainer):
                 steps_per_execution=self.steps_per_execution,
             )
 
+        # Parallelize model if ModelParallel distribution is active
+        self._parallelize_if_needed()
+
         self._symbolic_build(iterator=epoch_iterator)
         epoch_iterator.reset()
 
@@ -555,6 +564,9 @@ class TorchTrainer(base_trainer.Trainer):
             shuffle=False,
             steps_per_execution=self.steps_per_execution,
         )
+
+        # Parallelize model if ModelParallel distribution is active
+        self._parallelize_if_needed()
 
         # Container that configures and calls callbacks.
         if not isinstance(callbacks, callbacks_module.CallbackList):
