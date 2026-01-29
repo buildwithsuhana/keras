@@ -129,37 +129,18 @@ class TorchTrainer(base_trainer.Trainer):
             pass
     
     def _symbolic_build(self, *args, **kwargs):
-        """Override _symbolic_build to add automatic parallelization.
-        
-        This is called during fit/evaluate/predict when the model needs to be
-        built. We add auto-parallelization here to ensure it happens before
-        weights are created when using ModelParallel distribution.
+        """Override _symbolic_build for automatic parallelization.
+
+        Note: Parallelization now happens BEFORE this method is called
+        (in fit()/evaluate()/predict()). This ensures that when weights
+        are created during _symbolic_build, they are created as sharded
+        DTensors from the start.
+
+        This method calls the parent _symbolic_build to handle the actual
+        model building and weight creation.
         """
-        # First, try to auto-parallelize before the actual symbolic build
-        try:
-            from keras.src.backend.torch.distribution_lib import (
-                _should_auto_parallelize,
-                _auto_parallelize_model,
-            )
-            
-            if _should_auto_parallelize():
-                # Get the underlying torch module
-                if hasattr(self, '_torch_layers'):
-                    torch_module = self._torch_layers
-                else:
-                    torch_module = self
-                
-                # Auto-parallelize
-                _auto_parallelize_model(torch_module)
-        except ImportError:
-            # If distribution lib not available, skip auto-parallelization
-            pass
-        except Exception:
-            # If auto-parallelization fails, continue with normal build
-            # This ensures the model still works without parallelization
-            pass
-        
         # Call the parent _symbolic_build method
+        # The model is already set up for parallelization by _parallelize_if_needed()
         return super()._symbolic_build(*args, **kwargs)
 
     def _should_torch_compile(self):
@@ -373,9 +354,6 @@ class TorchTrainer(base_trainer.Trainer):
                 val_sample_weight,
             ) = data_adapter_utils.unpack_x_y_sample_weight(validation_data)
 
-        # Parallelize model if ModelParallel distribution is active
-        self._parallelize_if_needed()
-
         # Create an iterator that yields batches for one epoch.
         epoch_iterator = TorchEpochIterator(
             x=x,
@@ -387,6 +365,13 @@ class TorchTrainer(base_trainer.Trainer):
             class_weight=class_weight,
             steps_per_execution=self.steps_per_execution,
         )
+
+        # CRITICAL: Parallelize model BEFORE any weight creation!
+        # This ensures that when _symbolic_build() creates weights, they are
+        # created as sharded DTensors from the start, preventing OOM.
+        # The parallelize_module transforms the model so weights are partitioned
+        # across devices during creation, not after.
+        self._parallelize_if_needed()
 
         self._symbolic_build(iterator=epoch_iterator)
         epoch_iterator.reset()
@@ -514,7 +499,9 @@ class TorchTrainer(base_trainer.Trainer):
                 steps_per_execution=self.steps_per_execution,
             )
 
-        # Parallelize model if ModelParallel distribution is active
+        # CRITICAL: Parallelize model BEFORE any weight creation!
+        # This ensures that when _symbolic_build() creates weights, they are
+        # created as sharded DTensors from the start, preventing OOM.
         self._parallelize_if_needed()
 
         self._symbolic_build(iterator=epoch_iterator)
@@ -565,7 +552,9 @@ class TorchTrainer(base_trainer.Trainer):
             steps_per_execution=self.steps_per_execution,
         )
 
-        # Parallelize model if ModelParallel distribution is active
+        # CRITICAL: Parallelize model BEFORE any weight creation!
+        # This ensures that when _symbolic_build() creates weights, they are
+        # created as sharded DTensors from the start, preventing OOM.
         self._parallelize_if_needed()
 
         # Container that configures and calls callbacks.
