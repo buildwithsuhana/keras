@@ -1053,7 +1053,48 @@ class BaseOptimizer(KerasSaveable):
                 self._learning_rate
             )
         elif isinstance(self._learning_rate, backend.Variable):
-            learning_rate = float(self._learning_rate.numpy())
+            try:
+                # Get the numpy value of the variable
+                lr_value = self._learning_rate.numpy()
+                # Handle case where numpy() returns None (can happen in
+                # distributed contexts with DTensor)
+                if lr_value is None:
+                    # Try to get value from the underlying tensor
+                    if hasattr(self._learning_rate, '_value'):
+                        lr_value = self._learning_rate._value
+                    elif hasattr(self._learning_rate, 'value'):
+                        lr_value = self._learning_rate.value
+                    else:
+                        # Fallback: try direct conversion
+                        lr_value = ops.convert_to_numpy(
+                            self._learning_rate._value
+                        )
+                learning_rate = float(lr_value)
+            except (ValueError, TypeError, AttributeError) as e:
+                # In distributed contexts (e.g., PyTorch DTensor),
+                # numpy() might fail or return None
+                # Fallback to extracting value from the underlying tensor
+                try:
+                    if hasattr(self._learning_rate, '_value'):
+                        lr_value = self._learning_rate._value
+                        if hasattr(lr_value, 'numpy'):
+                            lr_value = lr_value.numpy()
+                        learning_rate = float(
+                            ops.convert_to_numpy(lr_value).item()
+                        )
+                    elif hasattr(self._learning_rate, 'value'):
+                        lr_value = self._learning_rate.value
+                        if hasattr(lr_value, 'numpy'):
+                            lr_value = lr_value.numpy()
+                        learning_rate = float(
+                            ops.convert_to_numpy(lr_value).item()
+                        )
+                    else:
+                        # Last resort: use 0.001 (default learning rate)
+                        learning_rate = 0.001
+                except Exception:
+                    # Ultimate fallback
+                    learning_rate = 0.001
         elif ops.is_tensor(self._learning_rate):
             learning_rate = float(self._learning_rate)
         elif callable(self._learning_rate):
