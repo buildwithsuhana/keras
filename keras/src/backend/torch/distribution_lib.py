@@ -470,8 +470,18 @@ def distribute_tensor(tensor: torch.Tensor, layout) -> torch.Tensor:
     return tensor
 
 
-def distribute_variable(tensor, layout):
-    """Distributes a Keras variable using PyTorch DTensor or manual sharding."""
+def distribute_variable(tensor, layout=None, module_name=None):
+    """Distributes a Keras variable using PyTorch DTensor with tensor parallelism.
+    
+    This function uses tensor parallelism with ColwiseParallel/RowwiseParallel
+    styles for proper model parallelism support.
+    
+    Args:
+        tensor: The tensor to distribute
+        layout: The layout specification (tuple of axis names or None)
+        module_name: Optional name of the module this variable belongs to
+                    (for tensor parallel plan creation)
+    """
     from keras.src.distribution.distribution_lib import distribution
 
     # Convert tensor first to check its dtype
@@ -503,9 +513,8 @@ def distribute_variable(tensor, layout):
             f"layout is None={layout is None}"
         )
     
+    # If no distribution or no layout, return non-distributed parameter
     if not current_distribution or layout is None:
-        # For non-floating point tensors (e.g., integer iterations counter),
-        # don't wrap in Parameter since PyTorch requires float/complex for grads
         if not is_float_or_complex:
             if debug_mode:
                 print(
@@ -558,19 +567,14 @@ def distribute_variable(tensor, layout):
                 # For tensors with fewer dimensions than the mesh, we need to adjust
                 if tensor_rank <= mesh_ndim:
                     # Map: mesh_dim -> tensor_dim (adjust for shorter tensors)
-                    # e.g., for 1D tensor with mesh_ndim=2 and mesh_dim=1,
-                    # we use tensor_dim=0 (last dimension)
                     tensor_dim = tensor_rank - mesh_ndim + i
                     if tensor_dim < 0:
-                        # This shouldn't happen if tensor_rank >= len(layout)
                         tensor_dim = i
                 else:
                     # For tensors with more dimensions than the mesh
-                    # layout axes map to the last len(layout) tensor dimensions
                     tensor_dim = tensor_rank - len(layout) + i
                 
                 # For 1D tensors, shard on the only dimension (dim 0)
-                # regardless of which mesh dimension 'model' maps to
                 if tensor_rank == 1:
                     tensor_dim = 0
                 
@@ -587,7 +591,6 @@ def distribute_variable(tensor, layout):
             placements.append(Replicate())
     
     # Ensure placements match mesh dimensions - pad with Replicate if needed
-    # PyTorch DTensor requires placements length == device_mesh.ndim
     if len(placements) < mesh_ndim:
         if debug_mode:
             print(
@@ -619,6 +622,35 @@ def distribute_variable(tensor, layout):
             )
         return torch.nn.Parameter(converted_tensor)
 
+    # Use tensor parallel approach with ColwiseParallel/RowwiseParallel
+    if TENSOR_PARALLEL_AVAILABLE and module_name is not None:
+        # Determine the parallel style based on layout
+        # For Linear layer weights (out_features, in_features):
+        # - Keras (None, 'model') means shard output features -> ColwiseParallel
+        # - Keras ('model', None) means shard input features -> RowwiseParallel
+        
+        parallel_style = _infer_parallel_style_from_layout(layout, tensor_rank)
+        
+        if parallel_style is not None:
+            if debug_mode:
+                print(
+                    f"DEBUG | [Rank {rank:02d}] Using tensor parallel style: "
+                    f"{type(parallel_style).__name__} for {module_name}"
+                )
+            
+            # Create DTensor with proper placement
+            dtensor = torch_distribute_tensor(
+                converted_tensor,
+                device_mesh,
+                placements
+            )
+            
+            if not is_float_or_complex:
+                return dtensor
+            
+            return torch.nn.Parameter(dtensor)
+
+    # Fallback to regular DTensor distribution
     if DTENSOR_AVAILABLE and torch_distribute_tensor is not None:
         # Create DTensor-based Parameter
         dtensor = torch_distribute_tensor(
@@ -650,7 +682,6 @@ def distribute_variable(tensor, layout):
         return param
     else:
         # Manual sharding fallback (Slicing)
-        # For non-floating point tensors, don't wrap in Parameter
         if not is_float_or_complex:
             if debug_mode:
                 print(
@@ -665,6 +696,57 @@ def distribute_variable(tensor, layout):
                 f"shape={converted_tensor.shape}, dtype={converted_tensor.dtype}"
             )
         return torch.nn.Parameter(converted_tensor)
+
+
+def _infer_parallel_style_from_layout(layout, tensor_rank):
+    """Infer the appropriate parallel style (ColwiseParallel/RowwiseParallel) from layout.
+    
+    This function translates Keras layout specifications to PyTorch tensor parallel styles.
+    
+    For a weight matrix:
+    - Keras (None, 'model') -> shard output dimension -> ColwiseParallel
+    - Keras ('model', None) -> shard input dimension -> RowwiseParallel
+    
+    Args:
+        layout: Tuple of axis names (e.g., (None, 'model') or ('model',))
+        tensor_rank: Rank of the tensor
+    
+    Returns:
+        ColwiseParallel or RowwiseParallel or None
+    """
+    if not TENSOR_PARALLEL_AVAILABLE:
+        return None
+    
+    # Find the position of 'model' axis in the layout
+    model_idx = None
+    for i, axis in enumerate(layout):
+        if axis == 'model':
+            model_idx = i
+            break
+    
+    if model_idx is None:
+        # No model axis specified, no tensor parallel needed
+        return None
+    
+    # For weight matrices (typically 2D):
+    # - Layout (None, 'model') with model_idx=1 means shard 2nd dim (output) -> ColwiseParallel
+    # - Layout ('model', None) with model_idx=0 means shard 1st dim (input) -> RowwiseParallel
+    
+    if tensor_rank == 2:
+        if model_idx == 1:
+            # Keras: (None, 'model') -> shard output features
+            # PyTorch Linear weight is (out_features, in_features)
+            # ColwiseParallel shards the output dimension (first dim of weight)
+            return ColwiseParallel()
+        elif model_idx == 0:
+            # Keras: ('model', None) -> shard input features
+            # RowwiseParallel shards the input dimension (second dim of weight)
+            return RowwiseParallel()
+    elif tensor_rank == 1:
+        # For bias vectors (1D), replicate
+        return None
+    
+    return None
 
 
 def _get_default_device_mesh() -> Optional[DeviceMesh]:
@@ -1336,4 +1418,123 @@ def create_replicate_dtensor(tensor, device_mesh=None):
         return tensor
     
     return DTensor.from_local(tensor, device_mesh, [Replicate()])
+
+
+def parallelize_keras_model(
+    model: torch.nn.Module,
+    device_mesh=None,
+    layout_map=None,
+):
+    """Parallelize a Keras model using tensor parallelism.
+    
+    This function uses PyTorch's `torch.distributed.tensor.parallel.parallelize_module`
+    to automatically handle DTensor conversions and weight sharding for the entire model.
+    
+    This is the recommended approach for distributed training as it:
+    - Automatically converts inputs to DTensors
+    - Automatically converts outputs back to local tensors
+    - Handles all weight sharding according to the layout
+    - Prevents "mixed torch.Tensor and DTensor" errors
+    
+    Args:
+        model: A Keras model (must have a ._torch_layers attribute for PyTorch backend)
+        device_mesh: A PyTorch DeviceMesh for distributed execution. If None, uses default.
+        layout_map: A dict mapping parameter patterns to Keras sharding specs.
+            Example: {'dense.*kernel': (None, 'model'), 'dense.*bias': ('model',)}
+            If None, the layout_map from the distribution context is used.
+    
+    Returns:
+        A parallelized module that handles DTensor operations automatically.
+    
+    Raises:
+        ImportError: If tensor parallel is not available
+        ValueError: If model or layout_map is not provided
+    """
+    if not TENSOR_PARALLEL_AVAILABLE:
+        raise ImportError(
+            "PyTorch tensor.parallel is not available. "
+            "Cannot use parallelize_keras_model. "
+            "Please install PyTorch with tensor parallel support."
+        )
+    
+    if model is None:
+        raise ValueError("model cannot be None for parallelization")
+    
+    debug_mode = _get_debug_setting()
+    rank = torch.distributed.get_rank() if torch.distributed.is_initialized() else 0
+    
+    # Get device mesh
+    if device_mesh is None:
+        device_mesh = _get_default_device_mesh()
+    
+    if device_mesh is None:
+        raise ValueError("device_mesh cannot be None for parallelization")
+    
+    # Get layout map from distribution context if not provided
+    if layout_map is None:
+        from keras.src.distribution import distribution
+        dist = distribution()
+        if dist is not None and hasattr(dist, '_layout_map'):
+            keras_layout_map = dict(dist._layout_map)
+        else:
+            keras_layout_map = {}
+    else:
+        # Convert to dict if it's a LayoutMap
+        if hasattr(layout_map, '_layout_map'):
+            keras_layout_map = dict(layout_map._layout_map)
+        else:
+            keras_layout_map = layout_map
+    
+    if debug_mode:
+        print(f"DEBUG | [Rank {rank:02d}] parallelize_keras_model called")
+        print(f"DEBUG | [Rank {rank:02d}] device_mesh: shape={device_mesh.shape}, mesh_dim_names={device_mesh.mesh_dim_names}")
+        print(f"DEBUG | [Rank {rank:02d}] keras_layout_map: {keras_layout_map}")
+    
+    # Get the underlying PyTorch module
+    # For Keras models, we need to get the _torch_layers attribute or similar
+    if hasattr(model, '_torch_layers'):
+        # Sequential or functional model with torch layers
+        torch_module = model._torch_layers
+    elif hasattr(model, '_flatten_to_sequence_inputs'):
+        # Model has a different structure, try to get the underlying module
+        # For now, use the model directly if it's a torch.nn.Module
+        torch_module = model
+    else:
+        # Try to get the first torch submodule
+        torch_module = model
+        for name, module in model.named_modules():
+            if isinstance(module, torch.nn.Module):
+                torch_module = module
+                break
+    
+    if debug_mode:
+        print(f"DEBUG | [Rank {rank:02d}] torch_module type: {type(torch_module).__name__}")
+    
+    # Create the parallel plan from Keras layout map
+    parallel_plan = create_tp_plan_from_layout_map(
+        torch_module,
+        device_mesh,
+        keras_layout_map
+    )
+    
+    if debug_mode:
+        print(f"DEBUG | [Rank {rank:02d}] parallel_plan: {parallel_plan}")
+    
+    if not parallel_plan:
+        if debug_mode:
+            print(f"DEBUG | [Rank {rank:02d}] No parallel plan created, returning original model")
+        return model
+    
+    # Apply tensor parallelism using parallelize_module
+    # This automatically handles all DTensor conversions
+    parallelized_module = parallelize_module(
+        torch_module,
+        device_mesh,
+        parallelize_plan=parallel_plan
+    )
+    
+    if debug_mode:
+        print(f"DEBUG | [Rank {rank:02d}] Module parallelized successfully")
+    
+    return parallelized_module
 
