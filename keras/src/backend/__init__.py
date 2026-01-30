@@ -43,7 +43,6 @@ elif backend() == "jax":
 elif backend() == "torch":
     from keras.src.backend.torch import *  # noqa: F403
     from keras.src.backend.torch.core import Variable as BackendVariable
-    from keras.src.backend.torch import distribution_lib as torch_distribution_lib
 elif backend() == "numpy":
     from keras.src.backend.numpy import *  # noqa: F403
     from keras.src.backend.numpy.core import Variable as BackendVariable

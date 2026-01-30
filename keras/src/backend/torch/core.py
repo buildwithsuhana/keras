@@ -59,11 +59,6 @@ TORCH_DTYPES = {
 }
 
 
-def _get_debug_setting():
-    """Check if distribution debug mode is enabled."""
-    return os.environ.get("KERAS_DISTRIBUTION_DEBUG", "0") == "1"
-
-
 @contextlib.contextmanager
 def device_scope(device_name):
     previous_device = global_state.get_global_attribute("torch_device", None)
@@ -117,6 +112,7 @@ class Variable(KerasVariable):
         # Get layout from distribution context if not explicitly set
         if self._layout is None:
             from keras.src.distribution import distribution
+            from keras.src.backend.torch.distribution_lib import _get_debug_setting
 
             dist = distribution()
             if _get_debug_setting():
@@ -163,6 +159,7 @@ class Variable(KerasVariable):
         """Create a distributed Parameter if distribution is configured."""
         # Import here to avoid circular dependency
         from keras.src.backend.torch import distribution_lib
+        from keras.src.backend.torch.distribution_lib import _get_debug_setting
 
         # Check if we are in a distribution context (mesh is active)
         active_mesh = distribution_lib._get_default_device_mesh()
@@ -413,14 +410,17 @@ def cast(x, dtype):
     if isinstance(x, Variable):
         x = x.value
     # Handle DTensor - cast the local tensor
-    from keras.src.backend.torch.distribution_lib import is_dtensor as _is_dtensor, get_dtensor_local
+    from keras.src.backend.torch.distribution_lib import (
+        is_dtensor as _is_dtensor,
+        get_dtensor_local,
+        DTensor,
+    )
     if _is_dtensor(x):
         # Cast the local tensor and wrap back in DTensor
         local_x = get_dtensor_local(x)
         local_x = local_x.to(dtype)
         # Get device mesh from original DTensor
         device_mesh = x.device_mesh
-        from keras.src.backend.torch.distribution_lib import DTensor, Replicate
         return DTensor.from_local(local_x, device_mesh, x.placements)
     if is_tensor(x):
         if x.dtype == dtype:
