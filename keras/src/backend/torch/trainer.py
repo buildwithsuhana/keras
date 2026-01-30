@@ -16,12 +16,6 @@ from keras.src.trainers.epoch_iterator import EpochIterator
 from keras.src.utils import traceback_utils
 
 
-def _get_debug_setting():
-    """Check if distribution debug mode is enabled."""
-    import os
-    return os.environ.get("KERAS_DISTRIBUTION_DEBUG", "0") == "1"
-
-
 class _AllGatherWithGradient(torch.autograd.Function):
     """Custom autograd function for all-gather with proper gradient flow.
     
@@ -99,12 +93,6 @@ class _AllGatherWithGradient(torch.autograd.Function):
         # Ensure gradient has the correct shape
         grad_local = grad_local.contiguous()
         
-        # Debug logging
-        if _get_debug_setting():
-            print(f"DEBUG | [Rank {rank:02d}] _AllGatherWithGradient backward:")
-            print(f"DEBUG | [Rank {rank:02d}]   grad_output shape: {grad_output.shape}")
-            print(f"DEBUG | [Rank {rank:02d}]   grad_local shape: {grad_local.shape}")
-        
         return grad_local, None
 
 
@@ -180,11 +168,6 @@ class TorchTrainer(base_trainer.Trainer):
         
         if not has_dtensor_weights:
             return x
-        
-        # Convert inputs to DTensors
-        if _get_debug_setting():
-            rank = torch.distributed.get_rank() if torch.distributed.is_initialized() else 0
-            print(f"DEBUG | [Rank {rank:02d}] Converting inputs to DTensors")
         
         # Handle nested structures (tuple, list, dict)
         return self._convert_to_dtensor_structure(x, device_mesh)
@@ -269,10 +252,6 @@ class TorchTrainer(base_trainer.Trainer):
             if is_sharded:
                 # Need to ALL_GATHER to reconstruct the full tensor
                 # This is critical for loss computation to work correctly
-                if _get_debug_setting():
-                    rank = torch.distributed.get_rank() if torch.distributed.is_initialized() else 0
-                    print(f"DEBUG | [Rank {rank:02d}] All-gathering sharded DTensor output")
-                
                 # Find the shard dimension (the dimension being sharded)
                 shard_dim = None
                 for i, placement in enumerate(x.placements):
@@ -280,34 +259,22 @@ class TorchTrainer(base_trainer.Trainer):
                         shard_dim = i
                         break
                 
-                if shard_dim is not None and torch.distributed.is_initialized():
-                    # Perform all_gather along the shard dimension
-                    world_size = torch.distributed.get_world_size()
-                    
-                    # Get local tensor
-                    local_tensor = x.to_local()
-                    local_shape = list(local_tensor.shape)
-                    global_shape = list(x.shape)
-                    
-                    if _get_debug_setting():
-                        rank = torch.distributed.get_rank()
-                        print(f"DEBUG | [Rank {rank:02d}] Local shape: {local_shape}, Global shape: {global_shape}")
-                        print(f"DEBUG | [Rank {rank:02d}] Shard dim: {shard_dim}, World size: {world_size}")
-                    
-                    # For sharded tensors in training, we need proper gradient handling
-                    # Use our custom all_gather that preserves gradients
-                    if local_tensor.requires_grad:
-                        # Use custom all_gather with gradient support
-                        full_tensor = _all_gather_with_grad(local_tensor, shard_dim)
+                    if shard_dim is not None and torch.distributed.is_initialized():
+                        # Perform all_gather along the shard dimension
+                        world_size = torch.distributed.get_world_size()
                         
-                        if _get_debug_setting():
-                            rank = torch.distributed.get_rank()
-                            print(f"DEBUG | [Rank {rank:02d}] All-gathered tensor shape: {full_tensor.shape}")
-                            print(f"DEBUG | [Rank {rank:02d}] Full tensor requires_grad: {full_tensor.requires_grad}")
-                            if full_tensor.grad_fn is not None:
-                                print(f"DEBUG | [Rank {rank:02d}] Full tensor has grad_fn: {type(full_tensor.grad_fn).__name__}")
+                        # Get local tensor
+                        local_tensor = x.to_local()
+                        local_shape = list(local_tensor.shape)
+                        global_shape = list(x.shape)
                         
-                        return full_tensor
+                        # For sharded tensors in training, we need proper gradient handling
+                        # Use our custom all_gather that preserves gradients
+                        if local_tensor.requires_grad:
+                            # Use custom all_gather with gradient support
+                            full_tensor = _all_gather_with_grad(local_tensor, shard_dim)
+                            
+                            return full_tensor
                     else:
                         # For inference mode - no gradients needed
                         output = [torch.empty_like(local_tensor) for _ in range(world_size)]
@@ -316,9 +283,6 @@ class TorchTrainer(base_trainer.Trainer):
                         return full_tensor
             
             # Not sharded or no distributed, just convert to local
-            if _get_debug_setting():
-                rank = torch.distributed.get_rank() if torch.distributed.is_initialized() else 0
-                print(f"DEBUG | [Rank {rank:02d}] Converting DTensor to local tensor (no sharding)")
             return dtensor_to_local(x)
         
         # For nested structures, check if any element is a DTensor
@@ -340,9 +304,6 @@ class TorchTrainer(base_trainer.Trainer):
             has_sharded_dtensor = check_for_sharded_dtensor(x)
             
             if has_sharded_dtensor:
-                if _get_debug_setting():
-                    rank = torch.distributed.get_rank() if torch.distributed.is_initialized() else 0
-                    print(f"DEBUG | [Rank {rank:02d}] Processing nested structure with sharded DTensors")
                 # Process recursively to properly handle all-gather for sharded DTensors
                 return self._convert_dtensor_output_structure(x)
         
@@ -450,10 +411,6 @@ class TorchTrainer(base_trainer.Trainer):
         else:
             torch_module = self
         
-        if _get_debug_setting():
-            rank = torch.distributed.get_rank() if torch.distributed.is_initialized() else 0
-            print(f"DEBUG | [Rank {rank:02d}] _parallelize_if_needed: parallelizing model")
-        
         # Parallelize the model
         try:
             parallelize_keras_model(
@@ -463,9 +420,7 @@ class TorchTrainer(base_trainer.Trainer):
             )
             self._torch_module_parallelized = True
         except Exception as e:
-            if _get_debug_setting():
-                rank = torch.distributed.get_rank() if torch.distributed.is_initialized() else 0
-                print(f"DEBUG | [Rank {rank:02d}] _parallelize_if_needed: parallelization failed: {e}")
+            pass
 
     def build(self, input_shape=None):
         """Build the model and optionally apply automatic parallelization.
@@ -520,27 +475,10 @@ class TorchTrainer(base_trainer.Trainer):
     def train_step(self, data):
         x, y, sample_weight = data_adapter_utils.unpack_x_y_sample_weight(data)
 
-        # Debug logging for tensor types
-        if _get_debug_setting():
-            rank = torch.distributed.get_rank() if torch.distributed.is_initialized() else 0
-            print(f"DEBUG | [Rank {rank:02d}] train_step: x type={type(x).__name__}, y type={type(y).__name__}")
-            if hasattr(x, 'to_local'):
-                print(f"DEBUG | [Rank {rank:02d}]   x is DTensor: shape={x.shape}")
-            if hasattr(y, 'to_local'):
-                print(f"DEBUG | [Rank {rank:02d}]   y is DTensor: shape={y.shape}")
-
         # Convert inputs to DTensors if needed for ModelParallel training
         # This ensures that when model has DTensor weights, inputs are also DTensors
         x = self._ensure_dtensor_input(x)
         y = self._ensure_dtensor_input(y)
-
-        if _get_debug_setting():
-            rank = torch.distributed.get_rank() if torch.distributed.is_initialized() else 0
-            print(f"DEBUG | [Rank {rank:02d}] after _ensure_dtensor_input: x type={type(x).__name__}, y type={type(y).__name__}")
-            if hasattr(x, 'to_local'):
-                print(f"DEBUG | [Rank {rank:02d}]   x is DTensor: shape={x.shape}")
-            if hasattr(y, 'to_local'):
-                print(f"DEBUG | [Rank {rank:02d}]   y is DTensor: shape={y.shape}")
 
         # Compute predictions
         if self._call_has_training_arg:
@@ -548,24 +486,10 @@ class TorchTrainer(base_trainer.Trainer):
         else:
             y_pred = self(x)
 
-        if _get_debug_setting():
-            rank = torch.distributed.get_rank() if torch.distributed.is_initialized() else 0
-            print(f"DEBUG | [Rank {rank:02d}] after forward: y_pred type={type(y_pred).__name__}")
-            if hasattr(y_pred, 'to_local'):
-                print(f"DEBUG | [Rank {rank:02d}]   y_pred is DTensor: shape={y_pred.shape}")
-        
         # Convert DTensor outputs and labels to local tensors for loss computation
         y_pred = self._convert_dtensor_output(y_pred)
         y = self._convert_dtensor_output(y)
         x = self._convert_dtensor_output(x)
-
-        if _get_debug_setting():
-            rank = torch.distributed.get_rank() if torch.distributed.is_initialized() else 0
-            print(f"DEBUG | [Rank {rank:02d}] after _convert_dtensor_output: y_pred type={type(y_pred).__name__}, y type={type(y).__name__}")
-            if hasattr(y_pred, 'to_local'):
-                print(f"DEBUG | [Rank {rank:02d}]   y_pred is still DTensor!")
-            if hasattr(y, 'to_local'):
-                print(f"DEBUG | [Rank {rank:02d}]   y is still DTensor!")
 
         # Call torch.nn.Module.zero_grad() to clear the leftover gradients
         # for the weights from the previous train step.

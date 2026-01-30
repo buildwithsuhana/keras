@@ -112,23 +112,11 @@ class Variable(KerasVariable):
         # Get layout from distribution context if not explicitly set
         if self._layout is None:
             from keras.src.distribution import distribution
-            from keras.src.backend.torch.distribution_lib import _get_debug_setting
 
             dist = distribution()
-            if _get_debug_setting():
-                import logging
-                logger = logging.getLogger(__name__)
-                logger.debug(
-                    f"_initialize_layout: distribution()={dist is not None}, "
-                    f"type={type(dist).__name__ if dist else None}"
-                )
             
             if dist is not None:
                 tensor_layout = dist.get_variable_layout(self)
-                if _get_debug_setting():
-                    logger.debug(
-                        f"_initialize_layout: tensor_layout={tensor_layout}"
-                    )
                 if tensor_layout is not None:
                     # Capture backend-specific sharding axes
                     # IMPORTANT: For ModelParallel, we want to capture the layout
@@ -139,11 +127,6 @@ class Variable(KerasVariable):
                         self._layout = tensor_layout.backend_layout
                     else:
                         self._layout = tensor_layout
-                    
-                    if _get_debug_setting():
-                        logger.debug(
-                            f"_initialize_layout: Set self._layout={self._layout}"
-                        )
 
     def _initialize(self, value):
         # Initialize layout from distribution context
@@ -159,7 +142,6 @@ class Variable(KerasVariable):
         """Create a distributed Parameter if distribution is configured."""
         # Import here to avoid circular dependency
         from keras.src.backend.torch import distribution_lib
-        from keras.src.backend.torch.distribution_lib import _get_debug_setting
 
         # Check if we are in a distribution context (mesh is active)
         active_mesh = distribution_lib._get_default_device_mesh()
@@ -185,25 +167,9 @@ class Variable(KerasVariable):
             distributed = distribution_lib.distribute_variable(
                 tensor, layout
             )
-            if _get_debug_setting():
-                import logging
-                logger = logging.getLogger(__name__)
-                logger.debug(
-                    f"Distributed parameter created with layout: "
-                    f"shape={tensor.shape}, layout={layout}, "
-                    f"result_type={type(distributed)}"
-                )
             return distributed
 
         # Default non-distributed fallback
-        if _get_debug_setting():
-            import logging
-            logger = logging.getLogger(__name__)
-            logger.debug(
-                f"Returning non-distributed parameter: "
-                f"shape={tensor.shape}, trainable={self.trainable}"
-            )
-
         return torch.nn.Parameter(
             tensor, requires_grad=self.trainable
         ).to(get_device())

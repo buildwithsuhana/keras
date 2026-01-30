@@ -9,7 +9,6 @@ Key features:
 - Tensor layout specification and distribution
 - Support for CPU, GPU, and TPU devices
 - Path adapter for converting between Keras `/` paths and PyTorch `.` paths
-- Debug logging for troubleshooting
 
 Example usage:
     import torch
@@ -32,19 +31,13 @@ Example usage:
         model.fit(...)
 """
 
-import logging
 import os
-import re
-from typing import List, Optional, Tuple, Union
+from typing import List, Optional
 
 import numpy as np
 import torch
 
 from keras.src.backend.common import global_state
-
-# Set up debug logging
-logger = logging.getLogger(__name__)
-logger.setLevel(logging.DEBUG)
 
 # Try to import DTensor - it may not be available in all PyTorch versions
 try:
@@ -61,10 +54,6 @@ try:
 except ImportError:
     DTENSOR_AVAILABLE = False
     torch_distribute_tensor = None
-    logger.warning(
-        "PyTorch DTensor is not available. Distribution support will be limited. "
-        "Please install PyTorch with DTensor support (torch>=2.1.0)."
-    )
 from keras.src.backend.torch.core import convert_to_tensor
 
 # Global variable to track if distribution is initialized
@@ -76,40 +65,6 @@ _MODEL_PARALLELIZED = False
 # Global variable to track if sharded DTensor weights were created
 # When this is True, we should NOT call parallelize_module()
 _DISTRIBUTED_WEIGHTS_CREATED = False
-
-
-def _get_debug_setting() -> bool:
-    """Get debug setting from environment variable."""
-    return os.environ.get("KERAS_DISTRIBUTION_DEBUG", "0") == "1"
-
-
-def _parse_device(device_name: str) -> torch.device:
-    """Parse a device name string to a torch.device.
-
-    Args:
-        device_name: Device name string like 'cpu:0', 'cuda:0', 'cuda', 'mps:0'
-
-    Returns:
-        torch.device object
-    """
-    device_name = str(device_name).lower()
-
-    # Handle special cases with dictionary of check functions
-    device_checks = {
-        'cpu': (None, lambda: torch.device('cpu')),
-        'cuda': (lambda: device_name.startswith('cuda:'), lambda: torch.device(device_name if ':' in device_name else 'cuda:0') if torch.cuda.is_available() else None),
-        'mps': (lambda: device_name.startswith('mps'), lambda: torch.device('mps') if hasattr(torch.backends, 'mps') and torch.backends.mps.is_available() else None),
-        'xpu': (lambda: device_name.startswith('xpu'), lambda: torch.device(device_name if ':' in device_name else 'xpu:0') if hasattr(torch, 'xpu') and torch.xpu.is_available() else None),
-    }
-
-    for name, (check_fn, device_fn) in device_checks.items():
-        if device_name == name or check_fn():
-            result = device_fn()
-            if result is not None:
-                return result
-            raise RuntimeError(f"{name.upper()} is not available")
-
-    return torch.device(device_name)
 
 
 def list_devices(device_type: Optional[str] = None) -> List[str]:
@@ -125,9 +80,6 @@ def list_devices(device_type: Optional[str] = None) -> List[str]:
     Returns:
         List of device strings like ['cuda:0', 'cuda:1', ...]
     """
-    if _get_debug_setting():
-        logger.debug(f"list_devices called with device_type={device_type}")
-    
     device_type = device_type.lower() if device_type else None
     
     devices = []
@@ -150,25 +102,13 @@ def list_devices(device_type: Optional[str] = None) -> List[str]:
             devices.extend([f'cuda:{i}' for i in range(nvidia_devices)])
             if device_type in ('gpu', 'cuda'):
                 return devices
-        # Check for MPS (Apple Silicon GPU)
-        if hasattr(torch.backends, 'mps') and torch.backends.mps.is_available():
-            devices.append('mps:0')
-            if device_type == 'gpu':
-                return devices
-        # Check for XPU (Intel GPU)
-        if hasattr(torch, 'xpu') and torch.xpu.is_available():
-            xpu_devices = torch.xpu.device_count()
-            devices.extend([f'xpu:{i}' for i in range(xpu_devices)])
-            if device_type == 'gpu':
-                return devices
     
     # Check for CPU
     if device_type in (None, 'cpu'):
         # For CPU, we simulate multiple devices for parallel execution
         num_cpu = os.cpu_count() or 4
         devices.extend([f'cpu:{i}' for i in range(num_cpu)])
-        if device_type == 'cpu':
-            return devices
+        return devices
     
     # If no specific device type was requested and we found GPU/TPU, return those
     if device_type is None:
@@ -190,9 +130,6 @@ def get_device_count(device_type: Optional[str] = None) -> int:
     Returns:
         int: The total number of devices of the specified type.
     """
-    if _get_debug_setting():
-        logger.debug(f"get_device_count called with device_type={device_type}")
-    
     device_type = device_type.lower() if device_type else None
     
     # TPU
@@ -200,35 +137,14 @@ def get_device_count(device_type: Optional[str] = None) -> int:
         try:
             import torch_xla.core.xla_model as xm
             tpu_devices = xm.get_xla_supported_devices('tpu')
-            count = len(tpu_devices)
-            if device_type == 'tpu':
-                return count
-            if count > 0:
-                return count
+            return len(tpu_devices)
         except ImportError:
             pass
     
     # GPU/CUDA
     if device_type in (None, 'gpu', 'cuda'):
         if torch.cuda.is_available():
-            count = torch.cuda.device_count()
-            if device_type in ('gpu', 'cuda'):
-                return count
-            if count > 0:
-                return count
-        # MPS
-        if hasattr(torch.backends, 'mps') and torch.backends.mps.is_available():
-            if device_type in ('gpu', 'cuda'):
-                return 1
-            if device_type is None:
-                return 1
-        # XPU
-        if hasattr(torch, 'xpu') and torch.xpu.is_available():
-            count = torch.xpu.device_count()
-            if device_type in ('gpu', 'cuda'):
-                return count
-            if count > 0:
-                return count
+            return torch.cuda.device_count()
     
     # CPU
     if device_type in (None, 'cpu'):
@@ -255,12 +171,6 @@ def initialize(
     """
     global _DISTRIBUTION_INITIALIZED
     
-    if _get_debug_setting():
-        logger.debug(
-            f"initialize called with job_addresses={job_addresses}, "
-            f"num_processes={num_processes}, process_id={process_id}"
-        )
-    
     # FIRST: Check if running with torchrun (common in multi-GPU training)
     # torchrun sets LOCAL_RANK and WORLD_SIZE environment variables BEFORE
     # the script starts, and also initializes torch.distributed
@@ -273,11 +183,6 @@ def initialize(
             num_processes = int(world_size_env)
         if process_id is None:
             process_id = int(local_rank)
-        if _get_debug_setting():
-            logger.debug(
-                f"Detected torchrun environment: LOCAL_RANK={local_rank}, "
-                f"WORLD_SIZE={world_size_env}"
-            )
     
     # Check for environment variables (Keras-specific)
     if job_addresses is None:
@@ -297,28 +202,14 @@ def initialize(
         # Check if torchrun already initialized distributed
         if torch.distributed.is_initialized():
             _DISTRIBUTION_INITIALIZED = True
-            if _get_debug_setting():
-                logger.debug(
-                    f"torch.distributed already initialized by torchrun: "
-                    f"rank={torch.distributed.get_rank()}, "
-                    f"world_size={torch.distributed.get_world_size()}"
-                )
         else:
             _DISTRIBUTION_INITIALIZED = True
-            if _get_debug_setting():
-                logger.debug("Single-process mode - no distributed initialization needed")
         return
     
     # For multi-process, initialize PyTorch distributed
     # First check if torchrun has already initialized it
     if torch.distributed.is_initialized():
         _DISTRIBUTION_INITIALIZED = True
-        if _get_debug_setting():
-            logger.debug(
-                f"Torch distributed already initialized: "
-                f"rank={torch.distributed.get_rank()}, "
-                f"world_size={torch.distributed.get_world_size()}"
-            )
     else:
         if job_addresses and "," in job_addresses:
             # Multiple addresses provided
@@ -340,12 +231,6 @@ def initialize(
             world_size=world_size,
             rank=rank,
         )
-        
-        if _get_debug_setting():
-            logger.debug(
-                f"Distributed process group initialized: "
-                f"rank={rank}, world_size={world_size}"
-            )
     
     _DISTRIBUTION_INITIALIZED = True
 
@@ -378,9 +263,6 @@ def distribute_tensor(tensor: torch.Tensor, layout) -> torch.Tensor:
     Returns:
         Distributed torch.Tensor or DTensor
     """
-    if _get_debug_setting():
-        logger.debug(f"distribute_tensor called with tensor shape={tensor.shape}, layout={layout}")
-    
     if layout is None:
         # Replicate the tensor
         if DTENSOR_AVAILABLE and _DISTRIBUTION_INITIALIZED:
@@ -424,8 +306,6 @@ def distribute_tensor(tensor: torch.Tensor, layout) -> torch.Tensor:
                 return distribute_tensor(tensor, device_mesh, placements)
     
     # No layout specified and DTensor not available, returning as-is (normal behavior)
-    if _get_debug_setting():
-        logger.debug("No layout specified, returning tensor as-is")
     return tensor
 
 
@@ -450,31 +330,12 @@ def distribute_variable(tensor, layout=None, module_name=None):
     # PyTorch requires floating point or complex dtype for requires_grad
     is_float_or_complex = converted_tensor.dtype.is_floating_point or converted_tensor.dtype.is_complex
 
-    # Log tensor info for debugging
-    debug_mode = _get_debug_setting()
-    rank = torch.distributed.get_rank() if torch.distributed.is_initialized() else 0
-    world_size = torch.distributed.get_world_size() if torch.distributed.is_initialized() else 1
-
-    if debug_mode:
-        print(
-            f"DEBUG | [Rank {rank:02d}] distribute_variable: "
-            f"shape={converted_tensor.shape}, dtype={converted_tensor.dtype}, "
-            f"is_float_or_complex={is_float_or_complex}, layout={layout}, "
-            f"world_size={world_size}"
-        )
-
     # Check if ModelParallel distribution is active (for tensor parallelism)
     is_model_parallel = False
     current_distribution = distribution()
     if current_distribution is not None:
         from keras.src.distribution.distribution_lib import ModelParallel
         is_model_parallel = isinstance(current_distribution, ModelParallel)
-    
-    if debug_mode:
-        print(
-            f"DEBUG | [Rank {rank:02d}] distribute_variable: "
-            f"is_model_parallel={is_model_parallel}"
-        )
     
     # =====================================================================
     # KEY FIX: For ModelParallel, create SHARDED DTensor directly
@@ -512,12 +373,6 @@ def distribute_variable(tensor, layout=None, module_name=None):
                 placements.extend([Replicate()] * (mesh_ndim - len(placements)))
             
             if needs_sharding and DTENSOR_AVAILABLE:
-                if debug_mode:
-                    print(
-                        f"DEBUG | [Rank {rank:02d}] ModelParallel SHARDED creation: "
-                        f"global_shape={converted_tensor.shape}, placements={placements}"
-                    )
-                
                 # Create DTensor directly - ONLY local shard exists on each device
                 # Full tensor NEVER exists in memory
                 if torch_distribute_tensor is not None:
@@ -532,83 +387,29 @@ def distribute_variable(tensor, layout=None, module_name=None):
                     global _DISTRIBUTED_WEIGHTS_CREATED
                     _DISTRIBUTED_WEIGHTS_CREATED = True
                     
-                    if debug_mode:
-                        local_shape = dtensor.to_local().shape
-                        print(
-                            f"DEBUG | [Rank {rank:02d}] Sharded DTensor created: "
-                            f"global={dtensor.shape}, local={local_shape}"
-                        )
-                    
                     # Return as Parameter for gradient tracking
                     return torch.nn.Parameter(dtensor)
             
-            if debug_mode:
-                print(
-                    f"DEBUG | [Rank {rank:02d}] ModelParallel: no sharding needed, replicating"
-                )
+            # No sharding needed, replicate
+            return torch.nn.Parameter(converted_tensor) if is_float_or_complex else converted_tensor
     
     # If ModelParallel is active but no sharding layout, create regular Parameter
     if is_model_parallel:
-        if not is_float_or_complex:
-            if debug_mode:
-                print(
-                    f"DEBUG | [Rank {rank:02d}] ModelParallel mode, non-floating tensor: "
-                    f"shape={converted_tensor.shape}, dtype={converted_tensor.dtype}"
-                )
-            return converted_tensor
-        if debug_mode:
-            print(
-                f"DEBUG | [Rank {rank:02d}] ModelParallel mode, creating regular Parameter: "
-                f"shape={converted_tensor.shape}, dtype={converted_tensor.dtype}"
-            )
-        return torch.nn.Parameter(converted_tensor)
-    
-    if debug_mode:
-        print(
-            f"DEBUG | [Rank {rank:02d}] distribute_variable: "
-            f"current_distribution={current_distribution}, "
-            f"layout is None={layout is None}"
-        )
+        return torch.nn.Parameter(converted_tensor) if is_float_or_complex else converted_tensor
     
     # If no distribution or no layout, return non-distributed parameter
     if not current_distribution or layout is None:
-        if not is_float_or_complex:
-            if debug_mode:
-                print(
-                    f"DEBUG | [Rank {rank:02d}] Non-floating tensor returned as-is (no grad tracking): "
-                    f"shape={converted_tensor.shape}, dtype={converted_tensor.dtype}"
-                )
-            return converted_tensor
-        return torch.nn.Parameter(converted_tensor)
+        return torch.nn.Parameter(converted_tensor) if is_float_or_complex else converted_tensor
 
     # Use the distribution object
     distribution_obj = current_distribution
 
     # Retrieve the mesh
     device_mesh = _to_backend_mesh(distribution_obj.device_mesh)
-
-    if debug_mode:
-        print(
-            f"DEBUG | [Rank {rank:02d}] distribute_variable: "
-            f"device_mesh={device_mesh}, "
-            f"mesh_dim_names={getattr(device_mesh, 'mesh_dim_names', None) if device_mesh else None}"
-        )
     
     if device_mesh is None:
         # No device mesh available, using regular Parameter (replicated)
-        if not is_float_or_complex:
-            if debug_mode:
-                print(
-                    f"DEBUG | [Rank {rank:02d}] No device mesh, non-floating tensor returned as-is: "
-                    f"shape={converted_tensor.shape}, dtype={converted_tensor.dtype}"
-                )
-            return converted_tensor
-        if debug_mode:
-            print(
-                f"DEBUG | [Rank {rank:02d}] No device mesh, creating regular Parameter (replicated): "
-                f"shape={converted_tensor.shape}, dtype={converted_tensor.dtype}"
-            )
-        return torch.nn.Parameter(converted_tensor)
+        return torch.nn.Parameter(converted_tensor) if is_float_or_complex else converted_tensor
 
     # Check which axes need sharding
     # layout is typically a tuple of axis names, e.g., (None, 'model')
@@ -643,46 +444,17 @@ def distribute_variable(tensor, layout=None, module_name=None):
                 placements.append(Shard(tensor_dim))
                 needs_sharding = True
             except ValueError:
-                if debug_mode:
-                    print(
-                        f"DEBUG | [Rank {rank:02d}] Axis '{axis}' not found in mesh_dim_names "
-                        f"{device_mesh.mesh_dim_names}, replicating"
-                    )
                 placements.append(Replicate())
         else:
             placements.append(Replicate())
     
     # Ensure placements match mesh dimensions - pad with Replicate if needed
     if len(placements) < mesh_ndim:
-        if debug_mode:
-            print(
-                f"DEBUG | [Rank {rank:02d}] Padding placements from {len(placements)} to {mesh_ndim} "
-                f"for mesh_dim_names={device_mesh.mesh_dim_names}"
-            )
         placements.extend([Replicate()] * (mesh_ndim - len(placements)))
-
-    if debug_mode:
-        print(
-            f"DEBUG | [Rank {rank:02d}] distribute_variable: "
-            f"placements={placements}, needs_sharding={needs_sharding}"
-        )
 
     if not needs_sharding:
         # No sharding needed, replicate the tensor
-        if not is_float_or_complex:
-            if debug_mode:
-                print(
-                    f"DEBUG | [Rank {rank:02d}] Non-floating tensor, no sharding needed (replicated): "
-                    f"shape={converted_tensor.shape}, dtype={converted_tensor.dtype}"
-                )
-            return converted_tensor
-
-        if debug_mode:
-            print(
-                f"DEBUG | [Rank {rank:02d}] No sharding needed, replicating: "
-                f"shape={converted_tensor.shape}, dtype={converted_tensor.dtype}"
-            )
-        return torch.nn.Parameter(converted_tensor)
+        return torch.nn.Parameter(converted_tensor) if is_float_or_complex else converted_tensor
 
     # Use tensor parallel approach with ColwiseParallel/RowwiseParallel
     if TENSOR_PARALLEL_AVAILABLE and module_name is not None:
@@ -694,12 +466,6 @@ def distribute_variable(tensor, layout=None, module_name=None):
         parallel_style = _infer_parallel_style_from_layout(layout, tensor_rank)
         
         if parallel_style is not None:
-            if debug_mode:
-                print(
-                    f"DEBUG | [Rank {rank:02d}] Using tensor parallel style: "
-                    f"{type(parallel_style).__name__} for {module_name}"
-                )
-            
             # Create DTensor with proper placement
             dtensor = torch_distribute_tensor(
                 converted_tensor,
@@ -721,42 +487,14 @@ def distribute_variable(tensor, layout=None, module_name=None):
             placements
         )
 
-        # Log the distributed tensor shape
-        if debug_mode:
-            local_shape = getattr(dtensor, 'to_local', lambda: dtensor)().shape
-            print(
-                f"DEBUG | [Rank {rank:02d}] Distributed tensor: "
-                f"local_shape={local_shape}, full_shape={dtensor.shape}, "
-                f"dtype={converted_tensor.dtype}"
-            )
-
         # For non-floating point tensors, don't wrap in Parameter
         if not is_float_or_complex:
-            if debug_mode:
-                print(
-                    f"DEBUG | [Rank {rank:02d}] Non-floating DTensor returned without Parameter wrapper: "
-                    f"shape={dtensor.shape}, dtype={converted_tensor.dtype}"
-                )
             return dtensor
 
         # Wrap as Parameter so it stays on device and tracks grads
-        param = torch.nn.Parameter(dtensor)
-        return param
+        return torch.nn.Parameter(dtensor)
     else:
         # Manual sharding fallback (Slicing)
-        if not is_float_or_complex:
-            if debug_mode:
-                print(
-                    f"DEBUG | [Rank {rank:02d}] Non-floating tensor returned without Parameter (no grad tracking): "
-                    f"shape={converted_tensor.shape}, dtype={converted_tensor.dtype}"
-                )
-            return converted_tensor
-
-        if debug_mode:
-            print(
-                f"DEBUG | [Rank {rank:02d}] Using regular Parameter (no DTensor available): "
-                f"shape={converted_tensor.shape}, dtype={converted_tensor.dtype}"
-            )
         return torch.nn.Parameter(converted_tensor)
 
 
@@ -852,9 +590,6 @@ def redistribute_dtensor(
     Returns:
         Redistributed DTensor
     """
-    if _get_debug_setting():
-        logger.debug(f"redistribute_dtensor: {dtensor} -> mesh={device_mesh}, placements={placements}")
-    
     return dtensor.redistribute(device_mesh, placements)
 
 
@@ -900,9 +635,6 @@ def _to_backend_layout(tensor_layout) -> tuple:
     Returns:
         Tuple of axis names for the layout.
     """
-    if _get_debug_setting():
-        logger.debug(f"_to_backend_layout called with tensor_layout={tensor_layout}")
-    
     if tensor_layout.device_mesh is None:
         raise ValueError(
             "Cannot create sharding when device mesh is not set "
@@ -930,10 +662,6 @@ except ImportError:
     RowwiseParallel = None
     PrepareModuleInput = None
     SequenceParallel = None
-    logger.warning(
-        "PyTorch tensor.parallel is not available. "
-        "Please install PyTorch with tensor parallel support (torch>=2.1.0)."
-    )
 
 
 def parallelize_torch_module(
@@ -943,8 +671,8 @@ def parallelize_torch_module(
 ) -> torch.nn.Module:
     """Parallelize a PyTorch module using tensor parallelism.
     
-    This function uses PyTorch's `torch.distributed.tensor.parallel.parallelize_module`
-    to automatically handle DTensor conversions and weight sharding.
+    This is a thin wrapper around parallelize_module from PyTorch's
+    tensor.parallel API.
     
     Args:
         module: A PyTorch nn.Module to parallelize
@@ -969,34 +697,11 @@ def parallelize_torch_module(
     if device_mesh is None:
         raise ValueError("device_mesh cannot be None for parallelization")
     
-    debug_mode = _get_debug_setting()
-    rank = torch.distributed.get_rank() if torch.distributed.is_initialized() else 0
-    
-    if debug_mode:
-        print(f"DEBUG | [Rank {rank:02d}] parallelize_torch_module called")
-        print(f"DEBUG | [Rank {rank:02d}] device_mesh: shape={device_mesh.shape}, mesh_dim_names={device_mesh.mesh_dim_names}")
-        print(f"DEBUG | [Rank {rank:02d}] layout_map: {layout_map}")
-    
-    # Use parallelize_module with the layout_map
-    # This automatically handles:
-    # - Converting inputs to DTensors
-    # - Sharding weights according to the layout
-    # - Converting outputs back to local tensors
-    parallelized_module = parallelize_module(
-        module,
-        device_mesh,
-        parallelize_plan=layout_map
-    )
-    
-    if debug_mode:
-        print(f"DEBUG | [Rank {rank:02d}] Module parallelized successfully")
-    
-    return parallelized_module
+    return parallelize_module(module, device_mesh, parallel_plan=layout_map)
 
 
 def create_tp_plan_from_layout_map(
     module: torch.nn.Module,
-    device_mesh: DeviceMesh,
     keras_layout_map: dict,
 ) -> dict:
     """Create a tensor parallel plan from a Keras-style layout map.
@@ -1007,166 +712,54 @@ def create_tp_plan_from_layout_map(
     
     Args:
         module: The PyTorch module being parallelized (to inspect layer types)
-        device_mesh: PyTorch DeviceMesh
         keras_layout_map: Dict mapping parameter patterns to Keras sharding specs.
             Example: {'dense.*kernel': (None, 'model'), 'dense.*bias': ('model',)}
     
     Returns:
         A dict mapping parameter names to PyTorch parallel styles
-    
-    Raises:
-        ValueError: If module is None or layout_map is empty
     """
-    debug_mode = _get_debug_setting()
-    rank = torch.distributed.get_rank() if torch.distributed.is_initialized() else 0
-    
-    if module is None:
-        raise ValueError("module cannot be None")
-    
-    if not keras_layout_map:
-        if debug_mode:
-            print(f"DEBUG | [Rank {rank:02d}] Empty layout_map, returning empty plan")
+    if not keras_layout_map or not TENSOR_PARALLEL_AVAILABLE:
         return {}
     
-    if not TENSOR_PARALLEL_AVAILABLE:
-        if debug_mode:
-            print(f"DEBUG | [Rank {rank:02d}] Tensor parallel not available")
-        return {}
+    # Style mapping: model_idx -> parallel style
+    styles = {0: RowwiseParallel(), 1: ColwiseParallel()}
     
+    # Build plan using dict comprehension for path conversion
     plan = {}
-    
-    # Find the mesh dimension for 'model' axis
-    model_axis = None
-    if hasattr(device_mesh, 'mesh_dim_names') and 'model' in device_mesh.mesh_dim_names:
-        model_axis = device_mesh.mesh_dim_names.index('model')
-    
     for pattern, sharding_spec in keras_layout_map.items():
-        if debug_mode:
-            print(f"DEBUG | [Rank {rank:02d}] Processing pattern '{pattern}' with spec {sharding_spec}")
-        
-        # Convert pattern from Keras format (dense/kernel) to PyTorch (dense.weight)
-        pytorch_pattern = pattern.replace('/', '.')
-        
         if sharding_spec is None:
-            # No sharding specified
             continue
         
-        # Handle TensorLayout objects (extract axes)
+        # Extract axes from TensorLayout if needed
         if hasattr(sharding_spec, 'axes'):
-            # It's a TensorLayout object, extract the axes tuple
             sharding_spec = sharding_spec.axes
-            if debug_mode:
-                print(f"DEBUG | [Rank {rank:02d}] Extracted axes from TensorLayout: {sharding_spec}")
+        
+        # Convert path from Keras format (dense/kernel) to PyTorch (dense.weight)
+        pytorch_pattern = pattern.replace('/', '.')
         
         if isinstance(sharding_spec, tuple):
-            # Keras spec like (None, 'model') or ('model',)
-            # For a weight matrix (input_dim, output_dim):
-            # - (None, 'model') means replicate input, shard output
-            # - ('model', None) means shard input, replicate output
-            
-            # Find which position has 'model'
-            model_idx = None
-            for i, axis in enumerate(sharding_spec):
-                if axis == 'model':
-                    model_idx = i
-                    break
-            
-            if model_idx is None:
-                # No model axis in this spec, replicate everything
-                if debug_mode:
-                    print(f"DEBUG | [Rank {rank:02d}] No 'model' axis in spec, using Replicate")
-                plan[pytorch_pattern] = ColwiseParallel()
-                continue
-            
-            # Determine parallel style based on position
-            # For nn.Linear weights: (out_features, in_features)
-            # In Keras: kernel shape is (in_features, out_features)
-            # So:
-            #   Keras (None, 'model') -> PyTorch ColwiseParallel (shard output dim)
-            #   Keras ('model', None) -> PyTorch RowwiseParallel (shard input dim)
-            
-            # For kernel (weight matrix):
-            # Keras layout [None, 'model'] means shard the output features (last dim)
-            # This maps to PyTorch ColwiseParallel (shards the weight's output dimension)
-            if model_idx == 1:
-                # Keras: (None, 'model') - shard output features
-                # PyTorch: ColwiseParallel
-                if debug_mode:
-                    print(f"DEBUG | [Rank {rank:02d}] Using ColwiseParallel for '{pytorch_pattern}'")
-                plan[pytorch_pattern] = ColwiseParallel()
-            elif model_idx == 0:
-                # Keras: ('model', None) - shard input features
-                # PyTorch: RowwiseParallel
-                if debug_mode:
-                    print(f"DEBUG | [Rank {rank:02d}] Using RowwiseParallel for '{pytorch_pattern}'")
-                plan[pytorch_pattern] = RowwiseParallel()
-        elif isinstance(sharding_spec, str):
-            # String spec like 'model'
-            if sharding_spec == 'model':
-                if debug_mode:
-                    print(f"DEBUG | [Rank {rank:02d}] Using ColwiseParallel for '{pytorch_pattern}'")
-                plan[pytorch_pattern] = ColwiseParallel()
-    
-    if debug_mode:
-        print(f"DEBUG | [Rank {rank:02d}] Created plan: {plan}")
+            # Find position of 'model' axis
+            model_idx = next((i for i, axis in enumerate(sharding_spec) if axis == 'model'), None)
+            if model_idx is not None:
+                plan[pytorch_pattern] = styles.get(model_idx, ColwiseParallel())
+        elif isinstance(sharding_spec, str) and sharding_spec == 'model':
+            plan[pytorch_pattern] = ColwiseParallel()
     
     return plan
 
 
-def ensure_dtensor_input(input_tensor, device_mesh):
-    """Ensure input tensor is a DTensor for DTensor operations.
-    
-    When a layer has DTensor weights but receives regular tensor inputs,
-    PyTorch DTensor operations will fail. This helper function converts
-    regular tensors to replicated DTensors.
-    
-    Args:
-        input_tensor: A torch.Tensor (can be regular or DTensor)
-        device_mesh: A DeviceMesh to use for DTensor conversion
-    
-    Returns:
-        A DTensor (if input was a DTensor or needs conversion) or original tensor
-    """
-    if not DTENSOR_AVAILABLE:
-        return input_tensor
-    
-    if input_tensor is None:
-        return input_tensor
-    
-    # Check if input is already a DTensor
-    if isinstance(input_tensor, DTensor):
-        return input_tensor
-    
-    # Check if there's an active device mesh
-    if device_mesh is None:
-        device_mesh = _get_default_device_mesh()
-    
-    if device_mesh is None:
-        return input_tensor
-    
-    # Convert regular tensor to replicated DTensor
-    # This ensures DTensor operations work correctly
-    if _get_debug_setting():
-        rank = torch.distributed.get_rank() if torch.distributed.is_initialized() else 0
-        print(f"DEBUG | [Rank {rank:02d}] Converting regular tensor to DTensor: shape={input_tensor.shape}")
-    
-    return DTensor.from_local(input_tensor, device_mesh, [Replicate()])
-
-
-def ensure_dtensor(tensor, device_mesh=None, placements=None):
+def _to_dtensor(tensor, device_mesh=None, placements=None):
     """Convert a tensor to DTensor if it isn't already.
 
-    This is a comprehensive helper that ensures all tensors in DTensor
-    operations are properly converted, preventing the "mixed torch.Tensor
-    and DTensor" error.
-
+    This is a unified helper for converting regular tensors to DTensors.
+    
     Args:
         tensor: torch.Tensor or DTensor to convert
         device_mesh: DeviceMesh to use for conversion. If None, uses default mesh.
         placements: Placements for the DTensor. If None, uses Replicate.
 
     Returns:
-        DTensor (or original if already a DTensor)
+        DTensor (or original if already a DTensor or conversion not possible)
     """
     if not DTENSOR_AVAILABLE or tensor is None or isinstance(tensor, DTensor):
         return tensor
@@ -1179,54 +772,6 @@ def ensure_dtensor(tensor, device_mesh=None, placements=None):
 
     placements = [Replicate()] if placements is None else (placements if isinstance(placements, list) else [placements])
     return DTensor.from_local(tensor, device_mesh, placements)
-
-
-def convert_tensors_to_dtensor(*tensors, device_mesh=None):
-    """Convert multiple tensors to DTensors, handling mixed types.
-
-    This function ensures all tensors in a collection are DTensors,
-    converting regular tensors to replicated DTensors. This prevents
-    the "mixed torch.Tensor and DTensor" error during operations.
-
-    Args:
-        *tensors: Variable number of torch.Tensor or DTensor objects
-        device_mesh: DeviceMesh to use for conversion
-
-    Returns:
-        Tuple of converted tensors (all DTensors or original if not available)
-    """
-    if not DTENSOR_AVAILABLE:
-        return tensors
-
-    if device_mesh is None:
-        device_mesh = _get_default_device_mesh()
-
-    if device_mesh is None:
-        return tensors
-
-    replicate = [Replicate()]
-    return tuple(
-        tensor if tensor is None or isinstance(tensor, DTensor)
-        else DTensor.from_local(tensor, device_mesh, replicate)
-        for tensor in tensors
-    )
-
-
-def get_dtensor_local(tensor):
-    """Get the local tensor from a DTensor, or return the tensor as-is.
-    
-    This helper extracts the local tensor data from a DTensor, which is
-    useful when you need to work with the actual data on the current device.
-    
-    Args:
-        tensor: torch.Tensor or DTensor
-    
-    Returns:
-        torch.Tensor (the local tensor if input was DTensor, else original tensor)
-    """
-    if isinstance(tensor, DTensor):
-        return tensor.to_local()
-    return tensor
 
 
 def dtensor_to_local(tensor):
@@ -1253,48 +798,6 @@ def dtensor_to_local(tensor):
     return tensor
 
 
-def is_dtensor(tensor) -> bool:
-    """Check if a tensor is a DTensor.
-    
-    Args:
-        tensor: torch.Tensor or DTensor
-    
-    Returns:
-        True if tensor is a DTensor, False otherwise
-    """
-    if not DTENSOR_AVAILABLE:
-        return False
-    return isinstance(tensor, DTensor)
-
-
-def create_replicate_dtensor(tensor, device_mesh=None):
-    """Create a replicated DTensor from a regular tensor.
-    
-    This is a convenience function for creating replicated DTensors
-    for operations that need consistent tensor types.
-    
-    Args:
-        tensor: torch.Tensor to convert
-        device_mesh: DeviceMesh to use
-    
-    Returns:
-        DTensor with Replicate placement
-    """
-    if not DTENSOR_AVAILABLE:
-        return tensor
-    
-    if isinstance(tensor, DTensor):
-        return tensor
-    
-    if device_mesh is None:
-        device_mesh = _get_default_device_mesh()
-    
-    if device_mesh is None:
-        return tensor
-    
-    return DTensor.from_local(tensor, device_mesh, [Replicate()])
-
-
 def _should_auto_parallelize():
     """Check if automatic model parallelization should be performed.
     
@@ -1303,49 +806,21 @@ def _should_auto_parallelize():
     """
     global _MODEL_PARALLELIZED
     
-    # Skip if already parallelized
-    if _MODEL_PARALLELIZED:
+    if _MODEL_PARALLELIZED or not TENSOR_PARALLEL_AVAILABLE:
         return False
     
-    # Skip if tensor parallel not available
-    if not TENSOR_PARALLEL_AVAILABLE:
-        return False
+    from keras.src.distribution.distribution_lib import distribution, ModelParallel
     
-    # =====================================================================
-    # KEY FIX: Skip parallelize_module for ModelParallel!
-    # 
-    # When using ModelParallel with DTensor weights:
-    # 1. distribute_variable() creates sharded DTensors for weights
-    # 2. We should NOT call parallelize_module() as it causes conflicts
-    #
-    # Solution: For ModelParallel with a valid layout_map, skip
-    # parallelize_module entirely and let distribute_variable handle it.
-    # =====================================================================
-    
-    # Check if ModelParallel distribution is active
-    from keras.src.distribution.distribution_lib import distribution as get_dist
-    dist = get_dist()
-    
+    dist = distribution()
     if dist is None:
         return False
     
-    # Check if it's a ModelParallel distribution
-    from keras.src.distribution.distribution_lib import ModelParallel
+    # Skip for ModelParallel (distribute_variable handles it)
     if isinstance(dist, ModelParallel):
-        # For ModelParallel, we use our DTensor-based approach in distribute_variable
-        # NOT PyTorch's parallelize_module (which causes conflicts)
-        debug_mode = _get_debug_setting()
-        if debug_mode:
-            rank = torch.distributed.get_rank() if torch.distributed.is_initialized() else 0
-            print(f"DEBUG | [Rank {rank:02d}] Skipping parallelize_module for ModelParallel - using DTensor-based distribution")
         return False
     
-    # For non-ModelParallel distributions (DataParallel), check layout map
-    # Check if there's a layout map with actual sharding
-    if not hasattr(dist, '_layout_map') or not dist._layout_map:
-        return False
-    
-    return True
+    # Check for layout map in non-ModelParallel distributions
+    return hasattr(dist, '_layout_map') and dist._layout_map
 
 
 def _auto_parallelize_model(model):
@@ -1360,28 +835,16 @@ def _auto_parallelize_model(model):
     Returns:
         The original model, possibly parallelized
     """
-    global _MODEL_PARALLELIZED
-    
     if not _should_auto_parallelize():
         return model
     
+    global _MODEL_PARALLELIZED
     try:
         parallelized = parallelize_keras_model(model)
         _MODEL_PARALLELIZED = True
-        
-        debug_mode = _get_debug_setting()
-        if debug_mode:
-            rank = torch.distributed.get_rank() if torch.distributed.is_initialized() else 0
-            print(f"DEBUG | [Rank {rank:02d}] Auto-parallelized model successfully")
-        
         return parallelized
-    except Exception as e:
+    except Exception:
         # Don't fail if auto-parallelization fails
-        # User can still use model without parallelism
-        debug_mode = _get_debug_setting()
-        if debug_mode:
-            rank = torch.distributed.get_rank() if torch.distributed.is_initialized() else 0
-            print(f"DEBUG | [Rank {rank:02d}] Auto-parallelization failed: {e}")
         return model
 
 
@@ -1398,102 +861,92 @@ def _get_tensor_parallel_mesh(device_mesh):
     """Extract a 1D DeviceMesh for tensor parallelism from a 2D mesh.
     
     PyTorch's parallelize_module requires a 1D DeviceMesh for tensor parallelism.
-    According to PyTorch docs: "If you are using a 2-D or N-D DeviceMesh for 
-    complex parallelism (e.g., combining tensor and data parallelism), you must 
-    slice the DeviceMesh to a 1-D sub-mesh (e.g., device_mesh['tp']) before 
-    passing it to the parallelize_module API."
+    Use device_mesh["tp"] for 2D meshes or return device_mesh if already 1D.
     
     Args:
         device_mesh: PyTorch DeviceMesh (can be 1D or 2D)
     
     Returns:
-        A 1D DeviceMesh for tensor parallelism, or None if extraction fails
+        A 1D DeviceMesh for tensor parallelism
     """
-    debug_mode = _get_debug_setting()
-    rank = torch.distributed.get_rank() if torch.distributed.is_initialized() else 0
-    
     if device_mesh is None:
         return None
-    
     # If already 1D, return as-is
     if len(device_mesh.mesh_dim_names) == 1:
         return device_mesh
+    # Use native slicing for 2D mesh (PyTorch 2.1+)
+    return device_mesh["tp"]
+
+
+def _get_keras_layout_map(layout_map):
+    """Extract Keras layout map from various input formats."""
+    if layout_map is None:
+        from keras.src.distribution import distribution
+        dist = distribution()
+        if dist is not None and hasattr(dist, '_layout_map'):
+            return dict(dist._layout_map)
+        return {}
+    if hasattr(layout_map, '_layout_map'):
+        return dict(layout_map._layout_map)
+    return dict(layout_map)
+
+
+def _get_torch_module(model):
+    """Extract the underlying PyTorch module from a Keras model."""
+    return getattr(model, '_torch_layers', model)
+
+
+def _parallelize_model(
+    model: torch.nn.Module,
+    device_mesh: DeviceMesh,
+    layout_map: dict,
+) -> torch.nn.Module:
+    """Internal function to parallelize a model using tensor parallelism.
     
-    # PyTorch 2.1+ provides the "tp" slice for tensor parallel mesh
-    # This is the RECOMMENDED approach from PyTorch docs
-    if hasattr(device_mesh, '__getitem__'):
-        try:
-            tp_mesh = device_mesh["tp"]
-            if debug_mode:
-                print(f"DEBUG | [Rank {rank:02d}] Extracted TP mesh using device_mesh['tp']: shape={tp_mesh.shape}, mesh_dim_names={tp_mesh.mesh_dim_names}")
-            return tp_mesh
-        except (KeyError, TypeError, IndexError):
-            pass
+    Args:
+        model: A Keras model or PyTorch module
+        device_mesh: A PyTorch DeviceMesh for distributed execution
+        layout_map: Dict mapping parameter patterns to Keras sharding specs
     
-    # Fallback: manual extraction using mesh_dim_names
-    # Check if 'model' axis exists in mesh_dim_names
-    if 'model' in device_mesh.mesh_dim_names:
-        model_dim = device_mesh.mesh_dim_names.index('model')
-        
-        try:
-            mesh_shape = device_mesh.shape
-            mesh_dim_names = device_mesh.mesh_dim_names
-            
-            # Get the size along the model dimension
-            tp_size = mesh_shape[model_dim]
-            
-            # Create a list of device IDs for the model dimension
-            # For a 2D mesh like (1, 2) with mesh_dim_names ('batch', 'model'),
-            # we need to flatten the batch dimension and extract model dimension devices
-            device_ids = []
-            mesh_flat = device_mesh.mesh.flatten()
-            for idx in range(tp_size):
-                device_ids.append(mesh_flat[idx].item())
-            
-            # Create 1D mesh for tensor parallelism
-            tp_mesh_array = np.array(device_ids)
-            tp_mesh = TorchDeviceMesh(
-                device_type=device_mesh.device_type,
-                mesh=tp_mesh_array,
-                mesh_dim_names=[mesh_dim_names[model_dim]]
-            )
-            
-            if debug_mode:
-                print(f"DEBUG | [Rank {rank:02d}] Created TP sub-mesh manually: shape={tp_mesh.shape}, mesh_dim_names={tp_mesh.mesh_dim_names}")
-            
-            return tp_mesh
-            
-        except Exception as e:
-            if debug_mode:
-                print(f"DEBUG | [Rank {rank:02d}] Failed to extract TP mesh manually: {e}")
+    Returns:
+        A parallelized module
+    """
+    if not TENSOR_PARALLEL_AVAILABLE:
+        raise ImportError(
+            "PyTorch tensor.parallel is not available. "
+            "Cannot use tensor parallelism. "
+            "Please install PyTorch with tensor parallel support."
+        )
     
-    if debug_mode:
-        print(f"DEBUG | [Rank {rank:02d}] No 'model' axis found in mesh_dim_names={device_mesh.mesh_dim_names}")
+    torch_module = _get_torch_module(model)
+    keras_layout_map = _get_keras_layout_map(layout_map)
     
-    return None
+    # Create parallel plan from Keras layout map
+    parallel_plan = create_tp_plan_from_layout_map(torch_module, keras_layout_map)
+    if not parallel_plan:
+        return model
+    
+    # Get 1D TP mesh (use device_mesh['tp'] or device_mesh if already 1D)
+    tp_mesh = device_mesh["tp"] if len(device_mesh.mesh_dim_names) > 1 else device_mesh
+    
+    # Apply tensor parallelism
+    return parallelize_module(torch_module, tp_mesh, parallel_plan=parallel_plan)
 
 
 def parallelize_keras_model(
     model: torch.nn.Module,
     device_mesh=None,
     layout_map=None,
-):
+) -> torch.nn.Module:
     """Parallelize a Keras model using tensor parallelism.
     
     This function uses PyTorch's `torch.distributed.tensor.parallel.parallelize_module`
     to automatically handle DTensor conversions and weight sharding for the entire model.
 
-    This is the recommended approach for distributed training as it:
-    - Automatically converts inputs to DTensors
-    - Automatically converts outputs back to local tensors
-    - Handles all weight sharding according to the layout
-    - Prevents "mixed torch.Tensor and DTensor" errors
-
     Args:
         model: A Keras model (must have a ._torch_layers attribute for PyTorch backend)
         device_mesh: A PyTorch DeviceMesh for distributed execution. If None, uses default.
         layout_map: A dict mapping parameter patterns to Keras sharding specs.
-            Example: {'dense.*kernel': (None, 'model'), 'dense.*bias': ('model',)}
             If None, the layout_map from the distribution context is used.
 
     Returns:
@@ -1501,157 +954,27 @@ def parallelize_keras_model(
 
     Raises:
         ImportError: If tensor parallel is not available
-        ValueError: If model or layout_map is not provided
+        ValueError: If model or device_mesh is not provided
     """
-    if not TENSOR_PARALLEL_AVAILABLE:
-        raise ImportError(
-            "PyTorch tensor.parallel is not available. "
-            "Cannot use parallelize_keras_model. "
-            "Please install PyTorch with tensor parallel support."
-        )
+    # Check for ModelParallel distribution (skip parallelize_module)
+    from keras.src.distribution.distribution_lib import distribution, ModelParallel
     
-    if model is None:
-        raise ValueError("model cannot be None for parallelization")
+    dist = distribution()
+    is_model_parallel = isinstance(dist, ModelParallel)
     
-    debug_mode = _get_debug_setting()
-    rank = torch.distributed.get_rank() if torch.distributed.is_initialized() else 0
-    
-    # =====================================================================
-    # GUARD: Skip parallelize_module for ModelParallel!
-    #
-    # When using ModelParallel with a 2D mesh (batch, model) and a layout_map,
-    # we use our DTensor-based approach in distribute_variable() instead of
-    # PyTorch's parallelize_module(). parallelize_module() conflicts with
-    # DTensor-based weight creation.
-    #
-    # Detection: If device_mesh is 2D AND we have a layout_map, this is
-    # ModelParallel mode, which we handle differently.
-    # =====================================================================
-    
-    # Get layout map from distribution context if not provided
-    if layout_map is None:
-        from keras.src.distribution import distribution
-        dist = distribution()
-        if dist is not None and hasattr(dist, '_layout_map'):
-            layout_map = dict(dist._layout_map)
-    
-    # Check if this is ModelParallel mode (2D mesh with layout_map)
-    # If so, skip parallelize_module and let distribute_variable handle it
-    if device_mesh is not None and layout_map:
-        if len(device_mesh.mesh_dim_names) >= 2:
-            if debug_mode:
-                print(
-                    f"DEBUG | [Rank {rank:02d}] Skipping parallelize_module for "
-                    f"ModelParallel (2D mesh with layout_map). "
-                    f"Using DTensor-based weight distribution instead."
-                )
-            # Mark as parallelized to prevent re-entry
-            global _MODEL_PARALLELIZED
-            _MODEL_PARALLELIZED = True
-            return model
-    
+    # Get device mesh
     if device_mesh is None:
         device_mesh = _get_default_device_mesh()
     
     if device_mesh is None:
         raise ValueError("device_mesh cannot be None for parallelization")
     
-    # Get layout map from distribution context if not provided
-    if layout_map is None:
-        from keras.src.distribution import distribution
-        dist = distribution()
-        if dist is not None and hasattr(dist, '_layout_map'):
-            keras_layout_map = dict(dist._layout_map)
-        else:
-            keras_layout_map = {}
-    else:
-        # Convert to dict if it's a LayoutMap
-        if hasattr(layout_map, '_layout_map'):
-            keras_layout_map = dict(layout_map._layout_map)
-        else:
-            keras_layout_map = layout_map
-    
-    if debug_mode:
-        print(f"DEBUG | [Rank {rank:02d}] parallelize_keras_model called")
-        print(f"DEBUG | [Rank {rank:02d}] device_mesh: shape={device_mesh.shape}, mesh_dim_names={device_mesh.mesh_dim_names}")
-        print(f"DEBUG | [Rank {rank:02d}] keras_layout_map: {keras_layout_map}")
-    
-    # Get the underlying PyTorch module
-    # For Keras models, we need to get the _torch_layers attribute or similar
-    if hasattr(model, '_torch_layers'):
-        # Sequential or functional model with torch layers
-        torch_module = model._torch_layers
-    elif hasattr(model, '_flatten_to_sequence_inputs'):
-        # Model has a different structure, try to get the underlying module
-        # For now, use the model directly if it's a torch.nn.Module
-        torch_module = model
-    else:
-        # Try to get the first torch submodule
-        torch_module = model
-        for name, module in model.named_modules():
-            if isinstance(module, torch.nn.Module):
-                torch_module = module
-                break
-    
-    if debug_mode:
-        print(f"DEBUG | [Rank {rank:02d}] torch_module type: {type(torch_module).__name__}")
-    
-    # Create the parallel plan from Keras layout map
-    parallel_plan = create_tp_plan_from_layout_map(
-        torch_module,
-        device_mesh,
-        keras_layout_map
-    )
-    
-    if debug_mode:
-        print(f"DEBUG | [Rank {rank:02d}] parallel_plan: {parallel_plan}")
-    
-    if not parallel_plan:
-        if debug_mode:
-            print(f"DEBUG | [Rank {rank:02d}] No parallel plan created, returning original model")
+    # For ModelParallel, distribute_variable handles weight sharding
+    if is_model_parallel:
+        global _MODEL_PARALLELIZED
+        _MODEL_PARALLELIZED = True
         return model
     
-    # Extract a 1D DeviceMesh for tensor parallelism
-    # PyTorch's parallelize_module requires a 1D DeviceMesh
-    # According to PyTorch docs: "If you are using a 2-D or N-D DeviceMesh for 
-    # complex parallelism, you must slice the DeviceMesh to a 1-D sub-mesh 
-    # (e.g., device_mesh['tp']) before passing it to the parallelize_module API."
-    tp_mesh = _get_tensor_parallel_mesh(device_mesh)
-    
-    if tp_mesh is None:
-        if debug_mode:
-            print(f"DEBUG | [Rank {rank:02d}] Cannot extract 1D TP mesh, using original mesh")
-        tp_mesh = device_mesh
-    
-    if debug_mode:
-        print(f"DEBUG | [Rank {rank:02d}] Using TP mesh: shape={tp_mesh.shape}, mesh_dim_names={tp_mesh.mesh_dim_names}")
-    
-    # Apply tensor parallelism using parallelize_module with 1D TP mesh
-    # This automatically handles all DTensor conversions
-    parallelized_module = parallelize_module(
-        torch_module,
-        tp_mesh,
-        parallelize_plan=parallel_plan
-    )
-    
-    if debug_mode:
-        print(f"DEBUG | [Rank {rank:02d}] Module parallelized successfully")
-    
-    # Update the Keras model's internal reference to the parallelized module
-    # This ensures that subsequent operations use the parallelized version
-    if hasattr(model, '_torch_layers'):
-        model._torch_layers = parallelized_module
-    
-    # Also update the model reference if it's a Sequential/Functional model
-    # that wraps the torch layers
-    if hasattr(model, '_layers'):
-        # For Sequential models, _layers contains references to internal layers
-        # We need to find and update the layer that owns torch_module
-        for i, layer in enumerate(model._layers):
-            if hasattr(layer, '_torch_layers') and layer._torch_layers is torch_module:
-                layer._torch_layers = parallelized_module
-            elif hasattr(layer, '_torch_module') and layer._torch_module is torch_module:
-                layer._torch_module = parallelized_module
-    
-    return parallelized_module
+    # For non-ModelParallel, use tensor parallelism
+    return _parallelize_model(model, device_mesh, layout_map)
 
