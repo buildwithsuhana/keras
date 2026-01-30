@@ -83,81 +83,33 @@ def _get_debug_setting() -> bool:
     return os.environ.get("KERAS_DISTRIBUTION_DEBUG", "0") == "1"
 
 
-class TorchPlacement:
-    """Represents a placement type for DTensor.
-    
-    This class wraps PyTorch's placement types (Replicate, Shard) to provide
-    a consistent interface with JAX/TensorFlow backends.
-    """
-    
-    def __init__(self, placement_type: str, **kwargs):
-        """Initialize a placement.
-        
-        Args:
-            placement_type: Type of placement - 'replicate' or 'shard'
-            **kwargs: Additional arguments for shard placement
-                - shard_dim: Dimension to shard on (for 'shard' placement)
-        """
-        self._placement_type = placement_type
-        self._shard_dim = kwargs.get('shard_dim', 0)
-        
-        if placement_type == 'replicate':
-            self._placement = Replicate()
-        elif placement_type == 'shard':
-            self._placement = Shard(dim=self._shard_dim)
-        else:
-            raise ValueError(f"Unknown placement type: {placement_type}")
-    
-    @property
-    def placement_type(self) -> str:
-        return self._placement_type
-    
-    @property
-    def shard_dim(self) -> int:
-        return self._shard_dim
-    
-    @property
-    def torch_placement(self):
-        return self._placement
-    
-    def __repr__(self):
-        if self._placement_type == 'replicate':
-            return "Replicate()"
-        else:
-            return f"Shard(dim={self._shard_dim})"
-
-
 def _parse_device(device_name: str) -> torch.device:
     """Parse a device name string to a torch.device.
-    
+
     Args:
         device_name: Device name string like 'cpu:0', 'cuda:0', 'cuda', 'mps:0'
-    
+
     Returns:
         torch.device object
     """
     device_name = str(device_name).lower()
-    
-    # Handle special cases
-    if device_name == 'cpu':
-        return torch.device('cpu')
-    elif device_name == 'cuda' or device_name.startswith('cuda:'):
-        if torch.cuda.is_available():
-            return torch.device(device_name if ':' in device_name else 'cuda:0')
-        else:
-            raise RuntimeError("CUDA is not available")
-    elif device_name.startswith('mps'):
-        if hasattr(torch.backends, 'mps') and torch.backends.mps.is_available():
-            return torch.device('mps')
-        else:
-            raise RuntimeError("MPS is not available")
-    elif device_name.startswith('xpu'):
-        if hasattr(torch, 'xpu') and torch.xpu.is_available():
-            return torch.device(device_name if ':' in device_name else 'xpu:0')
-        else:
-            raise RuntimeError("XPU is not available")
-    else:
-        return torch.device(device_name)
+
+    # Handle special cases with dictionary of check functions
+    device_checks = {
+        'cpu': (None, lambda: torch.device('cpu')),
+        'cuda': (lambda: device_name.startswith('cuda:'), lambda: torch.device(device_name if ':' in device_name else 'cuda:0') if torch.cuda.is_available() else None),
+        'mps': (lambda: device_name.startswith('mps'), lambda: torch.device('mps') if hasattr(torch.backends, 'mps') and torch.backends.mps.is_available() else None),
+        'xpu': (lambda: device_name.startswith('xpu'), lambda: torch.device(device_name if ':' in device_name else 'xpu:0') if hasattr(torch, 'xpu') and torch.xpu.is_available() else None),
+    }
+
+    for name, (check_fn, device_fn) in device_checks.items():
+        if device_name == name or check_fn():
+            result = device_fn()
+            if result is not None:
+                return result
+            raise RuntimeError(f"{name.upper()} is not available")
+
+    return torch.device(device_name)
 
 
 def list_devices(device_type: Optional[str] = None) -> List[str]:
@@ -865,53 +817,24 @@ def _get_default_device_mesh() -> Optional[DeviceMesh]:
     return mesh
 
 
-def _set_default_device_mesh(mesh: DeviceMesh) -> None:
-    """Set the default device mesh in global state."""
-    global_state.set_global_attribute("torch_device_mesh", mesh)
-from keras.src.backend.common.global_state import get_global_attribute
-from keras.src.backend.common.global_state import set_global_attribute
-
-def _get_mesh_info():
-    """Internal helper to get the current backend mesh info."""
-    mesh = get_global_attribute("torch_device_mesh")
-    if mesh is None:
-        return None
-    return {
-        "shape": mesh.shape,
-        "dim_names": mesh.mesh_dim_names,
-        "device_type": mesh.device_type
-    }
-
-
 def _axis_names_to_placements(
     axis_names: tuple,
     device_mesh: DeviceMesh,
 ) -> List[Placement]:
     """Convert axis names to DTensor placements.
-    
+
     Args:
         axis_names: Tuple of axis names (strings or None)
         device_mesh: DeviceMesh object
-    
+
     Returns:
         List of Placement objects
     """
-    placements = []
-    axis_names = list(axis_names)
-    
-    for axis in axis_names:
-        if axis is None:
-            # Replicate on this axis
-            placements.append(Replicate())
-        elif axis in device_mesh.mesh_dim_names:
-            # Shard on this axis
-            dim = device_mesh.mesh_dim_names.index(axis)
-            placements.append(Shard(dim=dim))
-        else:
-            # Unknown axis, replicate
-            placements.append(Replicate())
-    
-    return placements
+    mesh_dim_names = device_mesh.mesh_dim_names
+    return [
+        Replicate() if axis is None else Shard(dim=mesh_dim_names.index(axis))
+        for axis in axis_names
+    ]
 
 
 def redistribute_dtensor(
@@ -935,80 +858,35 @@ def redistribute_dtensor(
     return dtensor.redistribute(device_mesh, placements)
 
 
-def _to_backend_device(device_name):
-    """Convert a device name string to a backend device.
-    
-    Args:
-        device_name: Device name string like 'cuda:0'
-    
-    Returns:
-        torch.device
-    """
-    return _parse_device(device_name)
-
-
 def _to_backend_mesh(device_mesh):
     """Converts a Keras DeviceMesh to a PyTorch DeviceMesh."""
-    debug_mode = _get_debug_setting()
-    
     if not DTENSOR_AVAILABLE:
-        if debug_mode:
-            print(f"DEBUG | DTensor not available, using non-distributed mode")
         return None
-    
-    # Create a unique cache key based on the mesh configuration (shape and axis_names)
-    # This ensures that different mesh configurations (e.g., 1D DP vs 2D MP)
-    # get their own cached backend mesh, preventing rank desync when switching
-    # between distribution strategies
-    shape_str = str(device_mesh.shape)
-    axes_str = str(device_mesh.axis_names)
-    cache_key = f"torch_mesh_{shape_str}_{axes_str}"
-    
-    existing_mesh = get_global_attribute(cache_key)
+
+    # Create cache key from mesh configuration
+    cache_key = f"torch_mesh_{device_mesh.shape}_{device_mesh.axis_names}"
+
+    # Check cache first
+    existing_mesh = global_state.get_global_attribute(cache_key)
     if existing_mesh is not None:
-        if debug_mode:
-            print(f"DEBUG | Found cached mesh for config {cache_key}: {existing_mesh}")
-        # Also update the default mesh for _get_default_device_mesh to find
         global_state.set_global_attribute("torch_device_mesh", existing_mesh)
         return existing_mesh
 
-    if debug_mode:
-        print(f"DEBUG | Creating new backend mesh from device_mesh: shape={device_mesh.shape}, axis_names={device_mesh.axis_names}")
-        print(f"DEBUG | device_mesh.devices = {device_mesh.devices}")
+    # Convert device strings to indices
+    device_ids = [
+        int(d.split(":")[-1]) if ":" in d else 0
+        for d in device_mesh.devices.flatten()
+    ]
 
-    # Flatten devices to list of indices
-    device_ids = []
-    for d in device_mesh.devices.flatten():
-        # Handle "cuda:0" or "cpu" strings
-        if ":" in d:
-            device_ids.append(int(d.split(":")[-1]))
-        else:
-            # Default to 0 if no index (e.g. "cpu")
-            device_ids.append(0)
-    
-    if debug_mode:
-        print(f"DEBUG | device_ids = {device_ids}")
-    
-    mesh_shape = device_mesh.shape
-    axis_names = device_mesh.axis_names
-    
-    # PyTorch expects a numpy array for the mesh structure
-    mesh_array = np.array(device_ids).reshape(mesh_shape)
-    
-    if debug_mode:
-        print(f"DEBUG | mesh_array.shape = {mesh_array.shape}, mesh_array = {mesh_array}")
-    
+    # Create backend mesh
     backend_mesh = TorchDeviceMesh(
         device_type="cuda" if torch.cuda.is_available() else "cpu",
-        mesh=mesh_array,
-        mesh_dim_names=axis_names
+        mesh=np.array(device_ids).reshape(device_mesh.shape),
+        mesh_dim_names=device_mesh.axis_names
     )
-    
-    if debug_mode:
-        print(f"DEBUG | Created TorchDeviceMesh: shape={backend_mesh.shape}, mesh_dim_names={backend_mesh.mesh_dim_names}")
-    
-    # Cache both with the specific key AND as the default mesh for _get_default_device_mesh
-    set_global_attribute(cache_key, backend_mesh)
+
+    # Cache the mesh
+    global_state.set_global_attribute(cache_key, backend_mesh)
     global_state.set_global_attribute("torch_device_mesh", backend_mesh)
     return backend_mesh
 
@@ -1033,104 +911,6 @@ def _to_backend_layout(tensor_layout) -> tuple:
     
     # Return the axes as-is (they will be used in distribute_tensor)
     return tensor_layout.axes
-
-
-# Path Adapter for converting between Keras and PyTorch naming conventions
-# Keras uses: "dense/kernel" (forward slashes)
-# PyTorch uses: "dense.weight" (dots)
-
-def keras_to_pytorch_path(keras_path: str) -> str:
-    """Convert a Keras variable path to PyTorch format.
-    
-    Args:
-        keras_path: Path like "dense/kernel" or "my_model/dense_1/bias"
-    
-    Returns:
-        PyTorch-style path like "dense.weight" or "my_model.dense_1.bias"
-    
-    Example:
-        >>> keras_to_pytorch_path("dense/kernel")
-        'dense.weight'
-        >>> keras_to_pytorch_path("conv2d/bias")
-        'conv2d.bias'
-    """
-    # Handle special case for weight names
-    # Keras often uses "layer_name/weight_name" pattern
-    # PyTorch uses "layer_name.weight_name" pattern
-    
-    if _get_debug_setting():
-        logger.debug(f"Converting Keras path to PyTorch: {keras_path}")
-    
-    # Replace forward slashes with dots
-    pytorch_path = keras_path.replace('/', '.')
-    
-    # Special handling for common variable names
-    # Keras: "kernel", PyTorch: "weight"
-    # Keras: "bias", PyTorch: "bias" (same)
-    
-    return pytorch_path
-
-
-def pytorch_to_keras_path(pytorch_path: str) -> str:
-    """Convert a PyTorch variable path to Keras format.
-    
-    Args:
-        pytorch_path: Path like "dense.weight" or "my_model.dense_1.bias"
-    
-    Returns:
-        Keras-style path like "dense/kernel" or "my_model/dense_1/bias"
-    
-    Example:
-        >>> pytorch_to_keras_path("dense.weight")
-        'dense/kernel'
-        >>> pytorch_to_keras_path("conv2d.bias")
-        'conv2d/bias'
-    """
-    if _get_debug_setting():
-        logger.debug(f"Converting PyTorch path to Keras: {pytorch_path}")
-    
-    # Replace dots with forward slashes
-    keras_path = pytorch_path.replace('.', '/')
-    
-    return keras_path
-
-
-def convert_path_for_regex(path: str, source_format: str = "keras") -> str:
-    """Convert a path to work with regex patterns from the other format.
-    
-    This is useful when you have regex patterns in Keras format but need
-    to match against PyTorch paths.
-    
-    Args:
-        path: The path to convert
-        source_format: "keras" if path is in Keras format, "pytorch" if in PyTorch
-    
-    Returns:
-        Converted path that should work with the other format's regex patterns
-    """
-    if source_format == "keras":
-        # Keras path -> check both Keras and PyTorch patterns
-        keras_path = path
-        pytorch_path = keras_to_pytorch_path(path)
-    else:
-        # PyTorch path -> check both formats
-        pytorch_path = path
-        keras_path = pytorch_to_keras_path(path)
-    
-    if _get_debug_setting():
-        logger.debug(
-            f"Path conversion: {path} (from {source_format}) -> "
-            f"keras='{keras_path}', pytorch='{pytorch_path}'"
-        )
-    
-    return keras_path, pytorch_path
-
-
-# Utility to get the backend distribution_lib module
-def get_distribution_lib():
-    """Get the torch backend distribution_lib module."""
-    import sys
-    return sys.modules[__name__]
 
 
 # Try to import tensor parallel functions
@@ -1375,96 +1155,61 @@ def ensure_dtensor_input(input_tensor, device_mesh):
 
 def ensure_dtensor(tensor, device_mesh=None, placements=None):
     """Convert a tensor to DTensor if it isn't already.
-    
+
     This is a comprehensive helper that ensures all tensors in DTensor
     operations are properly converted, preventing the "mixed torch.Tensor
     and DTensor" error.
-    
+
     Args:
         tensor: torch.Tensor or DTensor to convert
         device_mesh: DeviceMesh to use for conversion. If None, uses default mesh.
         placements: Placements for the DTensor. If None, uses Replicate.
-    
+
     Returns:
         DTensor (or original if already a DTensor)
     """
-    if not DTENSOR_AVAILABLE:
+    if not DTENSOR_AVAILABLE or tensor is None or isinstance(tensor, DTensor):
         return tensor
-    
-    if tensor is None:
-        return tensor
-    
-    # Already a DTensor, just return
-    if isinstance(tensor, DTensor):
-        return tensor
-    
-    # Get device mesh
+
     if device_mesh is None:
         device_mesh = _get_default_device_mesh()
-    
+
     if device_mesh is None:
         return tensor
-    
-    # Default placements to replicate
-    if placements is None:
-        placements = [Replicate()]
-    elif not isinstance(placements, list):
-        placements = [placements]
-    
-    debug_mode = _get_debug_setting()
-    rank = torch.distributed.get_rank() if torch.distributed.is_initialized() else 0
-    
-    if debug_mode:
-        print(f"DEBUG | [Rank {rank:02d}] ensure_dtensor: converting tensor to DTensor")
-        print(f"DEBUG | [Rank {rank:02d}]   input shape: {tensor.shape}, dtype: {tensor.dtype}")
-        print(f"DEBUG | [Rank {rank:02d}]   device_mesh: {device_mesh}")
-        print(f"DEBUG | [Rank {rank:02d}]   placements: {placements}")
-    
-    # Convert to DTensor
-    result = DTensor.from_local(tensor, device_mesh, placements)
-    
-    if debug_mode:
-        local_shape = result.to_local().shape
-        print(f"DEBUG | [Rank {rank:02d}]   output: DTensor with local_shape={local_shape}, global_shape={result.shape}")
-    
-    return result
+
+    placements = [Replicate()] if placements is None else (placements if isinstance(placements, list) else [placements])
+    return DTensor.from_local(tensor, device_mesh, placements)
 
 
 def convert_tensors_to_dtensor(*tensors, device_mesh=None):
     """Convert multiple tensors to DTensors, handling mixed types.
-    
+
     This function ensures all tensors in a collection are DTensors,
     converting regular tensors to replicated DTensors. This prevents
     the "mixed torch.Tensor and DTensor" error during operations.
-    
+
     Args:
         *tensors: Variable number of torch.Tensor or DTensor objects
         device_mesh: DeviceMesh to use for conversion
-    
+
     Returns:
         Tuple of converted tensors (all DTensors or original if not available)
     """
     if not DTENSOR_AVAILABLE:
         return tensors
-    
-    # Get device mesh
+
     if device_mesh is None:
         device_mesh = _get_default_device_mesh()
-    
+
     if device_mesh is None:
         return tensors
-    
-    result = []
-    for tensor in tensors:
-        if tensor is None:
-            result.append(None)
-        elif isinstance(tensor, DTensor):
-            result.append(tensor)
-        else:
-            # Convert regular tensor to replicated DTensor
-            result.append(DTensor.from_local(tensor, device_mesh, [Replicate()]))
-    
-    return tuple(result)
+
+    replicate = [Replicate()]
+    return tuple(
+        tensor if tensor is None or isinstance(tensor, DTensor)
+        else DTensor.from_local(tensor, device_mesh, replicate)
+        for tensor in tensors
+    )
 
 
 def get_dtensor_local(tensor):
@@ -1486,29 +1231,25 @@ def get_dtensor_local(tensor):
 
 def dtensor_to_local(tensor):
     """Convert a DTensor to local tensor format.
-    
+
     This function handles the conversion needed when using sharded DTensors.
     When a layer has DTensor weights, the output will be a DTensor that needs
     to be converted back to a local tensor for subsequent operations.
-    
+
     Args:
         tensor: torch.Tensor, DTensor, or nested structure
-    
+
     Returns:
         Same structure with DTensors converted to local tensors
     """
     if tensor is None:
         return tensor
-    
     if isinstance(tensor, DTensor):
         return tensor.to_local()
-    
     if isinstance(tensor, dict):
         return {k: dtensor_to_local(v) for k, v in tensor.items()}
-    
     if isinstance(tensor, (list, tuple)):
         return type(tensor)(dtensor_to_local(v) for v in tensor)
-    
     return tensor
 
 
@@ -1524,20 +1265,6 @@ def is_dtensor(tensor) -> bool:
     if not DTENSOR_AVAILABLE:
         return False
     return isinstance(tensor, DTensor)
-
-
-def get_dtensor_spec(tensor):
-    """Get the DTensor spec (placements) from a tensor.
-    
-    Args:
-        tensor: A DTensor or regular tensor
-    
-    Returns:
-        The DTensor spec if input is DTensor, None otherwise
-    """
-    if isinstance(tensor, DTensor):
-        return tensor.placements
-    return None
 
 
 def create_replicate_dtensor(tensor, device_mesh=None):
@@ -1660,13 +1387,11 @@ def _auto_parallelize_model(model):
 
 def reset_model_parallelization_state():
     """Reset the model parallelization state.
-    
+
     This can be used to force re-parallelization of a model.
     """
-    global _MODEL_PARALLELIZED
-    global _DISTRIBUTED_WEIGHTS_CREATED
-    _MODEL_PARALLELIZED = False
-    _DISTRIBUTED_WEIGHTS_CREATED = False
+    global _MODEL_PARALLELIZED, _DISTRIBUTED_WEIGHTS_CREATED
+    _MODEL_PARALLELIZED = _DISTRIBUTED_WEIGHTS_CREATED = False
 
 
 def _get_tensor_parallel_mesh(device_mesh):
