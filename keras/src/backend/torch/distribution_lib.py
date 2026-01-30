@@ -774,6 +774,61 @@ def _to_dtensor(tensor, device_mesh=None, placements=None):
     return DTensor.from_local(tensor, device_mesh, placements)
 
 
+def is_dtensor(tensor):
+    """Check if a tensor is a DTensor.
+    
+    Args:
+        tensor: torch.Tensor or DTensor to check
+        
+    Returns:
+        bool: True if tensor is a DTensor, False otherwise
+    """
+    if not DTENSOR_AVAILABLE:
+        return False
+    return isinstance(tensor, DTensor)
+
+
+def ensure_dtensor(tensor, device_mesh=None, placements=None):
+    """Ensure a tensor is a DTensor, converting if necessary.
+    
+    Args:
+        tensor: torch.Tensor or DTensor
+        device_mesh: DeviceMesh to use for conversion. If None, uses default mesh.
+        placements: Placements for the DTensor. If None, uses Replicate.
+        
+    Returns:
+        DTensor (or original if already a DTensor or conversion not possible)
+    """
+    return _to_dtensor(tensor, device_mesh, placements)
+
+
+def create_replicate_dtensor(tensor, device_mesh=None):
+    """Create a replicated DTensor from a regular tensor.
+    
+    Args:
+        tensor: torch.Tensor to convert
+        device_mesh: DeviceMesh to use. If None, uses default mesh.
+        
+    Returns:
+        Replicated DTensor (or original tensor if conversion not possible)
+    """
+    return _to_dtensor(tensor, device_mesh, [Replicate()])
+
+
+def get_dtensor_local(tensor):
+    """Get the local tensor from a DTensor.
+    
+    Args:
+        tensor: DTensor or regular tensor
+        
+    Returns:
+        Local tensor if input is DTensor, otherwise returns the input unchanged
+    """
+    if isinstance(tensor, DTensor):
+        return tensor.to_local()
+    return tensor
+
+
 def dtensor_to_local(tensor):
     """Convert a DTensor to local tensor format.
 
