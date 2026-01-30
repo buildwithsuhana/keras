@@ -275,12 +275,12 @@ class TorchTrainer(base_trainer.Trainer):
                             full_tensor = _all_gather_with_grad(local_tensor, shard_dim)
                             
                             return full_tensor
-                    else:
-                        # For inference mode - no gradients needed
-                        output = [torch.empty_like(local_tensor) for _ in range(world_size)]
-                        torch.distributed.all_gather(output, local_tensor.contiguous())
-                        full_tensor = torch.cat(output, dim=shard_dim)
-                        return full_tensor
+                        else:
+                            # For inference mode - no gradients needed
+                            output = [torch.empty_like(local_tensor) for _ in range(world_size)]
+                            torch.distributed.all_gather(output, local_tensor.contiguous())
+                            full_tensor = torch.cat(output, dim=shard_dim)
+                            return full_tensor
             
             # Not sharded or no distributed, just convert to local
             return dtensor_to_local(x)
