@@ -43,4 +43,3 @@ from keras.src.backend.torch.rnn import cudnn_ok
 from keras.src.backend.torch.rnn import gru
 from keras.src.backend.torch.rnn import lstm
 from keras.src.backend.torch.rnn import rnn
-from keras.src.backend.torch import distribution_lib
