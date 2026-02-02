@@ -407,42 +407,6 @@ class TorchTrainer(base_trainer.Trainer):
         except Exception as e:
             pass
 
-    def build(self, input_shape=None):
-        """Build the model and optionally apply automatic parallelization.
-        
-        This override automatically calls parallelize_keras_model() when:
-        - PyTorch backend is active
-        - ModelParallel distribution is set
-        - Model has layers that can be parallelized
-        """
-        # Call parent build method if it exists
-        # The parent Layer.build creates weights and sets self.built = True
-        try:
-            from keras.src.layers.layer import Layer
-            if isinstance(self, Layer) and hasattr(super(), 'build'):
-                if input_shape is not None:
-                    super().build(input_shape)
-                else:
-                    super().build()
-        except (TypeError, AttributeError):
-            # If super().build doesn't exist or fails, continue anyway
-            pass
-    
-    def _symbolic_build(self, *args, **kwargs):
-        """Override _symbolic_build for automatic parallelization.
-
-        Note: Parallelization now happens BEFORE this method is called
-        (in fit()/evaluate()/predict()). This ensures that when weights
-        are created during _symbolic_build, they are created as sharded
-        DTensors from the start.
-
-        This method calls the parent _symbolic_build to handle the actual
-        model building and weight creation.
-        """
-        # Call the parent _symbolic_build method
-        # The model is already set up for parallelization by _parallelize_if_needed()
-        return super()._symbolic_build(*args, **kwargs)
-
     def _should_torch_compile(self):
         # require torch>=2.1.0 to enable dynamo since it
         # includes many improvements/fixes to torch.compile()
