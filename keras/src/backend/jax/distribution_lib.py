@@ -3,7 +3,6 @@
 import jax
 import numpy as np
 
-from keras.src.backend.common import global_state
 from keras.src.random import seed_generator
 from keras.src.utils import jax_utils
 from keras.src.utils import rng_utils
@@ -157,28 +156,8 @@ def initialize_rng():
         # Set the global seed.
         rng_utils.set_random_seed(global_seed)
 
-    # Check if the global seed generator is set and ensure it has an initialized
-    # seed.  Otherwise, reset the seed to the global seed.
-    global_seed_generator = global_state.get_global_attribute(
-        seed_generator.GLOBAL_SEED_GENERATOR
-    )
-    if global_seed_generator is not None:
-        seed = global_seed_generator.get_config()["seed"]
-        if seed is None:
-            global_state.set_global_attribute(
-                seed_generator.GLOBAL_SEED_GENERATOR,
-                seed_generator.SeedGenerator(
-                    seed=global_seed,
-                    name=global_seed_generator.name,
-                    backend=global_seed_generator.backend,
-                ),
-            )
-
 
 def initialize(job_addresses, num_processes, process_id):
-    # For single-process or local development environments, JAX distributed
-    # initialization may not be needed. We only initialize when proper
-    # multi-process configuration is provided.
     if job_addresses and "," in job_addresses:
         # When user provide all the job addresses, we will split and get the
         # first one, which is the coordinator.
@@ -192,23 +171,8 @@ def initialize(job_addresses, num_processes, process_id):
                 f"{num_processes}"
             )
         coordinator_address = job_addresses[0]
-    elif job_addresses:
-        # Single job address provided - use it as coordinator
-        coordinator_address = job_addresses
     else:
-        # No job_addresses provided - check if we need JAX distributed init
-        # In single-process environments or when num_processes is 1,
-        # we don't need to initialize JAX distributed
-        if num_processes is not None and num_processes > 1:
-            raise ValueError(
-                "For multi-process distributed training, job_addresses "
-                "must be provided. You can set it via the job_addresses "
-                "parameter or the KERAS_DISTRIBUTION_JOB_ADDRESSES "
-                "environment variable."
-            )
-        # For single-process or undefined process count, skip JAX distributed
-        # initialization
-        return
+        coordinator_address = job_addresses
 
     jax.distributed.initialize(
         coordinator_address=coordinator_address,
