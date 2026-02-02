@@ -60,9 +60,8 @@ def test_device_detection():
     log_section("TEST 1: DEVICE DETECTION")
     
     gpu_devices = keras.distribution.list_devices("gpu")
-    tpu_devices = keras.distribution.list_devices("tpu")
     
-    devices = gpu_devices if gpu_devices else tpu_devices
+    devices = gpu_devices
     log(f"✓ Keras detected devices: {devices}")
     log("")
 
@@ -73,7 +72,7 @@ def test_data_parallel(epochs=3):
     
     log_section("TEST 2: DATA PARALLEL (DP)")
     
-    devices = list_devices("gpu") or list_devices("tpu") or ["cpu:0"]
+    devices = list_devices("gpu")
     dp = DataParallel(devices=devices)
     
     with dp.scope():
@@ -105,7 +104,7 @@ def test_model_parallel():
     
     log_section("TEST 3: MODEL PARALLEL (MP)")
     
-    devices = list_devices("gpu") or list_devices("tpu")
+    devices = list_devices("gpu")
     if len(devices) < 2:
         log("⚠ Skipping: Need >= 2 devices for ModelParallel")
         return
