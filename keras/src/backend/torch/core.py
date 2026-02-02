@@ -59,6 +59,15 @@ TORCH_DTYPES = {
 }
 
 
+# DTensor helper for distribution support
+def _get_dtensor_info(x):
+    """Check if x is a DTensor and return (is_dtensor, local_tensor)."""
+    from keras.src.backend.torch.distribution_lib import is_dtensor, get_dtensor_local
+    if is_dtensor(x):
+        return (True, get_dtensor_local(x))
+    return (False, None)
+
+
 @contextlib.contextmanager
 def device_scope(device_name):
     previous_device = global_state.get_global_attribute("torch_device", None)
@@ -103,30 +112,20 @@ def to_torch_dtype(dtype):
 
 class Variable(KerasVariable):
     def __init__(self, *args, layout=None, **kwargs):
-        # Intercept layout parameter so that it is available
-        # during initialization.
         self._layout = layout
         super().__init__(*args, **kwargs)
 
     def _initialize_layout(self):
-        # Get layout from distribution context if not explicitly set
-        if self._layout is None:
-            from keras.src.distribution import distribution
-
-            dist = distribution()
-            
-            if dist is not None:
-                tensor_layout = dist.get_variable_layout(self)
-                if tensor_layout is not None:
-                    # Capture backend-specific sharding axes
-                    # IMPORTANT: For ModelParallel, we want to capture the layout
-                    # so that distribute_variable knows how to shard the variable
-                    if hasattr(tensor_layout, 'axes'):
-                        self._layout = tensor_layout.axes
-                    elif hasattr(tensor_layout, 'backend_layout'):
-                        self._layout = tensor_layout.backend_layout
-                    else:
-                        self._layout = tensor_layout
+        if self._layout is not None:
+            return
+        from keras.src.distribution import distribution
+        dist = distribution()
+        if dist is None:
+            return
+        tensor_layout = dist.get_variable_layout(self)
+        if tensor_layout is not None:
+            self._layout = getattr(tensor_layout, 'axes',
+                          getattr(tensor_layout, 'backend_layout', tensor_layout))
 
     def _initialize(self, value):
         # Initialize layout from distribution context
@@ -139,58 +138,34 @@ class Variable(KerasVariable):
             self._value = self._distribute_parameter(tensor)
 
     def _distribute_parameter(self, tensor):
-        """Create a distributed Parameter if distribution is configured."""
-        # Import here to avoid circular dependency
         from keras.src.backend.torch import distribution_lib
-
-        # Check if we are in a distribution context (mesh is active)
-        active_mesh = distribution_lib._get_default_device_mesh()
-
-        # If no explicit layout, check if there's a distribution context
-        # This handles the case where variables are created inside a
-        # distribution scope but layout wasn't set during __init__
         layout = self._layout
+        active_mesh = distribution_lib._get_default_device_mesh()
+        
         if layout is None and active_mesh is not None:
             from keras.src.distribution import distribution
-
             dist = distribution()
             if dist is not None:
                 tensor_layout = dist.get_variable_layout(self)
                 if tensor_layout is not None:
-                    # Extract the layout for distribute_variable
-                    if hasattr(tensor_layout, 'backend_layout'):
-                        layout = tensor_layout.backend_layout
-                    else:
-                        layout = tensor_layout
-
+                    layout = getattr(tensor_layout, 'backend_layout', tensor_layout)
+        
         if layout is not None or active_mesh is not None:
-            distributed = distribution_lib.distribute_variable(
-                tensor, layout
-            )
-            return distributed
-
-        # Default non-distributed fallback
-        return torch.nn.Parameter(
-            tensor, requires_grad=self.trainable
-        ).to(get_device())
+            return distribution_lib.distribute_variable(tensor, layout)
+        
+        return torch.nn.Parameter(tensor, requires_grad=self.trainable).to(get_device())
 
     def _direct_assign(self, value):
         with torch.no_grad():
             if self._layout is not None:
-                # Distribute the value before assigning
                 from keras.src.backend.torch import distribution_lib
-
-                value = distribution_lib.distribute_variable(
-                    value, self._layout
-                )
+                value = distribution_lib.distribute_variable(value, self._layout)
                 if isinstance(value, torch.nn.Parameter):
                     self._value.copy_(value)
+                elif hasattr(value, 'to_local'):
+                    self._value.copy_(value.to_local())
                 else:
-                    # It's a DTensor, handle accordingly
-                    if hasattr(value, 'to_local'):
-                        self._value.copy_(value.to_local())
-                    else:
-                        self._value.copy_(value)
+                    self._value.copy_(value)
             else:
                 self.value.copy_(value)
 
@@ -320,10 +295,9 @@ def convert_to_tensor(x, dtype=None, sparse=None, ragged=None):
 def convert_to_numpy(x):
     def transform(x):
         if is_tensor(x):
-            # Handle DTensor - get local tensor first
-            from keras.src.backend.torch.distribution_lib import is_dtensor, get_dtensor_local
-            if is_dtensor(x):
-                x = get_dtensor_local(x)
+            is_dtensor, local_x = _get_dtensor_info(x)
+            if is_dtensor:
+                x = local_x
             
             if x.requires_grad:
                 x = x.detach()
@@ -344,11 +318,6 @@ def convert_to_numpy(x):
 
 
 def is_tensor(x):
-    # Handle DTensor - it should also be considered as a tensor
-    from keras.src.backend.torch.distribution_lib import is_dtensor as _is_dtensor
-    if _is_dtensor(x):
-        return True
-    
     # Using the built-in `isinstance` is recommended by pytorch
     # over using torch.is_tensor
     # see: https://pytorch.org/docs/stable/generated/torch.is_tensor.html
@@ -357,17 +326,13 @@ def is_tensor(x):
     # a torch.Tensor and numpy.ndarray of the same size, shape, and dtype
     # is passed, if called on a Tensor first the second call with ndarray
     # will return `True` and vice-versa.
-    return isinstance(x, torch.Tensor)
+    from keras.src.backend.torch.distribution_lib import is_dtensor
+    return is_dtensor(x) or isinstance(x, torch.Tensor)
 
 
 def shape(x):
-    # Handle DTensor - get global shape
-    from keras.src.backend.torch.distribution_lib import is_dtensor as _is_dtensor
-    if _is_dtensor(x):
-        # DTensor has a shape attribute that gives the global shape
-        return tuple(x.shape)
-    
     # Convert from `torch.Size` to plain tuple.
+    # DTensor has a shape attribute that gives the global shape
     return tuple(x.shape)
 
 
@@ -376,18 +341,11 @@ def cast(x, dtype):
     if isinstance(x, Variable):
         x = x.value
     # Handle DTensor - cast the local tensor
-    from keras.src.backend.torch.distribution_lib import (
-        is_dtensor as _is_dtensor,
-        get_dtensor_local,
-        DTensor,
-    )
-    if _is_dtensor(x):
-        # Cast the local tensor and wrap back in DTensor
-        local_x = get_dtensor_local(x)
+    from keras.src.backend.torch.distribution_lib import DTensor
+    is_dtensor, local_x = _get_dtensor_info(x)
+    if is_dtensor:
         local_x = local_x.to(dtype)
-        # Get device mesh from original DTensor
-        device_mesh = x.device_mesh
-        return DTensor.from_local(local_x, device_mesh, x.placements)
+        return DTensor.from_local(local_x, x.device_mesh, x.placements)
     if is_tensor(x):
         if x.dtype == dtype:
             return x
