@@ -24,25 +24,23 @@ from keras.src.distribution.path_utils import (
 DEFAULT_BATCH_DIM_NAME = "batch"
 GLOBAL_ATTRIBUTE_NAME = "distribution"
 
-# Backend detection
-_BACKEND = None
 
-
-def _get_backend():
-    """Get the current backend type."""
-    global _BACKEND
-    if _BACKEND is None:
-        try:
-            from keras.src.backend import config
-            _BACKEND = config.backend()
-        except ImportError:
-            _BACKEND = "unknown"
-    return _BACKEND
-
-
-def _is_torch_backend():
-    """Check if using PyTorch backend."""
-    return _get_backend() == "torch"
+def _get_distribution_debug_info():
+    """Get debug info for distribution operations.
+    
+    Returns:
+        tuple: (rank, world_size) for distributed training debug info.
+    """
+    rank = 0
+    world_size = 1
+    try:
+        import torch.distributed as dist
+        if dist.is_available() and dist.is_initialized():
+            rank = dist.get_rank()
+            world_size = dist.get_world_size()
+    except:
+        pass
+    return rank, world_size
 
 
 def _check_path_for_layout_map(
@@ -62,7 +60,8 @@ def _check_path_for_layout_map(
         The matching TensorLayout or None
     """
     # For non-PyTorch backends, just use the standard lookup
-    if not _is_torch_backend():
+    from keras.src.backend import config
+    if config.backend() != "torch":
         return layout_map[path]
 
     # For PyTorch backend, check both formats
@@ -455,15 +454,7 @@ class Distribution:
         
         debug_mode = os.environ.get("KERAS_DISTRIBUTION_DEBUG", "0") == "1"
         if debug_mode:
-            rank = 0
-            world_size = 1
-            try:
-                import torch.distributed as dist
-                if dist.is_available() and dist.is_initialized():
-                    rank = dist.get_rank()
-                    world_size = dist.get_world_size()
-            except:
-                pass
+            rank, world_size = _get_distribution_debug_info()
             print(f"DEBUG | [Rank {rank:02d}] scope() entering with distribution={self}")
         
         original_scope = get_dist()
@@ -565,18 +556,9 @@ class DataParallel(Distribution):
         self._process_id = distribution_lib.process_id()
         self._is_multi_process = self._num_process > 1
 
-        # For PyTorch backend, ensure the backend mesh is created
-        # This is needed for DTensor support and proper gradient tracking
-        # in distributed training
-        if _is_torch_backend():
-            try:
-                # Access the backend_mesh property to trigger creation
-                # and registration in global state
-                _ = self.device_mesh.backend_mesh
-            except Exception:
-                # Backend mesh creation might fail in some environments
-                # That's OK - the distribution will fall back to non-distributed
-                pass
+        from keras.src.backend import config
+        if config.backend() == "torch":
+            _ = self.device_mesh.backend_mesh
 
     def _initialize_with_device_mesh(self, device_mesh, auto_shard_dataset):
         if not isinstance(device_mesh, DeviceMesh):
@@ -813,7 +795,8 @@ class ModelParallel(Distribution):
 
         # For PyTorch backend, ensure the backend mesh is created
         # This is needed for DTensor support
-        if _is_torch_backend():
+        from keras.src.backend import config
+        if config.backend() == "torch":
             try:
                 # Access the backend_mesh property to trigger creation
                 # and registration in global state
@@ -1079,15 +1062,7 @@ def distribution():
     # Add debug logging
     debug_mode = os.environ.get("KERAS_DISTRIBUTION_DEBUG", "0") == "1"
     if debug_mode:
-        rank = 0
-        world_size = 1
-        try:
-            import torch.distributed as dist
-            if dist.is_available() and dist.is_initialized():
-                rank = dist.get_rank()
-                world_size = dist.get_world_size()
-        except:
-            pass
+        rank, world_size = _get_distribution_debug_info()
         print(f"DEBUG | [Rank {rank:02d}] distribution() called, returning: {result}")
     return result
 
@@ -1102,14 +1077,6 @@ def set_distribution(value):
     # Add debug logging
     debug_mode = os.environ.get("KERAS_DISTRIBUTION_DEBUG", "0") == "1"
     if debug_mode:
-        rank = 0
-        world_size = 1
-        try:
-            import torch.distributed as dist
-            if dist.is_available() and dist.is_initialized():
-                rank = dist.get_rank()
-                world_size = dist.get_world_size()
-        except:
-            pass
+        rank, world_size = _get_distribution_debug_info()
         print(f"DEBUG | [Rank {rank:02d}] set_distribution({value}) called")
     global_state.set_global_attribute(GLOBAL_ATTRIBUTE_NAME, value)
