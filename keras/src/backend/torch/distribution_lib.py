@@ -183,7 +183,9 @@ def distribute_tensor(tensor: torch.Tensor, layout) -> torch.Tensor:
 
 def distribute_variable(tensor, layout=None, module_name=None):
     """Distributes a Keras variable using PyTorch DTensor."""
+    # Lazy import to avoid circular import
     from keras.src.distribution.distribution_lib import distribution
+    from keras.src.distribution.distribution_lib import TensorLayout
 
     converted_tensor = convert_to_tensor(tensor)
     is_float_or_complex = converted_tensor.dtype.is_floating_point or converted_tensor.dtype.is_complex
@@ -270,6 +272,8 @@ def _to_backend_mesh(device_mesh):
 
 def _to_backend_layout(tensor_layout):
     """Convert TensorLayout to backend layout tuple."""
+    from keras.src.distribution.distribution_lib import TensorLayout
+    
     if tensor_layout.device_mesh is None:
         raise ValueError("Cannot create sharding without device mesh")
     return tensor_layout.axes
