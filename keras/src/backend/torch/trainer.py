@@ -10,15 +10,7 @@ from keras.src import optimizers as optimizers_module
 from keras.src import tree
 from keras.src.backend import config
 from keras.src.backend.torch import distribution_lib
-from keras.src.backend.torch.distribution_lib import (
-    _get_default_device_mesh,
-    parallelize_torch_module,
-    TENSOR_PARALLEL_AVAILABLE,
-)
-from keras.src.distribution.distribution_lib import (
-    distribution,
-    ModelParallel,
-)
+from keras.src.distribution.distribution_lib import (distribution, ModelParallel)
 from keras.src.trainers import trainer as base_trainer
 from keras.src.trainers.data_adapters import array_slicing
 from keras.src.trainers.data_adapters import data_adapter_utils
@@ -42,19 +34,19 @@ class TorchTrainer(base_trainer.Trainer):
         """
         if self._torch_module_parallelized:
             return
-        if not TENSOR_PARALLEL_AVAILABLE:
+        if not distribution_lib.TENSOR_PARALLEL_AVAILABLE:
             return
         dist = distribution()
         if not isinstance(dist, ModelParallel):
             return
         if not dist._layout_map:
             return
-        device_mesh = _get_default_device_mesh()
+        device_mesh = distribution_lib._get_default_device_mesh()
         if device_mesh is None:
             return
         torch_module = getattr(self, '_torch_layers', self)
         
-        parallelize_torch_module(torch_module, device_mesh=device_mesh, layout_map=dist._layout_map)
+        distribution_lib.parallelize_torch_module(torch_module, device_mesh=device_mesh, layout_map=dist._layout_map)
         self._torch_module_parallelized = True
 
     def _should_torch_compile(self):
@@ -76,7 +68,6 @@ class TorchTrainer(base_trainer.Trainer):
 
         x = distribution_lib.prepare_input_for_distribution(x)
         y = distribution_lib.prepare_input_for_distribution(y)
-
         # Compute predictions
         if self._call_has_training_arg:
             y_pred = self(x, training=True)
@@ -86,7 +77,6 @@ class TorchTrainer(base_trainer.Trainer):
         y_pred = distribution_lib.prepare_output_for_loss(y_pred)
         y = distribution_lib.prepare_output_for_loss(y)
         x = distribution_lib.prepare_output_for_loss(x)
-
         # Call torch.nn.Module.zero_grad() to clear the leftover gradients
         # for the weights from the previous train step.
         self.zero_grad()
@@ -128,7 +118,6 @@ class TorchTrainer(base_trainer.Trainer):
         ) = data_adapter_utils.unpack_x_y_sample_weight(data)
         x = distribution_lib.prepare_input_for_distribution(x)
         y = distribution_lib.prepare_input_for_distribution(y)
-
         if self._call_has_training_arg:
             y_pred = self(x, training=False)
         else:
@@ -136,7 +125,6 @@ class TorchTrainer(base_trainer.Trainer):
         y_pred = distribution_lib.prepare_output_for_loss(y_pred)
         y = distribution_lib.prepare_output_for_loss(y)
         x = distribution_lib.prepare_output_for_loss(x)
-
         loss = self._compute_loss(
             x=x, y=y, y_pred=y_pred, sample_weight=sample_weight, training=False
         )
@@ -285,7 +273,6 @@ class TorchTrainer(base_trainer.Trainer):
         )
 
         self._parallelize_if_needed()
-
         self._symbolic_build(iterator=epoch_iterator)
         epoch_iterator.reset()
 
