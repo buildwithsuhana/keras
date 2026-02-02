@@ -349,9 +349,5 @@ def dtensor_to_local(tensor):
     return tensor
 
 
-from keras.src.distribution.path_utils import (
-    keras_to_pytorch_path,
-    pytorch_to_keras_path,
-    convert_path_for_matching,
-)
+
 

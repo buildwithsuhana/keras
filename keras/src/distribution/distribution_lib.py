@@ -19,7 +19,6 @@ import numpy as np
 
 from keras.src.api_export import keras_export
 from keras.src.backend import KerasTensor
-from keras.src.backend import distribution_lib
 from keras.src.backend.common import global_state
 from keras.src.distribution.path_utils import (
     keras_to_pytorch_path,
@@ -188,6 +187,8 @@ def list_devices(device_type=None):
     Return:
         List of devices that are available for distribute computation.
     """
+    from keras.src.backend import distribution_lib
+
     return distribution_lib.list_devices(device_type)
 
 
@@ -202,6 +203,8 @@ def get_device_count(device_type=None):
     Returns:
         int: The total number of JAX devices for the specified type.
     """
+    from keras.src.backend import distribution_lib
+
     return distribution_lib.get_device_count(device_type=device_type)
 
 
@@ -292,6 +295,8 @@ def initialize(job_addresses=None, num_processes=None, process_id=None):
         num_processes = int(os.environ["KERAS_DISTRIBUTION_NUM_PROCESSES"])
     if process_id is None and "KERAS_DISTRIBUTION_PROCESS_ID" in os.environ:
         process_id = int(os.environ["KERAS_DISTRIBUTION_PROCESS_ID"])
+    from keras.src.backend import distribution_lib
+
     distribution_lib.initialize(job_addresses, num_processes, process_id)
 
 
@@ -366,6 +371,8 @@ class DeviceMesh:
     @property
     def backend_mesh(self):
         if not hasattr(self, "_backend_mesh"):
+            from keras.src.backend import distribution_lib
+
             self._backend_mesh = distribution_lib._to_backend_mesh(self)
         return self._backend_mesh
 
@@ -426,6 +433,8 @@ class TensorLayout:
     @property
     def backend_layout(self):
         if not hasattr(self, "_backend_layout"):
+            from keras.src.backend import distribution_lib
+
             self._backend_layout = distribution_lib._to_backend_layout(self)
         return self._backend_layout
 
@@ -626,6 +635,8 @@ class DataParallel(Distribution):
             self._initialize_mesh_from_list_devices(auto_shard_dataset)
 
         # Those following attributes might get convert to public methods.
+        from keras.src.backend import distribution_lib
+
         self._num_process = distribution_lib.num_processes()
         self._process_id = distribution_lib.process_id()
         self._is_multi_process = self._num_process > 1
@@ -870,6 +881,8 @@ class ModelParallel(Distribution):
         self._layout_map = layout_map
 
         # Those following attributes might get convert to public methods.
+        from keras.src.backend import distribution_lib
+
         self._num_process = distribution_lib.num_processes()
         self._process_id = distribution_lib.process_id()
         self._is_multi_process = self._num_process > 1
@@ -1130,6 +1143,8 @@ def distribute_tensor(tensor, layout):
         # keras tensor is only used for building functional model, and can't be
         # used to alter layout/sharding.
         return tensor
+    from keras.src.backend import distribution_lib
+
     return distribution_lib.distribute_tensor(tensor, layout)
 
 
