@@ -22,7 +22,6 @@ def keras_to_pytorch_path(keras_path: str) -> str:
         >>> keras_to_pytorch_path("conv2d/bias")
         'conv2d.bias'
     """
-    # Replace forward slashes with dots
     pytorch_path = keras_path.replace('/', '.')
     return pytorch_path
 
@@ -42,7 +41,6 @@ def pytorch_to_keras_path(pytorch_path: str) -> str:
         >>> pytorch_to_keras_path("conv2d.bias")
         'conv2d/bias'
     """
-    # Replace dots with forward slashes
     keras_path = pytorch_path.replace('.', '/')
     return keras_path
 

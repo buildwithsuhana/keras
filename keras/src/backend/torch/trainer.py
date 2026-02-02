@@ -10,6 +10,15 @@ from keras.src import optimizers as optimizers_module
 from keras.src import tree
 from keras.src.backend import config
 from keras.src.backend.torch import distribution_lib
+from keras.src.backend.torch.distribution_lib import (
+    _get_default_device_mesh,
+    parallelize_torch_module,
+    TENSOR_PARALLEL_AVAILABLE,
+)
+from keras.src.distribution.distribution_lib import (
+    distribution,
+    ModelParallel,
+)
 from keras.src.trainers import trainer as base_trainer
 from keras.src.trainers.data_adapters import array_slicing
 from keras.src.trainers.data_adapters import data_adapter_utils
@@ -25,8 +34,6 @@ class TorchTrainer(base_trainer.Trainer):
         self.predict_function = None
         self._torch_module_parallelized = False
 
-
-
     def _parallelize_if_needed(self):
         """Parallelize the model if ModelParallel distribution is active.
         
@@ -35,53 +42,20 @@ class TorchTrainer(base_trainer.Trainer):
         """
         if self._torch_module_parallelized:
             return
-        
-        try:
-            from keras.src.backend.torch.distribution_lib import (
-                parallelize_keras_model,
-                _get_default_device_mesh,
-                TENSOR_PARALLEL_AVAILABLE,
-            )
-            from keras.src.distribution.distribution_lib import (
-                distribution,
-                ModelParallel,
-            )
-        except ImportError:
-            return
-        
         if not TENSOR_PARALLEL_AVAILABLE:
             return
-        
-        # Check if ModelParallel distribution is active
         dist = distribution()
         if not isinstance(dist, ModelParallel):
             return
-        
-        # Check if we have a layout map
-        if not hasattr(dist, '_layout_map') or not dist._layout_map:
+        if not dist._layout_map:
             return
-        
-        # Get device mesh
         device_mesh = _get_default_device_mesh()
         if device_mesh is None:
             return
+        torch_module = getattr(self, '_torch_layers', self)
         
-        # Get the underlying torch module
-        if hasattr(self, '_torch_layers'):
-            torch_module = self._torch_layers
-        else:
-            torch_module = self
-        
-        # Parallelize the model
-        try:
-            parallelize_keras_model(
-                torch_module,
-                device_mesh=device_mesh,
-                layout_map=dist._layout_map
-            )
-            self._torch_module_parallelized = True
-        except Exception as e:
-            pass
+        parallelize_torch_module(torch_module, device_mesh=device_mesh, layout_map=dist._layout_map)
+        self._torch_module_parallelized = True
 
     def _should_torch_compile(self):
         # require torch>=2.1.0 to enable dynamo since it
@@ -100,8 +74,6 @@ class TorchTrainer(base_trainer.Trainer):
     def train_step(self, data):
         x, y, sample_weight = data_adapter_utils.unpack_x_y_sample_weight(data)
 
-        # Convert inputs to DTensors if needed for ModelParallel training
-        # This ensures that when model has DTensor weights, inputs are also DTensors
         x = distribution_lib.prepare_input_for_distribution(x)
         y = distribution_lib.prepare_input_for_distribution(y)
 
@@ -111,7 +83,6 @@ class TorchTrainer(base_trainer.Trainer):
         else:
             y_pred = self(x)
 
-        # Convert DTensor outputs and labels to local tensors for loss computation
         y_pred = distribution_lib.prepare_output_for_loss(y_pred)
         y = distribution_lib.prepare_output_for_loss(y)
         x = distribution_lib.prepare_output_for_loss(x)
@@ -155,8 +126,6 @@ class TorchTrainer(base_trainer.Trainer):
             y,
             sample_weight,
         ) = data_adapter_utils.unpack_x_y_sample_weight(data)
-
-        # Convert inputs to DTensors if needed for ModelParallel training
         x = distribution_lib.prepare_input_for_distribution(x)
         y = distribution_lib.prepare_input_for_distribution(y)
 
@@ -164,8 +133,6 @@ class TorchTrainer(base_trainer.Trainer):
             y_pred = self(x, training=False)
         else:
             y_pred = self(x)
-
-        # Convert DTensor outputs and labels to local tensors for loss computation
         y_pred = distribution_lib.prepare_output_for_loss(y_pred)
         y = distribution_lib.prepare_output_for_loss(y)
         x = distribution_lib.prepare_output_for_loss(x)
@@ -183,16 +150,12 @@ class TorchTrainer(base_trainer.Trainer):
 
     def predict_step(self, data):
         x, _, _ = data_adapter_utils.unpack_x_y_sample_weight(data)
-
-        # Convert inputs to DTensors if needed for ModelParallel training
         x = distribution_lib.prepare_input_for_distribution(x)
 
         if self._call_has_training_arg:
             y_pred = self(x, training=False)
         else:
             y_pred = self(x)
-
-        # Convert DTensor outputs to local tensors
         y_pred = distribution_lib.prepare_output_for_loss(y_pred)
 
         return y_pred
@@ -321,11 +284,6 @@ class TorchTrainer(base_trainer.Trainer):
             steps_per_execution=self.steps_per_execution,
         )
 
-        # CRITICAL: Parallelize model BEFORE any weight creation!
-        # This ensures that when _symbolic_build() creates weights, they are
-        # created as sharded DTensors from the start, preventing OOM.
-        # The parallelize_module transforms the model so weights are partitioned
-        # across devices during creation, not after.
         self._parallelize_if_needed()
 
         self._symbolic_build(iterator=epoch_iterator)
@@ -453,10 +411,6 @@ class TorchTrainer(base_trainer.Trainer):
                 shuffle=False,
                 steps_per_execution=self.steps_per_execution,
             )
-
-        # CRITICAL: Parallelize model BEFORE any weight creation!
-        # This ensures that when _symbolic_build() creates weights, they are
-        # created as sharded DTensors from the start, preventing OOM.
         self._parallelize_if_needed()
 
         self._symbolic_build(iterator=epoch_iterator)
@@ -506,10 +460,6 @@ class TorchTrainer(base_trainer.Trainer):
             shuffle=False,
             steps_per_execution=self.steps_per_execution,
         )
-
-        # CRITICAL: Parallelize model BEFORE any weight creation!
-        # This ensures that when _symbolic_build() creates weights, they are
-        # created as sharded DTensors from the start, preventing OOM.
         self._parallelize_if_needed()
 
         # Container that configures and calls callbacks.
