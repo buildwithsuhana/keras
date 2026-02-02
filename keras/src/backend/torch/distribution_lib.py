@@ -348,3 +348,7 @@ def dtensor_to_local(tensor):
     if isinstance(tensor, (list, tuple)):
         return type(tensor)(dtensor_to_local(v) for v in tensor)
     return tensor
+
+
+# Alias for backwards compatibility
+get_dtensor_local = dtensor_to_local
