@@ -1,12 +1,7 @@
 """Unified high-level distribution APIs across backends.
 
-This module provides distribution strategies for data parallelism and model
-parallelism across different backends (JAX, PyTorch, TensorFlow).
-
-Supported backends:
-- JAX: Full support via `jax.sharding`
-- PyTorch: Full support via `torch.distributed._tensor` (DTensor)
-- TensorFlow: Limited support (TF Dataset sharding only)
+Currently only the JAX backend is supported. The TensorFlow backend
+will be supported in the future (via tf.dtensor API).
 """
 
 import collections
@@ -48,77 +43,6 @@ def _get_backend():
 def _is_torch_backend():
     """Check if using PyTorch backend."""
     return _get_backend() == "torch"
-
-
-# Path adapter utilities for converting between Keras and PyTorch naming conventions
-# Keras uses: "dense/kernel" (forward slashes)
-# PyTorch uses: "dense.weight" (dots)
-
-
-def keras_to_pytorch_path(keras_path: str) -> str:
-    """Convert a Keras variable path to PyTorch format.
-
-    Args:
-        keras_path: Path like "dense/kernel" or "my_model/dense_1/bias"
-
-    Returns:
-        PyTorch-style path like "dense.weight" or "my_model.dense_1.bias"
-
-    Example:
-        >>> keras_to_pytorch_path("dense/kernel")
-        'dense.weight'
-        >>> keras_to_pytorch_path("conv2d/bias")
-        'conv2d.bias'
-    """
-    # Replace forward slashes with dots
-    pytorch_path = keras_path.replace('/', '.')
-    return pytorch_path
-
-
-def pytorch_to_keras_path(pytorch_path: str) -> str:
-    """Convert a PyTorch variable path to Keras format.
-
-    Args:
-        pytorch_path: Path like "dense.weight" or "my_model.dense_1.bias"
-
-    Returns:
-        Keras-style path like "dense/kernel" or "my_model/dense_1/bias"
-
-    Example:
-        >>> pytorch_to_keras_path("dense.weight")
-        'dense/kernel'
-        >>> pytorch_to_keras_path("conv2d.bias")
-        'conv2d/bias'
-    """
-    # Replace dots with forward slashes
-    keras_path = pytorch_path.replace('.', '/')
-    return keras_path
-
-
-def convert_path_for_matching(
-    path: str,
-    source_format: str = "keras",
-) -> tuple:
-    """Convert a path to work with regex patterns from the other format.
-
-    This is useful when you have regex patterns in Keras format but need
-    to match against PyTorch paths (and vice versa).
-
-    Args:
-        path: The path to convert
-        source_format: "keras" if path is in Keras format, "pytorch" if in PyTorch
-
-    Returns:
-        Tuple of (keras_path, pytorch_path)
-    """
-    if source_format == "keras":
-        keras_path = path
-        pytorch_path = keras_to_pytorch_path(path)
-    else:
-        pytorch_path = path
-        keras_path = pytorch_to_keras_path(path)
-
-    return keras_path, pytorch_path
 
 
 def _check_path_for_layout_map(
