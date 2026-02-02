@@ -352,3 +352,325 @@ def dtensor_to_local(tensor):
 
 # Alias for backwards compatibility
 get_dtensor_local = dtensor_to_local
+
+
+class _AllGatherWithGradient(torch.autograd.Function):
+    """Custom autograd function for all-gather with proper gradient flow.
+
+    This function performs an all-gather operation that preserves gradient flow.
+    During forward pass, it gathers tensors from all ranks.
+    During backward pass, it scatters gradients back to each rank.
+    """
+
+    @staticmethod
+    def forward(ctx, local_tensor, shard_dim):
+        """Forward pass: all-gather tensors from all ranks.
+
+        Args:
+            local_tensor: The local tensor to gather
+            shard_dim: The dimension along which to gather
+
+        Returns:
+            Concatenated tensor from all ranks
+        """
+        world_size = torch.distributed.get_world_size()
+        rank = torch.distributed.get_rank()
+
+        # Create output tensor for gathered data
+        local_shape = list(local_tensor.shape)
+        output_shape = local_shape.copy()
+        output_shape[shard_dim] = output_shape[shard_dim] * world_size
+
+        # Allocate output tensor
+        output = torch.empty(
+            output_shape, dtype=local_tensor.dtype, device=local_tensor.device
+        )
+
+        # All-gather
+        if hasattr(torch.distributed, "all_gather_into_tensor"):
+            # Use newer API if available
+            torch.distributed.all_gather_into_tensor(
+                output, local_tensor.contiguous()
+            )
+        else:
+            # Fallback to list-based all_gather
+            output_list = [torch.empty_like(local_tensor) for _ in range(world_size)]
+            torch.distributed.all_gather(output_list, local_tensor.contiguous())
+            output = torch.cat(output_list, dim=shard_dim)
+
+        # Save context for backward
+        ctx.shard_dim = shard_dim
+        ctx.world_size = world_size
+        ctx.local_shape = local_shape
+        ctx.local_tensor_requires_grad = local_tensor.requires_grad
+
+        return output
+
+    @staticmethod
+    def backward(ctx, grad_output):
+        """Backward pass: scatter gradients back to each rank.
+
+        Args:
+            grad_output: Gradient from the next layer
+
+        Returns:
+            Gradient for the local tensor
+        """
+        shard_dim = ctx.shard_dim
+        world_size = ctx.world_size
+        local_shape = ctx.local_shape
+        rank = torch.distributed.get_rank()
+
+        # Calculate the slice of grad_output that belongs to this rank
+        shard_size = grad_output.shape[shard_dim] // world_size
+        start_idx = rank * shard_size
+        end_idx = start_idx + shard_size
+
+        # Extract the gradient slice for this rank
+        grad_slices = [slice(None)] * grad_output.dim()
+        grad_slices[shard_dim] = slice(start_idx, end_idx)
+
+        grad_local = grad_output[tuple(grad_slices)]
+
+        # Ensure gradient has the correct shape
+        grad_local = grad_local.contiguous()
+
+        return grad_local, None
+
+
+def _all_gather_with_grad(local_tensor, shard_dim):
+    """Perform all-gather with proper gradient flow.
+
+    Args:
+        local_tensor: The local tensor to gather
+        shard_dim: The dimension along which to gather
+
+    Returns:
+        Concatenated tensor from all ranks with proper gradient tracking
+    """
+    return _AllGatherWithGradient.apply(local_tensor, shard_dim)
+
+
+def _convert_to_dtensor_structure(x, device_mesh):
+    """Convert nested structures to DTensors recursively.
+
+    Args:
+        x: Input structure (can be tensor, tuple, list, dict)
+        device_mesh: DeviceMesh for DTensor conversion
+
+    Returns:
+        Same structure with tensors converted to DTensors
+    """
+    if x is None:
+        return x
+
+    if isinstance(x, DTensor):
+        return x
+
+    if isinstance(x, torch.Tensor):
+        return DTensor.from_local(x, device_mesh, [Replicate()])
+
+    if isinstance(x, dict):
+        return {k: _convert_to_dtensor_structure(v, device_mesh) for k, v in x.items()}
+
+    if isinstance(x, list):
+        return [_convert_to_dtensor_structure(v, device_mesh) for v in x]
+
+    if isinstance(x, tuple):
+        return tuple(_convert_to_dtensor_structure(v, device_mesh) for v in x)
+
+    # For other types, return as-is
+    return x
+
+
+def _convert_dtensor_output_structure(x):
+    """Recursively convert nested DTensor structures with proper all-gather.
+
+    Args:
+        x: Nested structure (dict, list, tuple) potentially containing DTensors
+
+    Returns:
+        Same structure with DTensors converted (sharded ones all-gathered)
+    """
+    if x is None:
+        return x
+
+    if isinstance(x, DTensor):
+        # Check if sharded and handle
+        is_sharded = not all(isinstance(p, Replicate) for p in x.placements)
+        if is_sharded and torch.distributed.is_initialized():
+            # Find shard dimension
+            shard_dim = None
+            for i, placement in enumerate(x.placements):
+                if isinstance(placement, Shard):
+                    shard_dim = i
+                    break
+
+            if shard_dim is not None:
+                local_tensor = x.to_local()
+                if local_tensor.requires_grad:
+                    # Use custom all_gather with gradient support
+                    return _all_gather_with_grad(local_tensor, shard_dim)
+                else:
+                    # For inference mode
+                    world_size = torch.distributed.get_world_size()
+                    output = [
+                        torch.empty_like(local_tensor) for _ in range(world_size)
+                    ]
+                    torch.distributed.all_gather(
+                        output, local_tensor.contiguous()
+                    )
+                    return torch.cat(output, dim=shard_dim)
+        # Not sharded or no distributed, convert to local
+        return x.to_local()
+
+    if isinstance(x, dict):
+        return {k: _convert_dtensor_output_structure(v) for k, v in x.items()}
+
+    if isinstance(x, list):
+        return [_convert_dtensor_output_structure(v) for v in x]
+
+    if isinstance(x, tuple):
+        return tuple(_convert_dtensor_output_structure(v) for v in x)
+
+    # For other types, return as-is
+    return x
+
+
+def prepare_input_for_distribution(x):
+    """Convert inputs to DTensors when model has DTensor weights.
+
+    For ModelParallel training with DTensor weights, inputs must also be
+    DTensors to avoid the "mixed torch.Tensor and DTensor" error.
+
+    Args:
+        x: Input tensor (can be torch.Tensor, DTensor, or nested structure)
+
+    Returns:
+        Same structure, with inputs converted to DTensors if needed
+    """
+    from keras.src.distribution.distribution_lib import (
+        distribution,
+        ModelParallel,
+    )
+
+    # If DTensor not available, return as-is
+    if not DTENSOR_AVAILABLE:
+        return x
+
+    # Check if ModelParallel distribution is active and distributed is initialized
+    dist = distribution()
+    if not isinstance(dist, ModelParallel):
+        return x
+
+    # If distributed is not initialized, no need to convert to DTensor
+    if not torch.distributed.is_initialized():
+        return x
+
+    # Get device mesh
+    device_mesh = _get_default_device_mesh()
+    if device_mesh is None:
+        return x
+
+    # Handle nested structures (tuple, list, dict)
+    return _convert_to_dtensor_structure(x, device_mesh)
+
+
+def prepare_output_for_loss(x):
+    """Convert DTensor outputs to local tensors.
+
+    When model has DTensor weights, the forward pass returns DTensors.
+    For sharded outputs, we need to ALL_GATHER to reconstruct the full tensor.
+    For loss computation, we need the full global shape, not just the local shard.
+
+    Args:
+        x: Output tensor (can be torch.Tensor, DTensor, or nested structure)
+
+    Returns:
+        Same structure, with DTensors converted to local tensors
+    """
+    from keras.src.distribution.distribution_lib import (
+        distribution,
+        ModelParallel,
+    )
+
+    # If DTensor not available, return as-is
+    if not DTENSOR_AVAILABLE:
+        return x
+
+    # Check if ModelParallel distribution is active
+    dist = distribution()
+    if not isinstance(dist, ModelParallel):
+        return x
+
+    # If x is None, return as-is
+    if x is None:
+        return x
+
+    # Check if it's a DTensor
+    if isinstance(x, DTensor):
+        # Check if the DTensor is sharded (has non-Replicate placements)
+        is_sharded = not all(isinstance(p, Replicate) for p in x.placements)
+
+        if is_sharded:
+            # Need to ALL_GATHER to reconstruct the full tensor
+            # This is critical for loss computation to work correctly
+            # Find the shard dimension (the dimension being sharded)
+            shard_dim = None
+            for i, placement in enumerate(x.placements):
+                if isinstance(placement, Shard):
+                    shard_dim = i
+                    break
+
+            if shard_dim is not None and torch.distributed.is_initialized():
+                # Perform all_gather along the shard dimension
+                world_size = torch.distributed.get_world_size()
+
+                # Get local tensor
+                local_tensor = x.to_local()
+
+                # For sharded tensors in training, we need proper gradient handling
+                # Use our custom all_gather that preserves gradients
+                if local_tensor.requires_grad:
+                    # Use custom all_gather with gradient support
+                    full_tensor = _all_gather_with_grad(local_tensor, shard_dim)
+
+                    return full_tensor
+                else:
+                    # For inference mode - no gradients needed
+                    output = [
+                        torch.empty_like(local_tensor) for _ in range(world_size)
+                    ]
+                    torch.distributed.all_gather(output, local_tensor.contiguous())
+                    full_tensor = torch.cat(output, dim=shard_dim)
+                    return full_tensor
+
+        # Not sharded or no distributed, just convert to local
+        return dtensor_to_local(x)
+
+    # For nested structures, check if any element is a DTensor and process recursively
+    if isinstance(x, (dict, list, tuple)):
+        # Check if any element is a sharded DTensor and process recursively
+        has_sharded_dtensor = False
+
+        def check_for_sharded_dtensor(item):
+            if isinstance(item, DTensor):
+                # Check if it's sharded
+                is_sharded = not all(
+                    isinstance(p, Replicate) for p in item.placements
+                )
+                if is_sharded:
+                    return True
+            if isinstance(item, (dict, list, tuple)):
+                for v in item.values() if isinstance(item, dict) else item:
+                    if check_for_sharded_dtensor(v):
+                        return True
+            return False
+
+        has_sharded_dtensor = check_for_sharded_dtensor(x)
+
+        if has_sharded_dtensor:
+            # Process recursively to properly handle all-gather for sharded DTensors
+            return _convert_dtensor_output_structure(x)
+
+    return x
