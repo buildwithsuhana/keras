@@ -142,31 +142,18 @@ class TorchTrainer(base_trainer.Trainer):
         if not DTENSOR_AVAILABLE:
             return x
         
-        # Check if ModelParallel distribution is active
+        # Check if ModelParallel distribution is active and distributed is initialized
         dist = distribution()
         if not isinstance(dist, ModelParallel):
+            return x
+        
+        # If distributed is not initialized, no need to convert to DTensor
+        if not torch.distributed.is_initialized():
             return x
         
         # Get device mesh
         device_mesh = _get_default_device_mesh()
         if device_mesh is None:
-            return x
-        
-        # Check if any weights are DTensors by checking if they have a layout attribute
-        # that indicates DTensor sharding
-        has_dtensor_weights = False
-        for var in self.trainable_weights:
-            if isinstance(var, torch.nn.Parameter):
-                # Check if it's a DTensor Parameter (has _tensor_attrs or similar)
-                if hasattr(var, '_tensor_attrs') or hasattr(var, '_spec'):
-                    has_dtensor_weights = True
-                    break
-                # Also check if the data is a DTensor
-                if hasattr(var, 'data') and isinstance(var.data, DTensor):
-                    has_dtensor_weights = True
-                    break
-        
-        if not has_dtensor_weights:
             return x
         
         # Handle nested structures (tuple, list, dict)
@@ -240,7 +227,7 @@ class TorchTrainer(base_trainer.Trainer):
         if not isinstance(dist, ModelParallel):
             return x
         
-        # If x is not a DTensor, return as-is
+        # If x is None, return as-is
         if x is None:
             return x
         
@@ -259,33 +246,31 @@ class TorchTrainer(base_trainer.Trainer):
                         shard_dim = i
                         break
                 
-                    if shard_dim is not None and torch.distributed.is_initialized():
-                        # Perform all_gather along the shard dimension
-                        world_size = torch.distributed.get_world_size()
+                if shard_dim is not None and torch.distributed.is_initialized():
+                    # Perform all_gather along the shard dimension
+                    world_size = torch.distributed.get_world_size()
+                    
+                    # Get local tensor
+                    local_tensor = x.to_local()
+                    
+                    # For sharded tensors in training, we need proper gradient handling
+                    # Use our custom all_gather that preserves gradients
+                    if local_tensor.requires_grad:
+                        # Use custom all_gather with gradient support
+                        full_tensor = _all_gather_with_grad(local_tensor, shard_dim)
                         
-                        # Get local tensor
-                        local_tensor = x.to_local()
-                        local_shape = list(local_tensor.shape)
-                        global_shape = list(x.shape)
-                        
-                        # For sharded tensors in training, we need proper gradient handling
-                        # Use our custom all_gather that preserves gradients
-                        if local_tensor.requires_grad:
-                            # Use custom all_gather with gradient support
-                            full_tensor = _all_gather_with_grad(local_tensor, shard_dim)
-                            
-                            return full_tensor
-                        else:
-                            # For inference mode - no gradients needed
-                            output = [torch.empty_like(local_tensor) for _ in range(world_size)]
-                            torch.distributed.all_gather(output, local_tensor.contiguous())
-                            full_tensor = torch.cat(output, dim=shard_dim)
-                            return full_tensor
+                        return full_tensor
+                    else:
+                        # For inference mode - no gradients needed
+                        output = [torch.empty_like(local_tensor) for _ in range(world_size)]
+                        torch.distributed.all_gather(output, local_tensor.contiguous())
+                        full_tensor = torch.cat(output, dim=shard_dim)
+                        return full_tensor
             
             # Not sharded or no distributed, just convert to local
             return dtensor_to_local(x)
         
-        # For nested structures, check if any element is a DTensor
+        # For nested structures, check if any element is a DTensor and process recursively
         if isinstance(x, (dict, list, tuple)):
             # Check if any element is a sharded DTensor and process recursively
             has_sharded_dtensor = False
