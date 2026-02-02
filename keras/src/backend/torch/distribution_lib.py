@@ -11,6 +11,7 @@ import numpy as np
 import torch
 
 from keras.src.backend.common import global_state
+from keras.src.backend.torch.core import convert_to_tensor
 
 from torch.distributed._tensor import (
         DTensor,
@@ -347,7 +348,3 @@ def dtensor_to_local(tensor):
     if isinstance(tensor, (list, tuple)):
         return type(tensor)(dtensor_to_local(v) for v in tensor)
     return tensor
-
-
-
-
