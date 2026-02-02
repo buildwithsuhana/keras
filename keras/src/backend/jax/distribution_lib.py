@@ -176,9 +176,6 @@ def initialize_rng():
 
 
 def initialize(job_addresses, num_processes, process_id):
-    # For single-process or local development environments, JAX distributed
-    # initialization may not be needed. We only initialize when proper
-    # multi-process configuration is provided.
     if job_addresses and "," in job_addresses:
         # When user provide all the job addresses, we will split and get the
         # first one, which is the coordinator.
