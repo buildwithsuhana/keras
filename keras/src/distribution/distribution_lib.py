@@ -21,6 +21,11 @@ from keras.src.api_export import keras_export
 from keras.src.backend import KerasTensor
 from keras.src.backend import distribution_lib
 from keras.src.backend.common import global_state
+from keras.src.distribution.path_utils import (
+    keras_to_pytorch_path,
+    pytorch_to_keras_path,
+    convert_path_for_matching,
+)
 
 DEFAULT_BATCH_DIM_NAME = "batch"
 GLOBAL_ATTRIBUTE_NAME = "distribution"
