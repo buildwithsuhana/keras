@@ -14,12 +14,10 @@ import numpy as np
 
 from keras.src.api_export import keras_export
 from keras.src.backend import KerasTensor
+from keras.src.backend import config
+from keras.src.backend import distribution_lib
 from keras.src.backend.common import global_state
-from keras.src.distribution.path_utils import (
-    keras_to_pytorch_path,
-    pytorch_to_keras_path,
-    convert_path_for_matching,
-)
+from keras.src.distribution.path_utils import convert_path_for_matching
 
 DEFAULT_BATCH_DIM_NAME = "batch"
 GLOBAL_ATTRIBUTE_NAME = "distribution"
@@ -60,7 +58,6 @@ def _check_path_for_layout_map(
         The matching TensorLayout or None
     """
     # For non-PyTorch backends, just use the standard lookup
-    from keras.src.backend import config
     if config.backend() != "torch":
         return layout_map[path]
 
@@ -110,8 +107,6 @@ def list_devices(device_type=None):
     Return:
         List of devices that are available for distribute computation.
     """
-    from keras.src.backend import distribution_lib
-
     return distribution_lib.list_devices(device_type)
 
 
@@ -126,8 +121,6 @@ def get_device_count(device_type=None):
     Returns:
         int: The total number of JAX devices for the specified type.
     """
-    from keras.src.backend import distribution_lib
-
     return distribution_lib.get_device_count(device_type=device_type)
 
 
@@ -218,8 +211,6 @@ def initialize(job_addresses=None, num_processes=None, process_id=None):
         num_processes = int(os.environ["KERAS_DISTRIBUTION_NUM_PROCESSES"])
     if process_id is None and "KERAS_DISTRIBUTION_PROCESS_ID" in os.environ:
         process_id = int(os.environ["KERAS_DISTRIBUTION_PROCESS_ID"])
-    from keras.src.backend import distribution_lib
-
     distribution_lib.initialize(job_addresses, num_processes, process_id)
 
 
@@ -294,8 +285,6 @@ class DeviceMesh:
     @property
     def backend_mesh(self):
         if not hasattr(self, "_backend_mesh"):
-            from keras.src.backend import distribution_lib
-
             self._backend_mesh = distribution_lib._to_backend_mesh(self)
         return self._backend_mesh
 
@@ -356,8 +345,6 @@ class TensorLayout:
     @property
     def backend_layout(self):
         if not hasattr(self, "_backend_layout"):
-            from keras.src.backend import distribution_lib
-
             self._backend_layout = distribution_lib._to_backend_layout(self)
         return self._backend_layout
 
@@ -550,13 +537,10 @@ class DataParallel(Distribution):
             self._initialize_mesh_from_list_devices(auto_shard_dataset)
 
         # Those following attributes might get convert to public methods.
-        from keras.src.backend import distribution_lib
-
         self._num_process = distribution_lib.num_processes()
         self._process_id = distribution_lib.process_id()
         self._is_multi_process = self._num_process > 1
 
-        from keras.src.backend import config
         if config.backend() == "torch":
             _ = self.device_mesh.backend_mesh
 
@@ -622,17 +606,15 @@ class DataParallel(Distribution):
             return None
 
         # Handle scalar variables (empty shape tuple () or shape with 0 rank).
-        # Scalar variables (like optimizer iteration counters) are replicated 
+        # Scalar variables (like optimizer iteration counters) are replicated
         # across the mesh and should return an empty axes list.
         if len(variable_shape) == 0:
-            from keras.src.distribution.distribution_lib import TensorLayout
             return TensorLayout([], self.device_mesh)
 
         # Otherwise, create a replicated layout (shard spec of [None, None, ...]).
         # This ensures variables are mirrored across devices rather than sharded.
         variable_shard_spec = [None] * len(variable_shape)
-        
-        from keras.src.distribution.distribution_lib import TensorLayout
+
         return TensorLayout(variable_shard_spec, self.device_mesh)
 
     def get_tensor_layout(self, path):
@@ -787,15 +769,12 @@ class ModelParallel(Distribution):
         self._layout_map = layout_map
 
         # Those following attributes might get convert to public methods.
-        from keras.src.backend import distribution_lib
-
         self._num_process = distribution_lib.num_processes()
         self._process_id = distribution_lib.process_id()
         self._is_multi_process = self._num_process > 1
 
         # For PyTorch backend, ensure the backend mesh is created
         # This is needed for DTensor support
-        from keras.src.backend import config
         if config.backend() == "torch":
             try:
                 # Access the backend_mesh property to trigger creation
@@ -1050,8 +1029,6 @@ def distribute_tensor(tensor, layout):
         # keras tensor is only used for building functional model, and can't be
         # used to alter layout/sharding.
         return tensor
-    from keras.src.backend import distribution_lib
-
     return distribution_lib.distribute_tensor(tensor, layout)
 
 

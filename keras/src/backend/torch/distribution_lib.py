@@ -17,7 +17,7 @@ from torch.distributed._tensor import DTensor, DeviceMesh, Replicate, Shard
 from torch.distributed._tensor.api import distribute_tensor as torch_distribute_tensor
 from torch.distributed.tensor.parallel import parallelize_module, ColwiseParallel, RowwiseParallel
 import torch_xla.core.xla_model as xm
-from keras.src.distribution import distribution_lib as dist_lib
+from keras.src.distribution.distribution_lib import distribution, ModelParallel
 
 
 DTENSOR_AVAILABLE = True
@@ -139,8 +139,7 @@ def distribute_variable(tensor, layout=None, module_name=None):
 
     converted_tensor = convert_to_tensor(tensor)
     is_float_or_complex = converted_tensor.dtype.is_floating_point or converted_tensor.dtype.is_complex
-
-    current_distribution = dist_lib.distribution()
+    current_distribution = distribution()
     if current_distribution is not None:
         device_mesh = _to_backend_mesh(current_distribution.device_mesh)
         if device_mesh is not None:
@@ -379,8 +378,8 @@ def _convert_structure(x, device_mesh=None, to_dtensor=True, gather_sharded=True
 
 def _is_model_parallel_distribution():
     """Check if ModelParallel distribution is active and distributed is initialized."""
-    dist = dist_lib.distribution()
-    return isinstance(dist, dist_lib.ModelParallel) and torch.distributed.is_initialized()
+    dist = distribution()
+    return isinstance(dist, ModelParallel) and torch.distributed.is_initialized()
 
 
 def prepare_input_for_distribution(x):
