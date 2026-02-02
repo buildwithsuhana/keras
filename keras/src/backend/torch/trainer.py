@@ -139,13 +139,11 @@ class TorchTrainer(base_trainer.Trainer):
     def predict_step(self, data):
         x, _, _ = data_adapter_utils.unpack_x_y_sample_weight(data)
         x = distribution_lib.prepare_input_for_distribution(x)
-
         if self._call_has_training_arg:
             y_pred = self(x, training=False)
         else:
             y_pred = self(x)
         y_pred = distribution_lib.prepare_output_for_loss(y_pred)
-
         return y_pred
 
     def make_train_function(self, force=False):
