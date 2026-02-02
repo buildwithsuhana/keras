@@ -16,7 +16,6 @@ we are doing the following to automate device placement if a GPU is available:
 
 from keras.src.backend.common.name_scope import name_scope
 from keras.src.backend.torch import core
-from keras.src.backend.torch import distribution_lib
 from keras.src.backend.torch import image
 from keras.src.backend.torch import linalg
 from keras.src.backend.torch import math
@@ -44,3 +43,4 @@ from keras.src.backend.torch.rnn import cudnn_ok
 from keras.src.backend.torch.rnn import gru
 from keras.src.backend.torch.rnn import lstm
 from keras.src.backend.torch.rnn import rnn
+from keras.src.backend.torch import distribution_lib

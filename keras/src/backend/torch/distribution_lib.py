@@ -12,35 +12,22 @@ import torch
 
 from keras.src.backend.common import global_state
 
-# Try to import DTensor - may not be available in all PyTorch versions
-try:
-    from torch.distributed._tensor import (
+from torch.distributed._tensor import (
         DTensor,
         DeviceMesh,
         Placement,
         Replicate,
         Shard,
     )
-    from torch.distributed._tensor.api import distribute_tensor as torch_distribute_tensor
-    from torch.distributed._tensor import DeviceMesh as TorchDeviceMesh
-    DTENSOR_AVAILABLE = True
-except ImportError:
-    DTENSOR_AVAILABLE = False
-    torch_distribute_tensor = None
-
-# Try to import tensor parallel functions
-try:
-    from torch.distributed.tensor.parallel import (
+from torch.distributed._tensor.api import distribute_tensor as torch_distribute_tensor
+from torch.distributed._tensor import DeviceMesh as TorchDeviceMesh
+DTENSOR_AVAILABLE = True
+from torch.distributed.tensor.parallel import (
         parallelize_module,
         ColwiseParallel,
         RowwiseParallel,
     )
-    TENSOR_PARALLEL_AVAILABLE = True
-except ImportError:
-    TENSOR_PARALLEL_AVAILABLE = False
-    parallelize_module = None
-    ColwiseParallel = None
-    RowwiseParallel = None
+TENSOR_PARALLEL_AVAILABLE = True
 
 # Global state tracking
 _DISTRIBUTION_INITIALIZED = False
@@ -358,8 +345,7 @@ def dtensor_to_local(tensor):
     return tensor
 
 
-# Re-export path conversion utilities from high-level module
-from keras.src.distribution.distribution_lib import (
+from keras.src.distribution.path_utils import (
     keras_to_pytorch_path,
     pytorch_to_keras_path,
     convert_path_for_matching,
