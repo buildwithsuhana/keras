@@ -24,17 +24,6 @@ TORCH_INT_TYPES = (
     torch.int64,
 )
 
-# Import DTensor components for distributed tensor support
-# Use centralized functions from distribution_lib for consistent handling
-from keras.src.backend.torch.distribution_lib import (
-    DTENSOR_AVAILABLE,
-    DTensor,
-    Replicate,
-    is_dtensor,
-    ensure_dtensor,
-    create_replicate_dtensor,
-)
-
 
 def rot90(array, k=1, axes=(0, 1)):
     """Rotate an array by 90 degrees in the specified plane using PyTorch.
@@ -78,14 +67,6 @@ def rot90(array, k=1, axes=(0, 1)):
 def add(x1, x2):
     x1 = convert_to_tensor(x1)
     x2 = convert_to_tensor(x2)
-
-    # Check if either tensor is a DTensor (PyTorch distributed tensor)
-    # If so, the other tensor also needs to be a DTensor for DTensor operations
-    if DTENSOR_AVAILABLE and is_dtensor(x1) and not is_dtensor(x2):
-        x2 = create_replicate_dtensor(x2, device_mesh=x1.device_mesh)
-    elif DTENSOR_AVAILABLE and is_dtensor(x2) and not is_dtensor(x1):
-        x1 = create_replicate_dtensor(x1, device_mesh=x2.device_mesh)
-
     return torch.add(x1, x2)
 
 
@@ -108,14 +89,6 @@ def einsum(subscripts, *operands, **kwargs):
 def subtract(x1, x2):
     x1 = convert_to_tensor(x1)
     x2 = convert_to_tensor(x2)
-
-    # Check if either tensor is a DTensor (PyTorch distributed tensor)
-    # If so, the other tensor also needs to be a DTensor for DTensor operations
-    if DTENSOR_AVAILABLE and is_dtensor(x1) and not is_dtensor(x2):
-        x2 = create_replicate_dtensor(x2, device_mesh=x1.device_mesh)
-    elif DTENSOR_AVAILABLE and is_dtensor(x2) and not is_dtensor(x1):
-        x1 = create_replicate_dtensor(x1, device_mesh=x2.device_mesh)
-
     # TODO: torch.subtract doesn't support bool
     if standardize_dtype(x1.dtype) == "bool":
         x1 = cast(x1, x2.dtype)
@@ -127,13 +100,6 @@ def subtract(x1, x2):
 def matmul(x1, x2):
     x1 = convert_to_tensor(x1)
     x2 = convert_to_tensor(x2)
-
-    # Check if either tensor is a DTensor (PyTorch distributed tensor)
-    # If so, the other tensor also needs to be a DTensor for DTensor operations
-    if DTENSOR_AVAILABLE and is_dtensor(x1) and not is_dtensor(x2):
-        x2 = create_replicate_dtensor(x2, device_mesh=x1.device_mesh)
-    elif DTENSOR_AVAILABLE and is_dtensor(x2) and not is_dtensor(x1):
-        x1 = create_replicate_dtensor(x1, device_mesh=x2.device_mesh)
 
     def can_use_int_matmul(x1, x2):
         # torch._int_mm only accepts the following conditions:
@@ -190,14 +156,6 @@ def matmul(x1, x2):
 def multiply(x1, x2):
     x1 = convert_to_tensor(x1)
     x2 = convert_to_tensor(x2)
-
-    # Check if either tensor is a DTensor (PyTorch distributed tensor)
-    # If so, the other tensor also needs to be a DTensor for DTensor operations
-    if DTENSOR_AVAILABLE and is_dtensor(x1) and not is_dtensor(x2):
-        x2 = create_replicate_dtensor(x2, device_mesh=x1.device_mesh)
-    elif DTENSOR_AVAILABLE and is_dtensor(x2) and not is_dtensor(x1):
-        x1 = create_replicate_dtensor(x1, device_mesh=x2.device_mesh)
-
     return torch.multiply(x1, x2)
 
 
@@ -1330,6 +1288,16 @@ def nanmax(x, axis=None, keepdims=False):
         torch.tensor(float("nan"), dtype=x.dtype, device=get_device()),
         out,
     )
+
+
+def nanmean(x, axis=None, keepdims=False):
+    x = convert_to_tensor(x)
+
+    if axis == () or axis == []:
+        return x
+
+    dtype = dtypes.result_type(standardize_dtype(x.dtype), float)
+    return torch.nanmean(cast(x, dtype), dim=axis, keepdim=keepdims)
 
 
 def nanmin(x, axis=None, keepdims=False):
