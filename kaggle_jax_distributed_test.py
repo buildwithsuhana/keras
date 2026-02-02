@@ -69,7 +69,7 @@ def test_device_detection():
 def test_data_parallel(epochs=3):
     import keras
     from keras import layers
-    from keras.distribution import DataParallel, list_devices
+    from keras.src.distribution import DataParallel, list_devices
     
     log_section("TEST 2: DATA PARALLEL (DP)")
     
@@ -101,7 +101,7 @@ def test_model_parallel():
     import jax
     import keras
     from keras import layers
-    from keras.distribution import ModelParallel, DeviceMesh, LayoutMap, list_devices
+    from keras.src.distribution import ModelParallel, DeviceMesh, LayoutMap, list_devices
     
     log_section("TEST 3: MODEL PARALLEL (MP)")
     
@@ -146,7 +146,7 @@ def test_model_parallel():
 
 def main():
     import keras
-    from keras.distribution import initialize
+    from keras.src.distribution import initialize
     
     # Initialize the distribution system
     initialize()
