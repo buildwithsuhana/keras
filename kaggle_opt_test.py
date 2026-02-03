@@ -1,6 +1,7 @@
 import os
 # Must be set before any other imports
 os.environ["KERAS_BACKEND"] = "torch"
+os.environ["TOKENIZERS_PARALLELISM"] = "false"
 
 import torch
 import torch.distributed as dist
@@ -10,6 +11,7 @@ import numpy as np
 import requests
 from keras.src.distribution import ModelParallel, DeviceMesh, LayoutMap, list_devices, initialize
 
+
 def get_data():
     """Fetch and preprocess Tiny Shakespeare."""
     url = "https://raw.githubusercontent.com/karpathy/char-rnn/master/data/tinyshakespeare/input.txt"
@@ -18,9 +20,38 @@ def get_data():
     # In a real scenario, use a proper KerasHub preprocessor/tokenizer
     return [text[i : i + 128] for i in range(0, len(text) - 128, 128)]
 
+
+def setup_device_for_rank():
+    """Set up the CUDA device for the current rank in multi-process training."""
+    local_rank = os.environ.get("LOCAL_RANK")
+    world_size = os.environ.get("WORLD_SIZE")
+    
+    if local_rank is not None and world_size is not None:
+        local_rank = int(local_rank)
+        world_size = int(world_size)
+        
+        # Check if GPU is available for this rank
+        if torch.cuda.is_available():
+            gpu_count = torch.cuda.device_count()
+            if local_rank < gpu_count:
+                # This rank has a GPU, set it as the active device
+                torch.cuda.set_device(local_rank)
+                print(f"[Rank {local_rank}] Using CUDA device {local_rank}")
+            else:
+                # This rank doesn't have a dedicated GPU
+                print(f"[Rank {local_rank}] No GPU available (only {gpu_count} GPUs for {world_size} processes)")
+        else:
+            print(f"[Rank {local_rank}] No CUDA available, using CPU")
+    
+    return local_rank
+
+
 def run_training():
     # 1. Initialize Distributed Backend
     initialize()
+    
+    # 2. Set up device for this rank (critical for multi-process training!)
+    local_rank = setup_device_for_rank()
     devices = list_devices("gpu")
     num_devices = len(devices)
     
@@ -53,7 +84,8 @@ def run_training():
     # batch_dim_name="data" tells Keras to split the dataset across the 'data' axis
     strategy = ModelParallel(
         layout_map=layout_map,
-        batch_dim_name="data"
+        batch_dim_name="data",
+        auto_shard_dataset=False  # Required for multi-process training with numpy arrays
     )
 
     # 5. Compile & Build Model within Strategy Scope
@@ -85,5 +117,11 @@ def run_training():
         print("\nVerification Generation:")
         print(model.generate("ROMEO: ", max_length=30))
 
+    # 9. Cleanup distributed resources
+    if dist.is_available() and dist.is_initialized():
+        dist.destroy_process_group()
+
+
 if __name__ == "__main__":
     run_training()
+
