@@ -6,22 +6,14 @@ DTensor API for distributed tensor computing.
 
 import os
 
-import numpy as np
 import torch
 
 from keras.src.backend.common import global_state
 from keras.src.backend.torch.core import convert_to_tensor
 
-# DTensor imports
-from torch.distributed._tensor import DTensor, DeviceMesh, Placement, Replicate, Shard
+from torch.distributed._tensor import DTensor, DeviceMesh, Replicate, Shard
 from torch.distributed._tensor.api import distribute_tensor as torch_distribute_tensor
 from torch.distributed.tensor.parallel import parallelize_module, ColwiseParallel, RowwiseParallel
-
-DTENSOR_AVAILABLE = True
-TENSOR_PARALLEL_AVAILABLE = True
-
-# Global state tracking
-_DISTRIBUTION_INITIALIZED = False
 
 
 def list_devices(device_type=None):
@@ -69,9 +61,6 @@ def get_device_count(device_type=None):
 
 def initialize(job_addresses=None, num_processes=None, process_id=None):
     """Initialize the distribution system for multi-process settings."""
-    global _DISTRIBUTION_INITIALIZED
-
-    # Check environment variables
     local_rank = os.environ.get("LOCAL_RANK")
     world_size_env = os.environ.get("WORLD_SIZE")
 
@@ -89,14 +78,12 @@ def initialize(job_addresses=None, num_processes=None, process_id=None):
         if locals()[param] is None:
             locals()[param] = os.environ.get(env_var)
 
-    # Convert string values to proper types
     if isinstance(num_processes, str):
         num_processes = int(num_processes)
     if isinstance(process_id, str):
         process_id = int(process_id)
 
     if not num_processes or num_processes == 1 or torch.distributed.is_initialized():
-        _DISTRIBUTION_INITIALIZED = True
         return
 
     init_method = f"tcp://{job_addresses}" if job_addresses else "env://"
@@ -109,7 +96,6 @@ def initialize(job_addresses=None, num_processes=None, process_id=None):
         world_size=num_processes,
         rank=process_id or 0,
     )
-    _DISTRIBUTION_INITIALIZED = True
 
 
 def num_processes():
@@ -128,34 +114,33 @@ def distribute_tensor(tensor, layout):
         return tensor if not tensor.requires_grad else tensor.requires_grad_(True)
 
     backend_layout = getattr(layout, 'backend_layout', layout)
+    device_mesh = _get_default_device_mesh()
+    if device_mesh is None:
+        return tensor
 
-    if DTENSOR_AVAILABLE:
-        device_mesh = _get_default_device_mesh()
-        if device_mesh is not None:
-            placements = (backend_layout.placements if hasattr(backend_layout, 'placements')
-                         else _axis_names_to_placements(backend_layout, device_mesh) if isinstance(backend_layout, tuple) else None)
-            if placements:
-                return tensor.redistribute(device_mesh, placements) if isinstance(tensor, DTensor) else torch_distribute_tensor(tensor, device_mesh, placements)
+    placements = (backend_layout.placements if hasattr(backend_layout, 'placements')
+                 else _axis_names_to_placements(backend_layout, device_mesh) if isinstance(backend_layout, tuple) else None)
+    if placements:
+        return tensor.redistribute(device_mesh, placements) if isinstance(tensor, DTensor) else torch_distribute_tensor(tensor, device_mesh, placements)
 
     return tensor
 
 
-def distribute_variable(tensor, layout=None, module_name=None):
+def distribute_variable(tensor, layout=None):
     """Distributes a Keras variable using PyTorch DTensor."""
-    from keras.src.distribution.distribution_lib import distribution, TensorLayout
+    from keras.src.distribution.distribution_lib import distribution
 
     converted_tensor = convert_to_tensor(tensor)
     is_float_or_complex = converted_tensor.dtype.is_floating_point or converted_tensor.dtype.is_complex
 
-    if DTENSOR_AVAILABLE:
-        current_distribution = distribution()
-        if current_distribution is not None:
-            device_mesh = _to_backend_mesh(current_distribution.device_mesh)
-            if device_mesh is not None:
-                placements = _layout_to_placements(layout, converted_tensor, device_mesh) if layout else None
-                if placements and any(isinstance(p, Shard) for p in placements):
-                    dtensor = torch_distribute_tensor(converted_tensor, device_mesh, placements)
-                    return torch.nn.Parameter(dtensor) if is_float_or_complex else dtensor
+    current_distribution = distribution()
+    if current_distribution is not None:
+        device_mesh = _to_backend_mesh(current_distribution.device_mesh)
+        if device_mesh is not None:
+            placements = _layout_to_placements(layout, converted_tensor, device_mesh) if layout else None
+            if placements and any(isinstance(p, Shard) for p in placements):
+                dtensor = torch_distribute_tensor(converted_tensor, device_mesh, placements)
+                return torch.nn.Parameter(dtensor) if is_float_or_complex else dtensor
 
     return torch.nn.Parameter(converted_tensor) if is_float_or_complex else converted_tensor
 
@@ -192,9 +177,6 @@ def _axis_names_to_placements(axis_names, device_mesh):
 
 def _to_backend_mesh(device_mesh):
     """Converts a Keras DeviceMesh to a PyTorch DeviceMesh."""
-    if not DTENSOR_AVAILABLE:
-        return None
-
     cache_key = f"torch_mesh_{device_mesh.shape}_{device_mesh.axis_names}"
     cached = global_state.get_global_attribute(cache_key)
     if cached is not None:
@@ -204,7 +186,7 @@ def _to_backend_mesh(device_mesh):
     device_ids = [int(d.split(":")[-1]) if ":" in d else 0 for d in device_mesh.devices.flatten()]
     backend_mesh = DeviceMesh(
         device_type="cuda" if torch.cuda.is_available() else "cpu",
-        mesh=np.array(device_ids).reshape(device_mesh.shape),
+        mesh=torch.tensor(device_ids).reshape(device_mesh.shape),
         mesh_dim_names=device_mesh.axis_names
     )
 
@@ -224,12 +206,9 @@ def _to_backend_layout(tensor_layout):
 
 def parallelize_torch_module(module, device_mesh, layout_map):
     """Parallelize a PyTorch module using tensor parallelism."""
-    if not TENSOR_PARALLEL_AVAILABLE:
-        raise ImportError("PyTorch tensor.parallel is not available")
     if device_mesh is None:
         raise ValueError("device_mesh cannot be None")
 
-    # Convert Keras LayoutMap to PyTorch parallelize plan
     from keras.src.distribution.distribution_lib import LayoutMap
     if isinstance(layout_map, LayoutMap):
         layout_map = create_tp_plan_from_layout_map(module, dict(layout_map))
@@ -239,7 +218,7 @@ def parallelize_torch_module(module, device_mesh, layout_map):
 
 def create_tp_plan_from_layout_map(module, keras_layout_map):
     """Create tensor parallel plan from Keras-style layout map."""
-    if not keras_layout_map or not TENSOR_PARALLEL_AVAILABLE:
+    if not keras_layout_map:
         return {}
 
     styles = {0: RowwiseParallel(), 1: ColwiseParallel()}
@@ -266,7 +245,7 @@ def create_tp_plan_from_layout_map(module, keras_layout_map):
 
 def _to_dtensor(tensor, device_mesh=None, placements=None):
     """Convert a tensor to DTensor if it isn't already."""
-    if not DTENSOR_AVAILABLE or tensor is None or isinstance(tensor, DTensor):
+    if tensor is None or isinstance(tensor, DTensor):
         return tensor
 
     device_mesh = device_mesh or _get_default_device_mesh()
@@ -279,7 +258,7 @@ def _to_dtensor(tensor, device_mesh=None, placements=None):
 
 def is_dtensor(tensor):
     """Check if a tensor is a DTensor."""
-    return DTENSOR_AVAILABLE and isinstance(tensor, DTensor)
+    return isinstance(tensor, DTensor)
 
 
 def dtensor_to_local(tensor):
@@ -296,7 +275,6 @@ def dtensor_to_local(tensor):
     return tensor
 
 
-# Backwards compatibility alias
 get_dtensor_local = dtensor_to_local
 
 
@@ -320,8 +298,6 @@ class _AllGatherWithGradient(torch.autograd.Function):
 
         ctx.shard_dim = shard_dim
         ctx.world_size = world_size
-        ctx.local_shape = list(local_tensor.shape)
-        ctx.local_tensor_requires_grad = local_tensor.requires_grad
         return output
 
     @staticmethod
@@ -342,17 +318,7 @@ def _all_gather_with_grad(local_tensor, shard_dim):
 
 
 def _convert_structure(x, device_mesh=None, to_dtensor=True, gather_sharded=True):
-    """Unified recursive structure converter for DTensor operations.
-
-    Args:
-        x: Input structure (can be tensor, tuple, list, dict)
-        device_mesh: DeviceMesh for DTensor conversion
-        to_dtensor: If True, convert to DTensors; if False, convert from DTensors
-        gather_sharded: If True, all-gather sharded DTensors during conversion
-
-    Returns:
-        Same structure with tensors converted as specified
-    """
+    """Unified recursive structure converter for DTensor operations."""
     if x is None:
         return x
 
@@ -386,9 +352,6 @@ def _convert_structure(x, device_mesh=None, to_dtensor=True, gather_sharded=True
 
 def _is_model_parallel_distribution():
     """Check if ModelParallel distribution is active and distributed is initialized."""
-    if not DTENSOR_AVAILABLE:
-        return False
-
     from keras.src.distribution.distribution_lib import distribution, ModelParallel
     dist = distribution()
     return isinstance(dist, ModelParallel) and torch.distributed.is_initialized()
@@ -396,9 +359,6 @@ def _is_model_parallel_distribution():
 
 def prepare_input_for_distribution(x):
     """Convert inputs to DTensors when model has DTensor weights."""
-    if not DTENSOR_AVAILABLE:
-        return x
-
     device_mesh = _get_default_device_mesh()
     if device_mesh is None or not _is_model_parallel_distribution():
         return x
@@ -408,9 +368,6 @@ def prepare_input_for_distribution(x):
 
 def prepare_output_for_loss(x):
     """Convert DTensor outputs to local tensors."""
-    if not DTENSOR_AVAILABLE:
-        return x
-
     if not _is_model_parallel_distribution():
         return x
 
