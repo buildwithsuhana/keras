@@ -246,7 +246,7 @@ def parallelize_torch_module(module, device_mesh, layout_map):
     if device_mesh is None:
         raise ValueError("device_mesh cannot be None")
 
-    return parallelize_module(module, device_mesh, parallel_plan=layout_map)
+    return parallelize_module(module, device_mesh, parallelize_plan=layout_map)
 
 
 def create_tp_plan_from_layout_map(module, keras_layout_map):
