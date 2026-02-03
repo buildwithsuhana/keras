@@ -25,20 +25,6 @@ DEFAULT_BATCH_DIM_NAME = "batch"
 GLOBAL_ATTRIBUTE_NAME = "distribution"
 
 
-def _check_path_for_layout_map(path, layout_map):
-    """Check a path against a LayoutMap.
-
-    Args:
-        path: The variable path to check
-        layout_map: The LayoutMap to query
-
-    Returns:
-        The matching TensorLayout or None
-    """
-    # For Keras-only backend, use standard lookup
-    return layout_map[path]
-
-
 @keras_export("keras.distribution.list_devices")
 def list_devices(device_type=None):
     """Return all the available devices based on the device type.
@@ -750,8 +736,8 @@ class ModelParallel(Distribution):
         # First check if the variable already has a layout assigned.
         if getattr(variable, "_layout", None) is not None:
             return variable._layout
-        # Check the layout map with path adapter support for PyTorch.
-        variable_layout = _check_path_for_layout_map(variable.path, self._layout_map)
+        # Check the layout map
+        variable_layout = self._layout_map[variable.path]
         if variable_layout is not None:
             return variable_layout
         # Return None if variable shape is not yet known (e.g., uninitialized
@@ -768,8 +754,8 @@ class ModelParallel(Distribution):
         return TensorLayout(variable_shard_spec, self.device_mesh)
 
     def get_tensor_layout(self, path):
-        # Use path adapter support for PyTorch backend
-        return _check_path_for_layout_map(path, self._layout_map)
+        # Check the layout map
+        return self._layout_map[path]
 
     def distribute_dataset(self, dataset):
         if not self._is_multi_process or not self.auto_shard_dataset:
