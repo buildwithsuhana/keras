@@ -5,7 +5,6 @@ DTensor API for distributed tensor computing.
 """
 
 import os
-from typing import List, Optional
 
 import numpy as np
 import torch
@@ -14,21 +13,18 @@ from keras.src.backend.common import global_state
 from keras.src.backend.torch.core import convert_to_tensor
 
 # DTensor imports
-try:
-    from torch.distributed._tensor import DTensor, DeviceMesh, Placement, Replicate, Shard
-    from torch.distributed._tensor.api import distribute_tensor as torch_distribute_tensor
-    from torch.distributed.tensor.parallel import parallelize_module, ColwiseParallel, RowwiseParallel
-    DTENSOR_AVAILABLE = True
-    TENSOR_PARALLEL_AVAILABLE = True
-except ImportError:
-    DTENSOR_AVAILABLE = False
-    TENSOR_PARALLEL_AVAILABLE = False
+from torch.distributed._tensor import DTensor, DeviceMesh, Placement, Replicate, Shard
+from torch.distributed._tensor.api import distribute_tensor as torch_distribute_tensor
+from torch.distributed.tensor.parallel import parallelize_module, ColwiseParallel, RowwiseParallel
+
+DTENSOR_AVAILABLE = True
+TENSOR_PARALLEL_AVAILABLE = True
 
 # Global state tracking
 _DISTRIBUTION_INITIALIZED = False
 
 
-def list_devices(device_type: Optional[str] = None) -> List[str]:
+def list_devices(device_type=None):
     """Return all available devices based on device type."""
     device_type = device_type.lower() if device_type else None
     devices = []
@@ -36,14 +32,11 @@ def list_devices(device_type: Optional[str] = None) -> List[str]:
 
     for dtype in check_types:
         if dtype == 'tpu':
-            try:
-                import torch_xla.core.xla_model as xm
-                tpu_devices = xm.get_xla_supported_devices('tpu')
-                devices.extend([f'tpu:{i}' for i in range(len(tpu_devices))])
-                if device_type == 'tpu':
-                    return devices
-            except ImportError:
-                pass
+            import torch_xla.core.xla_model as xm
+            tpu_devices = xm.get_xla_supported_devices('tpu')
+            devices.extend([f'tpu:{i}' for i in range(len(tpu_devices))])
+            if device_type == 'tpu':
+                return devices
         elif dtype in ('gpu', 'cuda'):
             if torch.cuda.is_available():
                 devices.extend([f'cuda:{i}' for i in range(torch.cuda.device_count())])
@@ -56,16 +49,13 @@ def list_devices(device_type: Optional[str] = None) -> List[str]:
     return [d for d in devices if not d.startswith('cpu:')] or devices if device_type is None else []
 
 
-def get_device_count(device_type: Optional[str] = None) -> int:
+def get_device_count(device_type=None):
     """Returns the number of available devices."""
     device_type = device_type.lower() if device_type else None
 
     if device_type in (None, 'tpu'):
-        try:
-            import torch_xla.core.xla_model as xm
-            return len(xm.get_xla_supported_devices('tpu'))
-        except ImportError:
-            pass
+        import torch_xla.core.xla_model as xm
+        return len(xm.get_xla_supported_devices('tpu'))
 
     if device_type in (None, 'gpu', 'cuda'):
         if torch.cuda.is_available():
@@ -77,11 +67,7 @@ def get_device_count(device_type: Optional[str] = None) -> int:
     return 0
 
 
-def initialize(
-    job_addresses: Optional[str] = None,
-    num_processes: Optional[int] = None,
-    process_id: Optional[int] = None,
-) -> None:
+def initialize(job_addresses=None, num_processes=None, process_id=None):
     """Initialize the distribution system for multi-process settings."""
     global _DISTRIBUTION_INITIALIZED
 
@@ -126,17 +112,17 @@ def initialize(
     _DISTRIBUTION_INITIALIZED = True
 
 
-def num_processes() -> int:
+def num_processes():
     """Return the number of processes for the current distribution setting."""
     return torch.distributed.get_world_size() if torch.distributed.is_initialized() else 1
 
 
-def process_id() -> int:
+def process_id():
     """Return the current process ID for the distribution setting."""
     return torch.distributed.get_rank() if torch.distributed.is_initialized() else 0
 
 
-def distribute_tensor(tensor: torch.Tensor, layout) -> torch.Tensor:
+def distribute_tensor(tensor, layout):
     """Distribute the tensor based on the layout."""
     if layout is None:
         return tensor if not tensor.requires_grad else tensor.requires_grad_(True)
@@ -182,12 +168,9 @@ def _layout_to_placements(layout, tensor, device_mesh):
 
     for i, axis in enumerate(layout):
         if axis is not None:
-            try:
-                mesh_dim = device_mesh.mesh_dim_names.index(axis)
-                tensor_dim = tensor_rank - len(layout) + i if tensor_rank > len(layout) else (0 if tensor_rank == 1 else i)
-                placements.append(Shard(tensor_dim))
-            except ValueError:
-                placements.append(Replicate())
+            mesh_dim = device_mesh.mesh_dim_names.index(axis)
+            tensor_dim = tensor_rank - len(layout) + i if tensor_rank > len(layout) else (0 if tensor_rank == 1 else i)
+            placements.append(Shard(tensor_dim))
         else:
             placements.append(Replicate())
 
@@ -197,7 +180,7 @@ def _layout_to_placements(layout, tensor, device_mesh):
     return placements
 
 
-def _get_default_device_mesh() -> Optional[DeviceMesh]:
+def _get_default_device_mesh():
     """Get the default device mesh from global state."""
     return global_state.get_global_attribute("torch_device_mesh", None)
 
