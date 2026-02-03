@@ -25,8 +25,6 @@ class TorchTrainer(base_trainer.Trainer):
         self.predict_function = None
         self._torch_module_parallelized = False
 
-
-
     def _parallelize_if_needed(self):
         """Parallelize the model if ModelParallel distribution is active.
         
@@ -35,20 +33,10 @@ class TorchTrainer(base_trainer.Trainer):
         """
         if self._torch_module_parallelized:
             return
-        
-        from keras.src.backend.torch.distribution_lib import (
-                parallelize_torch_module,
-                _get_default_device_mesh,
-                TENSOR_PARALLEL_AVAILABLE,
-        )
-        from keras.src.distribution.distribution_lib import (
-                distribution,
-                ModelParallel,
-        )
-        
+        from keras.src.backend.torch.distribution_lib import parallelize_torch_module, _get_default_device_mesh, TENSOR_PARALLEL_AVAILABLE
+        from keras.src.distribution.distribution_lib import distribution,ModelParallel
         if not TENSOR_PARALLEL_AVAILABLE:
             return
-        
         dist = distribution()
         if not isinstance(dist, ModelParallel):
             return
@@ -87,7 +75,6 @@ class TorchTrainer(base_trainer.Trainer):
         x, y, sample_weight = data_adapter_utils.unpack_x_y_sample_weight(data)
         x = distribution_lib.prepare_input_for_distribution(x)
         y = distribution_lib.prepare_input_for_distribution(y)
-
         # Compute predictions
         if self._call_has_training_arg:
             y_pred = self(x, training=True)
@@ -97,7 +84,6 @@ class TorchTrainer(base_trainer.Trainer):
         y_pred = distribution_lib.prepare_output_for_loss(y_pred)
         y = distribution_lib.prepare_output_for_loss(y)
         x = distribution_lib.prepare_output_for_loss(x)
-
         # Call torch.nn.Module.zero_grad() to clear the leftover gradients
         # for the weights from the previous train step.
         self.zero_grad()
@@ -466,7 +452,6 @@ class TorchTrainer(base_trainer.Trainer):
             shuffle=False,
             steps_per_execution=self.steps_per_execution,
         )
-        
         self._parallelize_if_needed()
         # Container that configures and calls callbacks.
         if not isinstance(callbacks, callbacks_module.CallbackList):
