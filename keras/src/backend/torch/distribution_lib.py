@@ -15,6 +15,9 @@ from torch.distributed._tensor import DTensor, DeviceMesh, Replicate, Shard
 from torch.distributed._tensor.api import distribute_tensor as torch_distribute_tensor
 from torch.distributed.tensor.parallel import parallelize_module, ColwiseParallel, RowwiseParallel
 
+# Tensor parallelism is available when these imports succeed
+TENSOR_PARALLEL_AVAILABLE = True
+
 
 def list_devices(device_type=None):
     """Return all available devices based on device type."""
