@@ -452,6 +452,7 @@ class TorchTrainer(base_trainer.Trainer):
             shuffle=False,
             steps_per_execution=self.steps_per_execution,
         )
+
         self._parallelize_if_needed()
         # Container that configures and calls callbacks.
         if not isinstance(callbacks, callbacks_module.CallbackList):
