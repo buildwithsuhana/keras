@@ -21,37 +21,11 @@ def get_data():
     return [text[i : i + 128] for i in range(0, len(text) - 128, 128)]
 
 
-def setup_device_for_rank():
-    """Set up the CUDA device for the current rank in multi-process training."""
-    local_rank = os.environ.get("LOCAL_RANK")
-    world_size = os.environ.get("WORLD_SIZE")
-    
-    if local_rank is not None and world_size is not None:
-        local_rank = int(local_rank)
-        world_size = int(world_size)
-        
-        # Check if GPU is available for this rank
-        if torch.cuda.is_available():
-            gpu_count = torch.cuda.device_count()
-            if local_rank < gpu_count:
-                # This rank has a GPU, set it as the active device
-                torch.cuda.set_device(local_rank)
-                print(f"[Rank {local_rank}] Using CUDA device {local_rank}")
-            else:
-                # This rank doesn't have a dedicated GPU
-                print(f"[Rank {local_rank}] No GPU available (only {gpu_count} GPUs for {world_size} processes)")
-        else:
-            print(f"[Rank {local_rank}] No CUDA available, using CPU")
-    
-    return local_rank
-
-
 def run_training():
     # 1. Initialize Distributed Backend
+    # This now automatically sets torch.cuda.set_device(local_rank) for each rank
     initialize()
     
-    # 2. Set up device for this rank (critical for multi-process training!)
-    local_rank = setup_device_for_rank()
     devices = list_devices("gpu")
     num_devices = len(devices)
     

@@ -15,7 +15,6 @@ from torch.distributed._tensor import DTensor, DeviceMesh, Replicate, Shard
 from torch.distributed._tensor.api import distribute_tensor as torch_distribute_tensor
 from torch.distributed.tensor.parallel import parallelize_module, ColwiseParallel, RowwiseParallel
 
-# Tensor parallelism is available when these imports succeed
 TENSOR_PARALLEL_AVAILABLE = True
 
 
@@ -88,6 +87,10 @@ def initialize(job_addresses=None, num_processes=None, process_id=None):
 
     if not num_processes or num_processes == 1 or torch.distributed.is_initialized():
         return
+
+    # Set the CUDA device for this rank (required for NCCL to work correctly)
+    if torch.cuda.is_available() and local_rank is not None:
+        torch.cuda.set_device(int(local_rank))
 
     init_method = f"tcp://{job_addresses}" if job_addresses else "env://"
     if "," in str(job_addresses):
