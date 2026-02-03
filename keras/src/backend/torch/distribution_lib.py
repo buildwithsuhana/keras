@@ -246,6 +246,11 @@ def parallelize_torch_module(module, device_mesh, layout_map):
     if device_mesh is None:
         raise ValueError("device_mesh cannot be None")
 
+    # Convert Keras LayoutMap to PyTorch parallelize plan
+    from keras.src.distribution.distribution_lib import LayoutMap
+    if isinstance(layout_map, LayoutMap):
+        layout_map = create_tp_plan_from_layout_map(module, dict(layout_map))
+
     return parallelize_module(module, device_mesh, parallelize_plan=layout_map)
 
 
