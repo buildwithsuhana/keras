@@ -67,6 +67,47 @@ def rot90(array, k=1, axes=(0, 1)):
 def add(x1, x2):
     x1 = convert_to_tensor(x1)
     x2 = convert_to_tensor(x2)
+
+    # Handle mixed DTensor and regular tensor operands
+    from keras.src.backend.torch.distribution_lib import (
+        is_dtensor,
+        _get_default_device_mesh,
+        DTensor,
+        Replicate,
+    )
+
+    # Check if we have at least one DTensor
+    x1_is_dtensor = is_dtensor(x1)
+    x2_is_dtensor = is_dtensor(x2)
+    
+    if x1_is_dtensor or x2_is_dtensor:
+        # Get device_mesh from DTensor if available, otherwise from global state
+        if x1_is_dtensor:
+            device_mesh = getattr(x1, 'device_mesh', None)
+            x1_placements = getattr(x1, 'placements', None)
+        elif x2_is_dtensor:
+            device_mesh = getattr(x2, 'device_mesh', None)
+            x2_placements = getattr(x2, 'placements', None)
+        else:
+            device_mesh = None
+        
+        if device_mesh is not None:
+            # Standard case - convert regular tensor to DTensor
+            if x1_is_dtensor and not x2_is_dtensor:
+                placements = x1_placements or [Replicate()]
+                x2 = DTensor.from_local(x2, device_mesh, placements)
+            elif x2_is_dtensor and not x1_is_dtensor:
+                placements = x2_placements or [Replicate()]
+                x1 = DTensor.from_local(x1, device_mesh, placements)
+        else:
+            # device_mesh is None - this can happen during symbolic build
+            # Fallback: extract local tensor from DTensor to avoid mixed tensor errors
+            # This handles the case where is_dtensor might not catch all cases
+            if hasattr(x1, 'to_local'):
+                x1 = x1.to_local()
+            if hasattr(x2, 'to_local'):
+                x2 = x2.to_local()
+
     return torch.add(x1, x2)
 
 
@@ -1658,6 +1699,45 @@ def take(x, indices, axis=None):
     )
     if x.ndim == 2 and axis == 0:
         # This case is equivalent to embedding lookup.
+        # Handle DTensor: when x is DTensor, we need to ensure indices is also
+        # DTensor or handle the embedding lookup properly.
+        from keras.src.backend.torch.distribution_lib import (
+            is_dtensor,
+            _get_default_device_mesh,
+            DTensor,
+            Replicate,
+        )
+
+        x_is_dtensor = is_dtensor(x)
+        indices_is_dtensor = is_dtensor(indices)
+        
+        if x_is_dtensor or indices_is_dtensor:
+            # Get device_mesh from DTensor if available
+            if x_is_dtensor:
+                device_mesh = getattr(x, 'device_mesh', None)
+                x_placements = getattr(x, 'placements', None)
+            elif indices_is_dtensor:
+                device_mesh = getattr(indices, 'device_mesh', None)
+                indices_placements = getattr(indices, 'placements', None)
+            else:
+                device_mesh = _get_default_device_mesh()
+            
+            if device_mesh is not None:
+                # Convert regular tensor to DTensor to match the other operand
+                if x_is_dtensor and not indices_is_dtensor:
+                    placements = x_placements or [Replicate()]
+                    indices = DTensor.from_local(indices, device_mesh, placements)
+                elif indices_is_dtensor and not x_is_dtensor:
+                    placements = indices_placements or [Replicate()]
+                    x = DTensor.from_local(x, device_mesh, placements)
+            else:
+                # device_mesh is None - this can happen during symbolic build
+                # Extract local tensor from DTensor to avoid mixed tensor errors
+                if x_is_dtensor:
+                    x = x.to_local()
+                if indices_is_dtensor:
+                    indices = indices.to_local()
+        
         return torch.nn.functional.embedding(indices, x)
     if axis is None:
         x = torch.reshape(x, (-1,))

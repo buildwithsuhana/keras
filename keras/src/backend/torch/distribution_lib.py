@@ -210,6 +210,59 @@ def _to_backend_layout(tensor_layout):
     return tensor_layout.axes
 
 
+def _get_tp_mesh_from_2d_mesh(device_mesh):
+    """Extract 1D tensor parallel mesh from 2D DeviceMesh.
+
+    PyTorch's parallelize_module API only accepts a 1D DeviceMesh.
+    When we have a 2D mesh with shape (batch, model), we need to
+    extract the "model" axis for tensor parallel operations.
+
+    Args:
+        device_mesh: A DeviceMesh instance (can be 1D or 2D)
+
+    Returns:
+        A 1D DeviceMesh suitable for tensor parallelism
+    """
+    if device_mesh.mesh.ndim == 1:
+        return device_mesh
+
+    # For 2D mesh, find the 'model' axis and extract it
+    mesh_dim_names = device_mesh.mesh_dim_names
+    if 'model' in mesh_dim_names:
+        model_dim = mesh_dim_names.index('model')
+        # Extract the model axis mesh
+        # Create indices to select only the model dimension
+        indices = [slice(None)] * device_mesh.mesh.ndim
+        indices[model_dim] = slice(None)  # Select all indices along model axis
+        model_mesh_tensor = device_mesh.mesh[tuple(indices)]
+
+        # Handle the case where the mesh tensor might be 2D even for single index
+        if model_mesh_tensor.ndim > 1:
+            # Flatten if needed
+            model_mesh_tensor = model_mesh_tensor.reshape(-1)
+
+        tp_mesh = DeviceMesh(
+            device_type=device_mesh.device_type,
+            mesh=model_mesh_tensor,
+            mesh_dim_names=['model']
+        )
+        return tp_mesh
+
+    # Fallback: use the last dimension
+    last_dim = device_mesh.mesh.ndim - 1
+    indices = [slice(None)] * device_mesh.mesh.ndim
+    indices[last_dim] = slice(None)
+    last_mesh_tensor = device_mesh.mesh[tuple(indices)]
+    if last_mesh_tensor.ndim > 1:
+        last_mesh_tensor = last_mesh_tensor.reshape(-1)
+
+    return DeviceMesh(
+        device_type=device_mesh.device_type,
+        mesh=last_mesh_tensor,
+        mesh_dim_names=[mesh_dim_names[last_dim]]
+    )
+
+
 def parallelize_torch_module(module, device_mesh, layout_map):
     """Parallelize a PyTorch module using tensor parallelism."""
     if device_mesh is None:
@@ -218,6 +271,12 @@ def parallelize_torch_module(module, device_mesh, layout_map):
     from keras.src.distribution.distribution_lib import LayoutMap
     if isinstance(layout_map, LayoutMap):
         layout_map = create_tp_plan_from_layout_map(module, dict(layout_map))
+
+    # PyTorch's parallelize_module only accepts a 1D DeviceMesh
+    # For 2D meshes, we need to extract the tensor parallel dimension
+    if hasattr(device_mesh, 'mesh') and device_mesh.mesh.ndim > 1:
+        tp_mesh = _get_tp_mesh_from_2d_mesh(device_mesh)
+        return parallelize_module(module, tp_mesh, parallelize_plan=layout_map)
 
     return parallelize_module(module, device_mesh, parallelize_plan=layout_map)
 
