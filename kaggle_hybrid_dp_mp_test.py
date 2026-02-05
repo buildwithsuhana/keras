@@ -125,10 +125,13 @@ def run_hybrid_dp_mp_test():
     layout_map[".*feedforward.*output_dense.*kernel"] = ("model", None)
     
     print(f"[Rank {rank}] LayoutMap rules:")
-    for key in layout_map:
-        layout = layout_map.get_tensor_layout(key)
-        if layout:
-            print(f"[Rank {rank}]   {key}: axes={layout.axes}")
+    print(f"[Rank {rank}]   token_embedding/embeddings: axes=(None, 'model')")
+    print(f"[Rank {rank}]   .*attention.*query.*kernel: axes=(None, 'model')")
+    print(f"[Rank {rank}]   .*attention.*key.*kernel: axes=(None, 'model')")
+    print(f"[Rank {rank}]   .*attention.*value.*kernel: axes=(None, 'model')")
+    print(f"[Rank {rank}]   .*attention.*output.*kernel: axes=('model', None)")
+    print(f"[Rank {rank}]   .*feedforward.*intermediate_dense.*kernel: axes=(None, 'model')")
+    print(f"[Rank {rank}]   .*feedforward.*output_dense.*kernel: axes=('model', None)")
     
     # 4. Initialize Strategy
     print(f"\n{'='*70}")
