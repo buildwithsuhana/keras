@@ -150,8 +150,12 @@ class Variable(KerasVariable):
                 if tensor_layout is not None:
                     layout = getattr(tensor_layout, 'backend_layout', tensor_layout)
         
+        # Distribute if we have a layout OR an active mesh
+        # When layout is None but mesh exists, use Replicate (empty tuple)
         if layout is not None or active_mesh is not None:
-            return distribution_lib.distribute_variable(tensor, layout)
+            # If layout is None but mesh exists, pass empty tuple for replicate
+            actual_layout = layout if layout is not None else ()
+            return distribution_lib.distribute_variable(tensor, actual_layout)
         
         # Only wrap as Parameter if the tensor dtype supports gradients.
         # PyTorch only supports gradients for floating point and complex dtypes.
