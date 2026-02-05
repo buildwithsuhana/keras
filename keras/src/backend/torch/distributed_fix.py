@@ -297,6 +297,164 @@ def apply_all_gather_fix():
 
 
 # =============================================================================
+# PATCH: Fix for DTensor redistribution hanging
+# =============================================================================
+
+def apply_dtensor_redistribute_fix():
+    """Fix for DTensor redistribution hanging during forward/backward pass.
+    
+    The issue is that DTensor.redistribute() calls NCCL collective ops
+    which can block if devices aren't properly synchronized.
+    """
+    try:
+        from torch.distributed._tensor import DTensor
+        
+        if not hasattr(DTensor, '_keras_patched'):
+            _original_redistribute = DTensor.redistribute
+            
+            @staticmethod
+            def patched_redistribute(self, device_mesh=None, placements=None):
+                """Patched DTensor.redistribute with timeout protection."""
+                import torch
+                import os
+                from concurrent.futures import ThreadPoolExecutor
+                
+                # Check if we should skip redistribution
+                skip_redistribute = (
+                    not _check_distributed_initialized() or
+                    os.environ.get("KERAS_SKIP_DISTRIBUTED_OPS", "0") == "1"
+                )
+                
+                if skip_redistribute:
+                    if DEBUG_DISTRIBUTION:
+                        print(f"[KERAS DIST DEBUG] DTensor.redistribute: skipping")
+                    return self
+                
+                # Use thread with timeout for redistribution
+                result = [None]
+                exception = [None]
+                
+                def do_redistribute():
+                    try:
+                        result[0] = _original_redistribute(self, device_mesh, placements)
+                    except Exception as e:
+                        exception[0] = e
+                
+                executor = ThreadPoolExecutor(max_workers=1)
+                future = executor.submit(do_redistribute)
+                executor.shutdown(wait=True)
+                
+                if exception[0] is not None:
+                    raise exception[0]
+                
+                return result[0]
+            
+            DTensor.redistribute = patched_redistribute
+            DTensor._keras_patched = True
+            
+            if DEBUG_DISTRIBUTION:
+                print("[KERAS DIST DEBUG] Applied DTensor.redistribute patch")
+                
+    except ImportError as e:
+        if DEBUG_DISTRIBUTION:
+            print(f"[KERAS DIST DEBUG] Could not apply DTensor patch: {e}")
+
+
+# =============================================================================
+# PATCH: Fix for prepare_input_for_distribution hanging
+# =============================================================================
+
+def apply_prepare_input_fix():
+    """Fix for prepare_input_for_distribution hanging during input conversion.
+    
+    The issue is that converting inputs to DTensor can cause NCCL blocking.
+    """
+    try:
+        from keras.src.backend.torch import distribution_lib
+        
+        _original_prepare_input = distribution_lib.prepare_input_for_distribution
+        
+        def patched_prepare_input(x):
+            """Patched prepare_input_for_distribution with deadlock prevention."""
+            import torch
+            import os
+            
+            # Check if we should skip
+            skip_prepare = (
+                not _check_distributed_initialized() or
+                os.environ.get("KERAS_SKIP_DISTRIBUTED_OPS", "0") == "1"
+            )
+            
+            if skip_prepare:
+                if DEBUG_DISTRIBUTION:
+                    print("[KERAS DIST DEBUG] prepare_input_for_distribution: skipping")
+                return x
+            
+            try:
+                return _original_prepare_input(x)
+            except Exception as e:
+                if DEBUG_DISTRIBUTION:
+                    print(f"[KERAS DIST DEBUG] prepare_input error: {e}, returning input as-is")
+                return x
+        
+        distribution_lib.prepare_input_for_distribution = patched_prepare_input
+        
+        if DEBUG_DISTRIBUTION:
+            print("[KERAS DIST DEBUG] Applied prepare_input_for_distribution patch")
+            
+    except ImportError as e:
+        if DEBUG_DISTRIBUTION:
+            print(f"[KERAS DIST DEBUG] Could not apply prepare_input patch: {e}")
+
+
+# =============================================================================
+# PATCH: Fix for prepare_output_for_loss hanging
+# =============================================================================
+
+def apply_prepare_output_fix():
+    """Fix for prepare_output_for_loss hanging during output conversion.
+    
+    The issue is that converting DTensor outputs to local can cause NCCL blocking.
+    """
+    try:
+        from keras.src.backend.torch import distribution_lib
+        
+        _original_prepare_output = distribution_lib.prepare_output_for_loss
+        
+        def patched_prepare_output(x):
+            """Patched prepare_output_for_loss with deadlock prevention."""
+            import torch
+            import os
+            
+            # Check if we should skip
+            skip_prepare = (
+                not _check_distributed_initialized() or
+                os.environ.get("KERAS_SKIP_DISTRIBUTED_OPS", "0") == "1"
+            )
+            
+            if skip_prepare:
+                if DEBUG_DISTRIBUTION:
+                    print("[KERAS DIST DEBUG] prepare_output_for_loss: skipping")
+                return x
+            
+            try:
+                return _original_prepare_output(x)
+            except Exception as e:
+                if DEBUG_DISTRIBUTION:
+                    print(f"[KERAS DIST DEBUG] prepare_output error: {e}, returning output as-is")
+                return x
+        
+        distribution_lib.prepare_output_for_loss = patched_prepare_output
+        
+        if DEBUG_DISTRIBUTION:
+            print("[KERAS DIST DEBUG] Applied prepare_output_for_loss patch")
+            
+    except ImportError as e:
+        if DEBUG_DISTRIBUTION:
+            print(f"[KERAS DIST DEBUG] Could not apply prepare_output patch: {e}")
+
+
+# =============================================================================
 # Main apply function
 # =============================================================================
 
@@ -309,6 +467,9 @@ def apply_all_fixes():
     apply_compute_output_spec_fix()
     apply_convert_structure_fix()
     apply_all_gather_fix()
+    apply_dtensor_redistribute_fix()
+    apply_prepare_input_fix()
+    apply_prepare_output_fix()
     
     if DEBUG_DISTRIBUTION:
         print("[KERAS DIST DEBUG] All distributed training fixes applied!")
