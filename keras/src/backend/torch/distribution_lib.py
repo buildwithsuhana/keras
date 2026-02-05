@@ -198,68 +198,43 @@ def distribute_variable(tensor, layout=None):
 def _layout_to_placements(layout, tensor, device_mesh):
     """Convert Keras layout tuple to DTensor placements.
     
-    IMPORTANT: Handles the case where layout has more dimensions than the mesh.
-    In multi-process DTensor, each process has a 1D mesh with only local devices.
-    We map the layout axes to the available mesh dimensions.
+    IMPORTANT: PyTorch DTensor requires placements to have the same length
+    as device_mesh.ndim, NOT the layout length or tensor rank.
     
     For model parallelism with 1D mesh (shape=(2,)):
-    - layout (None, 'model') should shard on dim 1 (output_dim)
-    - We map 'model' to the single mesh dimension
+    - layout (None, 'model') should produce ONE placement: [Shard(0)]
+    - layout () should produce ONE placement: [Replicate()]
     
-    CRITICAL: Placements list length MUST match tensor rank, not mesh ndim.
-    PyTorch DTensor uses the placement list to determine sharding for each
-    tensor dimension. If placements is shorter than tensor rank, it will
-    incorrectly interpret the sharding dimension.
+    We map the 'model' axis to the single mesh dimension (index 0).
     """
-    placements = []
     tensor_rank = tensor.dim()
     mesh_ndim = device_mesh.mesh.ndim
-    mesh_dim_names = device_mesh.mesh_dim_names
     
-    # For 1D mesh, we can only have one mesh dimension
-    # But we still need placements for ALL tensor dimensions
+    # For 1D mesh, return exactly 1 placement
     if mesh_ndim == 1:
-        # 1D mesh case: map 'model' axis to the single mesh dimension
-        # But keep placements for ALL tensor dimensions
+        # Look for 'model' axis in the layout
         for i, axis in enumerate(layout):
             if axis == 'model':
-                # Shard on this tensor dimension using the single mesh dim
-                tensor_dim = tensor_rank - len(layout) + i if tensor_rank > len(layout) else i
-                placements.append(Shard(tensor_dim))
-            elif axis is None:
-                # Replicate this dimension
-                placements.append(Replicate())
-            else:
-                # Other axis names (shouldn't happen in 1D mesh but handle anyway)
-                placements.append(Replicate())
-        
-        # Ensure we have placements for ALL tensor dimensions
-        # Pad with Replicate() if layout has fewer dimensions than tensor
-        while len(placements) < tensor_rank:
-            placements.append(Replicate())
+                # Found 'model' axis - shard on mesh dim 0
+                return [Shard(0)]
+        # No 'model' axis found - replicate
+        return [Replicate()]
     else:
         # Multi-dimensional mesh case
-        for i, axis in enumerate(layout):
-            if i < mesh_ndim:
-                # Map layout axis to mesh dimension
-                if axis is not None:
-                    mesh_dim = mesh_dim_names.index(axis)
-                    tensor_dim = tensor_rank - len(layout) + i if tensor_rank > len(layout) else (0 if tensor_rank == 1 else i)
-                    placements.append(Shard(tensor_dim))
+        # Return exactly mesh_ndim placements
+        placements = []
+        for i in range(mesh_ndim):
+            if i < len(layout):
+                axis = layout[i]
+                if axis is None:
+                    placements.append(Replicate())
+                elif axis == 'model':
+                    placements.append(Shard(i))
                 else:
                     placements.append(Replicate())
             else:
-                # Extra layout dimensions beyond mesh - replicate
                 placements.append(Replicate())
-        
-        # Ensure we have placements for ALL tensor dimensions
-        while len(placements) < tensor_rank:
-            placements.append(Replicate())
-        
-        # Truncate only if we somehow have more than tensor_rank
-        placements = placements[:tensor_rank]
-    
-    return placements
+        return placements
 
 
 def _get_default_device_mesh():
@@ -268,8 +243,42 @@ def _get_default_device_mesh():
 
 
 def _axis_names_to_placements(axis_names, device_mesh):
-    """Convert axis names to DTensor placements."""
-    return [Replicate() if axis is None else Shard(device_mesh.mesh_dim_names.index(axis)) for axis in axis_names]
+    """Convert axis names to DTensor placements.
+    
+    IMPORTANT: PyTorch DTensor requires placements to have the same length
+    as device_mesh.ndim, NOT the length of axis_names.
+    
+    For a 1D mesh (mesh.ndim == 1), we return only ONE placement:
+    - If 'model' axis is in axis_names, return [Shard(0)] to shard on that mesh dim
+    - Otherwise return [Replicate()]
+    
+    For multi-dimensional meshes, we return mesh_ndim placements.
+    """
+    mesh_ndim = device_mesh.mesh.ndim
+    mesh_dim_names = device_mesh.mesh_dim_names
+    
+    # For 1D mesh, return exactly 1 placement
+    if mesh_ndim == 1:
+        # Check if the single mesh dimension ('model') is in the axis names
+        if 'model' in axis_names:
+            return [Shard(0)]
+        return [Replicate()]
+    else:
+        # Multi-dimensional mesh case
+        # Return exactly mesh_ndim placements
+        placements = []
+        for i in range(mesh_ndim):
+            if i < len(axis_names):
+                axis = axis_names[i]
+                if axis is None:
+                    placements.append(Replicate())
+                elif axis in mesh_dim_names:
+                    placements.append(Shard(mesh_dim_names.index(axis)))
+                else:
+                    placements.append(Replicate())
+            else:
+                placements.append(Replicate())
+        return placements
 
 
 def _to_backend_mesh(device_mesh):

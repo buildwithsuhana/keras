@@ -1,102 +1,193 @@
 #!/usr/bin/env python3
-"""Test to verify the DTensor sharding fix works correctly."""
+"""
+Test script to verify DTensor sharding fix.
+
+This tests that the _axis_names_to_placements and _layout_to_placements
+functions correctly return placements matching device_mesh.ndim.
+"""
 
 import os
+# Must be set before any other imports
 os.environ["KERAS_BACKEND"] = "torch"
 
 import torch
-from torch.distributed._tensor import DTensor, DeviceMesh, Replicate, Shard
+from torch.distributed._tensor import DeviceMesh, Replicate, Shard
 
-# Test the _layout_to_placements function logic
-def test_layout_to_placements():
-    """Test that layout_to_placements returns correct placements for 2D tensor with 1D mesh."""
+# Import the fixed functions directly
+import sys
+sys.path.insert(0, '/Users/suhanaaa/keras')
+
+from keras.src.backend.torch.distribution_lib import (
+    _axis_names_to_placements,
+    _layout_to_placements,
+    _to_backend_mesh
+)
+from keras.src.distribution import DeviceMesh as KerasDeviceMesh
+
+
+def test_axis_names_to_placements_1d():
+    """Test _axis_names_to_placements with 1D mesh."""
+    print("Test 1: _axis_names_to_placements with 1D mesh")
     
-    # Simulate what happens in _layout_to_placements
-    # For 1D mesh with shape (2,), tensor shape (64, 256), layout (None, 'model')
+    # Create a 1D DeviceMesh
+    mesh_tensor = torch.tensor([0, 1], dtype=torch.int64)
+    device_mesh = DeviceMesh(
+        device_type="cuda",
+        mesh=mesh_tensor,
+        mesh_dim_names=["model"]
+    )
     
-    tensor_rank = 2  # (64, 256) is 2D
-    mesh_ndim = 1
+    # Test with 'model' axis
+    placements = _axis_names_to_placements(('model',), device_mesh)
+    print(f"  axis_names=('model',): {placements}")
+    assert len(placements) == device_mesh.mesh.ndim == 1, \
+        f"Expected 1 placement, got {len(placements)}"
+    assert isinstance(placements[0], Shard), \
+        f"Expected Shard placement, got {placements[0]}"
+    
+    # Test with None axis
+    placements = _axis_names_to_placements((None,), device_mesh)
+    print(f"  axis_names=(None,): {placements}")
+    assert len(placements) == 1
+    assert isinstance(placements[0], Replicate)
+    
+    # Test with empty tuple
+    placements = _axis_names_to_placements((), device_mesh)
+    print(f"  axis_names=(): {placements}")
+    assert len(placements) == 1
+    assert isinstance(placements[0], Replicate)
+    
+    print("  ✓ PASSED\n")
+
+
+def test_layout_to_placements_1d():
+    """Test _layout_to_placements with 1D mesh."""
+    print("Test 2: _layout_to_placements with 1D mesh")
+    
+    # Create a 1D DeviceMesh
+    mesh_tensor = torch.tensor([0, 1], dtype=torch.int64)
+    device_mesh = DeviceMesh(
+        device_type="cuda",
+        mesh=mesh_tensor,
+        mesh_dim_names=["model"]
+    )
+    
+    # Create a sample tensor (e.g., weight matrix)
+    tensor = torch.randn(256, 512)  # 2D tensor
+    
+    # Test with (None, 'model') layout - should shard on dim 1
     layout = (None, 'model')
+    placements = _layout_to_placements(layout, tensor, device_mesh)
+    print(f"  layout=(None, 'model'), tensor shape={tensor.shape}: {placements}")
+    assert len(placements) == device_mesh.mesh.ndim == 1, \
+        f"Expected 1 placement, got {len(placements)}"
+    assert isinstance(placements[0], Shard), \
+        f"Expected Shard placement, got {placements[0]}"
     
-    placements = []
+    # Test with () layout - should replicate
+    layout = ()
+    placements = _layout_to_placements(layout, tensor, device_mesh)
+    print(f"  layout=(), tensor shape={tensor.shape}: {placements}")
+    assert len(placements) == 1
+    assert isinstance(placements[0], Replicate)
     
-    # 1D mesh case: map 'model' axis to the single mesh dimension
-    # But keep placements for ALL tensor dimensions
-    for i, axis in enumerate(layout):
-        if axis == 'model':
-            # Shard on this tensor dimension using the single mesh dim
-            tensor_dim = tensor_rank - len(layout) + i if tensor_rank > len(layout) else i
-            placements.append(Shard(tensor_dim))
-        elif axis is None:
-            # Replicate this dimension
-            placements.append(Replicate())
-        else:
-            # Other axis names
-            placements.append(Replicate())
-    
-    # Ensure we have placements for ALL tensor dimensions
-    # Pad with Replicate() if layout has fewer dimensions than tensor
-    while len(placements) < tensor_rank:
-        placements.append(Replicate())
-    
-    print(f"Layout: {layout}")
-    print(f"Tensor rank: {tensor_rank}")
-    print(f"Placements: {placements}")
-    
-    # Verify
-    assert len(placements) == tensor_rank, f"Expected {tensor_rank} placements, got {len(placements)}"
-    assert isinstance(placements[0], Replicate), f"Dim 0 should be Replicate, got {placements[0]}"
-    assert isinstance(placements[1], Shard), f"Dim 1 should be Shard, got {placements[1]}"
-    assert placements[1].dim == 1, f"Shard dim should be 1, got {placements[1].dim}"
-    
-    print("✓ Test passed! Placements are correct:")
-    print(f"  - Dim 0 (input_dim=64): Replicate")
-    print(f"  - Dim 1 (output_dim=256): Shard on dim 1")
+    print("  ✓ PASSED\n")
 
 
-def test_old_broken_logic():
-    """Show why the old logic was broken."""
+def test_to_backend_mesh():
+    """Test _to_backend_mesh with Keras DeviceMesh."""
+    print("Test 3: _to_backend_mesh with Keras DeviceMesh")
     
-    tensor_rank = 2  # (64, 256) is 2D
-    mesh_ndim = 1
-    layout = (None, 'model')
+    # Create Keras DeviceMesh
+    keras_mesh = KerasDeviceMesh(
+        shape=(2,),
+        axis_names=["model"],
+        devices=["cuda:0", "cuda:1"]
+    )
     
-    # OLD BROKEN LOGIC
-    placements_old = []
-    for i, axis in enumerate(layout):
-        if axis == 'model':
-            tensor_dim = tensor_rank - len(layout) + i if tensor_rank > len(layout) else i
-            placements_old.append(Shard(tensor_dim))
-            break
-    else:
-        placements_old.append(Replicate())
+    # Convert to PyTorch DeviceMesh
+    torch_mesh = _to_backend_mesh(keras_mesh)
+    print(f"  Keras mesh shape: {keras_mesh.shape}")
+    print(f"  Torch mesh shape: {torch_mesh.mesh.shape}")
+    print(f"  Torch mesh ndim: {torch_mesh.mesh.ndim}")
     
-    # Old logic truncated to mesh_ndim
-    placements_old = placements_old[:mesh_ndim]
+    assert torch_mesh.mesh.ndim == 1, \
+        f"Expected 1D mesh, got ndim={torch_mesh.mesh.ndim}"
     
-    print(f"\nOLD BROKEN LOGIC:")
-    print(f"Layout: {layout}")
-    print(f"Tensor rank: {tensor_rank}")
-    print(f"Placements: {placements_old}")
-    print(f"Length: {len(placements_old)}")
+    print("  ✓ PASSED\n")
+
+
+def test_end_to_end():
+    """Test end-to-end sharding with the test script's setup."""
+    print("Test 4: End-to-end sharding test")
     
-    # This was broken - only 1 placement for a 2D tensor!
-    assert len(placements_old) == 1, "Old logic incorrectly had only 1 placement"
-    print("  ✗ Old logic only had 1 placement (WRONG!)")
-    print("    - When PyTorch tried to compute global shape, it saw:")
-    print("    - Shard(dim=1) on a list with only 1 element")
-    print("    - This caused: 'Sharding dim 1 greater than tensor ndim 1'")
+    # Setup similar to kaggle_hybrid_dp_mp_actual_sharding.py
+    from keras.src.distribution import DeviceMesh, LayoutMap, ModelParallel, initialize
+    from keras.src.backend.torch import distribution_lib
+    
+    initialize()
+    
+    devices = ["cuda:0", "cuda:1"]
+    mesh = DeviceMesh(
+        shape=(len(devices),),
+        axis_names=["model"],
+        devices=devices
+    )
+    
+    layout_map = LayoutMap(mesh)
+    layout_map[".*dense.*kernel"] = (None, "model")  # Shard on dim 1
+    layout_map[".*dense.*bias"] = ()  # Replicate
+    
+    strategy = ModelParallel(
+        layout_map=layout_map,
+        batch_dim_name="data",
+        auto_shard_dataset=False
+    )
+    
+    with strategy.scope():
+        # Create a simple tensor with the layout
+        tensor = torch.randn(256, 512)  # Simulating Dense kernel
+        placements = _layout_to_placements((None, 'model'), tensor, _to_backend_mesh(mesh))
+        print(f"  Kernel tensor shape: {tensor.shape}")
+        print(f"  Placements for (None, 'model'): {placements}")
+        
+        assert len(placements) == 1, \
+            f"Expected 1 placement for 1D mesh, got {len(placements)}"
+        
+        # Test bias tensor (should replicate)
+        bias = torch.randn(512)
+        placements_bias = _layout_to_placements((), bias, _to_backend_mesh(mesh))
+        print(f"  Bias tensor shape: {bias.shape}")
+        print(f"  Placements for (): {placements_bias}")
+        
+        assert len(placements_bias) == 1
+    
+    print("  ✓ PASSED\n")
 
 
 if __name__ == "__main__":
-    print("=" * 70)
-    print("Testing DTensor Sharding Fix")
-    print("=" * 70)
+    print("=" * 60)
+    print("DTensor Sharding Fix Verification Tests")
+    print("=" * 60)
+    print()
     
-    test_layout_to_placements()
-    test_old_broken_logic()
-    
-    print("\n" + "=" * 70)
-    print("All tests passed! The fix is correct.")
-    print("=" * 70)
+    try:
+        test_axis_names_to_placements_1d()
+        test_layout_to_placements_1d()
+        test_to_backend_mesh()
+        test_end_to_end()
+        
+        print("=" * 60)
+        print("ALL TESTS PASSED!")
+        print("=" * 60)
+    except AssertionError as e:
+        print(f"\n❌ TEST FAILED: {e}")
+        import traceback
+        traceback.print_exc()
+        sys.exit(1)
+    except Exception as e:
+        print(f"\n❌ ERROR: {e}")
+        import traceback
+        traceback.print_exc()
+        sys.exit(1)
 
