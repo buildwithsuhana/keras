@@ -29,10 +29,11 @@ def _make_torch_param(value):
         if DEBUG_LAYER:
             print(f"[DEBUG _make_torch_param] value.dtype={value.dtype}, is_float_or_complex={is_float_or_complex}")
         if is_float_or_complex:
-            requires_grad = getattr(value, 'requires_grad', True)
+            # Always set requires_grad=True for float/complex tensors
+            # since these are the dtypes that can be trained parameters
             if DEBUG_LAYER:
-                print(f"[DEBUG _make_torch_param] Creating Parameter with requires_grad={requires_grad}")
-            return torch.nn.Parameter(value, requires_grad=requires_grad)
+                print(f"[DEBUG _make_torch_param] Creating Parameter with requires_grad=True")
+            return torch.nn.Parameter(value, requires_grad=True)
     if DEBUG_LAYER:
         print(f"[DEBUG _make_torch_param] Returning value as-is (non-floating dtype)")
     return value
