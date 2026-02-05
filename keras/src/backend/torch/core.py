@@ -142,6 +142,21 @@ class Variable(KerasVariable):
         layout = self._layout
         active_mesh = distribution_lib._get_default_device_mesh()
         
+        # Debug logging
+        debug_mode = os.environ.get("KERAS_DISTRIBUTION_DEBUG", "0") == "1"
+        if debug_mode:
+            rank = 0
+            try:
+                import torch.distributed as dist
+                if dist.is_available() and dist.is_initialized():
+                    rank = dist.get_rank()
+            except:
+                pass
+            print(f"DEBUG | [Rank {rank}] _distribute_parameter() for variable")
+            print(f"DEBUG | [Rank {rank}]   - variable.path: {getattr(self, 'path', 'N/A')}")
+            print(f"DEBUG | [Rank {rank}]   - self._layout: {self._layout}")
+            print(f"DEBUG | [Rank {rank}]   - active_mesh: {active_mesh}")
+        
         if layout is None and active_mesh is not None:
             from keras.src.distribution import distribution
             dist = distribution()
@@ -149,13 +164,21 @@ class Variable(KerasVariable):
                 tensor_layout = dist.get_variable_layout(self)
                 if tensor_layout is not None:
                     layout = getattr(tensor_layout, 'backend_layout', tensor_layout)
+                    if debug_mode:
+                        print(f"DEBUG | [Rank {rank}]   - tensor_layout from distribution: {tensor_layout}")
+                        print(f"DEBUG | [Rank {rank}]   - converted layout: {layout}")
         
         # Distribute if we have a layout OR an active mesh
         # When layout is None but mesh exists, use Replicate (empty tuple)
         if layout is not None or active_mesh is not None:
             # If layout is None but mesh exists, pass empty tuple for replicate
             actual_layout = layout if layout is not None else ()
+            if debug_mode:
+                print(f"DEBUG | [Rank {rank}]   - actual_layout: {actual_layout}")
             return distribution_lib.distribute_variable(tensor, actual_layout)
+        
+        if debug_mode:
+            print(f"DEBUG | [Rank {rank}]   - No distribution, returning as-is")
         
         # Only wrap as Parameter if the tensor dtype supports gradients.
         # PyTorch only supports gradients for floating point and complex dtypes.
