@@ -240,10 +240,11 @@ def _axis_names_to_placements(axis_names, device_mesh):
 def _to_backend_mesh(device_mesh):
     """Converts a Keras DeviceMesh to a PyTorch DeviceMesh.
     
-    IMPORTANT: PyTorch's DeviceMesh requires the mesh tensor to be on CPU.
-    The device_type specifies which devices the mesh represents, but the mesh
-    tensor itself must be a CPU tensor.
+    IMPORTANT: For multi-process setups, each process can only see its local GPU.
+    We use init_device_mesh which properly handles this case.
     """
+    from torch.distributed.device_mesh import init_device_mesh
+    
     cache_key = f"torch_mesh_{device_mesh.shape}_{device_mesh.axis_names}"
     cached = global_state.get_global_attribute(cache_key)
     if cached is not None:
@@ -258,26 +259,26 @@ def _to_backend_mesh(device_mesh):
             # Ensure we use the correct CUDA device for this process
             torch.cuda.set_device(local_rank)
 
-    # Parse device IDs from Keras DeviceMesh
-    # For multi-process, each process has its own local device
-    device_ids = []
-    for d in device_mesh.devices.flatten():
-        if ":" in d:
-            # Extract device number and adjust for local rank
-            device_num = int(d.split(":")[-1])
-            # Use local rank-adjusted device
-            adjusted_device = local_rank if torch.distributed.is_initialized() else device_num
-            device_ids.append(adjusted_device)
-        else:
-            device_ids.append(local_rank if torch.distributed.is_initialized() else 0)
-
-    # Create backend DeviceMesh with proper device type
-    device_type = "cuda" if torch.cuda.is_available() else "cpu"
+    # For multi-process setups, use init_device_mesh
+    if torch.distributed.is_initialized():
+        world_size = torch.distributed.get_world_size()
+        if world_size > 1:
+            # Each process has its own local GPU
+            # Create a 1D mesh for the model parallelism dimension
+            if torch.cuda.is_available():
+                backend_mesh = init_device_mesh(
+                    device_type="cuda",
+                    mesh_shape=(world_size,),
+                    mesh_dim_names=["model"]
+                )
+                global_state.set_global_attribute(cache_key, backend_mesh)
+                global_state.set_global_attribute("torch_device_mesh", backend_mesh)
+                return backend_mesh
     
-    # IMPORTANT: mesh tensor must be on CPU for PyTorch DeviceMesh
-    # The device_type specifies the device mesh represents, not where mesh tensor lives
+    # For single-process, create DeviceMesh with all GPUs
+    device_type = "cuda" if torch.cuda.is_available() else "cpu"
+    device_ids = [int(d.split(":")[-1]) if ":" in d else 0 for d in device_mesh.devices.flatten()]
     mesh_tensor = torch.tensor(device_ids, dtype=torch.int64).reshape(device_mesh.shape)
-    # Keep mesh tensor on CPU (this is required by PyTorch)
     
     backend_mesh = DeviceMesh(
         device_type=device_type,
