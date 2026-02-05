@@ -38,7 +38,8 @@ def run_simple_dp_test():
 
     # 3. No sharding - just replicate the model
     layout_map = LayoutMap(mesh)
-    layout_map[".*"] = None  # Replicate (no sharding)
+    from keras.src.backend.torch.distribution_lib import Replicate
+    layout_map[".*"] = Replicate()  # Replicate (no sharding)
     
     # 4. Initialize Strategy
     strategy = ModelParallel(
