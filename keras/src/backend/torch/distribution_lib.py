@@ -516,7 +516,15 @@ def _convert_structure(x, device_mesh=None, to_dtensor=True, gather_sharded=True
         return x
 
     if isinstance(x, torch.Tensor):
-        return DTensor.from_local(x, device_mesh, [Replicate()]) if to_dtensor else x
+        if to_dtensor:
+            # For model parallelism, inputs need to be replicated across model dim
+            # to match the sharded kernel dimensions
+            if device_mesh is not None:
+                # Check if we have a model parallel distribution
+                if _is_model_parallel_distribution():
+                    # Inputs should be replicated across model dimension
+                    return DTensor.from_local(x, device_mesh, [Replicate()])
+        return x
 
     if isinstance(x, dict):
         return {k: _convert_structure(v, device_mesh, to_dtensor, gather_sharded) for k, v in x.items()}
@@ -535,7 +543,11 @@ def _is_model_parallel_distribution():
 
 
 def prepare_input_for_distribution(x):
-    """Convert inputs to DTensors when model has DTensor weights."""
+    """Convert inputs to DTensors when model has DTensor weights.
+    
+    For model parallelism with sharded weights, inputs need to be replicated
+    across the model dimension to match the sharded kernel dimensions.
+    """
     device_mesh = _get_default_device_mesh()
     if device_mesh is None or not _is_model_parallel_distribution():
         return x

@@ -2,12 +2,8 @@
 """
 Hybrid Data Parallel + Model Parallel Test with ACTUAL sharding verification
 
-This test verifies that:
-1. DTensor handling works correctly (FIXED)
-2. Model parallelism sharding is applied when configured
-
-Key insight: Keras ModelParallel creates DTensors only when sharding is applied.
-Replicated weights (layout=()) remain as regular tensors.
+This test verifies that model parallelism sharding is working by checking that
+weights are actually sharded across GPUs.
 """
 
 import os
@@ -55,7 +51,6 @@ def run_hybrid_dp_mp_test():
     layout_map = LayoutMap(mesh)
     
     # Shard kernels on dim 1 (output_dim) - each GPU gets half
-    # This requires output_dim to be divisible by world_size
     layout_map[".*dense.*kernel"] = (None, "model")  # Shard on dim 1
     
     # Biases must be replicated (they broadcast to output)
@@ -88,20 +83,6 @@ def run_hybrid_dp_mp_test():
         
         print(f"[Rank {local_rank}] ✓ Model built")
         
-        # Check variable paths and layouts
-        print(f"\n[Rank {local_rank}] Variable paths:")
-        for v in model.variables:
-            print(f"  - {v.path}")
-        
-        # Check what layout is assigned
-        print(f"\n[Rank {local_rank}] Checking layouts:")
-        from keras.src.distribution.distribution_lib import distribution
-        current_dist = distribution()
-        if current_dist:
-            for v in model.variables:
-                layout = current_dist.get_variable_layout(v)
-                print(f"  {v.path}: {layout}")
-        
         model.compile(
             optimizer=keras.optimizers.Adam(learning_rate=1e-3),
             loss='mse',
@@ -120,29 +101,18 @@ def run_hybrid_dp_mp_test():
     try:
         print(f"[Rank {local_rank}] Input shape: {x.shape}")
         
+        # CRITICAL: Convert inputs to DTensors for model parallelism
+        x_tensor = torch.from_numpy(x).cuda()
+        x_dtensor = distribution_lib.prepare_input_for_distribution(x_tensor)
+        print(f"[Rank {local_rank}] Input converted to DTensor: {type(x_dtensor)}")
+        
         # Forward pass
-        outputs = model(x, training=False)
+        outputs = model(x_dtensor, training=False)
         
         print(f"[Rank {local_rank}] ✓ Forward pass successful!")
         print(f"Output shape: {outputs.shape}")
         
-        # Training test
-        print(f"\n{'='*70}")
-        print(f"TEST: TRAINING")
-        print(f"{'='*70}")
-        
-        history = model.fit(x, y, epochs=3, verbose=1, batch_size=batch_size)
-        
-        print(f"\n[Rank {local_rank}] ✓ Training successful!")
-        print(f"Final loss: {history.history['loss'][-1]:.6f}")
-        
-        # Verify training worked
-        initial_loss = history.history['loss'][0]
-        final_loss = history.history['loss'][-1]
-        improvement = (initial_loss - final_loss) / initial_loss * 100
-        print(f"Loss improvement: {improvement:.1f}%")
-        
-        # Check if model parallel is working
+        # Check if weights are sharded
         print(f"\n{'='*70}")
         print(f"MODEL PARALLEL VERIFICATION")
         print(f"{'='*70}")
@@ -182,10 +152,26 @@ def run_hybrid_dp_mp_test():
             print(f"\n[Rank {local_rank}] ✓ Model parallelism IS active!")
         else:
             print(f"\n[Rank {local_rank}] Note: Weights are not sharded.")
-            print(f"  This could be because:")
-            print(f"  1. Layout patterns don't match variable paths")
-            print(f"  2. ModelParallel uses a different sharding mechanism")
-            print(f"  3. For this test, Data Parallel is working correctly")
+        
+        # Training test
+        print(f"\n{'='*70}")
+        print(f"TEST: TRAINING")
+        print(f"{'='*70}")
+        
+        # Convert training data too
+        y_tensor = torch.from_numpy(y).cuda()
+        y_dtensor = distribution_lib.prepare_input_for_distribution(y_tensor)
+        
+        history = model.fit(x_dtensor, y_dtensor, epochs=3, verbose=1, batch_size=batch_size)
+        
+        print(f"\n[Rank {local_rank}] ✓ Training successful!")
+        print(f"Final loss: {history.history['loss'][-1]:.6f}")
+        
+        # Verify training worked
+        initial_loss = history.history['loss'][0]
+        final_loss = history.history['loss'][-1]
+        improvement = (initial_loss - final_loss) / initial_loss * 100
+        print(f"Loss improvement: {improvement:.1f}%")
         
     except Exception as e:
         print(f"[Rank {local_rank}] ✗ Test failed: {e}")
