@@ -95,7 +95,8 @@ def run_hybrid_dp_mp_test():
         if isinstance(token_ids_raw, (list, tuple)):
             token_ids = {
                 "token_ids": token_ids_raw[0],
-                "padding_mask": token_ids_raw[1]  # BERT uses "padding_mask"
+                "padding_mask": token_ids_raw[1],
+                "segment_ids": token_ids_raw[2] if len(token_ids_raw) > 2 else None  # BERT needs segment_ids
             }
         else:
             token_ids = token_ids_raw
@@ -104,7 +105,8 @@ def run_hybrid_dp_mp_test():
         import torch
         token_ids_torch = {
             "token_ids": torch.as_tensor(token_ids["token_ids"]).cuda(),
-            "padding_mask": torch.as_tensor(token_ids["padding_mask"]).cuda()
+            "padding_mask": torch.as_tensor(token_ids["padding_mask"]).cuda(),
+            "segment_ids": torch.as_tensor(token_ids["segment_ids"]).cuda() if token_ids["segment_ids"] is not None else None
         }
         
         print(f"Rank {rank}: Token IDs shape: {token_ids_torch['token_ids'].shape}")
