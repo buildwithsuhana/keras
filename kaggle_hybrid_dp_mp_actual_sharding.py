@@ -100,7 +100,7 @@ def run_hybrid_dp_mp_test():
         
         print(f"\n[Rank {local_rank}] Verifying sharding:")
         for layer in model.layers:
-            if hasattr(layer, 'kernel') and hasattr(layer, 'kernel', 'value'):
+            if hasattr(layer, 'kernel') and hasattr(layer.kernel, 'value'):
                 kernel_var = layer.kernel
                 if hasattr(kernel_var, 'value'):
                     kernel_tensor = kernel_var.value
