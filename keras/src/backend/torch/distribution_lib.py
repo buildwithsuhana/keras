@@ -201,31 +201,50 @@ def _layout_to_placements(layout, tensor, device_mesh):
     IMPORTANT: Handles the case where layout has more dimensions than the mesh.
     In multi-process DTensor, each process has a 1D mesh with only local devices.
     We map the layout axes to the available mesh dimensions.
+    
+    For model parallelism with 1D mesh (shape=(2,)):
+    - layout (None, 'model') should shard on dim 1 (output_dim)
+    - We map 'model' to the single mesh dimension
     """
     placements = []
     tensor_rank = tensor.dim()
     mesh_ndim = device_mesh.mesh.ndim
+    mesh_dim_names = device_mesh.mesh_dim_names
     
-    for i, axis in enumerate(layout):
-        if i < mesh_ndim:
-            # Map layout axis to mesh dimension
-            if axis is not None:
-                mesh_dim = device_mesh.mesh_dim_names.index(axis)
-                tensor_dim = tensor_rank - len(layout) + i if tensor_rank > len(layout) else (0 if tensor_rank == 1 else i)
+    # For 1D mesh, we can only have one placement
+    # If layout has 'model' axis, we should shard on that tensor dimension
+    if mesh_ndim == 1 and len(layout) > 1:
+        # 1D mesh case: map 'model' axis to the single mesh dimension
+        for i, axis in enumerate(layout):
+            if axis == 'model':
+                # Shard on this tensor dimension using the single mesh dim
+                tensor_dim = tensor_rank - len(layout) + i if tensor_rank > len(layout) else i
                 placements.append(Shard(tensor_dim))
-            else:
-                placements.append(Replicate())
+                break
         else:
-            # Extra layout dimensions beyond mesh - replicate
+            # No 'model' axis found, use Replicate
             placements.append(Replicate())
-    
-    # Ensure we have exactly mesh_ndim placements
-    while len(placements) < mesh_ndim:
-        placements.append(Replicate())
-    
-    # If we have more placements than mesh dimensions, truncate
-    # This handles multi-process where each process has a 1D mesh
-    placements = placements[:mesh_ndim]
+    else:
+        # Multi-dimensional mesh case
+        for i, axis in enumerate(layout):
+            if i < mesh_ndim:
+                # Map layout axis to mesh dimension
+                if axis is not None:
+                    mesh_dim = mesh_dim_names.index(axis)
+                    tensor_dim = tensor_rank - len(layout) + i if tensor_rank > len(layout) else (0 if tensor_rank == 1 else i)
+                    placements.append(Shard(tensor_dim))
+                else:
+                    placements.append(Replicate())
+            else:
+                # Extra layout dimensions beyond mesh - replicate
+                placements.append(Replicate())
+        
+        # Ensure we have exactly mesh_ndim placements
+        while len(placements) < mesh_ndim:
+            placements.append(Replicate())
+        
+        # If we have more placements than mesh dimensions, truncate
+        placements = placements[:mesh_ndim]
     
     return placements
 

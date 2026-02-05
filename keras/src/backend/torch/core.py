@@ -157,19 +157,33 @@ class Variable(KerasVariable):
             print(f"DEBUG | [Rank {rank}]   - self._layout: {self._layout}")
             print(f"DEBUG | [Rank {rank}]   - active_mesh: {active_mesh}")
         
+        # If layout is not set but we have an active mesh, get layout from distribution
         if layout is None and active_mesh is not None:
             from keras.src.distribution import distribution
             dist = distribution()
             if dist is not None:
                 tensor_layout = dist.get_variable_layout(self)
                 if tensor_layout is not None:
-                    layout = getattr(tensor_layout, 'backend_layout', tensor_layout)
+                    # Extract layout - check for TensorLayout object
+                    if hasattr(tensor_layout, 'axes'):
+                        layout = tensor_layout.axes
+                    elif hasattr(tensor_layout, 'backend_layout'):
+                        backend_layout = tensor_layout.backend_layout
+                        # backend_layout could be a tuple or a ShardingSpec
+                        if hasattr(backend_layout, 'placements'):
+                            # It's a ShardingSpec, need to convert
+                            layout = backend_layout
+                        elif isinstance(backend_layout, tuple):
+                            layout = backend_layout
+                        else:
+                            layout = backend_layout
+                    else:
+                        layout = tensor_layout
                     if debug_mode:
-                        print(f"DEBUG | [Rank {rank}]   - tensor_layout from distribution: {tensor_layout}")
-                        print(f"DEBUG | [Rank {rank}]   - converted layout: {layout}")
+                        print(f"DEBUG | [Rank {rank}]   - tensor_layout: {tensor_layout}")
+                        print(f"DEBUG | [Rank {rank}]   - extracted layout: {layout}")
         
         # Distribute if we have a layout OR an active mesh
-        # When layout is None but mesh exists, use Replicate (empty tuple)
         if layout is not None or active_mesh is not None:
             # If layout is None but mesh exists, pass empty tuple for replicate
             actual_layout = layout if layout is not None else ()
