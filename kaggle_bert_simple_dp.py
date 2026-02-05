@@ -1,4 +1,4 @@
-"""Simple test for non-floating dtype fix with BERT using pure Data Parallel (faster)"""
+"""Simple test for BERT distributed training with Data Parallel (no sharding)"""
 
 import os
 # Must be set before any other imports
@@ -27,18 +27,25 @@ def run_simple_dp_test():
         print(f"Detected {num_devices} GPU(s). Need at least 2 for distributed demo.")
         return
 
-    print(f"Rank {rank}: {num_devices} GPUs available")
+    print(f"\n{'='*70}")
+    print(f"TEST: PURE DATA PARALLEL")
+    print(f"{'='*70}")
+    print(f"[Rank {rank}] {num_devices} GPUs available")
     
-    # 2. Use 1D Device Mesh for pure Data Parallel (no model sharding)
+    # 2. Use 1D Device Mesh for pure Data Parallel
+    print(f"\n[Rank {rank}] Setting up DeviceMesh for Data Parallel...")
+    
     mesh = DeviceMesh(
         shape=(num_devices,),
         axis_names=["data"],
         devices=devices
     )
 
-    # 3. No sharding - just replicate the model (empty tuple = replicate)
+    # 3. No sharding - just replicate (empty tuple = replicate)
     layout_map = LayoutMap(mesh)
-    layout_map[".*"] = ()  # Empty tuple = Replicate (no sharding)
+    layout_map[".*"] = ()  # Replicate all weights
+    
+    print(f"[Rank {rank}] Layout: Replicate (no sharding)")
     
     # 4. Initialize Strategy
     strategy = ModelParallel(
@@ -48,6 +55,8 @@ def run_simple_dp_test():
     )
 
     # 5. Build model
+    print(f"\n[Rank {rank}] Loading BERT-tiny model...")
+    
     with strategy.scope():
         model = keras_hub.models.BertTextClassifier.from_preset(
             "bert_tiny_en_uncased",
@@ -60,18 +69,27 @@ def run_simple_dp_test():
             metrics=['accuracy']
         )
 
-    # 6. Generate small batch
-    batch_size = 2  # Small batch
-    texts = ["This is a sample text"] * (batch_size * num_devices)
-    labels = np.array([0, 1] * (batch_size))
+    # 6. Generate small batch - each rank gets different data
+    batch_size = 2
+    texts = ["This is a sample text for testing"] * (batch_size * num_devices)
+    labels = np.array([0, 1] * (batch_size * num_devices))
     
-    print(f"Rank {rank}: Starting training...")
-    print(f"Rank {rank}: Using pure Data Parallel (replicated model)")
+    # Each rank processes its own subset
+    rank_texts = texts[rank::num_devices]
+    rank_labels = labels[rank::num_devices]
     
-    # 7. Training
+    print(f"\n[Rank {rank}] Dataset info:")
+    print(f"[Rank {rank}]   - Total samples: {len(texts)}")
+    print(f"[Rank {rank}]   - Samples per rank: {len(rank_texts)}")
+    
+    # 7. Training - each rank trains independently
+    print(f"\n[Rank {rank}] Starting training...")
+    print(f"[Rank {rank}]   Epochs: 1")
+    print(f"[Rank {rank}]   Local batch size: {batch_size}")
+    
     model.fit(
-        texts,
-        labels,
+        rank_texts,
+        rank_labels,
         epochs=1,
         batch_size=batch_size,
         verbose=1 if rank == 0 else 0
