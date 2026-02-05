@@ -68,8 +68,9 @@ def run_bert_distributed_test():
     batch_size = 16
     seq_length = 32  # Short sequences for quick testing
     
-    # Create dummy text data
+    # Create dummy text data with labels (sparse categorical labels)
     texts = ["This is a sample text for testing"] * (batch_size * 4)
+    labels = np.array([0, 1] * ((batch_size * 4) // 2))  # Binary labels
     
     # 7. Start Training
     print(f"Rank {dist.get_rank()}: Starting BERT-tiny distributed training...")
@@ -77,6 +78,7 @@ def run_bert_distributed_test():
     
     model.fit(
         texts,
+        labels,  # Pass labels as numpy array
         epochs=1,  # Just 1 epoch for quick test
         batch_size=batch_size,
         verbose=1 if dist.get_rank() == 0 else 0
