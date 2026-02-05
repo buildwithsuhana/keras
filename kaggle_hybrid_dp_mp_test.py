@@ -4,6 +4,8 @@ import os
 # Must be set before any other imports
 os.environ["KERAS_BACKEND"] = "torch"
 os.environ["TOKENIZERS_PARALLELISM"] = "false"
+os.environ["NCCL_DEBUG"] = "INFO"  # Enable NCCL debugging
+os.environ["NCCL_TIMEOUT"] = "1800000"  # 30 minute timeout
 
 import torch
 import torch.distributed as dist
@@ -11,6 +13,16 @@ import keras
 import keras_hub
 import numpy as np
 from keras.src.distribution import ModelParallel, DeviceMesh, LayoutMap, list_devices, initialize
+
+# Apply distributed fixes BEFORE importing keras
+# This patches common deadlock issues
+try:
+    from keras.src.backend.torch import distributed_fix
+    distributed_fix.DEBUG_DISTRIBUTION = True  # Enable debug output
+    distributed_fix.apply_all_fixes()
+    print("Applied distributed training fixes")
+except Exception as e:
+    print(f"Could not apply distributed fixes: {e}")
 
 
 def run_hybrid_dp_mp_test():
