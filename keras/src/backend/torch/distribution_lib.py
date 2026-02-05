@@ -193,22 +193,37 @@ def distribute_variable(tensor, layout=None):
 
 
 def _layout_to_placements(layout, tensor, device_mesh):
-    """Convert Keras layout tuple to DTensor placements."""
+    """Convert Keras layout tuple to DTensor placements.
+    
+    IMPORTANT: Handles the case where layout has more dimensions than the mesh.
+    In multi-process DTensor, each process has a 1D mesh with only local devices.
+    We map the layout axes to the available mesh dimensions.
+    """
     placements = []
     tensor_rank = tensor.dim()
-    mesh_ndim = len(device_mesh.mesh_dim_names)
-
+    mesh_ndim = device_mesh.mesh.ndim
+    
     for i, axis in enumerate(layout):
-        if axis is not None:
-            mesh_dim = device_mesh.mesh_dim_names.index(axis)
-            tensor_dim = tensor_rank - len(layout) + i if tensor_rank > len(layout) else (0 if tensor_rank == 1 else i)
-            placements.append(Shard(tensor_dim))
+        if i < mesh_ndim:
+            # Map layout axis to mesh dimension
+            if axis is not None:
+                mesh_dim = device_mesh.mesh_dim_names.index(axis)
+                tensor_dim = tensor_rank - len(layout) + i if tensor_rank > len(layout) else (0 if tensor_rank == 1 else i)
+                placements.append(Shard(tensor_dim))
+            else:
+                placements.append(Replicate())
         else:
+            # Extra layout dimensions beyond mesh - replicate
             placements.append(Replicate())
-
+    
+    # Ensure we have exactly mesh_ndim placements
     while len(placements) < mesh_ndim:
         placements.append(Replicate())
-
+    
+    # If we have more placements than mesh dimensions, truncate
+    # This handles multi-process where each process has a 1D mesh
+    placements = placements[:mesh_ndim]
+    
     return placements
 
 
