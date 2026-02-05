@@ -86,12 +86,20 @@ def run_hybrid_dp_mp_test():
     print(f"Rank {rank}: Running forward pass...")
     
     # Run one forward pass manually to check for device issues
-    # The issue is often in how keras handles data conversion
     try:
-        # Tokenize
-        tokenizer = model.preprocessor.tokenizer
-        token_ids = tokenizer(texts)
+        # Tokenize - keras_hub tokenizer returns a tuple/list
+        token_ids_raw = model.preprocessor.tokenizer(texts)
+        print(f"Rank {rank}: Tokenizer output type: {type(token_ids_raw)}")
         
+        # Convert to dict if it's a tuple
+        if isinstance(token_ids_raw, (list, tuple)):
+            token_ids = {
+                "token_ids": token_ids_raw[0],
+                "attention_mask": token_ids_raw[1]
+            }
+        else:
+            token_ids = token_ids_raw
+            
         print(f"Rank {rank}: Token IDs device: {token_ids['token_ids'].device}")
         
         # Forward pass
