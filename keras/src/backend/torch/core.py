@@ -153,7 +153,15 @@ class Variable(KerasVariable):
         if layout is not None or active_mesh is not None:
             return distribution_lib.distribute_variable(tensor, layout)
         
-        return torch.nn.Parameter(tensor, requires_grad=self.trainable).to(get_device())
+        # Only wrap as Parameter if the tensor dtype supports gradients.
+        # PyTorch only supports gradients for floating point and complex dtypes.
+        if hasattr(tensor, 'dtype') and (
+            tensor.dtype.is_floating_point or tensor.dtype.is_complex
+        ):
+            return torch.nn.Parameter(tensor, requires_grad=self.trainable).to(get_device())
+        else:
+            # For non-floating point dtypes (e.g., int32), return as-is
+            return tensor.to(get_device())
 
     def _direct_assign(self, value):
         with torch.no_grad():
