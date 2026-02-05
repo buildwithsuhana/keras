@@ -706,10 +706,10 @@ def slice(inputs, start_indices, shape):
     shape = convert_to_tensor(shape).to(shape_dtype)
 
     python_slice = __builtins__["slice"]
-    slices = [
+    slices = tuple(
         python_slice(start_index, start_index + length)
         for start_index, length in zip(start_indices, shape)
-    ]
+    )
     return inputs[slices]
 
 

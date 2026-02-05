@@ -113,6 +113,37 @@ def add(x1, x2):
 
 def einsum(subscripts, *operands, **kwargs):
     operands = [convert_to_tensor(operand) for operand in operands]
+
+    # Handle mixed DTensor and regular tensor operands
+    from keras.src.backend.torch.distribution_lib import (
+        is_dtensor,
+        _get_default_device_mesh,
+        DTensor,
+        Replicate,
+    )
+
+    # Check if we have at least one DTensor
+    operands_is_dtensor = [is_dtensor(op) for op in operands]
+    if any(operands_is_dtensor):
+        # Get device_mesh from first DTensor if available
+        device_mesh = None
+        for i, is_d in enumerate(operands_is_dtensor):
+            if is_d:
+                device_mesh = getattr(operands[i], 'device_mesh', None)
+                break
+        
+        if device_mesh is not None:
+            # Convert regular tensors to DTensors to match
+            for i, (op, is_d) in enumerate(zip(operands, operands_is_dtensor)):
+                if not is_d:
+                    placements = [Replicate()]
+                    operands[i] = DTensor.from_local(op, device_mesh, placements)
+        else:
+            # device_mesh is None - fallback to local tensors
+            for i, (op, is_d) in enumerate(zip(operands, operands_is_dtensor)):
+                if is_d and hasattr(op, 'to_local'):
+                    operands[i] = op.to_local()
+
     # When all operands are of int8, we cast the result to int32 to align with
     # the behavior of jax.
     dtypes_to_resolve = list(set(standardize_dtype(x.dtype) for x in operands))
@@ -141,6 +172,45 @@ def subtract(x1, x2):
 def matmul(x1, x2):
     x1 = convert_to_tensor(x1)
     x2 = convert_to_tensor(x2)
+
+    # Handle mixed DTensor and regular tensor operands
+    from keras.src.backend.torch.distribution_lib import (
+        is_dtensor,
+        _get_default_device_mesh,
+        DTensor,
+        Replicate,
+    )
+
+    # Check if we have at least one DTensor
+    x1_is_dtensor = is_dtensor(x1)
+    x2_is_dtensor = is_dtensor(x2)
+    
+    if x1_is_dtensor or x2_is_dtensor:
+        # Get device_mesh from DTensor if available, otherwise from global state
+        if x1_is_dtensor:
+            device_mesh = getattr(x1, 'device_mesh', None)
+            x1_placements = getattr(x1, 'placements', None)
+        elif x2_is_dtensor:
+            device_mesh = getattr(x2, 'device_mesh', None)
+            x2_placements = getattr(x2, 'placements', None)
+        else:
+            device_mesh = None
+        
+        if device_mesh is not None:
+            # Standard case - convert regular tensor to DTensor
+            if x1_is_dtensor and not x2_is_dtensor:
+                placements = x1_placements or [Replicate()]
+                x2 = DTensor.from_local(x2, device_mesh, placements)
+            elif x2_is_dtensor and not x1_is_dtensor:
+                placements = x2_placements or [Replicate()]
+                x1 = DTensor.from_local(x1, device_mesh, placements)
+        else:
+            # device_mesh is None - this can happen during symbolic build
+            # Fallback: extract local tensor from DTensor to avoid mixed tensor errors
+            if hasattr(x1, 'to_local'):
+                x1 = x1.to_local()
+            if hasattr(x2, 'to_local'):
+                x2 = x2.to_local()
 
     def can_use_int_matmul(x1, x2):
         # torch._int_mm only accepts the following conditions:
@@ -197,6 +267,46 @@ def matmul(x1, x2):
 def multiply(x1, x2):
     x1 = convert_to_tensor(x1)
     x2 = convert_to_tensor(x2)
+
+    # Handle mixed DTensor and regular tensor operands
+    from keras.src.backend.torch.distribution_lib import (
+        is_dtensor,
+        _get_default_device_mesh,
+        DTensor,
+        Replicate,
+    )
+
+    # Check if we have at least one DTensor
+    x1_is_dtensor = is_dtensor(x1)
+    x2_is_dtensor = is_dtensor(x2)
+    
+    if x1_is_dtensor or x2_is_dtensor:
+        # Get device_mesh from DTensor if available, otherwise from global state
+        if x1_is_dtensor:
+            device_mesh = getattr(x1, 'device_mesh', None)
+            x1_placements = getattr(x1, 'placements', None)
+        elif x2_is_dtensor:
+            device_mesh = getattr(x2, 'device_mesh', None)
+            x2_placements = getattr(x2, 'placements', None)
+        else:
+            device_mesh = None
+        
+        if device_mesh is not None:
+            # Standard case - convert regular tensor to DTensor
+            if x1_is_dtensor and not x2_is_dtensor:
+                placements = x1_placements or [Replicate()]
+                x2 = DTensor.from_local(x2, device_mesh, placements)
+            elif x2_is_dtensor and not x1_is_dtensor:
+                placements = x2_placements or [Replicate()]
+                x1 = DTensor.from_local(x1, device_mesh, placements)
+        else:
+            # device_mesh is None - this can happen during symbolic build
+            # Fallback: extract local tensor from DTensor to avoid mixed tensor errors
+            if hasattr(x1, 'to_local'):
+                x1 = x1.to_local()
+            if hasattr(x2, 'to_local'):
+                x2 = x2.to_local()
+
     return torch.multiply(x1, x2)
 
 
@@ -791,6 +901,46 @@ def digitize(x, bins):
 def dot(x1, x2):
     x1 = convert_to_tensor(x1)
     x2 = convert_to_tensor(x2)
+
+    # Handle mixed DTensor and regular tensor operands
+    from keras.src.backend.torch.distribution_lib import (
+        is_dtensor,
+        _get_default_device_mesh,
+        DTensor,
+        Replicate,
+    )
+
+    # Check if we have at least one DTensor
+    x1_is_dtensor = is_dtensor(x1)
+    x2_is_dtensor = is_dtensor(x2)
+    
+    if x1_is_dtensor or x2_is_dtensor:
+        # Get device_mesh from DTensor if available, otherwise from global state
+        if x1_is_dtensor:
+            device_mesh = getattr(x1, 'device_mesh', None)
+            x1_placements = getattr(x1, 'placements', None)
+        elif x2_is_dtensor:
+            device_mesh = getattr(x2, 'device_mesh', None)
+            x2_placements = getattr(x2, 'placements', None)
+        else:
+            device_mesh = None
+        
+        if device_mesh is not None:
+            # Standard case - convert regular tensor to DTensor
+            if x1_is_dtensor and not x2_is_dtensor:
+                placements = x1_placements or [Replicate()]
+                x2 = DTensor.from_local(x2, device_mesh, placements)
+            elif x2_is_dtensor and not x1_is_dtensor:
+                placements = x2_placements or [Replicate()]
+                x1 = DTensor.from_local(x1, device_mesh, placements)
+        else:
+            # device_mesh is None - this can happen during symbolic build
+            # Fallback: extract local tensor from DTensor to avoid mixed tensor errors
+            if hasattr(x1, 'to_local'):
+                x1 = x1.to_local()
+            if hasattr(x2, 'to_local'):
+                x2 = x2.to_local()
+
     result_dtype = dtypes.result_type(x1.dtype, x2.dtype)
     # GPU only supports float types
     compute_dtype = dtypes.result_type(result_dtype, float)
@@ -1779,6 +1929,46 @@ def tanh(x):
 def tensordot(x1, x2, axes=2):
     x1 = convert_to_tensor(x1)
     x2 = convert_to_tensor(x2)
+
+    # Handle mixed DTensor and regular tensor operands
+    from keras.src.backend.torch.distribution_lib import (
+        is_dtensor,
+        _get_default_device_mesh,
+        DTensor,
+        Replicate,
+    )
+
+    # Check if we have at least one DTensor
+    x1_is_dtensor = is_dtensor(x1)
+    x2_is_dtensor = is_dtensor(x2)
+    
+    if x1_is_dtensor or x2_is_dtensor:
+        # Get device_mesh from DTensor if available, otherwise from global state
+        if x1_is_dtensor:
+            device_mesh = getattr(x1, 'device_mesh', None)
+            x1_placements = getattr(x1, 'placements', None)
+        elif x2_is_dtensor:
+            device_mesh = getattr(x2, 'device_mesh', None)
+            x2_placements = getattr(x2, 'placements', None)
+        else:
+            device_mesh = None
+        
+        if device_mesh is not None:
+            # Standard case - convert regular tensor to DTensor
+            if x1_is_dtensor and not x2_is_dtensor:
+                placements = x1_placements or [Replicate()]
+                x2 = DTensor.from_local(x2, device_mesh, placements)
+            elif x2_is_dtensor and not x1_is_dtensor:
+                placements = x2_placements or [Replicate()]
+                x1 = DTensor.from_local(x1, device_mesh, placements)
+        else:
+            # device_mesh is None - this can happen during symbolic build
+            # Fallback: extract local tensor from DTensor to avoid mixed tensor errors
+            if hasattr(x1, 'to_local'):
+                x1 = x1.to_local()
+            if hasattr(x2, 'to_local'):
+                x2 = x2.to_local()
+
     result_dtype = dtypes.result_type(x1.dtype, x2.dtype)
     # TODO: torch.tensordot only supports float types
     compute_dtype = dtypes.result_type(result_dtype, float)
