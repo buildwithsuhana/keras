@@ -62,7 +62,13 @@ def get_device_count(device_type=None):
 
 
 def initialize(job_addresses=None, num_processes=None, process_id=None):
-    """Initialize the distribution system for multi-process settings."""
+    """Initialize the distribution system for multi-process settings.
+    
+    IMPORTANT: This function now properly initializes NCCL with appropriate
+    timeout settings to prevent communication timeouts during DTensor operations.
+    """
+    import datetime
+    
     local_rank = os.environ.get("LOCAL_RANK")
     world_size_env = os.environ.get("WORLD_SIZE")
 
@@ -92,15 +98,26 @@ def initialize(job_addresses=None, num_processes=None, process_id=None):
     if torch.cuda.is_available() and local_rank is not None:
         torch.cuda.set_device(int(local_rank))
 
+    # Set NCCL environment variables for better performance and reliability
+    os.environ.setdefault("NCCL_DEBUG", "INFO")
+    os.environ.setdefault("NCCL_SOCKET_IFNAME", "lo")
+    
+    # Set NCCL timeout to prevent hangs during initialization
+    # Default is 10 minutes, we set it to 30 minutes for safety
+    os.environ.setdefault("NCCL_TIMEOUT", "1800")
+
     init_method = f"tcp://{job_addresses}" if job_addresses else "env://"
     if "," in str(job_addresses):
         init_method = f"tcp://{job_addresses.split(',')[0]}"
 
+    # Initialize NCCL with proper timeout (30 minutes)
+    timeout = datetime.timedelta(seconds=1800)
     torch.distributed.init_process_group(
         backend="nccl" if torch.cuda.is_available() else "gloo",
         init_method=init_method,
         world_size=num_processes,
         rank=process_id or 0,
+        timeout=timeout,
     )
 
 
@@ -206,17 +223,49 @@ def _axis_names_to_placements(axis_names, device_mesh):
 
 
 def _to_backend_mesh(device_mesh):
-    """Converts a Keras DeviceMesh to a PyTorch DeviceMesh."""
+    """Converts a Keras DeviceMesh to a PyTorch DeviceMesh.
+    
+    IMPORTANT: This function now properly handles local rank device mapping
+    to ensure NCCL communication works correctly across processes.
+    """
     cache_key = f"torch_mesh_{device_mesh.shape}_{device_mesh.axis_names}"
     cached = global_state.get_global_attribute(cache_key)
     if cached is not None:
         global_state.set_global_attribute("torch_device_mesh", cached)
         return cached
 
-    device_ids = [int(d.split(":")[-1]) if ":" in d else 0 for d in device_mesh.devices.flatten()]
+    # Get local rank for proper CUDA device mapping
+    local_rank = 0
+    if torch.distributed.is_initialized():
+        local_rank = torch.distributed.get_rank()
+        if torch.cuda.is_available():
+            # Ensure we use the correct CUDA device for this process
+            torch.cuda.set_device(local_rank)
+
+    # Parse device IDs from Keras DeviceMesh
+    # For multi-process, each process has its own local device
+    device_ids = []
+    for d in device_mesh.devices.flatten():
+        if ":" in d:
+            # Extract device number and adjust for local rank
+            device_num = int(d.split(":")[-1])
+            # Use local rank-adjusted device
+            adjusted_device = local_rank if torch.distributed.is_initialized() else device_num
+            device_ids.append(adjusted_device)
+        else:
+            device_ids.append(local_rank if torch.distributed.is_initialized() else 0)
+
+    # Create backend DeviceMesh with proper device type
+    device_type = "cuda" if torch.cuda.is_available() else "cpu"
+    
+    # Create mesh tensor on the correct device
+    mesh_tensor = torch.tensor(device_ids, dtype=torch.int64).reshape(device_mesh.shape)
+    if device_type == "cuda":
+        mesh_tensor = mesh_tensor.cuda()
+    
     backend_mesh = DeviceMesh(
-        device_type="cuda" if torch.cuda.is_available() else "cpu",
-        mesh=torch.tensor(device_ids).reshape(device_mesh.shape),
+        device_type=device_type,
+        mesh=mesh_tensor,
         mesh_dim_names=device_mesh.axis_names
     )
 
