@@ -144,10 +144,34 @@ def distribute_variable(tensor, layout=None):
         device_mesh = _to_backend_mesh(current_distribution.device_mesh)
         if device_mesh is not None:
             placements = _layout_to_placements(layout, converted_tensor, device_mesh) if layout else None
+            
+            # Debug logging
+            debug_mode = os.environ.get("KERAS_DISTRIBUTION_DEBUG", "0") == "1"
+            if debug_mode:
+                rank = 0
+                try:
+                    import torch.distributed as dist
+                    if dist.is_available() and dist.is_initialized():
+                        rank = dist.get_rank()
+                except:
+                    pass
+                print(f"DEBUG | [Rank {rank}] distribute_variable() called")
+                print(f"DEBUG | [Rank {rank}]   - tensor shape: {converted_tensor.shape}")
+                print(f"DEBUG | [Rank {rank}]   - layout: {layout}")
+                print(f"DEBUG | [Rank {rank}]   - placements: {placements}")
+                print(f"DEBUG | [Rank {rank}]   - device_mesh: {device_mesh}")
+                print(f"DEBUG | [Rank {rank}]   - is_float_or_complex: {is_float_or_complex}")
+            
             if placements and any(isinstance(p, Shard) for p in placements):
                 dtensor = torch_distribute_tensor(converted_tensor, device_mesh, placements)
+                if debug_mode:
+                    print(f"DEBUG | [Rank {rank}]   - Created DTensor with local shape: {dtensor.to_local().shape}")
                 return torch.nn.Parameter(dtensor) if is_float_or_complex else dtensor
+            elif debug_mode:
+                print(f"DEBUG | [Rank {rank}]   - No sharding placements, returning as-is or replicated")
 
+    if debug_mode:
+        print(f"DEBUG | [Rank {rank}]   - No distribution active, returning regular tensor")
     return torch.nn.Parameter(converted_tensor) if is_float_or_complex else converted_tensor
 
 
