@@ -156,28 +156,31 @@ def distribute_variable(tensor, layout=None):
     converted_tensor = convert_to_tensor(tensor)
     is_float_or_complex = converted_tensor.dtype.is_floating_point or converted_tensor.dtype.is_complex
 
+    # Debug logging - define at function level
+    debug_mode = os.environ.get("KERAS_DISTRIBUTION_DEBUG", "0") == "1"
+    rank = 0
+    try:
+        import torch.distributed as dist
+        if dist.is_available() and dist.is_initialized():
+            rank = dist.get_rank()
+    except:
+        pass
+
+    if debug_mode:
+        print(f"DEBUG | [Rank {rank}] distribute_variable() called")
+        print(f"DEBUG | [Rank {rank}]   - tensor shape: {converted_tensor.shape}")
+        print(f"DEBUG | [Rank {rank}]   - layout: {layout}")
+        print(f"DEBUG | [Rank {rank}]   - is_float_or_complex: {is_float_or_complex}")
+
     current_distribution = distribution()
     if current_distribution is not None:
         device_mesh = _to_backend_mesh(current_distribution.device_mesh)
         if device_mesh is not None:
             placements = _layout_to_placements(layout, converted_tensor, device_mesh) if layout else None
             
-            # Debug logging
-            debug_mode = os.environ.get("KERAS_DISTRIBUTION_DEBUG", "0") == "1"
             if debug_mode:
-                rank = 0
-                try:
-                    import torch.distributed as dist
-                    if dist.is_available() and dist.is_initialized():
-                        rank = dist.get_rank()
-                except:
-                    pass
-                print(f"DEBUG | [Rank {rank}] distribute_variable() called")
-                print(f"DEBUG | [Rank {rank}]   - tensor shape: {converted_tensor.shape}")
-                print(f"DEBUG | [Rank {rank}]   - layout: {layout}")
-                print(f"DEBUG | [Rank {rank}]   - placements: {placements}")
                 print(f"DEBUG | [Rank {rank}]   - device_mesh: {device_mesh}")
-                print(f"DEBUG | [Rank {rank}]   - is_float_or_complex: {is_float_or_complex}")
+                print(f"DEBUG | [Rank {rank}]   - placements: {placements}")
             
             if placements and any(isinstance(p, Shard) for p in placements):
                 dtensor = torch_distribute_tensor(converted_tensor, device_mesh, placements)
