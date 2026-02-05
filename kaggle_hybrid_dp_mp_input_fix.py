@@ -45,11 +45,13 @@ def run_hybrid_dp_mp_test():
     print(f"\n[Rank {local_rank}] DeviceMesh: shape={mesh.shape}")
     
     # Create LayoutMap with CORRECTED patterns for BERT
+    # IMPORTANT: For BERT, the intermediate dimension (512) is NOT divisible by 2,
+    # so we cannot shard on dimension 1. We must replicate all weights.
     layout_map = LayoutMap(mesh)
     
-    # FFN layers - these can be safely sharded
-    layout_map[".*feedforward.*intermediate.*kernel"] = ("model",)
-    layout_map[".*feedforward.*output.*kernel"] = ("model",)
+    # FFN layers - REPLICATE for now (can't shard because intermediate_dim=512 not divisible by 2)
+    layout_map[".*feedforward.*intermediate.*kernel"] = ()  # Replicate
+    layout_map[".*feedforward.*output.*kernel"] = ()  # Replicate
     
     # Attention - replicate (can't shard due to reshape requirements)
     layout_map[".*attention.*query.*kernel"] = ()  # Replicate
@@ -66,7 +68,8 @@ def run_hybrid_dp_mp_test():
     layout_map[".*pooled_dense.*kernel"] = ()
     layout_map[".*logits.*kernel"] = ()
     
-    print(f"[Rank {local_rank}] LayoutMap patterns configured (FFN sharding)")
+    print(f"[Rank {local_rank}] LayoutMap patterns configured (ALL REPLICATED)")
+    print(f"[Rank {local_rank}] NOTE: FFN sharding skipped because intermediate_dim=512 not divisible by 2")
     
     # Create strategy
     strategy = ModelParallel(

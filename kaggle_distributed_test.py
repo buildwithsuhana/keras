@@ -271,8 +271,8 @@ def test_model_parallel(epochs=3):
     
     # Create layout map for sharding
     layout_map = LayoutMap(mesh)
-    layout_map["dense.*kernel"] = (None, "model")  # Shard on model axis
-    layout_map["dense.*bias"] = ("model",)
+    layout_map["dense.*kernel"] = (None, "model")  # Shard on model axis (dim 1)
+    layout_map["dense.*bias"] = ()  # Replicate bias - biases must be replicated!
     
     log("✓ LayoutMap configured:")
     for key in layout_map.keys():
