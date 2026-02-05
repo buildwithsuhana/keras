@@ -1,7 +1,11 @@
+import os
 import torch
 
 from keras.src.backend.common.stateless_scope import in_stateless_scope
 from keras.src.ops.operation import Operation
+
+# Debug flag for distributed training issues
+DEBUG_LAYER = os.environ.get("KERAS_TORCH_LAYER_DEBUG", "0") == "1"
 
 
 def _make_torch_param(value):
@@ -10,12 +14,27 @@ def _make_torch_param(value):
     Only floating point and complex tensors can be wrapped as
     torch.nn.Parameter with requires_grad=True. Non-floating point
     tensors (like int32) must be stored as regular tensors.
+
+    Also preserves existing torch.nn.Parameter instances to avoid
+    double-wrapping which can cause errors with non-floating dtypes.
     """
+    # If already a Parameter, return as-is to avoid double-wrapping
+    if isinstance(value, torch.nn.Parameter):
+        if DEBUG_LAYER:
+            print(f"[DEBUG _make_torch_param] Skipping double-wrap for existing Parameter")
+        return value
+
     if hasattr(value, 'dtype'):
         is_float_or_complex = value.dtype.is_floating_point or value.dtype.is_complex
+        if DEBUG_LAYER:
+            print(f"[DEBUG _make_torch_param] value.dtype={value.dtype}, is_float_or_complex={is_float_or_complex}")
         if is_float_or_complex:
             requires_grad = getattr(value, 'requires_grad', True)
+            if DEBUG_LAYER:
+                print(f"[DEBUG _make_torch_param] Creating Parameter with requires_grad={requires_grad}")
             return torch.nn.Parameter(value, requires_grad=requires_grad)
+    if DEBUG_LAYER:
+        print(f"[DEBUG _make_torch_param] Returning value as-is (non-floating dtype)")
     return value
 
 
