@@ -86,27 +86,26 @@ def run_hybrid_dp_mp_test():
     # 7. Manual forward pass to verify device placement
     print(f"Rank {rank}: Running forward pass...")
     
-    # Run one forward pass manually to check for device issues
+    # Use preprocessor instead of tokenizer directly - it handles padding/truncation correctly
     try:
-        # Tokenize with padding and proper batching
-        token_ids_raw = model.preprocessor.tokenizer(texts, padding="longest", truncation=False, return_tensors="np")
-        print(f"Rank {rank}: Tokenizer output type: {type(token_ids_raw)}")
+        # Use the preprocessor which handles batching properly
+        token_ids_raw = model.preprocessor(texts[:batch_size])  # Pass batch directly
+        print(f"Rank {rank}: Preprocessor output type: {type(token_ids_raw)}")
         
-        # Convert to dict with proper batch dimension
+        # The preprocessor returns a dictionary with proper batch dimensions
         if isinstance(token_ids_raw, dict):
-            # keras_hub with return_tensors="np" returns a dict
             token_ids = {
                 "token_ids": token_ids_raw["token_ids"],
                 "padding_mask": token_ids_raw["padding_mask"],
-                "segment_ids": token_ids_raw.get("segment_ids", np.zeros_like(token_ids_raw["token_ids"]))
             }
+            # Add segment_ids if present, otherwise create zeros
+            if "segment_ids" in token_ids_raw:
+                token_ids["segment_ids"] = token_ids_raw["segment_ids"]
+            else:
+                # BERTTextClassifier expects segment_ids
+                token_ids["segment_ids"] = np.zeros_like(token_ids["token_ids"])
         else:
-            # Convert list/tuple to dict
-            token_ids = {
-                "token_ids": token_ids_raw[0],
-                "padding_mask": token_ids_raw[1],
-                "segment_ids": token_ids_raw[2] if len(token_ids_raw) > 2 else np.zeros_like(token_ids_raw[0])
-            }
+            raise ValueError(f"Unexpected preprocessor output type: {type(token_ids_raw)}")
             
         # Convert to torch tensors with proper device and batch shape
         import torch
