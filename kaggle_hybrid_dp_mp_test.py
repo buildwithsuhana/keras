@@ -77,8 +77,9 @@ def run_hybrid_dp_mp_test():
 
     # 6. Generate data - ensure proper device placement
     batch_size = 4  # Per-rank batch
-    seq_length = 32
+    seq_length = 32  # Sequence length
     
+    # Create batched inputs - BERT expects (batch_size, seq_length)
     texts = ["This is a sample text for testing"] * (batch_size * 2)
     labels = np.array([0, 1] * (batch_size))
     
@@ -87,26 +88,32 @@ def run_hybrid_dp_mp_test():
     
     # Run one forward pass manually to check for device issues
     try:
-        # Tokenize - keras_hub tokenizer returns a tuple/list
-        token_ids_raw = model.preprocessor.tokenizer(texts)
+        # Tokenize with padding and proper batching
+        token_ids_raw = model.preprocessor.tokenizer(texts, padding="longest", truncation=False, return_tensors="np")
         print(f"Rank {rank}: Tokenizer output type: {type(token_ids_raw)}")
         
-        # Convert to dict - keras_hub returns (token_ids, attention_mask)
-        if isinstance(token_ids_raw, (list, tuple)):
+        # Convert to dict with proper batch dimension
+        if isinstance(token_ids_raw, dict):
+            # keras_hub with return_tensors="np" returns a dict
+            token_ids = {
+                "token_ids": token_ids_raw["token_ids"],
+                "padding_mask": token_ids_raw["padding_mask"],
+                "segment_ids": token_ids_raw.get("segment_ids", np.zeros_like(token_ids_raw["token_ids"]))
+            }
+        else:
+            # Convert list/tuple to dict
             token_ids = {
                 "token_ids": token_ids_raw[0],
                 "padding_mask": token_ids_raw[1],
-                "segment_ids": token_ids_raw[2] if len(token_ids_raw) > 2 else None  # BERT needs segment_ids
+                "segment_ids": token_ids_raw[2] if len(token_ids_raw) > 2 else np.zeros_like(token_ids_raw[0])
             }
-        else:
-            token_ids = token_ids_raw
             
-        # Convert to torch tensors with proper device
+        # Convert to torch tensors with proper device and batch shape
         import torch
         token_ids_torch = {
             "token_ids": torch.as_tensor(token_ids["token_ids"]).cuda(),
             "padding_mask": torch.as_tensor(token_ids["padding_mask"]).cuda(),
-            "segment_ids": torch.as_tensor(token_ids["segment_ids"]).cuda() if token_ids["segment_ids"] is not None else None
+            "segment_ids": torch.as_tensor(token_ids["segment_ids"]).cuda()
         }
         
         print(f"Rank {rank}: Token IDs shape: {token_ids_torch['token_ids'].shape}")
