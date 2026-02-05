@@ -91,7 +91,7 @@ def run_hybrid_dp_mp_test():
         token_ids_raw = model.preprocessor.tokenizer(texts)
         print(f"Rank {rank}: Tokenizer output type: {type(token_ids_raw)}")
         
-        # Convert to dict if it's a tuple
+        # Convert to dict - keras_hub returns (token_ids, attention_mask, etc.)
         if isinstance(token_ids_raw, (list, tuple)):
             token_ids = {
                 "token_ids": token_ids_raw[0],
@@ -100,14 +100,18 @@ def run_hybrid_dp_mp_test():
         else:
             token_ids = token_ids_raw
             
-        print(f"Rank {rank}: Token IDs device: {token_ids['token_ids'].device}")
+        # Convert to torch tensors with proper device
+        import torch
+        token_ids_torch = {
+            "token_ids": torch.as_tensor(token_ids["token_ids"]).cuda(),
+            "attention_mask": torch.as_tensor(token_ids["attention_mask"]).cuda()
+        }
+        
+        print(f"Rank {rank}: Token IDs shape: {token_ids_torch['token_ids'].shape}")
+        print(f"Rank {rank}: Token IDs device: {token_ids_torch['token_ids'].device}")
         
         # Forward pass
-        outputs = model(
-            {"token_ids": token_ids["token_ids"], 
-             "attention_mask": token_ids["attention_mask"]},
-            training=True
-        )
+        outputs = model(token_ids_torch, training=True)
         
         print(f"Rank {rank}: Forward pass successful!")
         print(f"Rank {rank}: Output shape: {outputs.shape}")
