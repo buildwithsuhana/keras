@@ -282,9 +282,24 @@ def convert_to_tensor(x, dtype=None, sparse=None, ragged=None):
         raise ValueError("`sparse=True` is not supported with torch backend")
     if ragged:
         raise ValueError("`ragged=True` is not supported with torch backend")
-    if isinstance(x, Variable) or is_tensor(x):
-        if isinstance(x, Variable):
-            x = x.value
+    
+    # Check if x is a DTensor and preserve it
+    from keras.src.backend.torch.distribution_lib import DTensor, is_dtensor
+    if is_dtensor(x):
+        # Preserve DTensor, just handle dtype conversion if needed
+        if dtype is not None:
+            dtype = to_torch_dtype(dtype)
+            if x.dtype != dtype:
+                # Convert the local tensor and recreate DTensor
+                local_x = x.to_local()
+                local_x = local_x.to(dtype)
+                return DTensor.from_local(local_x, x.device_mesh, x.placements)
+        return x
+    
+    if isinstance(x, Variable):
+        x = x.value
+    
+    if is_tensor(x):
         device = get_device()
         if x.device != device:
             if x.is_meta:
@@ -294,6 +309,7 @@ def convert_to_tensor(x, dtype=None, sparse=None, ragged=None):
         if dtype is not None:
             x = x.to(to_torch_dtype(dtype))
         return x
+    
     if dtype is None:
         if isinstance(x, bool):
             return torch.as_tensor(x, dtype=torch.bool, device=get_device())
