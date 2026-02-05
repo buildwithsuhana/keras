@@ -1,7 +1,6 @@
-"""Simple test for BERT distributed training with Data Parallel (no sharding)"""
+"""Simple test for BERT distributed training with manual data handling"""
 
 import os
-# Must be set before any other imports
 os.environ["KERAS_BACKEND"] = "torch"
 os.environ["TOKENIZERS_PARALLELISM"] = "false"
 
@@ -14,9 +13,8 @@ from keras.src.distribution import ModelParallel, DeviceMesh, LayoutMap, list_de
 
 
 def run_simple_dp_test():
-    """Simple test using pure Data Parallel (no model sharding)."""
+    """Simple test using pure Data Parallel with manual data handling."""
     
-    # 1. Initialize Distributed Backend
     initialize()
     
     devices = list_devices("gpu")
@@ -24,7 +22,7 @@ def run_simple_dp_test():
     rank = dist.get_rank() if dist.is_initialized() else 0
     
     if num_devices < 2:
-        print(f"Detected {num_devices} GPU(s). Need at least 2 for distributed demo.")
+        print(f"Detected {num_devices} GPU(s). Need at least 2 GPUs.")
         return
 
     print(f"\n{'='*70}")
@@ -32,29 +30,27 @@ def run_simple_dp_test():
     print(f"{'='*70}")
     print(f"[Rank {rank}] {num_devices} GPUs available")
     
-    # 2. Use 1D Device Mesh for pure Data Parallel
-    print(f"\n[Rank {rank}] Setting up DeviceMesh for Data Parallel...")
-    
+    # Setup DeviceMesh
     mesh = DeviceMesh(
         shape=(num_devices,),
         axis_names=["data"],
         devices=devices
     )
 
-    # 3. No sharding - just replicate (empty tuple = replicate)
+    # Layout: replicate (no sharding)
     layout_map = LayoutMap(mesh)
-    layout_map[".*"] = ()  # Replicate all weights
+    layout_map[".*"] = ()
     
     print(f"[Rank {rank}] Layout: Replicate (no sharding)")
     
-    # 4. Initialize Strategy
+    # Initialize Strategy
     strategy = ModelParallel(
         layout_map=layout_map,
         batch_dim_name="data",
         auto_shard_dataset=False
     )
 
-    # 5. Build model
+    # Build model
     print(f"\n[Rank {rank}] Loading BERT-tiny model...")
     
     with strategy.scope():
@@ -62,40 +58,54 @@ def run_simple_dp_test():
             "bert_tiny_en_uncased",
             num_classes=2
         )
-        
-        model.compile(
-            optimizer=keras.optimizers.Adam(learning_rate=5e-5),
-            loss='sparse_categorical_crossentropy',
-            metrics=['accuracy']
-        )
 
-    # 6. Generate small batch - each rank gets different data
+    # Generate small batch
     batch_size = 2
-    texts = ["This is a sample text for testing"] * (batch_size * num_devices)
-    labels = np.array([0, 1] * (batch_size * num_devices))
+    texts = ["This is a sample text"] * batch_size
     
-    # Each rank processes its own subset
-    rank_texts = texts[rank::num_devices]
-    rank_labels = labels[rank::num_devices]
+    print(f"\n[Rank {rank}] Preprocessing data...")
     
-    print(f"\n[Rank {rank}] Dataset info:")
-    print(f"[Rank {rank}]   - Total samples: {len(texts)}")
-    print(f"[Rank {rank}]   - Samples per rank: {len(rank_texts)}")
+    # Preprocess data
+    token_ids = model.preprocessor(texts)
     
-    # 7. Training - each rank trains independently
+    # Convert to torch
+    inputs = {
+        "token_ids": torch.as_tensor(token_ids["token_ids"]).cuda(),
+        "padding_mask": torch.as_tensor(token_ids["padding_mask"]).cuda(),
+    }
+    if "segment_ids" in token_ids:
+        inputs["segment_ids"] = torch.as_tensor(token_ids["segment_ids"]).cuda()
+    else:
+        inputs["segment_ids"] = torch.zeros_like(inputs["token_ids"])
+    
+    labels = torch.tensor([0, 1]).cuda()
+    
+    print(f"[Rank {rank}] Input shape: {inputs['token_ids'].shape}")
+    print(f"[Rank {rank}] Labels shape: {labels.shape}")
+    
+    # Training
     print(f"\n[Rank {rank}] Starting training...")
     print(f"[Rank {rank}]   Epochs: 1")
-    print(f"[Rank {rank}]   Local batch size: {batch_size}")
+    print(f"[Rank {rank}]   Batch size: {batch_size}")
     
-    model.fit(
-        rank_texts,
-        rank_labels,
-        epochs=1,
-        batch_size=batch_size,
-        verbose=1 if rank == 0 else 0
-    )
-
-    # 8. Success
+    optimizer = keras.optimizers.Adam(learning_rate=5e-5)
+    loss_fn = keras.losses.SparseCategoricalCrossentropy(from_logits=True)
+    
+    for epoch in range(1):
+        print(f"[Rank {rank}]   Epoch {epoch + 1}/1")
+        
+        # Forward pass
+        outputs = model(inputs, training=True)
+        loss = loss_fn(labels, outputs)
+        
+        # Backward pass
+        optimizer.zero_grad()
+        loss.backward()
+        optimizer.step()
+        
+        print(f"[Rank {rank}]     Loss: {loss.item():.4f}")
+    
+    # Success
     if rank == 0:
         print("\n" + "="*60)
         print("✓ Simple DP training completed!")
