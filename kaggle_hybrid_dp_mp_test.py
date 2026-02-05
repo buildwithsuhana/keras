@@ -91,11 +91,11 @@ def run_hybrid_dp_mp_test():
         token_ids_raw = model.preprocessor.tokenizer(texts)
         print(f"Rank {rank}: Tokenizer output type: {type(token_ids_raw)}")
         
-        # Convert to dict - keras_hub returns (token_ids, attention_mask, etc.)
+        # Convert to dict - keras_hub returns (token_ids, attention_mask)
         if isinstance(token_ids_raw, (list, tuple)):
             token_ids = {
                 "token_ids": token_ids_raw[0],
-                "attention_mask": token_ids_raw[1]
+                "padding_mask": token_ids_raw[1]  # BERT uses "padding_mask"
             }
         else:
             token_ids = token_ids_raw
@@ -104,7 +104,7 @@ def run_hybrid_dp_mp_test():
         import torch
         token_ids_torch = {
             "token_ids": torch.as_tensor(token_ids["token_ids"]).cuda(),
-            "attention_mask": torch.as_tensor(token_ids["attention_mask"]).cuda()
+            "padding_mask": torch.as_tensor(token_ids["padding_mask"]).cuda()
         }
         
         print(f"Rank {rank}: Token IDs shape: {token_ids_torch['token_ids'].shape}")
