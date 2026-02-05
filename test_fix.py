@@ -37,10 +37,9 @@ print("  ✓ Existing Parameter: OK")
 # Test 2: Test TorchLayer with non-float dtypes
 print("\nTest 2: Testing TorchLayer with non-float dtypes...")
 
-from keras.src.backend.torch.layer import TorchLayer
 from keras.src.layers import Layer
 
-class TestLayer(TorchLayer):
+class TestLayer(Layer):
     def __init__(self):
         super().__init__()
         # Add a non-float dtype variable (like int32)
