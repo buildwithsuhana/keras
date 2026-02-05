@@ -4,6 +4,21 @@ from keras.src.backend.common.stateless_scope import in_stateless_scope
 from keras.src.ops.operation import Operation
 
 
+def _make_torch_param(value):
+    """Convert a tensor to torch.nn.Parameter if possible.
+
+    Only floating point and complex tensors can be wrapped as
+    torch.nn.Parameter with requires_grad=True. Non-floating point
+    tensors (like int32) must be stored as regular tensors.
+    """
+    if hasattr(value, 'dtype'):
+        is_float_or_complex = value.dtype.is_floating_point or value.dtype.is_complex
+        if is_float_or_complex:
+            requires_grad = getattr(value, 'requires_grad', True)
+            return torch.nn.Parameter(value, requires_grad=requires_grad)
+    return value
+
+
 class TorchLayer(torch.nn.Module):
     @property
     def torch_params(self):
@@ -22,7 +37,7 @@ class TorchLayer(torch.nn.Module):
         # set torch_params attribute will have module automatically track
         # parameters.
         self._torch_params = torch.nn.ParameterDict(
-            {variable.path: variable.value for variable in self.variables}
+            {variable.path: _make_torch_param(variable.value) for variable in self.variables}
         )
 
     def named_parameters(
@@ -57,7 +72,7 @@ class TorchLayer(torch.nn.Module):
     def _post_track_variable(self, variable):
         if hasattr(self, "_torch_params"):
             if variable.path not in self.torch_params:
-                self.torch_params[variable.path] = variable.value
+                self.torch_params[variable.path] = _make_torch_param(variable.value)
 
     def _post_untrack_variable(self, variable):
         if hasattr(self, "_torch_params"):
