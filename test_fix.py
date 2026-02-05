@@ -61,20 +61,37 @@ class TestLayer(Layer):
 layer = TestLayer()
 _ = layer.build((3, 3))
 
+# Print the keys to debug
+print(f"torch_params keys: {list(layer.torch_params.keys())}")
+
 # Check that torch_params contains both variables
-assert "non_float_var" in layer.torch_params, "non_float_var should be in torch_params"
-assert "float_var" in layer.torch_params, "float_var should be in torch_params"
+# Note: Variable paths include layer name as prefix when auto-named
+assert any("variable" in key for key in layer.torch_params.keys()), \
+    "Variables should be in torch_params"
 
-# Check that non_float_var is NOT a Parameter
-assert not isinstance(layer.torch_params["non_float_var"], nn.Parameter), \
-    "non_float_var should NOT be a Parameter (int32 dtype)"
+# Since we have two variables, verify they exist
+assert len(layer.torch_params) == 2, f"Expected 2 variables, got {len(layer.torch_params)}"
 
-# Check that float_var IS a Parameter
-assert isinstance(layer.torch_params["float_var"], nn.Parameter), \
-    "float_var should be a Parameter (float32 dtype)"
+# Check that float and non-float variables are handled correctly
+float_found = False
+non_float_found = False
+for key, value in layer.torch_params.items():
+    if hasattr(value, 'dtype'):
+        if value.dtype.is_floating_point or value.dtype.is_complex:
+            # Float variable should be a Parameter
+            assert isinstance(value, nn.Parameter), \
+                f"Float variable at key '{key}' should be a Parameter, got {type(value)}"
+            float_found = True
+            print(f"  ✓ Float variable at '{key}' correctly wrapped as Parameter")
+        else:
+            # Non-float variable should NOT be a Parameter
+            assert not isinstance(value, nn.Parameter), \
+                f"Non-float variable at key '{key}' should NOT be a Parameter"
+            non_float_found = True
+            print(f"  ✓ Non-float variable at '{key}' correctly NOT wrapped as Parameter")
 
-print("  ✓ Non-float variable correctly NOT wrapped as Parameter")
-print("  ✓ Float variable correctly wrapped as Parameter")
+assert float_found, "Float variable should be found"
+assert non_float_found, "Non-float variable should be found"
 
 # Test 3: Test that named_parameters works correctly
 print("\nTest 3: Testing named_parameters...")
@@ -82,8 +99,11 @@ print("\nTest 3: Testing named_parameters...")
 params = list(layer.named_parameters())
 param_names = [name for name, _ in params]
 
-assert "float_var" in param_names, "float_var should be in named_parameters"
-assert "non_float_var" not in param_names, "non_float_var should NOT be in named_parameters (int32 dtype)"
+print(f"  named_parameters: {param_names}")
+
+# Only the float variable should be in named_parameters (not the int32 one)
+assert len(param_names) == 1, \
+    f"Only float variable should be in named_parameters. Got: {param_names}"
 
 print("  ✓ named_parameters correctly excludes non-float parameters")
 
