@@ -547,12 +547,30 @@ def prepare_input_for_distribution(x):
     
     For model parallelism with sharded weights, inputs need to be replicated
     across the model dimension to match the sharded kernel dimensions.
+    
+    This function checks if we have an active device mesh and distributed
+    context, and converts inputs to DTensors accordingly.
     """
+    from keras.src.distribution.distribution_lib import distribution, ModelParallel
+    
+    dist = distribution()
+    
+    # Check if we have a ModelParallel distribution active
+    is_mp = isinstance(dist, ModelParallel)
+    
+    # Also check if torch distributed is initialized
+    # Even outside the scope, we might have sharded weights
+    is_distributed = torch.distributed.is_initialized()
+    
     device_mesh = _get_default_device_mesh()
-    if device_mesh is None or not _is_model_parallel_distribution():
-        return x
-
-    return _convert_structure(x, device_mesh, to_dtensor=True, gather_sharded=False)
+    
+    # Convert to DTensor if:
+    # 1. We have a device mesh AND
+    # 2. Either ModelParallel is active OR distributed is initialized
+    if device_mesh is not None and (is_mp or is_distributed):
+        return _convert_structure(x, device_mesh, to_dtensor=True, gather_sharded=False)
+    
+    return x
 
 
 def prepare_output_for_loss(x):

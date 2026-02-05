@@ -102,11 +102,13 @@ def run_hybrid_dp_mp_test():
         print(f"[Rank {local_rank}] Input shape: {x.shape}")
         
         # CRITICAL: Convert inputs to DTensors for model parallelism
-        x_tensor = torch.from_numpy(x).cuda()
-        x_dtensor = distribution_lib.prepare_input_for_distribution(x_tensor)
-        print(f"[Rank {local_rank}] Input converted to DTensor: {type(x_dtensor)}")
+        # Must be called inside strategy scope to access distribution
+        with strategy.scope():
+            x_tensor = torch.from_numpy(x).cuda()
+            x_dtensor = distribution_lib.prepare_input_for_distribution(x_tensor)
+            print(f"[Rank {local_rank}] Input converted to DTensor: {type(x_dtensor)}")
         
-        # Forward pass
+        # Forward pass (outside scope is OK, weights are already DTensors)
         outputs = model(x_dtensor, training=False)
         
         print(f"[Rank {local_rank}] ✓ Forward pass successful!")
