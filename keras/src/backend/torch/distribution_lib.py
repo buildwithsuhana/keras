@@ -225,8 +225,9 @@ def _axis_names_to_placements(axis_names, device_mesh):
 def _to_backend_mesh(device_mesh):
     """Converts a Keras DeviceMesh to a PyTorch DeviceMesh.
     
-    IMPORTANT: This function now properly handles local rank device mapping
-    to ensure NCCL communication works correctly across processes.
+    IMPORTANT: PyTorch's DeviceMesh requires the mesh tensor to be on CPU.
+    The device_type specifies which devices the mesh represents, but the mesh
+    tensor itself must be a CPU tensor.
     """
     cache_key = f"torch_mesh_{device_mesh.shape}_{device_mesh.axis_names}"
     cached = global_state.get_global_attribute(cache_key)
@@ -258,10 +259,10 @@ def _to_backend_mesh(device_mesh):
     # Create backend DeviceMesh with proper device type
     device_type = "cuda" if torch.cuda.is_available() else "cpu"
     
-    # Create mesh tensor on the correct device
+    # IMPORTANT: mesh tensor must be on CPU for PyTorch DeviceMesh
+    # The device_type specifies the device mesh represents, not where mesh tensor lives
     mesh_tensor = torch.tensor(device_ids, dtype=torch.int64).reshape(device_mesh.shape)
-    if device_type == "cuda":
-        mesh_tensor = mesh_tensor.cuda()
+    # Keep mesh tensor on CPU (this is required by PyTorch)
     
     backend_mesh = DeviceMesh(
         device_type=device_type,
