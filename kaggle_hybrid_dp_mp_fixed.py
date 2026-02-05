@@ -55,15 +55,16 @@ def initialize_distributed():
 def create_device_mesh():
     """Create DeviceMesh using actual local rank device.
     
-    IMPORTANT: Use local_rank device ID, not logical Keras device ID.
-    This ensures PyTorch's NCCL communicators work correctly.
+    IMPORTANT: For multi-process setup, each process has its own local device.
+    The DeviceMesh shape should match the number of devices in the list.
     """
     local_rank = int(os.environ.get("LOCAL_RANK", 0))
     world_size = int(os.environ.get("WORLD_SIZE", 1))
     
+    from keras.src.distribution import DeviceMesh, LayoutMap
+    
     if world_size < 2:
-        # Single GPU
-        from keras.src.distribution import DeviceMesh, LayoutMap
+        # Single GPU - use shape (1,) with single device
         mesh = DeviceMesh(
             shape=(1,),
             axis_names=["data"],
@@ -71,19 +72,21 @@ def create_device_mesh():
         )
         return mesh
     
-    from keras.src.distribution import DeviceMesh, LayoutMap
+    # Multi-GPU: Each process has its own local device
+    # For a 1D mesh with world_size devices, each process creates a DeviceMesh
+    # with shape (1,) containing just its local device
+    # The actual device mesh for distributed operations is handled by PyTorch's
+    # internal process group, not the Keras DeviceMesh
     
-    # For multi-GPU, we need a 1D mesh for now (simpler than 2D)
-    # The DeviceMesh should use the actual local GPU IDs
-    devices = [f"cuda:{local_rank}"]
-    
+    # Create a 1D mesh with single device per process
+    # This is the correct approach for multi-process DTensor
     mesh = DeviceMesh(
-        shape=(world_size,),
+        shape=(1,),
         axis_names=["data"],
-        devices=devices  # Single device per mesh for now
+        devices=[f"cuda:{local_rank}"]
     )
     
-    print(f"[Rank {local_rank}] DeviceMesh created with local device: {devices}")
+    print(f"[Rank {local_rank}] DeviceMesh created: shape={mesh.shape}, local_device=cuda:{local_rank}")
     return mesh
 
 
