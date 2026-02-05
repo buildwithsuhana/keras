@@ -298,7 +298,7 @@ def convert_to_tensor(x, dtype=None, sparse=None, ragged=None):
         raise ValueError("`ragged=True` is not supported with torch backend")
     
     # Check if x is a DTensor and preserve it
-    from keras.src.backend.torch.distribution_lib import DTensor, is_dtensor
+    from keras.src.backend.torch.distribution_lib import DTensor, is_dtensor, _get_default_device_mesh
     if is_dtensor(x):
         # Preserve DTensor, just handle dtype conversion if needed
         if dtype is not None:
@@ -309,6 +309,23 @@ def convert_to_tensor(x, dtype=None, sparse=None, ragged=None):
                 local_x = local_x.to(dtype)
                 return DTensor.from_local(local_x, x.device_mesh, x.placements)
         return x
+    
+    # Check if we have an active device mesh and should convert to DTensor
+    # This is critical for hybrid DP+MP training where inputs must be DTensors
+    device_mesh = _get_default_device_mesh()
+    is_mp_distribution = False
+    try:
+        from keras.src.distribution.distribution_lib import distribution, ModelParallel
+        dist = distribution()
+        is_mp_distribution = isinstance(dist, ModelParallel)
+    except:
+        pass
+    
+    if is_tensor(x) and device_mesh is not None and (is_mp_distribution or torch.distributed.is_initialized()):
+        # Convert regular torch.Tensor to DTensor with Replicate placement
+        # This ensures all tensors are DTensors when distributed training is active
+        from torch.distributed._tensor import Replicate
+        return DTensor.from_local(x, device_mesh, [Replicate()])
     
     if isinstance(x, Variable):
         x = x.value
