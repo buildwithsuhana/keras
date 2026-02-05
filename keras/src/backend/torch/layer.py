@@ -53,11 +53,20 @@ class TorchLayer(torch.nn.Module):
         self._track_variables()
 
     def _track_variables(self):
-        # set torch_params attribute will have module automatically track
-        # parameters.
-        self._torch_params = torch.nn.ParameterDict(
-            {variable.path: _make_torch_param(variable.value) for variable in self.variables}
-        )
+        # Use a regular dict instead of ParameterDict to avoid automatic
+        # wrapping of non-floating point tensors as Parameters (which would
+        # cause RuntimeError: Only Tensors of floating point and complex
+        # dtype can require gradients).
+        # We manually register parameters with the Module to ensure they
+        # are tracked correctly.
+        self._torch_params = {}
+        for variable in self.variables:
+            param = _make_torch_param(variable.value)
+            self._torch_params[variable.path] = param
+            # Register with PyTorch module for proper tracking
+            # Only register if it's a Parameter (to avoid duplicate registration)
+            if isinstance(param, torch.nn.Parameter) and not hasattr(self, variable.path):
+                self.register_parameter(variable.path, param)
 
     def named_parameters(
         self,
@@ -67,6 +76,8 @@ class TorchLayer(torch.nn.Module):
     ):
         if not hasattr(self, "_torch_params"):
             self._track_variables()
+        # Use Module's named_parameters to get all registered parameters
+        # This now includes parameters we registered via register_parameter
         return torch.nn.Module.named_parameters(
             self, prefix, recurse, remove_duplicate
         )
@@ -91,9 +102,16 @@ class TorchLayer(torch.nn.Module):
     def _post_track_variable(self, variable):
         if hasattr(self, "_torch_params"):
             if variable.path not in self.torch_params:
-                self.torch_params[variable.path] = _make_torch_param(variable.value)
+                param = _make_torch_param(variable.value)
+                self.torch_params[variable.path] = param
+                # Register with PyTorch module for proper tracking
+                if isinstance(param, torch.nn.Parameter) and not hasattr(self, variable.path):
+                    self.register_parameter(variable.path, param)
 
     def _post_untrack_variable(self, variable):
         if hasattr(self, "_torch_params"):
             if variable.path in self.torch_params:
+                # Unregister from PyTorch module if it was registered
+                if hasattr(self, variable.path):
+                    self._parameters.pop(variable.path, None)
                 self.torch_params.pop(variable.path)
