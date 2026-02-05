@@ -36,10 +36,9 @@ def run_simple_dp_test():
         devices=devices
     )
 
-    # 3. No sharding - just replicate the model
+    # 3. No sharding - just replicate the model (empty tuple = replicate)
     layout_map = LayoutMap(mesh)
-    from keras.src.backend.torch.distribution_lib import Replicate
-    layout_map[".*"] = Replicate()  # Replicate (no sharding)
+    layout_map[".*"] = ()  # Empty tuple = Replicate (no sharding)
     
     # 4. Initialize Strategy
     strategy = ModelParallel(
