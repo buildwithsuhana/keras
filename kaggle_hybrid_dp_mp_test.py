@@ -118,8 +118,14 @@ def run_hybrid_dp_mp_test():
         print(f"Rank {rank}: Token IDs shape: {token_ids_torch['token_ids'].shape}")
         print(f"Rank {rank}: Token IDs device: {token_ids_torch['token_ids'].device}")
         
-        # Forward pass
+        # Forward pass with progress indicators
+        print(f"Rank {rank}: Starting forward pass...")
+        print(f"Rank {rank}: Model is on devices: cuda:0, cuda:1 (MP sharded)")
+        
+        print(f"Rank {rank}: Calling model...")
         outputs = model(token_ids_torch, training=True)
+        print(f"Rank {rank}: Forward pass complete!")
+        print(f"Rank {rank}: Output shape: {outputs.shape}")
         
         print(f"Rank {rank}: Forward pass successful!")
         print(f"Rank {rank}: Output shape: {outputs.shape}")
