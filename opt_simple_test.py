@@ -173,131 +173,95 @@ def test_data_parallel_simple(epochs=1, seq_length=64):
 
 
 def test_model_parallel_simple(epochs=1, seq_length=64):
-    """Test ModelParallel with OPT-125M."""
     import torch
     import keras
     from keras.src.distribution import ModelParallel, DeviceMesh, LayoutMap, list_devices, initialize
     import numpy as np
     
     log_section("MODEL PARALLEL TEST")
-    
     initialize()
     
-    # Check GPU count
+    # Ensure backend is clean
+    keras.backend.set_floatx("float32")
+    
     gpu_count = torch.cuda.device_count()
     if gpu_count < 2:
         log(f"⚠ Skipping: Need 2+ GPUs, have {gpu_count}")
         return False
     
-    # Get devices
     devices = list_devices("gpu")
-    log(f"Using devices: {devices}")
-    
-    # Create 2D device mesh
     mesh = DeviceMesh(
         shape=(1, len(devices)),
         axis_names=["batch", "model"],
         devices=devices
     )
-    log(f"✓ DeviceMesh: shape={mesh.shape}")
     
-    # Create layout map
+    # Updated LayoutMap for KerasHub OPT
     layout_map = LayoutMap(mesh)
+    layout_map[".*embeddings/.*"] = (None, "model")
+    layout_map[".*rel_p_embeddings/.*"] = (None, "model") # For OPT
     layout_map[".*kernel"] = (None, "model")
-    layout_map[".*bias"] = ("model",)
-    layout_map[".*embeddings.*"] = (None, "model")
-    log(f"✓ LayoutMap configured")
+    layout_map[".*bias"] = (None, "model")
     
-    # Create ModelParallel
     mp = ModelParallel(
         layout_map=layout_map,
         batch_dim_name="batch",
-        auto_shard_dataset=False
     )
-    log(f"✓ ModelParallel created")
     
-    # Check if keras_hub is available
     try:
         import keras_hub
         has_keras_hub = True
     except ImportError:
         has_keras_hub = False
     
-    # Create model
     with mp.scope():
         if has_keras_hub:
-            try:
-                # Use smaller OPT config for demo
-                log("Creating OPT backbone with sharding...")
-                opt_backbone = keras_hub.models.OPTBackbone(
-                    vocabulary_size=50265,
-                    num_layers=4,  # Smaller for demo
-                    num_heads=8,
-                    hidden_dim=512,
-                    intermediate_dim=2048,
-                    max_sequence_length=seq_length,
-                    dtype="float32"
-                )
-                
-                # Build the model
-                dummy_input = {
-                    "token_ids": np.zeros((1, seq_length), dtype=np.int32),
-                    "padding_mask": np.ones((1, seq_length), dtype=np.int32)
-                }
-                _ = opt_backbone(dummy_input)
-                
-                inputs = keras.Input(shape=(seq_length,), dtype='int32', name="token_ids")
-                padding_mask = keras.Input(shape=(seq_length,), dtype='int32', name="padding_mask")
-                
-                x = opt_backbone({"token_ids": inputs, "padding_mask": padding_mask})
-                outputs = keras.layers.Dense(50265, name="output_dense")(x)
-                
-                model = keras.Model(inputs=[inputs, padding_mask], outputs=outputs)
-                
-                log(f"✓ OPT model created: {model.count_params():,} params (sharded)")
-                
-            except Exception as e:
-                log(f"Error creating OPT: {e}")
-                import traceback
-                log(traceback.format_exc())
-                has_keras_hub = False
-        
-        if not has_keras_hub:
-            # Fallback to simple model
-            log("Creating simple sharded model...")
+            log("Creating OPT backbone with sharding...")
+            # Use the preset but wrap it in the scope to ensure weights are DTensors
+            opt_backbone = keras_hub.models.OPTBackbone(
+                vocabulary_size=50265,
+                num_layers=4,
+                num_heads=8,
+                hidden_dim=512,
+                intermediate_dim=2048,
+                max_sequence_length=seq_length,
+                dtype="float32"
+            )
+            
+            inputs = keras.Input(shape=(seq_length,), dtype='int32', name="token_ids")
+            padding_mask = keras.Input(shape=(seq_length,), dtype='int32', name="padding_mask")
+            
+            x = opt_backbone({"token_ids": inputs, "padding_mask": padding_mask})
+            outputs = keras.layers.Dense(50265, name="output_dense")(x)
+            model = keras.Model(inputs=[inputs, padding_mask], outputs=outputs)
+        else:
             model = keras.Sequential([
                 keras.layers.Embedding(1000, 256),
-                keras.layers.Dense(512, activation='relu'),
-                keras.layers.Dense(256, activation='relu'),
                 keras.layers.Dense(1000)
             ])
             
-            # Build the model
-            dummy_input = np.zeros((1, seq_length), dtype=np.int32)
-            _ = model(dummy_input)
-            
-            log(f"✓ Simple model created: {model.count_params():,} params (sharded)")
-        
         optimizer = keras.optimizers.Adam(learning_rate=0.001)
+        # Use a simpler loss for debugging if necessary
         model.compile(optimizer=optimizer, loss='sparse_categorical_crossentropy')
-    
-    # Prepare data
+
     log("Preparing data...")
     x_train, y_train, padding_mask = prepare_dummy_data(seq_length=seq_length, num_samples=50)
-    log(f"Data shapes: x={x_train.shape}, y={y_train.shape}")
     
-    # Quick training test
+    # IMPORTANT: In PyTorch ModelParallel, we often need to ensure the 
+    # dataset itself is prepared to yield tensors that match the backend requirement.
     log("Training (1 epoch)...")
     with mp.scope():
+        # Keras .fit() handles the distribution of numpy arrays automatically 
+        # as long as it's called WITHIN the mp.scope()
         history = model.fit(
-            [x_train, padding_mask] if has_keras_hub else x_train,
-            y_train,
+            x={"token_ids": x_train, "padding_mask": padding_mask} if has_keras_hub else x_train,
+            y=y_train,
             epochs=epochs,
             batch_size=4,
             verbose=1
         )
     
-    log(f"✓ ModelParallel completed. Final loss: {history.history['loss'][-1]:.4f}")
+    log(f"✓ ModelParallel completed.")
     return True
 
 

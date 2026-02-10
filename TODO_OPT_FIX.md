@@ -17,10 +17,14 @@
 
 ### Step 2: Update `distribution_lib.py`
 - Fix `distribute_variable()` to NOT wrap non-floating point tensors (int32) with Parameter
-- Add helper function to convert inputs to DTensors when weight is DTensor
 - **Status**: ✅ COMPLETED
 
-### Step 3: Test the fix
+### Step 3: Update `numpy.py`
+- Fix `take()` function to handle DTensor case for embedding lookup
+- When x is DTensor and indices is not, convert indices to DTensor
+- **Status**: ✅ COMPLETED
+
+### Step 4: Test the fix
 - Run opt_simple_test.py with ModelParallel
 - Verify both DataParallel and ModelParallel tests pass
 - **Status**: Pending - User needs to test
@@ -29,6 +33,7 @@
 
 1. `keras/src/layers/core/embedding.py`
 2. `keras/src/backend/torch/distribution_lib.py`
+3. `keras/src/backend/torch/numpy.py`
 
 ## Summary of Changes
 
@@ -41,6 +46,11 @@
 - Added `is_integer_dtype` check in `distribute_variable()`
 - When creating sharded DTensors, returns DTensor directly for integer tensors (no Parameter wrapper)
 - Added debug logging for integer tensor handling
+
+### numpy.py
+- Fixed `take()` function to handle DTensor embedding lookup
+- When x (embeddings) is a DTensor and indices is not, converts indices to DTensor
+- This prevents "mixed torch.Tensor and DTensor" error
 
 ## Testing Command
 
