@@ -1700,6 +1700,10 @@ def take(x, indices, axis=None):
     )
     if x.ndim == 2 and axis == 0:
         # This case is equivalent to embedding lookup.
+        # Handle DTensor case: when x is DTensor, indices must also be DTensor
+        if DTENSOR_AVAILABLE and is_dtensor(x) and not is_dtensor(indices):
+            # Convert indices to DTensor with Replicate placement
+            indices = create_replicate_dtensor(indices, device_mesh=x.device_mesh)
         return torch.nn.functional.embedding(indices, x)
     if axis is None:
         x = torch.reshape(x, (-1,))
