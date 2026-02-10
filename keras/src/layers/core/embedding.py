@@ -163,6 +163,28 @@ class Embedding(Layer):
     def call(self, inputs):
         if inputs.dtype != "int32" and inputs.dtype != "int64":
             inputs = ops.cast(inputs, "int32")
+
+        # Handle DTensor weights - convert inputs to DTensor if needed
+        # This prevents "mixed torch.Tensor and DTensor" error
+        embeddings = self.embeddings
+        if hasattr(embeddings, 'to_local'):
+            # embeddings is a DTensor - we need to handle inputs specially
+            from keras.src.backend.torch.distribution_lib import is_dtensor, ensure_dtensor_input, _get_default_device_mesh
+            from keras.src.backend.torch.core import convert_to_tensor
+
+            if not is_dtensor(inputs):
+                # Convert inputs to DTensor for DTensor embedding operation
+                device_mesh = _get_default_device_mesh()
+                if device_mesh is not None:
+                    inputs = ensure_dtensor_input(inputs, device_mesh)
+
+            # Get the local embedding tensor for the operation
+            local_embeddings = embeddings.to_local()
+            outputs = ops.take(local_embeddings, inputs, axis=0)
+
+            # Return the output - it will be a DTensor automatically
+            return ops.cast(outputs, dtype=self.compute_dtype)
+
         outputs = ops.take(self.embeddings, inputs, axis=0)
         return ops.cast(outputs, dtype=self.compute_dtype)
 

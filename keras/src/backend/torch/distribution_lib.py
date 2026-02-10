@@ -503,12 +503,15 @@ def distribute_variable(tensor, layout=None, module_name=None):
     rank = torch.distributed.get_rank() if torch.distributed.is_initialized() else 0
     world_size = torch.distributed.get_world_size() if torch.distributed.is_initialized() else 1
 
+    # Check if this is an integer tensor (like embedding indices)
+    is_integer_dtype = converted_tensor.dtype in (torch.int32, torch.int64)
+
     if debug_mode:
         print(
             f"DEBUG | [Rank {rank:02d}] distribute_variable: "
             f"shape={converted_tensor.shape}, dtype={converted_tensor.dtype}, "
             f"is_float_or_complex={is_float_or_complex}, layout={layout}, "
-            f"world_size={world_size}"
+            f"world_size={world_size}, is_integer_dtype={is_integer_dtype}"
         )
 
     # Check if ModelParallel distribution is active (for tensor parallelism)
@@ -587,8 +590,18 @@ def distribute_variable(tensor, layout=None, module_name=None):
                             f"global={dtensor.shape}, local={local_shape}"
                         )
                     
-                    # Return as Parameter for gradient tracking
-                    return torch.nn.Parameter(dtensor)
+                    # Return as Parameter for gradient tracking ONLY for float/complex tensors
+                    # Integer tensors (like embedding indices) cannot be Parameters
+                    if is_float_or_complex:
+                        return torch.nn.Parameter(dtensor)
+                    else:
+                        # For integer tensors, return the DTensor directly
+                        if debug_mode:
+                            print(
+                                f"DEBUG | [Rank {rank:02d}] Integer tensor DTensor returned without Parameter wrapper: "
+                                f"shape={dtensor.shape}, dtype={converted_tensor.dtype}"
+                            )
+                        return dtensor
             
             if debug_mode:
                 print(
