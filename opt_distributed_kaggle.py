@@ -15,7 +15,7 @@ Usage on Kaggle:
     torchrun --nproc_per_node=2 opt_distributed_kaggle.py
 
 Requirements:
-    - 2+ GPUs (T4 on Kaggle)
+    - 2+ GPUs (T4 on Kaggle provides 2)
     - keras >= 3.0
     - keras-hub >= 0.17.0
 """
@@ -323,14 +323,16 @@ def test_model_parallel_opt(epochs=2, seq_length=128):
     # Create layout map for sharding
     layout_map = LayoutMap(mesh)
     
-    # OPT-125M has:
-    # - Token embedding: vocab_size x hidden_dim (50265 x 768)
-    # - Transformer layers: 12 layers, each with:
-    #   - Self-attention: q, k, v, o projections (hidden_dim x hidden_dim each)
+    # OPT-125M has the following weight structure:
+    # - Embedding layer: token_embedding (vocab_size x hidden_dim)
+    # - TransformerDecoder layers (12 layers), each with:
+    #   - Self-attention: query, key, value, output projections (hidden_dim x hidden_dim)
     #   - FFN: two linear layers (hidden_dim x intermediate_dim, intermediate_dim x hidden_dim)
+    # - LayerNorm layers
+    # - Final output layer (hidden_dim x vocab_size)
     
-    # We'll shard the large weight matrices across the "model" axis (dim 1)
-    # For 2D tensors, (None, "model") means shard the last dimension
+    # We use regex patterns to match layer names for sharding
+    # For 2D tensors, (None, "model") means shard the last dimension (the hidden_dim)
     # For 1D tensors, ("model",) means shard across that dimension
     
     log("Configuring LayoutMap for OPT-125M sharding:")
@@ -339,31 +341,30 @@ def test_model_parallel_opt(epochs=2, seq_length=128):
     layout_map[".*embeddings.*"] = (None, "model")
     layout_map[".*token_embedding.*"] = (None, "model")
     
-    # Transformer encoder layers sharding
-    layout_map[".*transformer_layer_.*\\.attention.*\\.query.*kernel"] = (None, "model")
-    layout_map[".*transformer_layer_.*\\.attention.*\\.query.*bias"] = ("model",)
-    layout_map[".*transformer_layer_.*\\.attention.*\\.key.*kernel"] = (None, "model")
-    layout_map[".*transformer_layer_.*\\.attention.*\\.key.*bias"] = ("model",)
-    layout_map[".*transformer_layer_.*\\.attention.*\\.value.*kernel"] = (None, "model")
-    layout_map[".*transformer_layer_.*\\.attention.*\\.value.*bias"] = ("model",)
-    layout_map[".*transformer_layer_.*\\.attention.*\\.output.*kernel"] = (None, "model")
-    layout_map[".*transformer_layer_.*\\.attention.*\\.output.*bias"] = ("model",)
-    layout_map[".*transformer_layer_.*\\.ffn.*\\.gate_up.*kernel"] = (None, "model")
-    layout_map[".*transformer_layer_.*\\.ffn.*\\.gate_up.*bias"] = ("model",)
-    layout_map[".*transformer_layer_.*\\.ffn.*\\.output.*kernel"] = (None, "model")
-    layout_map[".*transformer_layer_.*\\.ffn.*\\.output.*bias"] = ("model",)
-    
-    # Output layer sharding
-    layout_map[".*layer_norm.*"] = ("model",)
+    # Dense layer sharding (covers attention projections and FFN)
     layout_map[".*dense.*kernel"] = (None, "model")
     layout_map[".*dense.*bias"] = ("model",)
     
+    # EinsumDense layers (used in MultiHeadAttention)
+    layout_map[".*einsum.*kernel"] = (None, "model")
+    layout_map[".*einsum.*bias"] = ("model",)
+    
+    # LayerNorm sharding (shard the feature dimension)
+    layout_map[".*layer_norm.*gamma"] = ("model",)
+    layout_map[".*layer_norm.*beta"] = ("model",)
+    layout_map[".*layer_normalization.*"] = ("model",)
+    
+    # Output projection layer
+    layout_map[".*output.*kernel"] = (None, "model")
+    layout_map[".*output.*bias"] = ("model",)
+    
     # Log configured layouts
     log("LayoutMap configured with patterns:")
-    for key in list(layout_map.keys())[:10]:  # Show first 10
+    for key in list(layout_map.keys())[:15]:  # Show first 15
         layout = layout_map[key]
         log(f"  - {key}: axes={layout.axes}")
-    log("  ... (and more patterns)")
+    if len(layout_map.keys()) > 15:
+        log(f"  ... and {len(layout_map.keys()) - 15} more patterns")
     
     # Create ModelParallel distribution
     mp = ModelParallel(
@@ -384,10 +385,12 @@ def test_model_parallel_opt(epochs=2, seq_length=128):
         
         log("")
         log("Loading OPT-125M with ModelParallel sharding...")
+        log("(Using smaller config for demonstration)")
         
         with mp.scope():
             # Create smaller OPT config for demonstration
             # Full OPT-125M: vocab=50265, layers=12, heads=12, hidden=768
+            # For demo, we use reduced size but still demonstrates sharding
             opt_backbone = keras_hub.models.OPTBackbone(
                 vocabulary_size=50265,
                 num_layers=6,  # Reduced for demo
@@ -511,6 +514,9 @@ def verify_model_sharding(model, distribution):
         pass
     
     # Check each layer's weights
+    sharded_count = 0
+    total_count = 0
+    
     for i, layer in enumerate(model.layers):
         # Skip input layers
         if not hasattr(layer, 'weights') or not layer.weights:
@@ -518,6 +524,7 @@ def verify_model_sharding(model, distribution):
         
         for j, weight in enumerate(layer.weights):
             weight_name = weight.name if hasattr(weight, 'name') else f"weight_{j}"
+            total_count += 1
             
             # Get the actual tensor (handle Keras Variable wrapping)
             if hasattr(weight, '_value'):
@@ -530,34 +537,41 @@ def verify_model_sharding(model, distribution):
             # Check if it's a DTensor
             if hasattr(tensor, 'to_local'):
                 # It's a DTensor - get local and global shapes
-                global_shape = tensor.shape
+                global_shape = tuple(tensor.shape)
                 local_tensor = tensor.to_local()
-                local_shape = local_tensor.shape
+                local_shape = tuple(local_tensor.shape)
                 
-                # Only log on rank 0 or show differences
+                # Check if sharded
+                is_sharded = False
+                sharded_dims = []
+                for k, (local_dim, global_dim) in enumerate(zip(local_shape, global_shape)):
+                    if global_dim > 1 and local_dim < global_dim:
+                        is_sharded = True
+                        sharded_dims.append(k)
+                
                 if rank == 0:
                     log(f"  {layer.name}/{weight_name}:")
-                    log(f"    - Global shape: {tuple(global_shape)}")
-                    log(f"    - Local shape: {tuple(local_shape)}")
-                    
-                    # Check if sharded (local dim < global dim)
-                    is_sharded = False
-                    for local_dim, global_dim in zip(local_shape, global_shape):
-                        if global_dim > 1 and local_dim < global_dim:
-                            is_sharded = True
-                            break
-                    
+                    log(f"    - Global shape: {global_shape}")
+                    log(f"    - Local shape: {local_shape}")
                     if is_sharded:
-                        log(f"    - Status: ✓ SHARDED across model axis")
+                        log(f"    - Status: ✓ SHARDED (dims {sharded_dims})")
+                        sharded_count += 1
                     else:
                         log(f"    - Status: Replicated")
             else:
-                # Regular tensor
+                # Regular tensor - check shape
                 if rank == 0:
                     shape = tuple(tensor.shape)
                     log(f"  {layer.name}/{weight_name}:")
                     log(f"    - Shape: {shape}")
-                    log(f"    - Status: Regular tensor (DTensor not yet applied)")
+                    log(f"    - Status: Regular tensor")
+    
+    if rank == 0:
+        log("")
+        log(f"Sharding Summary:")
+        log(f"  - Total weight tensors: {total_count}")
+        log(f"  - Sharded tensors: {sharded_count}")
+        log(f"  - Replicated tensors: {total_count - sharded_count}")
 
 
 def generate_text_demo(sequence_length=128):
