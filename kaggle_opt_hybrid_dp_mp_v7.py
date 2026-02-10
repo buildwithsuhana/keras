@@ -198,24 +198,13 @@ def redistribute_model_weights(model, strategy, layout_map):
         
         print(f"  DEBUG: placements={placements}, needs_shard={needs_shard}")
         
-        # If we need to shard, we must carefully copy the local shard to the right position
-        # in the full tensor, rather than trying to replace the entire tensor
+        # If we need to shard, we slice the local tensor to keep only this rank's portion
+        # This is different from distribute_tensor because we assume all ranks have
+        # the full tensor loaded (from checkpoint) and we just slice locally
         if needs_shard:
             try:
-                # Distribute the tensor
-                try:
-                    from torch.distributed._tensor.api import distribute_tensor as torch_distribute_tensor
-                except ImportError:
-                    from torch.distributed.tensor.api import distribute_tensor as torch_distribute_tensor
-                
-                distributed = torch_distribute_tensor(torch_tensor, device_mesh, placements)
-                
-                # Get the local shard
-                local_shard = distributed.to_local()
-                local_shape = tuple(local_shard.shape)
+                local_shape = tuple(torch_tensor.shape)
                 global_shape = tuple(torch_tensor.shape)
-                
-                print(f"  [Rank {local_rank}] Redistributing {v.path}: global={global_shape}, local={local_shape}, placements={placements}")
                 
                 # Calculate the slice indices for this rank
                 shard_dim = placements[0].dim  # The dimension being sharded
@@ -223,7 +212,9 @@ def redistribute_model_weights(model, strategy, layout_map):
                 num_shards = device_mesh.mesh.shape[0]
                 shard_per_rank = shard_size // num_shards
                 
-                # Build slice indices for the global tensor
+                print(f"  [Rank {local_rank}] Slicing {v.path}: global={global_shape}, dim={shard_dim}, shard_per_rank={shard_per_rank}")
+                
+                # Build slice indices for the local tensor (keep only this rank's portion)
                 slices = []
                 for dim, size in enumerate(global_shape):
                     if dim == shard_dim:
@@ -234,22 +225,35 @@ def redistribute_model_weights(model, strategy, layout_map):
                     else:
                         slices.append(slice(None))
                 
-                # Assign the local shard to the correct position in the global tensor
-                # Get the torch tensor from the Keras variable
-                var_tensor = torch_tensor
-                if hasattr(torch_tensor, 'data'):
-                    var_tensor = torch_tensor.data
+                # Get the sliced tensor (clone to avoid view issues)
+                sliced_tensor = torch_tensor[tuple(slices)].clone()
+                sliced_shape = tuple(sliced_tensor.shape)
                 
-                # Use torch advanced indexing to copy to the right position
-                with torch.no_grad():
-                    # Create index expression for the global tensor
-                    var_tensor[tuple(slices)] = local_shard
+                print(f"  [Rank {local_rank}] Sliced tensor shape: {sliced_shape}")
+                
+                # Now we need to replace the Keras variable's internal tensor with the sliced one
+                # IMPORTANT: We must directly modify v._value, not the property v.value
+                
+                # Check if the variable's _value exists and is a Parameter
+                if hasattr(v, '_value') and v._value is not None:
+                    old_value = v._value
+                    old_shape = tuple(old_value.shape)
+                    old_requires_grad = old_value.requires_grad if hasattr(old_value, 'requires_grad') else True
+                    
+                    # Create new Parameter with sliced data
+                    new_value = torch.nn.Parameter(sliced_tensor, requires_grad=old_requires_grad)
+                    
+                    # Directly replace the _value attribute (bypass property setter)
+                    v.__dict__['_value'] = new_value
+                    
+                    print(f"  [Rank {local_rank}] ✓ Sliced {v.path}: {old_shape} -> {sliced_shape}")
+                else:
+                    print(f"  [Rank {local_rank}] Warning: No _value attribute found for {v.path}")
                 
                 redistributed_count += 1
-                print(f"  [Rank {local_rank}] ✓ Redistributed: {v.path}")
                 
             except Exception as e:
-                print(f"  [Rank {local_rank}] Warning: Could not redistribute {v.path}: {e}")
+                print(f"  [Rank {local_rank}] Warning: Could not slice {v.path}: {e}")
                 import traceback
                 traceback.print_exc()
     
