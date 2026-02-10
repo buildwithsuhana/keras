@@ -256,10 +256,18 @@ def _layout_to_placements(layout, tensor, device_mesh):
     as device_mesh.ndim, NOT the layout length or tensor rank.
     
     For model parallelism with 1D mesh (shape=(2,)):
-    - layout (None, 'model') should produce ONE placement: [Shard(0)]
+    - layout (None, 'model') should produce ONE placement: [Shard(1)]
+      This means shard on TENSOR dimension 1, using the single mesh dimension
     - layout () should produce ONE placement: [Replicate()]
     
-    We map the 'model' axis to the single mesh dimension (index 0).
+    The 'model' axis in the layout specifies which TENSOR dimension should be
+    sharded across the model-parallel devices.
+    
+    Example:
+    - For query kernel with shape (768, 12, 64) and layout (None, 'model'):
+      - We want to shard on the 2nd dimension (12 -> 6+6)
+      - Layout position 1 has 'model', so we return [Shard(1)]
+      - This shards tensor dimension 1 across the 2 model-parallel devices
     """
     tensor_rank = tensor.dim()
     mesh_ndim = device_mesh.mesh.ndim
@@ -269,8 +277,11 @@ def _layout_to_placements(layout, tensor, device_mesh):
         # Look for 'model' axis in the layout
         for i, axis in enumerate(layout):
             if axis == 'model':
-                # Found 'model' axis - shard on mesh dim 0
-                return [Shard(0)]
+                # Found 'model' axis at layout position i
+                # Shard on TENSOR dimension i (not mesh dimension)
+                # For 1D mesh, there's only one mesh dim (0), but the tensor
+                # dimension to shard is specified by where 'model' appears in layout
+                return [Shard(i)]
         # No 'model' axis found - replicate
         return [Replicate()]
     else:
