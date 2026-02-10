@@ -266,18 +266,31 @@ def redistribute_model_weights(model, strategy, layout_map):
 
 
 def _layout_to_placements(layout, tensor, device_mesh):
-    """Convert Keras layout tuple to DTensor placements."""
+    """Convert Keras layout tuple to DTensor placements.
+    
+    The layout tuple (None, 'model') means:
+    - None = replicate on tensor dimension 0
+    - 'model' = shard on tensor dimension 1
+    
+    For DTensor Shard(dim), dim refers to the TENSOR dimension, not mesh dimension.
+    For 1D mesh, we use [Shard(tensor_dim)] where tensor_dim is where 'model' appears.
+    """
     from torch.distributed._tensor import Replicate, Shard
     
     mesh_ndim = device_mesh.mesh.ndim
+    tensor_ndim = len(tensor.shape) if hasattr(tensor, 'shape') else tensor.dim()
     
-    # For 1D mesh, return exactly 1 placement
+    # For 1D mesh, find where 'model' appears in the layout
     if mesh_ndim == 1:
-        # Look for 'model' axis in the layout
+        # Look for 'model' axis in the layout and shard on that tensor dimension
         for i, axis in enumerate(layout):
             if axis == 'model':
-                # Found 'model' axis - shard on mesh dim 0
-                return [Shard(0)]
+                if i < tensor_ndim:
+                    # Found 'model' at layout position i - shard on tensor dimension i
+                    return [Shard(i)]
+                else:
+                    # Layout position beyond tensor dims, replicate
+                    return [Replicate()]
         # No 'model' axis found - replicate
         return [Replicate()]
     else:
@@ -289,7 +302,11 @@ def _layout_to_placements(layout, tensor, device_mesh):
                 if axis is None:
                     placements.append(Replicate())
                 elif axis == 'model':
-                    placements.append(Shard(i))
+                    # Shard on tensor dimension i
+                    if i < tensor_ndim:
+                        placements.append(Shard(i))
+                    else:
+                        placements.append(Replicate())
                 else:
                     placements.append(Replicate())
             else:
