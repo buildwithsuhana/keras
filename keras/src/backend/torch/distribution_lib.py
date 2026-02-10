@@ -66,15 +66,18 @@ def initialize(job_addresses=None, num_processes=None, process_id=None):
     
     IMPORTANT: This function now properly initializes NCCL with appropriate
     timeout settings to prevent communication timeouts during DTensor operations.
+    
+    CRITICAL: This function sets CUDA device for the current rank BEFORE
+    initializing distributed to prevent "Duplicate GPU detected" errors.
     """
     import datetime
     
-    local_rank = os.environ.get("LOCAL_RANK")
+    local_rank_env = os.environ.get("LOCAL_RANK")
     world_size_env = os.environ.get("WORLD_SIZE")
 
-    if local_rank is not None and world_size_env is not None:
+    if local_rank_env is not None and world_size_env is not None:
         num_processes = num_processes or int(world_size_env)
-        process_id = process_id or int(local_rank)
+        process_id = process_id or int(local_rank_env)
 
     env_map = {
         "KERAS_DISTRIBUTION_JOB_ADDRESSES": "job_addresses",
@@ -94,9 +97,13 @@ def initialize(job_addresses=None, num_processes=None, process_id=None):
     if not num_processes or num_processes == 1 or torch.distributed.is_initialized():
         return
 
-    # Set the CUDA device for this rank (required for NCCL to work correctly)
-    if torch.cuda.is_available() and local_rank is not None:
-        torch.cuda.set_device(int(local_rank))
+    # CRITICAL: Set the CUDA device for this rank BEFORE any distributed init
+    # This must be done before init_process_group to prevent NCCL errors
+    if torch.cuda.is_available() and local_rank_env is not None:
+        local_rank = int(local_rank_env)
+        num_gpus = torch.cuda.device_count()
+        gpu_id = local_rank % num_gpus
+        torch.cuda.set_device(gpu_id)
 
     # Set NCCL environment variables for better performance and reliability
     os.environ.setdefault("NCCL_DEBUG", "INFO")
