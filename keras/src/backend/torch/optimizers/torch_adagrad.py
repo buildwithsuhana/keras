@@ -17,6 +17,12 @@ class Adagrad(
         keras_variables = variables
         variables = [v.value for v in variables]
 
+        # Convert gradients to DTensor if optimizer states are DTensor
+        # This is required for torch._foreach_* operations to work with DTensor
+        grads = torch_parallel_optimizer._convert_grads_to_dtensor(
+            grads, keras_variables
+        )
+
         dtype = variables[0].dtype
         lr = ops.cast(learning_rate, dtype)
 
@@ -35,3 +41,4 @@ class Adagrad(
             ),
             alpha=-1,
         )
+

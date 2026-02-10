@@ -13,6 +13,13 @@ class SGD(torch_parallel_optimizer.TorchParallelOptimizer, optimizers.SGD):
     ):
         keras_variables = variables
         variables = [v.value for v in variables]
+
+        # Convert gradients to DTensor if optimizer states are DTensor
+        # This is required for torch._foreach_* operations to work with DTensor
+        grads = torch_parallel_optimizer._convert_grads_to_dtensor(
+            grads, keras_variables
+        )
+
         if self.momentum != 0:
             bufs = [
                 self.momentums[self._get_variable_index(variable)].value
@@ -34,3 +41,4 @@ class SGD(torch_parallel_optimizer.TorchParallelOptimizer, optimizers.SGD):
 
         else:
             torch._foreach_add_(variables, grads, alpha=-learning_rate)
+
