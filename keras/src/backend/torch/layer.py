@@ -28,16 +28,38 @@ class TorchLayer(torch.nn.Module):
             value = variable.value
             # Check if value can be wrapped in Parameter
             # PyTorch only allows floating point or complex dtypes for requires_grad
-            if isinstance(value, torch.Tensor):
+            
+            # Check if value is already a DTensor (from distributed training)
+            is_dtensor = hasattr(torch, 'distributed') and hasattr(value, 'to_local')
+            
+            if is_dtensor:
+                # DTensor - check the local tensor's dtype
+                local_tensor = value.to_local()
+                is_float_or_complex = (local_tensor.dtype.is_floating_point or 
+                                       local_tensor.dtype.is_complex)
+            elif isinstance(value, torch.Tensor):
                 is_float_or_complex = value.dtype.is_floating_point or value.dtype.is_complex
-                if is_float_or_complex:
-                    # Wrap in Parameter for gradient tracking
-                    if not isinstance(value, torch.nn.Parameter):
-                        value = torch.nn.Parameter(value, requires_grad=variable.trainable)
-                else:
-                    # Integer/bool tensors cannot be Parameters, store as-is
-                    # These are typically not trainable weights (e.g., padding masks)
+            else:
+                is_float_or_complex = False
+            
+            if is_float_or_complex:
+                # Wrap in Parameter for gradient tracking
+                if isinstance(value, torch.nn.Parameter):
+                    # Already a Parameter, just use it
                     pass
+                elif is_dtensor:
+                    # For DTensors, wrap the DTensor in Parameter
+                    # PyTorch Parameter can wrap DTensor if local tensor is float/complex
+                    value = torch.nn.Parameter(value, requires_grad=variable.trainable)
+                else:
+                    # Regular tensor - wrap in Parameter
+                    value = torch.nn.Parameter(value, requires_grad=variable.trainable)
+            else:
+                # Integer/bool tensors cannot be Parameters, store as-is
+                # These are typically not trainable weights (e.g., padding masks)
+                # Don't wrap in Parameter
+                pass
+            
             params_dict[variable.path] = value
         self._torch_params = torch.nn.ParameterDict(params_dict)
 
@@ -77,12 +99,37 @@ class TorchLayer(torch.nn.Module):
                 # Skip adding non-floating point tensors to ParameterDict
                 # PyTorch's ParameterDict will try to wrap values in Parameter()
                 # which fails for integer tensors (can't require gradients)
-                if isinstance(value, torch.Tensor):
+                
+                # Check if value is a DTensor (from distributed training)
+                is_dtensor = hasattr(torch, 'distributed') and hasattr(value, 'to_local')
+                
+                if is_dtensor:
+                    # DTensor - check the local tensor's dtype
+                    local_tensor = value.to_local()
+                    is_float_or_complex = (local_tensor.dtype.is_floating_point or 
+                                           local_tensor.dtype.is_complex)
+                elif isinstance(value, torch.Tensor):
                     is_float_or_complex = value.dtype.is_floating_point or value.dtype.is_complex
-                    if not is_float_or_complex:
-                        # Skip non-floating point tensors (e.g., padding masks)
-                        return
-                self.torch_params[variable.path] = value
+                else:
+                    is_float_or_complex = False
+                
+                if not is_float_or_complex:
+                    # Skip non-floating point tensors (e.g., padding masks)
+                    # Don't try to wrap them in Parameter
+                    return
+                
+                # Add to ParameterDict - handle DTensors and regular tensors
+                if isinstance(value, torch.nn.Parameter):
+                    self.torch_params[variable.path] = value
+                elif is_dtensor:
+                    # Wrap DTensor in Parameter if local tensor is float/complex
+                    self.torch_params[variable.path] = torch.nn.Parameter(
+                        value, requires_grad=variable.trainable
+                    )
+                else:
+                    self.torch_params[variable.path] = torch.nn.Parameter(
+                        value, requires_grad=variable.trainable
+                    )
 
     def _post_untrack_variable(self, variable):
         if hasattr(self, "_torch_params"):

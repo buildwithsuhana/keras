@@ -592,18 +592,20 @@ def distribute_variable(tensor, layout=None, module_name=None):
                     
                     # Return as Parameter for gradient tracking ONLY for float/complex tensors
                     # Integer tensors (like embedding indices or padding masks) cannot be Parameters
-                    # But we set requires_grad=False so they can still be wrapped later
-                    if is_float_or_complex:
+                    # Get local tensor dtype to check if it's float/complex
+                    local_tensor = dtensor.to_local()
+                    local_dtype_is_float_or_complex = (local_tensor.dtype.is_floating_point or 
+                                                       local_tensor.dtype.is_complex)
+                    
+                    if local_dtype_is_float_or_complex:
                         return torch.nn.Parameter(dtensor)
                     else:
-                        # For integer tensors, we need to make them compatible with Parameter wrapping
-                        # Parameter requires requires_grad to work with float/complex, or it fails
-                        # We'll return the DTensor directly - it can still participate in operations
-                        # and when wrapped in Parameter, torch will handle it
+                        # For integer tensors, return DTensor directly without Parameter wrapper
+                        # PyTorch Parameter cannot wrap tensors with non-float dtypes
                         if debug_mode:
                             print(
-                                f"DEBUG | [Rank {rank:02d}] Integer tensor DTensor returned (requires_grad=False): "
-                                f"shape={dtensor.shape}, dtype={converted_tensor.dtype}"
+                                f"DEBUG | [Rank {rank:02d}] Integer tensor DTensor returned (no Parameter wrapper): "
+                                f"shape={dtensor.shape}, local_dtype={local_tensor.dtype}"
                             )
                         return dtensor
             
