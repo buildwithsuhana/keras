@@ -169,6 +169,9 @@ def distribute_variable(tensor, layout=None):
     if debug_mode:
         print(f"DEBUG | [Rank {rank}] distribute_variable() called")
         print(f"DEBUG | [Rank {rank}]   - tensor shape: {converted_tensor.shape}")
+        print(f"DEBUG | [Rank {rank}]   - tensor type: {type(converted_tensor)}")
+        if isinstance(converted_tensor, DTensor):
+            print(f"DEBUG | [Rank {rank}]   - existing placements: {converted_tensor.placements}")
         print(f"DEBUG | [Rank {rank}]   - layout: {layout}")
         print(f"DEBUG | [Rank {rank}]   - is_float_or_complex: {is_float_or_complex}")
 
@@ -180,8 +183,55 @@ def distribute_variable(tensor, layout=None):
             
             if debug_mode:
                 print(f"DEBUG | [Rank {rank}]   - device_mesh: {device_mesh}")
-                print(f"DEBUG | [Rank {rank}]   - placements: {placements}")
+                print(f"DEBUG | [Rank {rank}]   - target placements: {placements}")
             
+            # Handle case where tensor is already a DTensor
+            if isinstance(converted_tensor, DTensor):
+                if placements:
+                    # Check if redistribution is needed
+                    current_placements = converted_tensor.placements
+                    needs_redistribute = False
+                    for i, (curr, target) in enumerate(zip(current_placements, placements)):
+                        # Check if current and target are different types
+                        curr_is_replicate = isinstance(curr, Replicate)
+                        curr_is_shard = isinstance(curr, Shard)
+                        target_is_replicate = isinstance(target, Replicate)
+                        target_is_shard = isinstance(target, Shard)
+                        
+                        if (curr_is_replicate and target_is_shard) or (curr_is_shard and target_is_replicate):
+                            needs_redistribute = True
+                            break
+                        elif curr_is_shard and target_is_shard:
+                            # Check if shard dimension is different
+                            if curr.dim != target.dim:
+                                needs_redistribute = True
+                                break
+                    
+                    if needs_redistribute:
+                        if debug_mode:
+                            print(f"DEBUG | [Rank {rank}]   - Redistributing DTensor from {current_placements} to {placements}")
+                        try:
+                            dtensor = converted_tensor.redistribute(device_mesh, placements)
+                        except Exception as e:
+                            if debug_mode:
+                                print(f"DEBUG | [Rank {rank}]   - Redistribute failed: {e}, using local tensor")
+                            # Fallback: convert from local and redistribute
+                            local_tensor = converted_tensor.to_local()
+                            dtensor = torch_distribute_tensor(local_tensor, device_mesh, placements)
+                    else:
+                        if debug_mode:
+                            print(f"DEBUG | [Rank {rank}]   - No redistribution needed, placements match")
+                        dtensor = converted_tensor
+                else:
+                    if debug_mode:
+                        print(f"DEBUG | [Rank {rank}]   - No target placements, returning as-is")
+                    dtensor = converted_tensor
+                
+                if debug_mode:
+                    print(f"DEBUG | [Rank {rank}]   - Final DTensor local shape: {dtensor.to_local().shape}")
+                return torch.nn.Parameter(dtensor) if is_float_or_complex else dtensor
+            
+            # Handle case where tensor is not yet a DTensor
             if placements and any(isinstance(p, Shard) for p in placements):
                 dtensor = torch_distribute_tensor(converted_tensor, device_mesh, placements)
                 if debug_mode:
