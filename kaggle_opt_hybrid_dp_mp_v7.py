@@ -140,7 +140,13 @@ def redistribute_model_weights(model, strategy, layout_map):
     # Convert keras layout_map to dict for easier lookup
     layout_dict = dict(layout_map)
     
+    # DEBUG: Print all layout_map patterns
+    print(f"[Rank {local_rank}] DEBUG: LayoutMap patterns:")
+    for pattern, layout in layout_dict.items():
+        print(f"  DEBUG: Pattern '{pattern}' -> layout {layout}")
+    
     redistributed_count = 0
+    matched_count = 0
     
     for v in model.trainable_variables:
         torch_tensor = getattr(v, 'value', v)
@@ -149,10 +155,13 @@ def redistribute_model_weights(model, strategy, layout_map):
         
         # Skip if already a DTensor
         if isinstance(torch_tensor, DTensor):
+            print(f"  DEBUG: {v.path} is already a DTensor, skipping")
             continue
         
         # Try to find matching pattern in layout_map
         target_layout = None
+        matched_pattern = None
+        
         for pattern, layout in layout_dict.items():
             if hasattr(layout, 'axes'):
                 pattern_layout = layout.axes
@@ -160,12 +169,25 @@ def redistribute_model_weights(model, strategy, layout_map):
                 pattern_layout = layout
             
             # Convert pattern to regex and match
-            regex_pattern = pattern.replace('.*', '.*').replace('/', '\\/')
-            if re.match(regex_pattern, v.path):
+            # Also try simple string contains check
+            simple_match = pattern.replace('.*', '').replace('\\/', '/') in v.path
+            
+            # Try regex match
+            regex_pattern = pattern.replace('.*', '.*').replace('\\/ ', '/')
+            try:
+                regex_match = re.search(regex_pattern, v.path)
+            except:
+                regex_match = None
+            
+            if simple_match or regex_match:
                 target_layout = pattern_layout
+                matched_pattern = pattern
+                matched_count += 1
+                print(f"  DEBUG: MATCH - Pattern '{pattern}' matches '{v.path}' -> layout {target_layout}")
                 break
         
         if target_layout is None:
+            print(f"  DEBUG: NO MATCH - '{v.path}'")
             continue
         
         # Convert layout to placements
@@ -173,6 +195,8 @@ def redistribute_model_weights(model, strategy, layout_map):
         
         # Check if we need to shard
         needs_shard = any(isinstance(p, Shard) for p in placements)
+        
+        print(f"  DEBUG: placements={placements}, needs_shard={needs_shard}")
         
         if needs_shard:
             try:
@@ -190,7 +214,12 @@ def redistribute_model_weights(model, strategy, layout_map):
                 print(f"  [Rank {local_rank}] Redistributed: {v.path} -> {placements}")
             except Exception as e:
                 print(f"  [Rank {local_rank}] Warning: Could not redistribute {v.path}: {e}")
+                import traceback
+                traceback.print_exc()
     
+    print(f"[Rank {local_rank}] DEBUG: Total patterns checked: {len(layout_dict)}")
+    print(f"[Rank {local_rank}] DEBUG: Variables matched: {matched_count}")
+    print(f"[Rank {local_rank}] DEBUG: Variables redistributed: {redistributed_count}")
     print(f"[Rank {local_rank}] Redistributed {redistributed_count} weights")
     return redistributed_count > 0
 
