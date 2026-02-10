@@ -206,17 +206,20 @@ class Variable(KerasVariable):
 
     def _direct_assign(self, value):
         with torch.no_grad():
-            if self._layout is not None:
-                from keras.src.backend.torch import distribution_lib
-                value = distribution_lib.distribute_variable(value, self._layout)
-                if isinstance(value, torch.nn.Parameter):
-                    self._value.copy_(value)
-                elif hasattr(value, 'to_local'):
-                    self._value.copy_(value.to_local())
-                else:
-                    self._value.copy_(value)
+            # Handle DTensor: extract local tensor if needed
+            from keras.src.backend.torch.distribution_lib import is_dtensor
+            if is_dtensor(value):
+                # Extract local tensor from DTensor
+                value = value.to_local()
+            
+            # Also handle if self._value is a DTensor
+            if hasattr(self._value, 'to_local'):
+                # self._value is a DTensor, extract its local tensor for copying
+                self_local = self._value.to_local()
+                self_local.copy_(value)
             else:
-                self.value.copy_(value)
+                # self._value is a regular torch.Tensor
+                self._value.copy_(value)
 
     def _convert_to_tensor(self, value, dtype=None):
         return convert_to_tensor(value, dtype=dtype)

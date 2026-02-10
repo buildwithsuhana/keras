@@ -213,8 +213,14 @@ def redistribute_model_weights(model, strategy, layout_map):
                 # PyTorch Parameter doesn't have .assign() method, use .copy_() instead
                 # or use the Keras Variable._direct_assign() method
                 if hasattr(v, '_direct_assign'):
-                    # This is a Keras Variable - use its built-in method
-                    v._direct_assign(distributed)
+                    # Get local tensor from distributed DTensor first
+                    # This is the key fix: we can't copy DTensor to regular tensor
+                    if hasattr(distributed, 'to_local'):
+                        local_tensor = distributed.to_local()
+                    else:
+                        local_tensor = distributed
+                    # This is a Keras Variable - use its built-in method with local tensor
+                    v._direct_assign(local_tensor)
                 elif hasattr(v, '_value'):
                     # This is a Keras Variable with _value attribute
                     if hasattr(v._value, 'copy_'):
