@@ -530,6 +530,9 @@ def run_opt_hybrid_dp_mp_test():
 
             print(f"[Rank {local_rank}] Training simple model...")
 
+            # Compile the model with optimizer and loss function
+            model.compile(optimizer="adam", loss="mean_squared_error")
+
             history = model.fit(
                 train_x, train_y,
                 epochs=1,
