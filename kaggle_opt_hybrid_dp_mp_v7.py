@@ -201,7 +201,12 @@ def redistribute_model_weights(model, strategy, layout_map):
         if needs_shard:
             try:
                 # Distribute the tensor using torch_distribute_tensor
-                from torch.distributed.tensor.api import distribute_tensor as torch_distribute_tensor
+                # Note: The correct import path varies by PyTorch version
+                try:
+                    from torch.distributed._tensor.api import distribute_tensor as torch_distribute_tensor
+                except ImportError:
+                    from torch.distributed.tensor.api import distribute_tensor as torch_distribute_tensor
+                
                 distributed = torch_distribute_tensor(torch_tensor, device_mesh, placements)
                 
                 # Update the variable's value
