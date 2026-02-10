@@ -83,6 +83,115 @@ def enable_distribution_for_forward_pass():
         return True
 
 
+def redistribute_model_weights(model, strategy, layout_map):
+    """Redistribute model weights to match the layout_map.
+    
+    This function manually redistributes existing model weights to DTensors
+    based on the layout_map. This is needed when distribution was disabled
+    during model creation and needs to be enabled afterwards.
+    """
+    import re
+    from torch.distributed._tensor import DTensor, Replicate, Shard
+    from keras.src.backend.torch import distribution_lib
+    
+    local_rank = int(os.environ.get("LOCAL_RANK", 0))
+    device_mesh = distribution_lib._get_default_device_mesh()
+    
+    if device_mesh is None:
+        print(f"[Rank {local_rank}] Warning: No device mesh found, skipping redistribution")
+        return False
+    
+    print(f"[Rank {local_rank}] Redistributing model weights to match layout_map...")
+    
+    # Convert keras layout_map to dict for easier lookup
+    layout_dict = dict(layout_map)
+    
+    redistributed_count = 0
+    
+    for v in model.trainable_variables:
+        torch_tensor = getattr(v, 'value', v)
+        if hasattr(torch_tensor, 'data'):
+            torch_tensor = torch_tensor.data
+        
+        # Skip if already a DTensor
+        if isinstance(torch_tensor, DTensor):
+            continue
+        
+        # Try to find matching pattern in layout_map
+        target_layout = None
+        for pattern, layout in layout_dict.items():
+            if hasattr(layout, 'axes'):
+                pattern_layout = layout.axes
+            else:
+                pattern_layout = layout
+            
+            # Convert pattern to regex and match
+            regex_pattern = pattern.replace('.*', '.*').replace('/', '\\/')
+            if re.match(regex_pattern, v.path):
+                target_layout = pattern_layout
+                break
+        
+        if target_layout is None:
+            continue
+        
+        # Convert layout to placements
+        placements = _layout_to_placements(target_layout, torch_tensor, device_mesh)
+        
+        # Check if we need to shard
+        needs_shard = any(isinstance(p, Shard) for p in placements)
+        
+        if needs_shard:
+            try:
+                # Distribute the tensor
+                distributed = distribution_lib.distribute_tensor(torch_tensor, target_layout)
+                
+                # Update the variable's value
+                if hasattr(v, '_value'):
+                    v._value.assign(distributed)
+                elif hasattr(v, 'value'):
+                    v.value.assign(distributed)
+                
+                redistributed_count += 1
+                print(f"  [Rank {local_rank}] Redistributed: {v.path} -> {placements}")
+            except Exception as e:
+                print(f"  [Rank {local_rank}] Warning: Could not redistribute {v.path}: {e}")
+    
+    print(f"[Rank {local_rank}] Redistributed {redistributed_count} weights")
+    return redistributed_count > 0
+
+
+def _layout_to_placements(layout, tensor, device_mesh):
+    """Convert Keras layout tuple to DTensor placements."""
+    from torch.distributed._tensor import Replicate, Shard
+    
+    mesh_ndim = device_mesh.mesh.ndim
+    
+    # For 1D mesh, return exactly 1 placement
+    if mesh_ndim == 1:
+        # Look for 'model' axis in the layout
+        for i, axis in enumerate(layout):
+            if axis == 'model':
+                # Found 'model' axis - shard on mesh dim 0
+                return [Shard(0)]
+        # No 'model' axis found - replicate
+        return [Replicate()]
+    else:
+        # Multi-dimensional mesh case
+        placements = []
+        for i in range(mesh_ndim):
+            if i < len(layout):
+                axis = layout[i]
+                if axis is None:
+                    placements.append(Replicate())
+                elif axis == 'model':
+                    placements.append(Shard(i))
+                else:
+                    placements.append(Replicate())
+            else:
+                placements.append(Replicate())
+        return placements
+
+
 def disable_distribution_for_model_creation():
     """Disable distribution during model creation.
 
