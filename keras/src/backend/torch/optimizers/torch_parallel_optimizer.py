@@ -78,6 +78,10 @@ class TorchParallelOptimizer(BaseOptimizer):
 
     @torch_utils.no_grad
     def _backend_increment_gradient_accumulators(self, grads, acc_grads):
+        # Convert grads to DTensors to match accumulated gradients (DTensors)
+        # This prevents "aten._foreach_add_.List: got mixed torch.Tensor and DTensor" error
+        converted_grads = _convert_grads_to_dtensor(grads, acc_grads)
+
         acc_list = [v.value for v in acc_grads]
-        torch._foreach_add_(acc_list, grads, alpha=1.0)
+        torch._foreach_add_(acc_list, converted_grads, alpha=1.0)
 
