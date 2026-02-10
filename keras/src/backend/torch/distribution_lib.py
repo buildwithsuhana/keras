@@ -158,8 +158,6 @@ def distribute_variable(tensor, layout=None):
 
     # Check if distribution is disabled
     if os.environ.get("KERAS_DISTRIBUTION_DISABLE", "0") == "1":
-        if debug_mode:
-            print(f"DEBUG | Distribution disabled via KERAS_DISTRIBUTION_DISABLE")
         return torch.nn.Parameter(converted_tensor) if is_float_or_complex else converted_tensor
 
     # Debug logging - define at function level
