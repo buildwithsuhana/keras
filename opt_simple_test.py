@@ -98,7 +98,7 @@ def test_data_parallel_simple(epochs=1, seq_length=64):
         log(f"keras_hub available: {keras_hub.__version__}")
         has_keras_hub = True
     except ImportError:
-        log("keras_hub not available, using custom model")
+        log("keras_hub not available")
         has_keras_hub = False
     
     # Create model
@@ -107,14 +107,24 @@ def test_data_parallel_simple(epochs=1, seq_length=64):
             try:
                 # Use OPT-125M from keras_hub
                 log("Loading OPT-125M backbone...")
-                opt_backbone = keras_hub.models.OPTBackbone.from_preset("opt_125m_en")
+                opt_backbone = keras_hub.models.OPTBackbone.from_preset(
+                    "opt_125m_en",
+                    dtype="float32"
+                )
+                
+                # Build the model by passing dummy input
+                dummy_input = {
+                    "token_ids": np.zeros((1, seq_length), dtype=np.int32),
+                    "padding_mask": np.ones((1, seq_length), dtype=np.int32)
+                }
+                _ = opt_backbone(dummy_input)
                 
                 # Create model
-                inputs = keras.Input(shape=(seq_length,), dtype='int32')
-                padding_mask = keras.Input(shape=(seq_length,), dtype='int32')
+                inputs = keras.Input(shape=(seq_length,), dtype='int32', name="token_ids")
+                padding_mask = keras.Input(shape=(seq_length,), dtype='int32', name="padding_mask")
                 
                 x = opt_backbone({"token_ids": inputs, "padding_mask": padding_mask})
-                outputs = keras.layers.Dense(opt_backbone.vocabulary_size)(x)
+                outputs = keras.layers.Dense(opt_backbone.vocabulary_size, name="output_dense")(x)
                 
                 model = keras.Model(inputs=[inputs, padding_mask], outputs=outputs)
                 
@@ -125,13 +135,18 @@ def test_data_parallel_simple(epochs=1, seq_length=64):
                 has_keras_hub = False
         
         if not has_keras_hub:
-            # Fallback to simple model
+            # Fallback to simple model - build it first
             log("Creating simple model...")
             model = keras.Sequential([
-                keras.layers.Embedding(1000, 128, input_length=seq_length),
+                keras.layers.Embedding(1000, 128),
                 keras.layers.Dense(256, activation='relu'),
                 keras.layers.Dense(1000)
             ])
+            
+            # Build the model by passing dummy input
+            dummy_input = np.zeros((1, seq_length), dtype=np.int32)
+            _ = model(dummy_input)
+            
             log(f"✓ Simple model created: {model.count_params():,} params")
         
         optimizer = keras.optimizers.Adam(learning_rate=0.001)
@@ -224,11 +239,18 @@ def test_model_parallel_simple(epochs=1, seq_length=64):
                     dtype="float32"
                 )
                 
-                inputs = keras.Input(shape=(seq_length,), dtype='int32')
-                padding_mask = keras.Input(shape=(seq_length,), dtype='int32')
+                # Build the model
+                dummy_input = {
+                    "token_ids": np.zeros((1, seq_length), dtype=np.int32),
+                    "padding_mask": np.ones((1, seq_length), dtype=np.int32)
+                }
+                _ = opt_backbone(dummy_input)
+                
+                inputs = keras.Input(shape=(seq_length,), dtype='int32', name="token_ids")
+                padding_mask = keras.Input(shape=(seq_length,), dtype='int32', name="padding_mask")
                 
                 x = opt_backbone({"token_ids": inputs, "padding_mask": padding_mask})
-                outputs = keras.layers.Dense(50265)(x)
+                outputs = keras.layers.Dense(50265, name="output_dense")(x)
                 
                 model = keras.Model(inputs=[inputs, padding_mask], outputs=outputs)
                 
@@ -236,17 +258,24 @@ def test_model_parallel_simple(epochs=1, seq_length=64):
                 
             except Exception as e:
                 log(f"Error creating OPT: {e}")
+                import traceback
+                log(traceback.format_exc())
                 has_keras_hub = False
         
         if not has_keras_hub:
             # Fallback to simple model
             log("Creating simple sharded model...")
             model = keras.Sequential([
-                keras.layers.Embedding(1000, 256, input_length=seq_length),
+                keras.layers.Embedding(1000, 256),
                 keras.layers.Dense(512, activation='relu'),
                 keras.layers.Dense(256, activation='relu'),
                 keras.layers.Dense(1000)
             ])
+            
+            # Build the model
+            dummy_input = np.zeros((1, seq_length), dtype=np.int32)
+            _ = model(dummy_input)
+            
             log(f"✓ Simple model created: {model.count_params():,} params (sharded)")
         
         optimizer = keras.optimizers.Adam(learning_rate=0.001)
