@@ -614,6 +614,9 @@ def distribute_variable(tensor, layout=None, module_name=None):
     
     # If ModelParallel is active but no sharding layout, create regular Parameter
     if is_model_parallel:
+        # IMPORTANT: PyTorch only allows floating-point or complex dtypes
+        # for tensors with requires_grad=True. Integer tensors cannot be wrapped
+        # in torch.nn.Parameter, so we return them as-is.
         if not is_float_or_complex:
             if debug_mode:
                 print(
