@@ -92,16 +92,50 @@ def redistribute_model_weights(model, strategy, layout_map):
     """
     import re
     from torch.distributed._tensor import DTensor, Replicate, Shard
-    from keras.src.backend.torch import distribution_lib
+    from torch.distributed.device_mesh import init_device_mesh
+    from keras.src.backend.common import global_state
     
     local_rank = int(os.environ.get("LOCAL_RANK", 0))
-    device_mesh = distribution_lib._get_default_device_mesh()
+    
+    # Try to get the device mesh from global state first
+    device_mesh = global_state.get_global_attribute("torch_device_mesh", None)
+    
+    # If not found, try to get it from the distribution
+    if device_mesh is None:
+        try:
+            dist = strategy
+            if hasattr(dist, 'device_mesh'):
+                keras_mesh = dist.device_mesh
+                # Create PyTorch DeviceMesh from Keras DeviceMesh
+                if torch.cuda.is_available():
+                    world_size = torch.distributed.get_world_size()
+                    device_mesh = init_device_mesh(
+                        device_type="cuda",
+                        mesh_shape=(world_size,),
+                        mesh_dim_names=["model"]
+                    )
+        except Exception as e:
+            print(f"[Rank {local_rank}] Could not get device mesh from strategy: {e}")
+    
+    # If still not found, create a new DeviceMesh
+    if device_mesh is None:
+        try:
+            if torch.distributed.is_initialized() and torch.cuda.is_available():
+                world_size = torch.distributed.get_world_size()
+                device_mesh = init_device_mesh(
+                    device_type="cuda",
+                    mesh_shape=(world_size,),
+                    mesh_dim_names=["model"]
+                )
+                print(f"[Rank {local_rank}] Created new DeviceMesh: shape={device_mesh.mesh.shape}")
+        except Exception as e:
+            print(f"[Rank {local_rank}] Could not create DeviceMesh: {e}")
     
     if device_mesh is None:
         print(f"[Rank {local_rank}] Warning: No device mesh found, skipping redistribution")
         return False
     
-    print(f"[Rank {local_rank}] Redistributing model weights to match layout_map...")
+    print(f"[Rank {local_rank}] Using DeviceMesh: shape={device_mesh.mesh.shape}")
     
     # Convert keras layout_map to dict for easier lookup
     layout_dict = dict(layout_map)
@@ -142,8 +176,9 @@ def redistribute_model_weights(model, strategy, layout_map):
         
         if needs_shard:
             try:
-                # Distribute the tensor
-                distributed = distribution_lib.distribute_tensor(torch_tensor, target_layout)
+                # Distribute the tensor using torch_distribute_tensor
+                from torch.distributed.tensor.api import distribute_tensor as torch_distribute_tensor
+                distributed = torch_distribute_tensor(torch_tensor, device_mesh, placements)
                 
                 # Update the variable's value
                 if hasattr(v, '_value'):
