@@ -210,10 +210,40 @@ def redistribute_model_weights(model, strategy, layout_map):
                 distributed = torch_distribute_tensor(torch_tensor, device_mesh, placements)
                 
                 # Update the variable's value
-                if hasattr(v, '_value'):
-                    v._value.assign(distributed)
+                # PyTorch Parameter doesn't have .assign() method, use .copy_() instead
+                # or use the Keras Variable._direct_assign() method
+                if hasattr(v, '_direct_assign'):
+                    # This is a Keras Variable - use its built-in method
+                    v._direct_assign(distributed)
+                elif hasattr(v, '_value'):
+                    # This is a Keras Variable with _value attribute
+                    if hasattr(v._value, 'copy_'):
+                        # PyTorch tensor or Parameter - use copy_
+                        # Get the local tensor if it's a DTensor
+                        if hasattr(distributed, 'to_local'):
+                            v._value.copy_(distributed.to_local())
+                        else:
+                            v._value.copy_(distributed)
+                    else:
+                        # Fallback to assign if available
+                        v._value.assign(distributed)
                 elif hasattr(v, 'value'):
-                    v.value.assign(distributed)
+                    # Alternative access to value
+                    value = v.value
+                    if hasattr(value, 'copy_'):
+                        if hasattr(distributed, 'to_local'):
+                            value.copy_(distributed.to_local())
+                        else:
+                            value.copy_(distributed)
+                    else:
+                        value.assign(distributed)
+                else:
+                    # Direct torch tensor - use copy_
+                    if hasattr(torch_tensor, 'copy_'):
+                        if hasattr(distributed, 'to_local'):
+                            torch_tensor.copy_(distributed.to_local())
+                        else:
+                            torch_tensor.copy_(distributed)
                 
                 redistributed_count += 1
                 print(f"  [Rank {local_rank}] Redistributed: {v.path} -> {placements}")
