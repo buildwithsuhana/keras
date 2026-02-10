@@ -641,18 +641,14 @@ def distribute_variable(tensor, layout=None, module_name=None):
         # This is important for integer tensors like padding masks
         if not is_float_or_complex:
             if debug_mode:
-                print(
-                    f"DEBUG | [Rank {rank:02d}] Non-floating tensor returned as-is (no grad tracking): "
-                    f"shape={converted_tensor.shape}, dtype={converted_tensor.dtype}"
-                )
-            return converted_tensor
-        
-        # For floating-point tensors, create Parameter
-        if debug_mode:
-            print(
-                f"DEBUG | [Rank {rank:02d}] Creating regular Parameter (replicated): "
-                f"shape={converted_tensor.shape}, dtype={converted_tensor.dtype}"
-            )
+                print(f"DEBUG | [Rank {rank:02d}] Returning raw tensor/DTensor for integer dtype")
+            # If it's already a DTensor from the ModelParallel path, return it.
+            # Otherwise, return the converted_tensor (replicated).
+            return dtensor if 'dtensor' in locals() else converted_tensor
+
+        # Only wrap in Parameter if it IS float/complex
+        if 'dtensor' in locals():
+            return torch.nn.Parameter(dtensor)
         return torch.nn.Parameter(converted_tensor)
 
     # Use the distribution object
