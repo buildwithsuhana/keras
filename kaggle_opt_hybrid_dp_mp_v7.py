@@ -251,6 +251,18 @@ def run_opt_hybrid_dp_mp_test():
     from torch.distributed._tensor import DTensor, Replicate
 
     print(f"[Rank {local_rank}] Initializing distributed backend...")
+
+    # Apply DTensor redistribution fix to handle weight loading issues
+    # This prevents errors when loading pretrained weights with different placements
+    try:
+        from keras.src.backend.torch import distributed_fix
+        distributed_fix.apply_dtensor_redistribute_fix()
+        distributed_fix.apply_convert_structure_fix()
+        distributed_fix.apply_all_gather_fix()
+        print(f"[Rank {local_rank}] Applied DTensor redistribution fixes")
+    except ImportError:
+        print(f"[Rank {local_rank}] Warning: Could not apply distributed fixes")
+
     initialize()
 
     # Verify initialization succeeded
