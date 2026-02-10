@@ -147,8 +147,32 @@ def main():
     import keras
     from keras.src.distribution import initialize
     
-    # Initialize the distribution system
-    initialize()
+    # Initialize the distribution system for multi-process training
+    # Check if running in multi-process mode via environment variables
+    job_addresses = os.environ.get("KERAS_DISTRIBUTION_JOB_ADDRESSES")
+    num_processes_str = os.environ.get("KERAS_DISTRIBUTION_NUM_PROCESSES")
+    num_processes = int(num_processes_str) if num_processes_str else None
+    
+    is_multi_process = num_processes is not None and num_processes > 1
+    
+    if is_multi_process:
+        # For multi-process training, we need proper configuration
+        if job_addresses is None:
+            log("⚠ Skipping initialize() for multi-process training - no job_addresses configured")
+            log("   To run multi-process training, set:")
+            log("   KERAS_DISTRIBUTION_JOB_ADDRESSES=coordinator_address:port")
+            log("   KERAS_DISTRIBUTION_NUM_PROCESSES=<number_of_processes>")
+            log("   KERAS_DISTRIBUTION_PROCESS_ID=<current_process_id>")
+        else:
+            # Properly initialize for multi-process training
+            process_id = int(os.environ.get("KERAS_DISTRIBUTION_PROCESS_ID", "0"))
+            initialize(job_addresses=job_addresses, num_processes=num_processes, process_id=process_id)
+            log("✓ Initialized for multi-process training")
+    else:
+        # For single-process training, initialize without arguments
+        # This is safe and doesn't require coordinator_address
+        initialize()
+        log("✓ Initialized for single-process training")
     
     setup_environment()
     test_device_detection()

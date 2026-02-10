@@ -176,27 +176,54 @@ def initialize_rng():
 
 
 def initialize(job_addresses, num_processes, process_id):
-    if job_addresses and "," in job_addresses:
-        # When user provide all the job addresses, we will split and get the
-        # first one, which is the coordinator.
-        job_addresses = job_addresses.split(",")
-        # Do a sanity check to make sure the number of addresses also match
-        # the num_processes.
-        if num_processes is not None and num_processes != len(job_addresses):
+    # Check if we need to initialize JAX distributed for multi-process training
+    # JAX distributed.initialize is only needed when running with multiple processes.
+    # For single-process training (num_processes <= 1 or not specified), we skip
+    # JAX distributed initialization to avoid errors.
+    
+    is_multi_process = num_processes is not None and num_processes > 1
+    
+    if is_multi_process:
+        # For multi-process training, we need a coordinator_address
+        if job_addresses is None:
             raise ValueError(
-                f"The provided job_addresses {job_addresses} has "
-                f"{len(job_addresses)} jobs, but num_processes is "
-                f"{num_processes}"
+                "job_addresses is required for multi-process distributed training. "
+                "Please provide the coordinator address via the job_addresses "
+                "parameter or via the KERAS_DISTRIBUTION_JOB_ADDRESSES environment "
+                "variable. For JAX backend, you can provide either the full list "
+                "of job addresses (comma-separated) or just the coordinator address."
             )
-        coordinator_address = job_addresses[0]
-    else:
-        coordinator_address = job_addresses
-
-    jax.distributed.initialize(
-        coordinator_address=coordinator_address,
-        num_processes=num_processes,
-        process_id=process_id,
-    )
+        
+        # Handle single address (coordinator address) case
+        if "," in job_addresses:
+            # When user provide all the job addresses, we will split and get the
+            # first one, which is the coordinator.
+            job_addresses_list = job_addresses.split(",")
+            # Do a sanity check to make sure the number of addresses also match
+            # the num_processes.
+            if num_processes is not None and num_processes != len(job_addresses_list):
+                raise ValueError(
+                    f"The provided job_addresses has {len(job_addresses_list)} "
+                    f"jobs, but num_processes is {num_processes}"
+                )
+            coordinator_address = job_addresses_list[0]
+        else:
+            # Single address provided - treat it as the coordinator address
+            coordinator_address = job_addresses
+        
+        if coordinator_address is None or coordinator_address == "":
+            raise ValueError(
+                "coordinator_address cannot be empty for multi-process distributed "
+                "training. Please provide a valid coordinator address."
+            )
+        
+        jax.distributed.initialize(
+            coordinator_address=coordinator_address,
+            num_processes=num_processes,
+            process_id=process_id,
+        )
+    # For single-process training, we skip JAX distributed.initialize
+    # as it requires a coordinator_address and is not needed for single-process
 
     # Ensure the random number generator is initialized across processes.
     initialize_rng()

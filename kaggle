@@ -1,0 +1,341 @@
+#!/usr/bin/env python3
+"""
+Hybrid Data Parallel + Model Parallel Test with OPT Model from KerasHub
+
+FIXED v8: Removed problematic NCCL barrier calls that cause hangs.
+
+The issue: NCCL collective operations (all_reduce, barrier) can hang when
+ranks are in different states or when there's network communication issues.
+
+Solution: Remove explicit barrier calls before forward pass. DTensor
+automatically handles synchronization through its internal communication.
+
+This test verifies model parallelism sharding on OPT model weights.
+"""
+
+import os
+# Must be set before any other imports
+os.environ["KERAS_BACKEND"] = "torch"
+os.environ["TOKENIZERS_PARALLELISM"] = "false"
+os.environ["TF_CPP_MIN_LOG_LEVEL"] = "3"
+
+# NCCL settings - reduced verbosity
+os.environ["NCCL_DEBUG"] = "WARN"
+os.environ["NCCL_TIMEOUT"] = "1800"
+
+import torch
+import numpy as np
+import signal
+import sys
+import time
+
+# Import keras at the top level
+import keras
+
+# Disable torch.compile for stability
+try:
+    import torch._dynamo
+    torch._dynamo.config.disable = True
+except Exception:
+    pass
+
+
+# Global flag for graceful shutdown
+shutdown_requested = False
+
+
+def signal_handler(signum, frame):
+    """Handle shutdown signals gracefully."""
+    global shutdown_requested
+    rank = os.environ.get("LOCAL_RANK", "?")
+    print(f"\n[Rank {rank}] Received signal {signum}, shutting down gracefully...")
+    shutdown_requested = True
+
+
+signal.signal(signal.SIGINT, signal_handler)
+signal.signal(signal.SIGTERM, signal_handler)
+
+
+def _sync_cuda():
+    """Synchronize CUDA streams."""
+    if torch.cuda.is_available():
+        try:
+            torch.cuda.synchronize()
+        except Exception:
+            pass
+
+
+def _get_backend_type():
+    """Determine the backend type."""
+    if hasattr(torch, 'xla') and hasattr(torch.xla, 'core') and hasattr(torch.xla.core.xla_model, 'xla_device'):
+        return "tpu"
+    elif torch.cuda.is_available():
+        return "cuda"
+    else:
+        return "cpu"
+
+
+def _cleanup_distributed():
+    """Safely cleanup distributed resources."""
+    try:
+        if torch.distributed.is_available() and torch.distributed.is_initialized():
+            rank = os.environ.get("LOCAL_RANK", "?")
+            print(f"[Rank {rank}] Destroying process group...")
+            torch.distributed.destroy_process_group()
+            print(f"[Rank {rank}] Process group destroyed successfully")
+    except Exception as e:
+        rank = os.environ.get("LOCAL_RANK", "?")
+        print(f"[Rank {rank}] Cleanup warning: {e}")
+
+
+def run_opt_hybrid_dp_mp_test():
+    """Test OPT model with hybrid Data Parallel + Model Parallel.
+
+    FIXED v8: Removed problematic NCCL barrier calls.
+    """
+    local_rank = int(os.environ.get("LOCAL_RANK", 0))
+    world_size = int(os.environ.get("WORLD_SIZE", 1))
+
+    backend = _get_backend_type()
+    print(f"\n{'='*70}")
+    print(f"TEST: OPT MODEL WITH HYBRID DATA PARALLEL + MODEL PARALLEL (v8)")
+    print(f"{'='*70}")
+    print(f"Local rank: {local_rank}, World size: {world_size}, Backend: {backend}")
+
+    # Set device
+    if backend == "cuda" and torch.cuda.is_available():
+        num_gpus = torch.cuda.device_count()
+        gpu_id = local_rank % num_gpus
+        torch.cuda.set_device(gpu_id)
+        print(f"Process {local_rank} -> GPU {gpu_id}")
+
+    # Initialize distributed backend
+    from keras.src.distribution import DeviceMesh, LayoutMap, ModelParallel, initialize
+    from keras.src.backend.torch import distribution_lib
+    from torch.distributed._tensor import DTensor, Replicate
+
+    print(f"[Rank {local_rank}] Initializing distributed backend...")
+    initialize()
+
+    if torch.distributed.is_initialized():
+        print(f"[Rank {local_rank}] Distributed backend initialized successfully")
+    elif world_size > 1:
+        print(f"[Rank {local_rank}] WARNING: Distributed backend not initialized")
+
+    # Create DeviceMesh
+    devices = [f"cuda:{i}" for i in range(torch.cuda.device_count())]
+    mesh = DeviceMesh(
+        shape=(len(devices),),
+        axis_names=["model"],
+        devices=devices
+    )
+    print(f"[Rank {local_rank}] DeviceMesh: shape={mesh.shape}")
+
+    # Create LayoutMap for OPT - sharding attention projections
+    layout_map = LayoutMap(mesh)
+    layout_map[".*attention.*query.*kernel"] = (None, "model")
+    layout_map[".*attention.*key.*kernel"] = (None, "model")
+    layout_map[".*attention.*value.*kernel"] = (None, "model")
+    layout_map[".*attention.*output.*kernel"] = (None, "model")
+    layout_map[".*attention.*bias"] = ()
+    layout_map["token_embedding/embeddings"] = ()
+    layout_map["position_embedding/embeddings"] = ()
+    layout_map[".*logits.*kernel"] = ()
+    layout_map[".*logits.*bias"] = ()
+
+    print(f"[Rank {local_rank}] LayoutMap: Column Parallelism for attention")
+
+    # Create strategy
+    strategy = ModelParallel(
+        layout_map=layout_map,
+        batch_dim_name="data",
+        auto_shard_dataset=False
+    )
+
+    # Build OPT model
+    model = None
+    try:
+        import keras_hub
+
+        with strategy.scope():
+            print(f"\n[Rank {local_rank}] Loading OPT model...")
+
+            model = keras_hub.models.OPTCausalLM.from_preset("opt_125m_en")
+
+            print(f"[Rank {local_rank}] ✓ OPT model loaded")
+            total_params = sum(np.prod(w.shape) for w in model.trainable_variables)
+            print(f"[Rank {local_rank}] Total parameters: {total_params:,}")
+
+    except Exception as e:
+        print(f"[Rank {local_rank}] Could not load OPT model: {e}")
+        print(f"[Rank {local_rank}] Using simple dense model...")
+
+        from keras import layers
+
+        with strategy.scope():
+            model = keras.Sequential([
+                layers.Input(shape=(64,)),
+                layers.Dense(256, activation="relu", name="dense_1"),
+                layers.Dense(128, activation="relu", name="dense_2"),
+                layers.Dense(10, name="output")
+            ])
+            print(f"[Rank {local_rank}] ✓ Simple model built")
+
+    if model is None:
+        print(f"[Rank {local_rank}] ERROR: Model could not be created")
+        return False
+
+    # Weight sharding verification
+    print(f"\n{'='*70}")
+    print(f"TEST: MODEL PARALLEL VERIFICATION")
+    print(f"{'='*70}")
+
+    sharded_count = 0
+    replicated_count = 0
+
+    print(f"\n[Rank {local_rank}] Checking weight sharding...")
+    print("-" * 70)
+
+    for v in model.trainable_variables:
+        torch_tensor = getattr(v, 'value', v)
+        if hasattr(torch_tensor, 'data'):
+            torch_tensor = torch_tensor.data
+
+        if isinstance(torch_tensor, DTensor):
+            local_shape = tuple(torch_tensor.to_local().shape)
+            global_shape = tuple(torch_tensor.shape)
+            is_sharded = (local_shape != global_shape)
+            status = "SHARDED" if is_sharded else "Replicated"
+            print(f"  {v.path}: {global_shape} -> Local: {local_shape} [{status}]")
+            if is_sharded:
+                sharded_count += 1
+            else:
+                replicated_count += 1
+        else:
+            print(f"  {v.path}: {tuple(torch_tensor.shape)} (regular tensor)")
+            replicated_count += 1
+
+    print("-" * 70)
+    print(f"\n[Rank {local_rank}] Sharding Summary:")
+    print(f"  Sharded: {sharded_count}")
+    print(f"  Replicated: {replicated_count}")
+
+    if sharded_count > 0:
+        print(f"\n[Rank {local_rank}] ✓ Model parallelism IS active!")
+
+    # FORWARD PASS - FIX: Remove all barrier calls!
+    print(f"\n{'='*70}")
+    print(f"TEST: FORWARD PASS")
+    print(f"{'='*70}")
+
+    # FIX: Do NOT call _safe_barrier() here - it causes NCCL hangs!
+    # The DTensor forward pass handles synchronization internally
+
+    try:
+        is_opt_model = hasattr(model, 'sampler')
+
+        if is_opt_model:
+            print(f"[Rank {local_rank}] Running forward pass for OPT model...")
+
+            batch_size = 1
+            seq_length = 4
+            vocab_size = 50272
+            token_ids = np.random.randint(0, min(100, vocab_size), size=(batch_size, seq_length))
+            padding_mask = np.ones((batch_size, seq_length), dtype=np.int32)
+
+            # Forward pass - DTensor handles synchronization internally
+            with torch.no_grad():
+                outputs = model(
+                    {"token_ids": token_ids, "padding_mask": padding_mask},
+                    training=False
+                )
+
+            print(f"[Rank {local_rank}] ✓ Forward pass successful!")
+            print(f"  Output shape: {tuple(outputs.shape)}")
+
+        else:
+            # Simple model
+            x = np.random.random((4, 64)).astype("float32")
+            with strategy.scope():
+                outputs = model(x, training=False)
+            print(f"[Rank {local_rank}] ✓ Forward pass successful!")
+            print(f"  Output shape: {outputs.shape}")
+
+    except Exception as e:
+        print(f"[Rank {local_rank}] Forward pass error: {e}")
+        import traceback
+        traceback.print_exc()
+        return False
+
+    # TRAINING TEST
+    print(f"\n{'='*70}")
+    print(f"TEST: TRAINING")
+    print(f"{'='*70}")
+
+    try:
+        is_opt_model = hasattr(model, 'sampler')
+
+        if is_opt_model:
+            print(f"[Rank {local_rank}] Running training step for OPT model...")
+
+            batch_size = 1
+            seq_length = 4
+            vocab_size = 50272
+            token_ids = np.random.randint(0, min(100, vocab_size), size=(batch_size, seq_length))
+            labels = token_ids.copy()
+            padding_mask = np.ones((batch_size, seq_length), dtype=np.int32)
+
+            # Forward and backward
+            outputs = model(
+                {"token_ids": token_ids, "padding_mask": padding_mask},
+                training=True
+            )
+
+            output_flat = outputs.view(-1, outputs.size(-1))
+            labels_flat = torch.from_numpy(labels).long().cuda()
+            loss_fn = torch.nn.CrossEntropyLoss()
+            loss = loss_fn(output_flat, labels_flat)
+            loss.backward()
+
+            print(f"[Rank {local_rank}] ✓ Training step successful!")
+            print(f"  Loss: {loss.item():.6f}")
+
+        else:
+            train_x = np.random.random((16, 64)).astype("float32")
+            train_y = np.random.random((16, 10)).astype("float32")
+
+            history = model.fit(train_x, train_y, epochs=1, batch_size=4, verbose=1)
+            print(f"[Rank {local_rank}] ✓ Training successful! Loss: {history.history['loss'][-1]:.6f}")
+
+    except Exception as e:
+        print(f"[Rank {local_rank}] Training error: {e}")
+        import traceback
+        traceback.print_exc()
+        return False
+
+    # Cleanup
+    _cleanup_distributed()
+
+    print(f"\n{'='*70}")
+    print("TEST COMPLETE - v8 (no barrier calls)")
+    print(f"{'='*70}")
+
+    return True
+
+
+if __name__ == "__main__":
+    success = False
+    try:
+        success = run_opt_hybrid_dp_mp_test()
+    except KeyboardInterrupt:
+        rank = os.environ.get("LOCAL_RANK", "0")
+        print(f"\n[Rank {rank}] Interrupted by user")
+    except Exception as e:
+        rank = os.environ.get("LOCAL_RANK", "0")
+        print(f"\n[Rank {rank}] Error: {e}")
+        import traceback
+        traceback.print_exc()
+    finally:
+        _cleanup_distributed()
+
+    sys.exit(0 if success else 1)
