@@ -148,8 +148,16 @@ def distribute_tensor(tensor, layout):
     if device_mesh is None:
         return tensor
 
-    placements = (backend_layout.placements if hasattr(backend_layout, 'placements')
-                 else _axis_names_to_placements(backend_layout, device_mesh) if isinstance(backend_layout, tuple) else None)
+    # Handle TensorLayout objects by extracting the axes tuple
+    from keras.src.distribution.distribution_lib import TensorLayout
+    if isinstance(backend_layout, TensorLayout):
+        # Convert TensorLayout to placements using _layout_to_placements
+        placements = _layout_to_placements(backend_layout, tensor, device_mesh)
+    elif isinstance(backend_layout, tuple):
+        placements = _axis_names_to_placements(backend_layout, device_mesh) if backend_layout else None
+    else:
+        placements = None
+    
     if placements:
         return tensor.redistribute(device_mesh, placements) if isinstance(tensor, DTensor) else torch_distribute_tensor(tensor, device_mesh, placements)
 
@@ -190,7 +198,15 @@ def distribute_variable(tensor, layout=None):
     if current_distribution is not None:
         device_mesh = _to_backend_mesh(current_distribution.device_mesh)
         if device_mesh is not None:
-            placements = _layout_to_placements(layout, converted_tensor, device_mesh) if layout else None
+            # CRITICAL FIX: Handle TensorLayout objects properly
+            from keras.src.distribution.distribution_lib import TensorLayout
+            if isinstance(layout, TensorLayout):
+                # Use the axes from TensorLayout
+                layout_axes = layout.axes
+            else:
+                layout_axes = layout
+            
+            placements = _layout_to_placements(layout_axes, converted_tensor, device_mesh) if layout_axes else None
             
             if debug_mode:
                 print(f"DEBUG | [Rank {rank}]   - device_mesh: {device_mesh}")
@@ -279,25 +295,33 @@ def _layout_to_placements(layout, tensor, device_mesh):
     tensor_rank = tensor.dim()
     mesh_ndim = device_mesh.mesh.ndim
     
+    # CRITICAL FIX: Handle TensorLayout objects properly
+    # The layout can be a TensorLayout object, tuple, or None
+    from keras.src.distribution.distribution_lib import TensorLayout
+    if isinstance(layout, TensorLayout):
+        # Get the axes tuple from the TensorLayout object
+        layout_axes = layout.axes
+    else:
+        layout_axes = layout
+    
     # For 1D mesh, return exactly 1 placement
     if mesh_ndim == 1:
         # Look for 'model' axis in the layout
-        for i, axis in enumerate(layout):
-            if axis == 'model':
-                # Found 'model' axis at layout position i
-                # Shard on TENSOR dimension i (not mesh dimension)
-                # For 1D mesh, there's only one mesh dim (0), but the tensor
-                # dimension to shard is specified by where 'model' appears in layout
-                return [Shard(i)]
-        # No 'model' axis found - replicate
+        if layout_axes is not None:
+            for i, axis in enumerate(layout_axes):
+                if axis == 'model':
+                    # Found 'model' axis at layout position i
+                    # Shard on TENSOR dimension i (not mesh dimension)
+                    return [Shard(i)]
+        # No 'model' axis found or layout is None - replicate
         return [Replicate()]
     else:
         # Multi-dimensional mesh case
         # Return exactly mesh_ndim placements
         placements = []
         for i in range(mesh_ndim):
-            if i < len(layout):
-                axis = layout[i]
+            if layout_axes is not None and i < len(layout_axes):
+                axis = layout_axes[i]
                 if axis is None:
                     placements.append(Replicate())
                 elif axis == 'model':
