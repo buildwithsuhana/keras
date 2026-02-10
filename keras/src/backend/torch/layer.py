@@ -21,9 +21,25 @@ class TorchLayer(torch.nn.Module):
     def _track_variables(self):
         # set torch_params attribute will have module automatically track
         # parameters.
-        self._torch_params = torch.nn.ParameterDict(
-            {variable.path: variable.value for variable in self.variables}
-        )
+        # Only add floating-point or complex tensors as Parameters
+        # Integer tensors (like padding masks) cannot be Parameters
+        params_dict = {}
+        for variable in self.variables:
+            value = variable.value
+            # Check if value can be wrapped in Parameter
+            # PyTorch only allows floating point or complex dtypes for requires_grad
+            if isinstance(value, torch.Tensor):
+                is_float_or_complex = value.dtype.is_floating_point or value.dtype.is_complex
+                if is_float_or_complex:
+                    # Wrap in Parameter for gradient tracking
+                    if not isinstance(value, torch.nn.Parameter):
+                        value = torch.nn.Parameter(value, requires_grad=variable.trainable)
+                else:
+                    # Integer/bool tensors cannot be Parameters, store as-is
+                    # These are typically not trainable weights (e.g., padding masks)
+                    pass
+            params_dict[variable.path] = value
+        self._torch_params = torch.nn.ParameterDict(params_dict)
 
     def named_parameters(
         self,
@@ -57,7 +73,16 @@ class TorchLayer(torch.nn.Module):
     def _post_track_variable(self, variable):
         if hasattr(self, "_torch_params"):
             if variable.path not in self.torch_params:
-                self.torch_params[variable.path] = variable.value
+                value = variable.value
+                # Skip adding non-floating point tensors to ParameterDict
+                # PyTorch's ParameterDict will try to wrap values in Parameter()
+                # which fails for integer tensors (can't require gradients)
+                if isinstance(value, torch.Tensor):
+                    is_float_or_complex = value.dtype.is_floating_point or value.dtype.is_complex
+                    if not is_float_or_complex:
+                        # Skip non-floating point tensors (e.g., padding masks)
+                        return
+                self.torch_params[variable.path] = value
 
     def _post_untrack_variable(self, variable):
         if hasattr(self, "_torch_params"):

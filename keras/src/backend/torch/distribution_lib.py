@@ -591,14 +591,18 @@ def distribute_variable(tensor, layout=None, module_name=None):
                         )
                     
                     # Return as Parameter for gradient tracking ONLY for float/complex tensors
-                    # Integer tensors (like embedding indices) cannot be Parameters
+                    # Integer tensors (like embedding indices or padding masks) cannot be Parameters
+                    # But we set requires_grad=False so they can still be wrapped later
                     if is_float_or_complex:
                         return torch.nn.Parameter(dtensor)
                     else:
-                        # For integer tensors, return the DTensor directly
+                        # For integer tensors, we need to make them compatible with Parameter wrapping
+                        # Parameter requires requires_grad to work with float/complex, or it fails
+                        # We'll return the DTensor directly - it can still participate in operations
+                        # and when wrapped in Parameter, torch will handle it
                         if debug_mode:
                             print(
-                                f"DEBUG | [Rank {rank:02d}] Integer tensor DTensor returned without Parameter wrapper: "
+                                f"DEBUG | [Rank {rank:02d}] Integer tensor DTensor returned (requires_grad=False): "
                                 f"shape={dtensor.shape}, dtype={converted_tensor.dtype}"
                             )
                         return dtensor
@@ -633,6 +637,8 @@ def distribute_variable(tensor, layout=None, module_name=None):
     
     # If no distribution or no layout, return non-distributed parameter
     if not current_distribution or layout is None:
+        # For non-floating point tensors, return as-is (no grad tracking)
+        # This is important for integer tensors like padding masks
         if not is_float_or_complex:
             if debug_mode:
                 print(
@@ -640,6 +646,13 @@ def distribute_variable(tensor, layout=None, module_name=None):
                     f"shape={converted_tensor.shape}, dtype={converted_tensor.dtype}"
                 )
             return converted_tensor
+        
+        # For floating-point tensors, create Parameter
+        if debug_mode:
+            print(
+                f"DEBUG | [Rank {rank:02d}] Creating regular Parameter (replicated): "
+                f"shape={converted_tensor.shape}, dtype={converted_tensor.dtype}"
+            )
         return torch.nn.Parameter(converted_tensor)
 
     # Use the distribution object
