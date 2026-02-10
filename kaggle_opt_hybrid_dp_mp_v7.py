@@ -198,10 +198,11 @@ def redistribute_model_weights(model, strategy, layout_map):
         
         print(f"  DEBUG: placements={placements}, needs_shard={needs_shard}")
         
+        # If we need to shard, we must carefully copy the local shard to the right position
+        # in the full tensor, rather than trying to replace the entire tensor
         if needs_shard:
             try:
-                # Distribute the tensor using torch_distribute_tensor
-                # Note: The correct import path varies by PyTorch version
+                # Distribute the tensor
                 try:
                     from torch.distributed._tensor.api import distribute_tensor as torch_distribute_tensor
                 except ImportError:
@@ -209,50 +210,44 @@ def redistribute_model_weights(model, strategy, layout_map):
                 
                 distributed = torch_distribute_tensor(torch_tensor, device_mesh, placements)
                 
-                # Update the variable's value
-                # PyTorch Parameter doesn't have .assign() method, use .copy_() instead
-                # or use the Keras Variable._direct_assign() method
-                if hasattr(v, '_direct_assign'):
-                    # Get local tensor from distributed DTensor first
-                    # This is the key fix: we can't copy DTensor to regular tensor
-                    if hasattr(distributed, 'to_local'):
-                        local_tensor = distributed.to_local()
+                # Get the local shard
+                local_shard = distributed.to_local()
+                local_shape = tuple(local_shard.shape)
+                global_shape = tuple(torch_tensor.shape)
+                
+                print(f"  [Rank {local_rank}] Redistributing {v.path}: global={global_shape}, local={local_shape}, placements={placements}")
+                
+                # Calculate the slice indices for this rank
+                shard_dim = placements[0].dim  # The dimension being sharded
+                shard_size = global_shape[shard_dim]
+                num_shards = device_mesh.mesh.shape[0]
+                shard_per_rank = shard_size // num_shards
+                
+                # Build slice indices for the global tensor
+                slices = []
+                for dim, size in enumerate(global_shape):
+                    if dim == shard_dim:
+                        rank = local_rank
+                        start = rank * shard_per_rank
+                        end = start + shard_per_rank
+                        slices.append(slice(start, end))
                     else:
-                        local_tensor = distributed
-                    # This is a Keras Variable - use its built-in method with local tensor
-                    v._direct_assign(local_tensor)
-                elif hasattr(v, '_value'):
-                    # This is a Keras Variable with _value attribute
-                    if hasattr(v._value, 'copy_'):
-                        # PyTorch tensor or Parameter - use copy_
-                        # Get the local tensor if it's a DTensor
-                        if hasattr(distributed, 'to_local'):
-                            v._value.copy_(distributed.to_local())
-                        else:
-                            v._value.copy_(distributed)
-                    else:
-                        # Fallback to assign if available
-                        v._value.assign(distributed)
-                elif hasattr(v, 'value'):
-                    # Alternative access to value
-                    value = v.value
-                    if hasattr(value, 'copy_'):
-                        if hasattr(distributed, 'to_local'):
-                            value.copy_(distributed.to_local())
-                        else:
-                            value.copy_(distributed)
-                    else:
-                        value.assign(distributed)
-                else:
-                    # Direct torch tensor - use copy_
-                    if hasattr(torch_tensor, 'copy_'):
-                        if hasattr(distributed, 'to_local'):
-                            torch_tensor.copy_(distributed.to_local())
-                        else:
-                            torch_tensor.copy_(distributed)
+                        slices.append(slice(None))
+                
+                # Assign the local shard to the correct position in the global tensor
+                # Get the torch tensor from the Keras variable
+                var_tensor = torch_tensor
+                if hasattr(torch_tensor, 'data'):
+                    var_tensor = torch_tensor.data
+                
+                # Use torch advanced indexing to copy to the right position
+                with torch.no_grad():
+                    # Create index expression for the global tensor
+                    var_tensor[tuple(slices)] = local_shard
                 
                 redistributed_count += 1
-                print(f"  [Rank {local_rank}] Redistributed: {v.path} -> {placements}")
+                print(f"  [Rank {local_rank}] ✓ Redistributed: {v.path}")
+                
             except Exception as e:
                 print(f"  [Rank {local_rank}] Warning: Could not redistribute {v.path}: {e}")
                 import traceback
