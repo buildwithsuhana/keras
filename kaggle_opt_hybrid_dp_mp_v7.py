@@ -538,6 +538,13 @@ def run_opt_hybrid_dp_mp_test():
     # This ensures all ranks enable distribution at the same time
     enable_distribution_for_forward_pass()
 
+    # KEY FIX: Redistribute model weights to match layout_map
+    # This converts regular tensors to sharded DTensors for model parallelism
+    try:
+        redistribute_model_weights(model, strategy, layout_map)
+    except Exception as e:
+        print(f"[Rank {local_rank}] Warning: Could not redistribute weights: {e}")
+
     # Sync again after enabling distribution to ensure all ranks are ready
     print(f"[Rank {local_rank}] Syncing after enabling distribution...")
     _sync_all_ranks_with_timeout(timeout_seconds=60)
