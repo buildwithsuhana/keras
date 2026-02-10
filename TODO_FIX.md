@@ -105,7 +105,42 @@ def distribute_variable(tensor, layout=None):
 
 Run with V12 test:
 ```bash
-torchrun --nproc_per_node=2 kaggle_opt_hybrid_dp_mp_fixed_v11.py
+torchrun --nproc_per_node=2 kaggle_opt_hybrid_dp_mp_fixed_v12.py
+```
+
+## Key V12 Additions
+
+### 1. Input DTensor Conversion (CRITICAL)
+```python
+def prepare_input_for_distribution(x, device_mesh=None):
+    """Convert input tensor to DTensor if distribution is enabled.
+    
+    This is crucial for avoiding "mixed torch.Tensor and DTensor" errors
+    during distributed forward passes.
+    """
+    if isinstance(x, np.ndarray):
+        x_tensor = torch.from_numpy(x)
+    elif isinstance(x, torch.Tensor):
+        x_tensor = x
+    
+    if torch.cuda.is_available():
+        x_tensor = x_tensor.cuda()
+    
+    # Convert to DTensor with Replicate placement
+    dtensor = torch_distribute_tensor(x_tensor, device_mesh, [Replicate()])
+    return dtensor
+```
+
+### 2. Fixed Regex Patterns
+```python
+# Use patterns that properly match with underscores
+layout_map[".*self_attention.*query.*kernel"] = (None, "model")
+layout_map[".*self_attention.*key.*kernel"] = (None, "model")
+layout_map[".*self_attention.*value.*kernel"] = (None, "model")
+layout_map[".*self_attention.*output.*kernel"] = (None, "model")
+
+layout_map[".*feedforward.*intermediate.*dense.*kernel"] = (None, "model")
+layout_map[".*feedforward.*output.*dense.*kernel"] = (None, "model")
 ```
 
 Expected results:
@@ -129,6 +164,6 @@ NCCL_DEBUG=INFO torchrun --nproc_per_node=2 kaggle_opt_hybrid_dp_mp_fixed_v11.py
 
 Run with Keras distribution debug:
 ```bash
-KERAS_DISTRIBUTION_DEBUG=1 torchrun --nproc_per_node=2 kaggle_opt_hybrid_dp_mp_fixed_v11.py
+KERAS_DISTRIBUTION_DEBUG=1 torchrun --nproc_per_node=2 kaggle_opt_hybrid_dp_mp_fixed_v12.py
 ```
 
