@@ -10,7 +10,7 @@ This script demonstrates:
 5. Training the model with model.fit() to verify actual training happens
 
 Usage:
-    python test_torch_model_parallel_2gpu.py
+    CUDA_LAUNCH_BLOCKING=1 python test_torch_model_parallel_2gpu.py
 
 Requirements:
     - At least 2 CUDA GPUs
@@ -22,11 +22,18 @@ import os
 import sys
 import logging
 
+# ============================================================================
+# CUDA Configuration - Must be done BEFORE importing torch/keras
+# ============================================================================
+
+# Enable synchronous CUDA for better error messages
+os.environ["CUDA_LAUNCH_BLOCKING"] = "1"
+
 # Set backend before importing keras
 os.environ["KERAS_BACKEND"] = "torch"
 
 # ============================================================================
-# GPU Configuration - Must be done BEFORE importing torch/keras
+# GPU Configuration
 # ============================================================================
 print("=" * 80)
 print("GPU Configuration - Setting up CUDA devices")
@@ -35,20 +42,26 @@ print("=" * 80)
 # Set CUDA visible devices to use first 2 GPUs
 os.environ["CUDA_VISIBLE_DEVICES"] = "0,1"
 
-# Configure PyTorch CUDA settings
+# Import torch AFTER setting environment variables
 import torch
 
 print(f"PyTorch version: {torch.__version__}")
 print(f"CUDA available: {torch.cuda.is_available()}")
 print(f"CUDA version: {torch.version.cuda if torch.cuda.is_available() else 'N/A'}")
 
+# Critical: Initialize CUDA before checking device count
 if torch.cuda.is_available():
+    # Ensure CUDA is properly initialized
+    torch.cuda.init()
+    
     gpu_count = torch.cuda.device_count()
     print(f"Number of available GPUs: {gpu_count}")
     
     if gpu_count < 2:
         print(f"⚠ WARNING: Only {gpu_count} GPU(s) available. This script requires 2 GPUs.")
         print("  Proceeding with available GPUs...")
+    elif gpu_count >= 2:
+        print(f"✓ Successfully detected {gpu_count} GPUs")
     
     # Print GPU details
     for i in range(min(gpu_count, 2)):
