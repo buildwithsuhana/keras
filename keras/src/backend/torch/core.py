@@ -112,6 +112,30 @@ class Variable(KerasVariable):
                 requires_grad=self.trainable,
             ).to(get_device())
 
+    def _initialize_layout(self):
+        # Initialize the layout for distributed training
+        # We can't import the keras/distribution/distribution_lib
+        # due to circular dependency.
+        distribution = global_state.get_global_attribute("distribution")
+        if self._layout is None and distribution is not None:
+            try:
+                tensor_layout = distribution.get_variable_layout(self)
+                if tensor_layout is not None:
+                    from keras.src.distribution import TensorLayout
+                    if isinstance(tensor_layout, TensorLayout):
+                        self._layout = tensor_layout
+            except Exception:
+                # If layout initialization fails, continue without distribution
+                pass
+
+    @property
+    def path(self):
+        """Return the path of the variable for layout mapping."""
+        if hasattr(self, '_path') and self._path is not None:
+            return self._path
+        # Default path for torch backend variables
+        return f"variable_{id(self)}"
+
     def _direct_assign(self, value):
         with torch.no_grad():
             self.value.copy_(value)
