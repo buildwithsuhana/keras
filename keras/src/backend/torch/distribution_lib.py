@@ -10,6 +10,7 @@ import os
 import re
 from typing import Any, Optional, Tuple, Union, Dict, List
 
+import numpy as np
 import torch
 import torch.distributed as dist
 import torch.distributed.tensor.parallel as tp
@@ -715,6 +716,54 @@ def _get_default_device_mesh():
         # Last resort: return None and let callers handle it
         print("Note: Could not create DeviceMesh, running in fallback mode")
         return None
+
+
+def _get_first_device():
+    """Get the primary device for the current process.
+    
+    Returns:
+        torch.device: The primary device (cuda:0, mps:0, cpu, or xla device)
+    """
+    if _is_gpu_available():
+        return torch.device("cuda:0")
+    elif torch.backends.mps.is_available():
+        return torch.device("mps:0")
+    elif _is_tpu_available():
+        try:
+            import torch_xla.core.xla_model as xm
+            return xm.xla_device()
+        except ImportError:
+            return torch.device("cpu")
+    else:
+        return torch.device("cpu")
+
+
+def _ensure_tensor_on_device(tensor, device):
+    """Ensure a tensor is on the specified device.
+    
+    Args:
+        tensor: PyTorch tensor or numpy array
+        device: Target torch.device
+        
+    Returns:
+        Tensor on the specified device.
+    """
+    if tensor is None:
+        return tensor
+    
+    # If it's a numpy array, convert to tensor first
+    if isinstance(tensor, np.ndarray):
+        tensor = torch.from_numpy(tensor)
+    
+    # Move to device if not already there
+    if isinstance(tensor, torch.Tensor):
+        if tensor.device != device:
+            try:
+                tensor = tensor.to(device)
+            except Exception:
+                pass  # Keep original if can't move
+    
+    return tensor
 
 
 def _set_default_device_mesh(mesh):
