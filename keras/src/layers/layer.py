@@ -585,6 +585,13 @@ class Layer(BackendLayer, Operation):
                 aggregation=aggregation,
                 name=name,
             )
+        # Set the variable's path for distribution/layout mapping
+        # The path is used by distribution strategies to determine sharding
+        if self._path is not None:
+            if name is not None:
+                variable.path = f"{self._path}/{name}"
+            else:
+                variable.path = f"{self._path}/variable_{id(variable)}"
         # Will be added to layer.losses
         variable.regularizer = regularizers.get(regularizer)
         variable.constraint = constraints.get(constraint)

@@ -105,22 +105,22 @@ def list_devices(device_type: Optional[str] = None) -> list:
         except ImportError:
             pass
     
-    # Detect GPU devices
+    # Detect GPU devices - always check for CUDA if device_type is None or "gpu"
     if device_type is None or device_type == "gpu":
         if torch.cuda.is_available():
             gpu_count = torch.cuda.device_count()
-            devices.extend([f"cuda:{i}" for i in range(gpu_count)])
+            if gpu_count > 0:
+                devices.extend([f"cuda:{i}" for i in range(gpu_count)])
         elif torch.backends.mps.is_available():
             # MPS is available on Apple Silicon
             devices.append("mps:0")
     
     # Detect CPU devices
     if device_type is None or device_type == "cpu":
-        if not devices:  # Only add CPU devices if no accelerators found
-            devices.append("cpu:0")
-        # Always include CPU as a fallback
-        if "cpu:0" not in devices:
-            devices.append("cpu:0")
+        # Always include CPU if no other devices found or if specifically requested
+        if not devices or device_type == "cpu":
+            if "cpu:0" not in devices:
+                devices.append("cpu:0")
     
     return devices
 

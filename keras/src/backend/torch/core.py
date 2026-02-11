@@ -125,7 +125,6 @@ class Variable(KerasVariable):
                                 tensor_layout, 
                                 None
                             )
-                            print(f"✓ Sharded variable: {self.path if hasattr(self, 'path') else 'variable'}")
                 except Exception:
                     pass  # Fall back to regular tensor
             
@@ -157,6 +156,11 @@ class Variable(KerasVariable):
             return self._path
         # Default path for torch backend variables
         return f"variable_{id(self)}"
+
+    @path.setter
+    def path(self, value):
+        """Set the path for the variable."""
+        self._path = value
 
     def _direct_assign(self, value):
         with torch.no_grad():
