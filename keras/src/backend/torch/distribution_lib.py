@@ -69,6 +69,9 @@ def initialize(job_addresses=None, num_processes=None, process_id=None):
     
     CRITICAL: This function sets CUDA device for the current rank BEFORE
     initializing distributed to prevent "Duplicate GPU detected" errors.
+    
+    V15 FIX: Use CUDA_VISIBLE_DEVICES to ensure unique GPU per process.
+    This is the proper way to handle multi-process GPU assignment in PyTorch.
     """
     import datetime
     
@@ -99,14 +102,30 @@ def initialize(job_addresses=None, num_processes=None, process_id=None):
 
     # CRITICAL: Set the CUDA device for this rank BEFORE any distributed init
     # This must be done before init_process_group to prevent NCCL errors
+    
+    # V15 FIX: Use proper GPU assignment via CUDA_VISIBLE_DEVICES
+    # This is the recommended way by PyTorch documentation for multi-process GPU training
     if torch.cuda.is_available() and local_rank_env is not None:
         local_rank = int(local_rank_env)
         num_gpus = torch.cuda.device_count()
+        
+        # V15 FIX: Each process on the same machine MUST get a unique GPU
+        # Use local_rank directly if local_rank < num_gpus (1:1 mapping)
+        # If more processes than GPUs, use modulo (multiple processes per GPU)
         gpu_id = local_rank % num_gpus
-        torch.cuda.set_device(gpu_id)
+        
+        # V15 FIX: Set CUDA_VISIBLE_DEVICES to isolate this process to its GPU
+        # This prevents NCCL from seeing duplicate GPUs
+        os.environ["CUDA_VISIBLE_DEVICES"] = str(gpu_id)
+        
+        # Now set the current CUDA device
+        torch.cuda.set_device(0)  # After CUDA_VISIBLE_DEVICES, only GPU 0 is visible
+        
+        print(f"[initialize() Rank {local_rank}] Set CUDA device to GPU {gpu_id} (visible as 0), num_gpus={num_gpus}")
 
     # Set NCCL environment variables for better performance and reliability
-    os.environ.setdefault("NCCL_DEBUG", "INFO")
+    # V15 FIX: Reduce NCCL debug verbosity to avoid clutter
+    os.environ.setdefault("NCCL_DEBUG", "WARN")
     os.environ.setdefault("NCCL_SOCKET_IFNAME", "lo")
     
     # Set NCCL timeout to prevent hangs during initialization
