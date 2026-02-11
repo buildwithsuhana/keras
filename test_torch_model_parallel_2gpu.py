@@ -24,13 +24,13 @@ import numpy as np
 # Set backend before importing keras
 os.environ["KERAS_BACKEND"] = "torch"
 
-# For multi-GPU training, we need to set these env vars BEFORE importing torch
+import torch
+
+# For multi-GPU training, we need to set these env vars BEFORE initializing distributed
 # This helps with NCCL backend initialization
 if torch.cuda.is_available() and torch.cuda.device_count() >= 2:
     os.environ["NCCL_DEBUG"] = "INFO"
     os.environ["NCCL_BLOCKING_WAIT"] = "0"
-
-import torch
 import torch.distributed as dist
 import torch.distributed.tensor.parallel as tp
 from torch.distributed.device_mesh import DeviceMesh, init_device_mesh
