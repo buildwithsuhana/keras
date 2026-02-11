@@ -13,7 +13,7 @@ Usage (with 2+ GPUs):
     torchrun --nproc_per_node=2 python test_torch_model_parallel_2gpu.py
 
 Or simply:
-    python test_torch_model_parallel_2gpu.py  # Will work if 2+ GPUs available
+    python test_torch_model_parallel_2gpu.py  # Will auto-spawn processes for multi-GPU
 """
 
 import os
@@ -31,6 +31,7 @@ import torch
 if torch.cuda.is_available() and torch.cuda.device_count() >= 2:
     os.environ["NCCL_DEBUG"] = "INFO"
     os.environ["NCCL_BLOCKING_WAIT"] = "0"
+
 import torch.distributed as dist
 import torch.distributed.tensor.parallel as tp
 from torch.distributed.device_mesh import DeviceMesh, init_device_mesh
@@ -39,6 +40,7 @@ from torch.distributed.tensor.parallel import (
     RowwiseParallel,
     SequenceParallel,
 )
+import torch.multiprocessing as mp
 
 import keras
 from keras.src.distribution import DeviceMesh as KerasDeviceMesh
@@ -51,49 +53,21 @@ logging.basicConfig(
 )
 logger = logging.getLogger(__name__)
 
-# ============================================================================
-# Distributed Setup
-# ============================================================================
 
-def setup_distributed():
-    """Initialize PyTorch distributed for multi-GPU training."""
-    local_rank = int(os.environ.get("LOCAL_RANK", 0))
-
+def setup_distributed_for_rank(rank, world_size):
+    """Initialize distributed for a specific rank."""
     if torch.cuda.is_available():
-        torch.cuda.set_device(local_rank)
-
-    # Check if we can initialize distributed
-    if torch.distributed.is_available() and torch.distributed.is_nccl_available():
-        # Check if running with torchrun (has WORLD_SIZE set)
-        world_size = int(os.environ.get("WORLD_SIZE", 1))
-        
-        # If WORLD_SIZE is not set but we have multiple GPUs,
-        # we're likely running with python on a multi-GPU machine
-        if world_size == 1 and torch.cuda.device_count() > 1:
-            num_gpus = torch.cuda.device_count()
-            # Set environment variables for multi-GPU mode
-            os.environ["WORLD_SIZE"] = str(num_gpus)
-            os.environ["RANK"] = "0"  # Will be updated per-process
-            os.environ["LOCAL_RANK"] = str(local_rank)
-            os.environ["MASTER_ADDR"] = "127.0.0.1"
-            os.environ["MASTER_PORT"] = "29500"
-            world_size = num_gpus
-
-        if world_size > 1:
-            # Running with torchrun or python with multi-GPU setup
-            if not dist.is_initialized():
-                torch.distributed.init_process_group(
-                    backend="nccl",
-                    init_method="env://",
-                    world_size=world_size,
-                    rank=local_rank
-                )
-            return dist.get_rank(), dist.get_world_size()
-        else:
-            # Single GPU mode - no distributed initialization needed
-            return 0, 1
-    else:
-        return 0, 1
+        torch.cuda.set_device(rank)
+    
+    if not dist.is_initialized():
+        torch.distributed.init_process_group(
+            backend="nccl",
+            init_method="env://",
+            world_size=world_size,
+            rank=rank
+        )
+    
+    return rank, world_size
 
 
 def cleanup_distributed():
@@ -106,11 +80,12 @@ def cleanup_distributed():
 # Helper Functions for DTensor
 # ============================================================================
 
-def create_device_mesh_2d(gpu_devices):
+def create_device_mesh_2d(gpu_devices, rank):
     """Create a 2D device mesh for model + data parallelism.
     
     Args:
         gpu_devices: List of CUDA device indices
+        rank: Current process rank
         
     Returns:
         PyTorch DeviceMesh
@@ -311,21 +286,19 @@ class OPT125MModelParallel(torch.nn.Module):
 
 
 # ============================================================================
-# Main Test Function
+# Main Test Function (runs on each rank)
 # ============================================================================
 
-def test_torch_dtensor_model_parallelism():
-    """Test actual PyTorch DTensor model parallelism with 2 GPUs."""
+def test_torch_dtensor_model_parallelism_worker(rank, world_size, num_gpus):
+    """Worker function that runs on each GPU process."""
     
-    print("=" * 80)
-    print("PyTorch DTensor Model Parallelism Test with 2+ GPUs")
-    print("=" * 80)
+    # Setup distributed for this rank
+    rank, world_size = setup_distributed_for_rank(rank, world_size)
+    local_rank = rank
     
-    # Setup distributed
-    rank, world_size = setup_distributed()
-    local_rank = int(os.environ.get("LOCAL_RANK", 0))
-    
-    print(f"\n[Rank {rank}/{world_size}] Starting test on local rank {local_rank}")
+    print(f"\n{'='*80}")
+    print(f"[Rank {rank}/{world_size}] Starting test on local rank {local_rank}")
+    print(f"{'='*80}")
     
     # Check GPU availability
     if not torch.cuda.is_available():
@@ -333,47 +306,36 @@ def test_torch_dtensor_model_parallelism():
         cleanup_distributed()
         return False
     
-    num_gpus = torch.cuda.device_count()
     print(f"\n[Rank {rank}] GPU check:")
     print(f"  - CUDA available: {torch.cuda.is_available()}")
     print(f"  - GPU count: {num_gpus}")
     print(f"  - Current GPU: {torch.cuda.current_device()}")
-    print(f"  - GPU name: {torch.cuda.get_device_name(0)}")
+    print(f"  - GPU name: {torch.cuda.get_device_name(rank)}")
     
-    if num_gpus < 2:
-        print("\nWARNING: This test requires 2+ GPUs for model parallelism.")
-        print("Running in single GPU mode (no actual sharding).")
-        do_sharding = False
-    else:
-        do_sharding = True
-        gpu_devices = list(range(num_gpus))
-        print(f"\n[Rank {rank}] Using GPUs: {gpu_devices}")
+    gpu_devices = list(range(num_gpus))
+    print(f"\n[Rank {rank}] Using GPUs: {gpu_devices}")
     
     # =========================================================================
     # Step 1: Create DeviceMesh for Model Parallelism
     # =========================================================================
-    print("\n" + "=" * 80)
-    print("STEP 1: Create DeviceMesh for Model Parallelism")
-    print("=" * 80)
+    print(f"\n{'='*80}")
+    print(f"STEP 1: Create DeviceMesh for Model Parallelism")
+    print(f"{'='*80}")
     
-    if do_sharding:
-        # Create PyTorch DeviceMesh
-        device_mesh = create_device_mesh_2d(gpu_devices)
-        print(f"\n✓ Created DeviceMesh: shape={device_mesh.mesh.shape}, dim_names={device_mesh.mesh_dim_names}")
-        
-        # Show mesh device assignments
-        for i, device in enumerate(device_mesh.device_ids):
-            print(f"  - Rank {i}: cuda:{device}")
-    else:
-        device_mesh = None
-        print("\n⚠ Using single GPU (no DeviceMesh)")
+    # Create PyTorch DeviceMesh
+    device_mesh = create_device_mesh_2d(gpu_devices, rank)
+    print(f"\n✓ [Rank {rank}] Created DeviceMesh: shape={device_mesh.mesh.shape}, dim_names={device_mesh.mesh_dim_names}")
+    
+    # Show mesh device assignments
+    for i, device in enumerate(device_mesh.device_ids):
+        print(f"  - Rank {i}: cuda:{device}")
     
     # =========================================================================
     # Step 2: Create OPT-125M Configuration
     # =========================================================================
-    print("\n" + "=" * 80)
-    print("STEP 2: OPT-125M Configuration")
-    print("=" * 80)
+    print(f"\n{'='*80}")
+    print(f"STEP 2: OPT-125M Configuration")
+    print(f"{'='*80}")
     
     OPT_125M_CONFIG = {
         'vocabulary_size': 50265,
@@ -385,7 +347,7 @@ def test_torch_dtensor_model_parallelism():
         'max_sequence_length': 2048,
     }
     
-    print("\nOPT-125M Configuration:")
+    print(f"\n[Rank {rank}] OPT-125M Configuration:")
     for key, value in OPT_125M_CONFIG.items():
         print(f"  - {key}: {value}")
     
@@ -409,75 +371,70 @@ def test_torch_dtensor_model_parallelism():
     # =========================================================================
     # Step 3: Create Model with DTensor Parallelism
     # =========================================================================
-    print("\n" + "=" * 80)
-    print("STEP 3: Create Model with DTensor Model Parallelism")
-    print("=" * 80)
+    print(f"\n{'='*80}")
+    print(f"STEP 3: Create Model with DTensor Model Parallelism")
+    print(f"{'='*80}")
     
     # Create model on current GPU
     model = OPT125MModelParallel(OPT_125M_CONFIG, device_mesh)
     model = model.cuda()
     
-    if do_sharding:
-        # Parallelize the entire module
-        model = tp.parallelize_module(model, device_mesh, {})
-        print("\n✓ Model parallelized across devices")
-    else:
-        print("\n⚠ Model on single GPU (not parallelized)")
+    # Parallelize the entire module
+    model = tp.parallelize_module(model, device_mesh, {})
+    print(f"\n✓ [Rank {rank}] Model parallelized across devices")
     
     # Count parameters
     total_params_count = sum(p.numel() for p in model.parameters())
     local_params_count = sum(p._local_tensor.numel() for p in model.parameters() if hasattr(p, '_local_tensor'))
     
-    print(f"\nParameter counts:")
+    print(f"\n[Rank {rank}] Parameter counts:")
     print(f"  - Total parameters (logical): {total_params_count:,}")
-    if do_sharding:
-        print(f"  - Local parameters (per device): {local_params_count:,}")
-        print(f"  - Sharding ratio: {total_params_count / local_params_count:.1f}x")
+    print(f"  - Local parameters (per device): {local_params_count:,}")
+    print(f"  - Sharding ratio: {total_params_count / local_params_count:.1f}x")
     
     # =========================================================================
     # Step 4: Verify Tensor Sharding
     # =========================================================================
-    print("\n" + "=" * 80)
-    print("STEP 4: Verify Tensor Sharding")
-    print("=" * 80)
+    print(f"\n{'='*80}")
+    print(f"STEP 4: Verify Tensor Sharding")
+    print(f"{'='*80}")
     
-    if do_sharding:
-        print("\nVerifying DTensor properties of model weights:")
-        
-        for name, param in model.named_parameters():
-            if hasattr(param, '_local_tensor'):
-                local_shape = tuple(param._local_tensor.shape)
-                global_shape = param.shape
-                
-                # Calculate expected shard shape
-                if 'attention' in name and 'weight' in name:
-                    expected_shard = global_shape[1] // 2  # Second dimension sharded
-                elif 'fc1' in name and 'weight' in name:
-                    expected_shard = global_shape[0] // 2  # First dimension sharded
-                elif 'fc2' in name and 'weight' in name:
-                    expected_shard = global_shape[1] // 2  # Second dimension sharded
-                elif 'embedding' in name:
-                    expected_shard = global_shape[0] // 2  # First dimension sharded
-                else:
-                    expected_shard = "replicated"
-                
-                print(f"  ✓ {name}:")
-                print(f"      Global shape: {global_shape}")
-                print(f"      Local shape: {local_shape}")
-                print(f"      Device: {param._local_tensor.device}")
-                
-                if isinstance(expected_shard, int):
-                    shard_ratio = global_shape[1] / local_shape[1] if len(local_shape) > 1 else 1
-                    print(f"      Shard ratio: {shard_ratio:.1f}x")
+    print(f"\n[Rank {rank}] Verifying DTensor properties of model weights:")
+    
+    for name, param in model.named_parameters():
+        if hasattr(param, '_local_tensor'):
+            local_shape = tuple(param._local_tensor.shape)
+            global_shape = param.shape
+            
+            # Calculate expected shard shape
+            if 'attention' in name and 'weight' in name:
+                expected_shard = global_shape[1] // 2  # Second dimension sharded
+            elif 'fc1' in name and 'weight' in name:
+                expected_shard = global_shape[0] // 2  # First dimension sharded
+            elif 'fc2' in name and 'weight' in name:
+                expected_shard = global_shape[1] // 2  # Second dimension sharded
+            elif 'embedding' in name:
+                expected_shard = global_shape[0] // 2  # First dimension sharded
             else:
-                print(f"  - {name}: {tuple(param.shape)} (replicated)")
+                expected_shard = "replicated"
+            
+            print(f"  ✓ {name}:")
+            print(f"      Global shape: {global_shape}")
+            print(f"      Local shape: {local_shape}")
+            print(f"      Device: {param._local_tensor.device}")
+            
+            if isinstance(expected_shard, int):
+                shard_ratio = global_shape[1] / local_shape[1] if len(local_shape) > 1 else 1
+                print(f"      Shard ratio: {shard_ratio:.1f}x")
+        else:
+            print(f"  - {name}: {tuple(param.shape)} (replicated)")
     
     # =========================================================================
     # Step 5: Forward Pass Test
     # =========================================================================
-    print("\n" + "=" * 80)
-    print("STEP 5: Forward Pass Test")
-    print("=" * 80)
+    print(f"\n{'='*80}")
+    print(f"STEP 5: Forward Pass Test")
+    print(f"{'='*80}")
     
     # Create sample input
     batch_size = 2
@@ -490,7 +447,7 @@ def test_torch_dtensor_model_parallelism():
         device=f"cuda:{local_rank}"
     )
     
-    print(f"\nInput:")
+    print(f"\n[Rank {rank}] Input:")
     print(f"  - Token IDs shape: {tuple(token_ids.shape)}")
     print(f"  - Device: {token_ids.device}")
     
@@ -499,7 +456,7 @@ def test_torch_dtensor_model_parallelism():
     with torch.no_grad():
         logits = model(token_ids)
     
-    print(f"\nOutput:")
+    print(f"\n[Rank {rank}] Output:")
     print(f"  - Logits shape: {tuple(logits.shape)}")
     print(f"  - Device: {logits.device}")
     
@@ -513,9 +470,9 @@ def test_torch_dtensor_model_parallelism():
     # =========================================================================
     # Step 6: Training Test
     # =========================================================================
-    print("\n" + "=" * 80)
-    print("STEP 6: Training Test")
-    print("=" * 80)
+    print(f"\n{'='*80}")
+    print(f"STEP 6: Training Test")
+    print(f"{'='*80}")
     
     # Create optimizer
     optimizer = torch.optim.Adam(model.parameters(), lr=5e-5)
@@ -528,7 +485,7 @@ def test_torch_dtensor_model_parallelism():
         device=f"cuda:{local_rank}"
     )
     
-    print(f"\nTraining configuration:")
+    print(f"\n[Rank {rank}] Training configuration:")
     print(f"  - Optimizer: Adam (lr=5e-5)")
     print(f"  - Batch size: {batch_size}")
     print(f"  - Sequence length: {seq_length}")
@@ -537,7 +494,7 @@ def test_torch_dtensor_model_parallelism():
     model.train()
     num_epochs = 2
     
-    print(f"\nTraining for {num_epochs} epoch(s)...")
+    print(f"\n[Rank {rank}] Training for {num_epochs} epoch(s)...")
     
     for epoch in range(num_epochs):
         optimizer.zero_grad()
@@ -562,39 +519,38 @@ def test_torch_dtensor_model_parallelism():
             if p.grad is not None:
                 grad_norm += p.grad.norm().item()
         
-        print(f"  Epoch {epoch+1}/{num_epochs}: loss={loss.item():.6f}, grad_norm={grad_norm:.4f}")
+        print(f"  [Rank {rank}] Epoch {epoch+1}/{num_epochs}: loss={loss.item():.6f}, grad_norm={grad_norm:.4f}")
     
-    print(f"\n✓ Training completed successfully!")
+    print(f"\n✓ [Rank {rank}] Training completed successfully!")
     
     # =========================================================================
     # Step 7: Verify Sharding After Training
     # =========================================================================
-    print("\n" + "=" * 80)
-    print("STEP 7: Verify Sharding After Training")
-    print("=" * 80)
+    print(f"\n{'='*80}")
+    print(f"STEP 7: Verify Sharding After Training")
+    print(f"{'='*80}")
     
-    if do_sharding:
-        print("\nVerifying sharded parameters after training:")
-        
-        for name, param in model.named_parameters():
-            if hasattr(param, '_local_tensor'):
-                local_shape = tuple(param._local_tensor.shape)
-                global_shape = param.shape
-                grad_norm = param.grad.norm().item() if param.grad is not None else 0.0
-                
-                print(f"  ✓ {name}:")
-                print(f"      Local shape: {local_shape}")
-                print(f"      Gradient norm: {grad_norm:.6f}")
+    print(f"\n[Rank {rank}] Verifying sharded parameters after training:")
+    
+    for name, param in model.named_parameters():
+        if hasattr(param, '_local_tensor'):
+            local_shape = tuple(param._local_tensor.shape)
+            global_shape = param.shape
+            grad_norm = param.grad.norm().item() if param.grad is not None else 0.0
+            
+            print(f"  ✓ {name}:")
+            print(f"      Local shape: {local_shape}")
+            print(f"      Gradient norm: {grad_norm:.6f}")
     
     # =========================================================================
     # Summary
     # =========================================================================
-    print("\n" + "=" * 80)
-    print("SUMMARY")
-    print("=" * 80)
+    print(f"\n{'='*80}")
+    print(f"SUMMARY (Rank {rank})")
+    print(f"{'='*80}")
     
-    print("""
-This test demonstrated:
+    print(f"""
+[Rank {rank}] This test demonstrated:
 
 1. ✓ PyTorch DTensor DeviceMesh creation for model parallelism
 2. ✓ Actual tensor parallel module parallelization using torch.distributed
@@ -609,21 +565,63 @@ Key insights for TRUE model parallelism:
 - Sharded tensors have _local_tensor attribute with device-local shape
 - Optimizer operates on local shards, PyTorch handles gradient synchronization
 - torch.distributed.tensor.parallel.parallelize_module() applies sharding styles
-
-To run with 2 GPUs:
-    torchrun --nproc_per_node=2 python test_torch_model_parallel_2gpu.py
-
-For more GPUs, adjust nproc_per_node accordingly.
 """)
     
-    print("=" * 80)
-    print("Test completed successfully!")
-    print("=" * 80)
+    print(f"{'='*80}")
+    print(f"[Rank {rank}] Test completed successfully!")
+    print(f"{'='*80}")
     
     cleanup_distributed()
     return True
 
 
+def main():
+    """Main entry point that spawns worker processes."""
+    
+    # Check if running under torchrun
+    world_size_from_env = int(os.environ.get("WORLD_SIZE", 1))
+    rank_from_env = int(os.environ.get("RANK", 0))
+    
+    # Check GPU availability
+    if not torch.cuda.is_available():
+        print("ERROR: CUDA not available. This test requires GPUs.")
+        sys.exit(1)
+    
+    num_gpus = torch.cuda.device_count()
+    print("=" * 80)
+    print("PyTorch DTensor Model Parallelism Test with 2+ GPUs")
+    print("=" * 80)
+    print(f"\nGPU Environment:")
+    print(f"  - CUDA available: {torch.cuda.is_available()}")
+    print(f"  - GPU count: {num_gpus}")
+    
+    if num_gpus < 2:
+        print("\nWARNING: This test requires 2+ GPUs for model parallelism.")
+        print("Running in single GPU mode (limited functionality).")
+        # Still run but without true model parallelism
+        test_torch_dtensor_model_parallelism_worker(rank=0, world_size=1, num_gpus=num_gpus)
+        return
+    
+    # Check if running under torchrun
+    if world_size_from_env > 1:
+        # Running under torchrun - just run the worker
+        print(f"\nDetected torchrun mode: WORLD_SIZE={world_size_from_env}")
+        test_torch_dtensor_model_parallelism_worker(rank=rank_from_env, world_size=world_size_from_env, num_gpus=num_gpus)
+    else:
+        # Not under torchrun - need to spawn processes ourselves
+        print(f"\nDetected python mode - spawning {num_gpus} processes for multi-GPU training")
+        print(f"\nTo run with torchrun instead, use:")
+        print(f"  torchrun --nproc_per_node={num_gpus} {sys.argv[0]}")
+        print()
+        
+        mp.spawn(
+            test_torch_dtensor_model_parallelism_worker,
+            args=(num_gpus, num_gpus),
+            nprocs=num_gpus,
+            join=True
+        )
+
+
 if __name__ == "__main__":
-    test_torch_dtensor_model_parallelism()
+    main()
 
