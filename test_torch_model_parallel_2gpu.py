@@ -327,7 +327,7 @@ def test_torch_dtensor_model_parallelism_worker(rank, world_size, num_gpus):
     print(f"\n✓ [Rank {rank}] Created DeviceMesh: shape={device_mesh.mesh.shape}, dim_names={device_mesh.mesh_dim_names}")
     
     # Show mesh device assignments
-    for i, device in enumerate(device_mesh.device_ids):
+    for i, device in enumerate(device_mesh.mesh):
         print(f"  - Rank {i}: cuda:{device}")
     
     # =========================================================================
