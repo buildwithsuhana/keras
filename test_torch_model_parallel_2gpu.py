@@ -66,9 +66,21 @@ def setup_distributed():
     if torch.distributed.is_available() and torch.distributed.is_nccl_available():
         # Check if running with torchrun (has WORLD_SIZE set)
         world_size = int(os.environ.get("WORLD_SIZE", 1))
+        
+        # If WORLD_SIZE is not set but we have multiple GPUs,
+        # we're likely running with python on a multi-GPU machine
+        if world_size == 1 and torch.cuda.device_count() > 1:
+            num_gpus = torch.cuda.device_count()
+            # Set environment variables for multi-GPU mode
+            os.environ["WORLD_SIZE"] = str(num_gpus)
+            os.environ["RANK"] = "0"  # Will be updated per-process
+            os.environ["LOCAL_RANK"] = str(local_rank)
+            os.environ["MASTER_ADDR"] = "127.0.0.1"
+            os.environ["MASTER_PORT"] = "29500"
+            world_size = num_gpus
 
         if world_size > 1:
-            # Running with torchrun - environment variables should be set
+            # Running with torchrun or python with multi-GPU setup
             if not dist.is_initialized():
                 torch.distributed.init_process_group(
                     backend="nccl",
