@@ -21,7 +21,7 @@ from torch.distributed.tensor.parallel import (
     RowwiseParallel,
     SequenceParallel,
 )
-from torch.distributed.tensor import DTensor
+from torch.distributed.tensor import DTensor, Shard, Replicate
 
 # Import DeviceMesh directly from keras.src.distribution to avoid circular import
 # Note: We import keras_dist_lib inside methods that need it, after the module is fully loaded
@@ -47,7 +47,9 @@ def _check_torch_available():
 
 def _check_distributed_initialized():
     """Check if torch.distributed is initialized."""
-    return dist.is_available() and dist.is_initialized()
+    if not dist.is_available():
+        return False
+    return dist.is_initialized()
 
 
 def _is_gpu_available():
@@ -372,7 +374,8 @@ def _create_placement_from_layout(layout_axes, mesh_dim_names):
             else:
                 placements.append(Replicate())
     
-    return placements
+    # Ensure we return a tuple of placements
+    return tuple(placements)
 
 
 # Global state for distribution
@@ -566,15 +569,21 @@ def distribute_variable(value, layout, device_mesh=None):
     
     # Create DTensor from tensor
     try:
+        # Ensure value is contiguous
+        if not isinstance(value, torch.Tensor):
+            value = torch.tensor(value)
+        value = value.contiguous()
+        
+        # Create DTensor using distribute_tensor
         dtensor = tp.distribute_tensor(
-            value.contiguous(),
+            value,
             device_mesh,
             placements
         )
         return dtensor
     except Exception as e:
         # Fallback to original tensor if DTensor creation fails
-        # This is expected on CPU-only systems
+        # This is expected on CPU-only systems or when mesh is incompatible
         return value
 
 
