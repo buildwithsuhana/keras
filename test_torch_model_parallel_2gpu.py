@@ -468,22 +468,34 @@ print("\nGenerating synthetic training data...")
 train_batch_size = TRAINING_CONFIG['batch_size']
 train_seq_length = TRAINING_CONFIG['train_seq_length']
 
+# Generate token IDs - ensure they are within vocabulary bounds
+# Use vocabulary_size - 1 as the upper bound to ensure all values are valid
+vocab_size = OPT_125M_CONFIG['vocabulary_size']
 train_token_ids = np.random.randint(
     0,
-    OPT_125M_CONFIG['vocabulary_size'],
-    size=(train_batch_size * 4, train_seq_length)  # 4 batches for 2 epochs
+    vocab_size - 1,  # Use vocab_size - 1 to be safe
+    size=(train_batch_size * 4, train_seq_length)
 )
 train_padding_mask = np.ones((train_batch_size * 4, train_seq_length), dtype="int32")
 
 # For language modeling, we need next token targets
 # Shift labels by 1 to predict next token
+# IMPORTANT: Labels must be within valid range [0, vocab_size - 1]
 train_labels = np.roll(train_token_ids, shift=-1, axis=1)
-train_labels[:, -1] = 0  # Pad the last position
+# Set the last position to 0 (a valid token index)
+train_labels[:, -1] = 0
+
+# Verify labels are within bounds
+print(f"  - Label range: [{train_labels.min()}, {train_labels.max()}]")
+print(f"  - Vocabulary size: {vocab_size}")
+assert train_labels.max() < vocab_size, f"Label value {train_labels.max()} exceeds vocabulary size {vocab_size}"
+assert train_labels.min() >= 0, f"Label value {train_labels.min()} is negative"
 
 print(f"✓ Generated training data:")
 print(f"  - Token IDs shape: {train_token_ids.shape}")
 print(f"  - Padding mask shape: {train_padding_mask.shape}")
 print(f"  - Labels shape: {train_labels.shape}")
+print(f"  - Labels validated: min={train_labels.min()}, max={train_labels.max()}")
 
 # ============================================================================
 # Step 11: Compile Model with Optimizer and Loss
@@ -527,6 +539,10 @@ print("=" * 80)
 print(f"\nStarting training for {TRAINING_CONFIG['epochs']} epoch(s)...")
 print("-" * 80)
 
+# Initialize history to None
+history = None
+training_success = False
+
 try:
     # Train the model using fit()
     history = model.fit(
@@ -540,6 +556,7 @@ try:
         verbose=1
     )
 
+    training_success = True
     print("\n" + "=" * 80)
     print("TRAINING RESULTS")
     print("=" * 80)
@@ -570,6 +587,7 @@ except Exception as e:
     print(f"✗ Training failed: {e}")
     import traceback
     traceback.print_exc()
+    training_success = False
 
 # ============================================================================
 # Step 13: Verify Model Still Works After Training
@@ -579,11 +597,11 @@ print("STEP 13: Verify Model Still Works After Training")
 print("=" * 80)
 
 # Perform another forward pass to verify model is still functional
-with model_parallel.scope():
-    try:
+try:
+    with model_parallel.scope():
         val_token_ids = np.random.randint(
             0,
-            OPT_125M_CONFIG['vocabulary_size'],
+            vocab_size - 1,
             size=(2, 8)
         )
         val_padding_mask = np.ones((2, 8), dtype="int32")
@@ -593,6 +611,7 @@ with model_parallel.scope():
             "padding_mask": val_padding_mask
         })
 
+        from keras.src.backend.torch.core import convert_to_numpy
         output_np = convert_to_numpy(output)
 
         print(f"✓ Forward pass after training successful!")
@@ -603,8 +622,10 @@ with model_parallel.scope():
         else:
             print(f"  - Output contains NaN values ✗")
 
-    except Exception as e:
-        print(f"✗ Post-training forward pass failed: {e}")
+except Exception as e:
+    print(f"✗ Post-training forward pass failed: {e}")
+    import traceback
+    traceback.print_exc()
 
 # ============================================================================
 # Step 14: GPU Memory Analysis After Training
@@ -698,34 +719,37 @@ print("\n>>> Checking if variables changed after training...")
 changed_count = 0
 total_checked = 0
 
-for var in model.trainable_variables:
-    var_path = var.path if hasattr(var, 'path') else str(id(var))
-    total_checked += 1
-    
-    try:
-        if hasattr(var, 'value') and hasattr(var.value, 'numpy'):
-            current_value = var.value.numpy()
-        elif hasattr(var, 'numpy'):
-            current_value = var.numpy()
-        else:
-            continue
-            
-        initial_value = initial_var_values.get(var_path)
+if training_success:
+    for var in model.trainable_variables:
+        var_path = var.path if hasattr(var, 'path') else str(id(var))
+        total_checked += 1
         
-        if initial_value is not None and current_value is not None:
-            if np.array_equal(initial_value, current_value):
-                print(f"  [UNCHANGED] {var_path}")
+        try:
+            if hasattr(var, 'value') and hasattr(var.value, 'numpy'):
+                current_value = var.value.numpy()
+            elif hasattr(var, 'numpy'):
+                current_value = var.numpy()
             else:
-                changed_count += 1
-                max_change = np.max(np.abs(initial_value - current_value))
-                mean_change = np.mean(np.abs(initial_value - current_value))
-                print(f"  [CHANGED ✓] {var_path}")
-                print(f"             Max change: {max_change:.6f}, Mean change: {mean_change:.6f}")
-        else:
-            print(f"  [UNKNOWN]  {var_path} - could not compare")
+                continue
+                
+            initial_value = initial_var_values.get(var_path)
             
-    except Exception as e:
-        print(f"  [ERROR]    {var_path}: {e}")
+            if initial_value is not None and current_value is not None:
+                if np.array_equal(initial_value, current_value):
+                    print(f"  [UNCHANGED] {var_path}")
+                else:
+                    changed_count += 1
+                    max_change = np.max(np.abs(initial_value - current_value))
+                    mean_change = np.mean(np.abs(initial_value - current_value))
+                    print(f"  [CHANGED ✓] {var_path}")
+                    print(f"             Max change: {max_change:.6f}, Mean change: {mean_change:.6f}")
+            else:
+                print(f"  [UNKNOWN]  {var_path} - could not compare")
+                
+        except Exception as e:
+            print(f"  [ERROR]    {var_path}: {e}")
+else:
+    print("  Skipping variable change check - training did not complete successfully")
 
 print(f"\n>>> Variable Update Summary:")
 print(f"  - Total variables checked: {total_checked}")
@@ -734,8 +758,10 @@ print(f"  - Variables unchanged: {total_checked - changed_count}")
 
 if changed_count > 0:
     print(f"\n  ✓ VERIFIED: {changed_count} variables were updated during training!")
-else:
+elif training_success:
     print(f"\n  ⚠ WARNING: No variables changed during training!")
+else:
+    print(f"\n  ⚠ Training did not complete, cannot verify variable updates")
 
 # ============================================================================
 # Step 16: Verify Actual Sharded Shapes
@@ -813,6 +839,11 @@ print("\n" + "=" * 80)
 print("SUMMARY - 2 GPU Model Parallelism Test")
 print("=" * 80)
 
+# Get final loss from history if available
+final_loss_str = "N/A"
+if history is not None and training_success:
+    final_loss_str = f"{history.history['loss'][-1]:.4f}"
+
 print(f"""
 GPU Configuration:
   - Real GPUs: {'Yes' if use_real_gpus else 'No (simulated)'}
@@ -834,16 +865,17 @@ Model:
 Training Results:
   - Epochs: {TRAINING_CONFIG['epochs']}
   - Batch size: {TRAINING_CONFIG['batch_size']}
-  - Final loss: {history.history['loss'][-1]:.4f}
-  - Variables updated: {changed_count}/{total_checked}
+  - Final loss: {final_loss_str}
+  - Variables updated: {changed_count}/{total_checked if training_success else 'N/A'}
+  - Training success: {'Yes' if training_success else 'No'}
 
 Key Verifications:
   ✓ DeviceMesh created for 2 devices
   ✓ LayoutMap configured for layer sharding
   ✓ ModelParallel distribution applied
   ✓ Forward pass successful
-  ✓ Training with model.fit() completed
-  ✓ Variables changed during training
+  {'✓ Training with model.fit() completed' if training_success else '✗ Training failed'}
+  {'✓ Variables changed during training' if changed_count > 0 else '⚠ No variables changed'}
   ✓ Model functional after training
 
 Note: Full DTensor sharding requires PyTorch 2.0+ with 
@@ -853,6 +885,6 @@ Note: Full DTensor sharding requires PyTorch 2.0+ with
 """)
 
 print("=" * 80)
-print("2 GPU Model Parallelism Test completed successfully!")
+print("2 GPU Model Parallelism Test completed!")
 print("=" * 80)
 
