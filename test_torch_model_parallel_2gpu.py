@@ -58,20 +58,28 @@ logger = logging.getLogger(__name__)
 def setup_distributed():
     """Initialize PyTorch distributed for multi-GPU training."""
     local_rank = int(os.environ.get("LOCAL_RANK", 0))
-    
+
     if torch.cuda.is_available():
         torch.cuda.set_device(local_rank)
-    
+
     # Check if we can initialize distributed
     if torch.distributed.is_available() and torch.distributed.is_nccl_available():
-        if not dist.is_initialized():
-            torch.distributed.init_process_group(
-                backend="nccl",
-                init_method="env://",
-                world_size=int(os.environ.get("WORLD_SIZE", torch.cuda.device_count())),
-                rank=local_rank
-            )
-        return dist.get_rank(), dist.get_world_size()
+        # Check if running with torchrun (has WORLD_SIZE set)
+        world_size = int(os.environ.get("WORLD_SIZE", 1))
+
+        if world_size > 1:
+            # Running with torchrun - environment variables should be set
+            if not dist.is_initialized():
+                torch.distributed.init_process_group(
+                    backend="nccl",
+                    init_method="env://",
+                    world_size=world_size,
+                    rank=local_rank
+                )
+            return dist.get_rank(), dist.get_world_size()
+        else:
+            # Single GPU mode - no distributed initialization needed
+            return 0, 1
     else:
         return 0, 1
 
