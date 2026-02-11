@@ -586,8 +586,10 @@ def run_opt_hybrid_dp_mp_test():
     # Sync again after redistribution
     print(f"[Rank {local_rank}] Syncing after redistribution...")
     _sync_all_ranks(timeout_seconds=60)
+    print("sync done")
 
     try:
+        print("hello world")
         is_opt_model = hasattr(model, 'sampler')
 
         if is_opt_model:
