@@ -650,7 +650,7 @@ def _get_default_device_mesh():
             num_devices = xm.xrt_world_size()
             devices = [f"tpu:{i}" for i in range(num_devices)]
             mesh = init_device_mesh(
-                backend="xla",
+                device_type="xla",
                 mesh_shape=(num_devices,),
                 mesh_dim_names=("model",)
             )
@@ -666,7 +666,7 @@ def _get_default_device_mesh():
         if num_gpus >= 1:
             try:
                 mesh = init_device_mesh(
-                    backend="cuda",
+                    device_type="cuda",
                     mesh_shape=(num_gpus,),
                     mesh_dim_names=("model",)
                 )
@@ -675,7 +675,7 @@ def _get_default_device_mesh():
                 return mesh
             except Exception as e:
                 print(f"Warning: Could not create GPU DeviceMesh: {e}")
-                # Try fallback approach
+                # Try fallback approach using DeviceMesh class directly
                 try:
                     devices = [f"cuda:{i}" for i in range(num_gpus)]
                     mesh = DeviceMesh(
@@ -691,7 +691,7 @@ def _get_default_device_mesh():
     if torch.backends.mps.is_available():
         try:
             mesh = init_device_mesh(
-                backend="mps",
+                device_type="mps",
                 mesh_shape=(1,),
                 mesh_dim_names=("model",)
             )
@@ -704,7 +704,7 @@ def _get_default_device_mesh():
     # CPU-only fallback - create a logical mesh for single process
     try:
         mesh = init_device_mesh(
-            backend="cpu",
+            device_type="cpu",
             mesh_shape=(1,),
             mesh_dim_names=("model",)
         )
@@ -944,9 +944,9 @@ class TorchModelParallel:
         
         # Initialize PyTorch Device Mesh
         if isinstance(device_mesh, (tuple, list)):
-            backend = _get_torch_backend(list_devices())
+            # Use device_type instead of backend for PyTorch 2.8+
             self.mesh = init_device_mesh(
-                backend=backend,
+                device_type=_get_torch_backend(list_devices()),
                 mesh_shape=device_mesh,
                 mesh_dim_names=("data", "model")
             )
