@@ -105,8 +105,9 @@ def create_device_mesh_2d(gpu_devices):
     """
     # Create a 1D mesh for model parallelism
     # For true 2D parallelism, we'd need more GPUs
+    # Note: init_device_mesh uses device_type, not backend parameter
     mesh = init_device_mesh(
-        backend="cuda",
+        device_type="cuda",
         mesh_shape=(len(gpu_devices),),
         mesh_dim_names=["model"]
     )
