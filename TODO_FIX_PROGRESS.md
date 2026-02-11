@@ -1,129 +1,90 @@
-# Fix Progress: Device Mismatch Error in DTensor Model Parallelism
+# Fix Progress: CUDA Tensor to NumPy Conversion Error
 
 ## Summary
 
-Fixed the device mismatch error (`Expected all tensors to be on the same device, but found at least two devices, cuda:0 and cuda:1!`) that occurred during model parallelism training with DTensor sharding.
+Fixed the CUDA tensor to NumPy conversion error that occurred when inspecting model variables.
+
+## Error Message
+```
+can't convert cuda:0 device type tensor to numpy. Use Tensor.cpu() to copy the tensor to host memory first.
+```
 
 ## Root Cause
 
-When using DTensor sharding with model parallelism:
-1. `embedded_tokens` from token embedding lookup ended up on one device
-2. `embedded_positions` from position embedding after `broadcast_to` ended up on a different device
-3. Adding them together caused the device mismatch error
+The test scripts were calling `.numpy()` directly on CUDA tensors, which PyTorch doesn't allow. The proper approach is to:
 
-The issue was in the torch backend's handling of DTensor in core operations like `broadcast_to`, `slice`, and `convert_to_tensor`.
+1. Detach the tensor from the computation graph (to stop gradient tracking)
+2. Move it to CPU using `.cpu()` 
+3. Then convert to numpy array
 
-## Changes Made
+## Solution
 
-### 1. `keras/src/backend/torch/numpy.py` - `broadcast_to` function
+Use the `convert_to_numpy()` function from `keras.src.backend.torch.core` which already handles CUDA tensors correctly by:
+1. Detaching the tensor from the computation graph
+2. Moving it to CPU if needed
+3. Converting to numpy array
 
-**File**: `keras/src/backend/torch/numpy.py` (around line 559)
+## Files Created (Fixed Versions)
 
-**Change**: Added DTensor handling to ensure proper device placement during broadcasting.
+### 1. `test_torch_model_parallel_2gpu_fixed.py`
 
+**Changes:**
+- Added `from keras.src.backend.torch.core import convert_to_numpy` import at the top of the file
+- Replaced all direct `.numpy()` calls with `convert_to_numpy()` calls in:
+  - Initial variable value capture (Step 15)
+  - Variable change detection (Step 15)
+  - Forward pass output conversion (Step 9 and Step 13)
+
+### 2. `test_torch_model_parallel_opt125m_fixed.py`
+
+**Changes:**
+- Added `from keras.src.backend.torch.core import convert_to_numpy` import at the top of the file
+- Replaced all direct `.numpy()` calls with `convert_to_numpy()` calls in:
+  - Initial variable value capture (Step 16)
+  - Variable change detection (Step 16)
+  - Forward pass output conversion (Step 9 and Step 14)
+
+## Key Code Changes
+
+### Before (fails on CUDA tensors):
 ```python
-def broadcast_to(x, shape):
-    x = convert_to_tensor(x)
-    # Handle DTensor properly to avoid device mismatch errors
-    # in distributed model parallelism scenarios
-    try:
-        from torch.distributed.tensor import DTensor
-        if isinstance(x, DTensor):
-            # Get the local tensor and ensure it's on the correct device
-            local_tensor = x._local_tensor
-            target_device = x.device()
-            if local_tensor.device != target_device:
-                local_tensor = local_tensor.to(target_device)
-            # Broadcast the local tensor
-            result = torch.broadcast_to(local_tensor, shape)
-            # Reconstruct DTensor with the same spec
-            return DTensor.from_local(result, x._spec, reshape=False)
-    except ImportError:
-        pass
-    return torch.broadcast_to(x, shape)
+# This FAILS on CUDA tensors:
+initial_var_values[var_path] = var.value.numpy().copy()
+current_value = var.numpy()
 ```
 
-### 2. `keras/src/backend/torch/core.py` - `slice` function
-
-**File**: `keras/src/backend/torch/core.py` (around line 635)
-
-**Change**: Added DTensor handling to ensure proper device placement during slicing.
-
+### After (works on all devices):
 ```python
-def slice(inputs, start_indices, shape):
-    shape_dtype = to_torch_dtype("int64")
-    inputs = convert_to_tensor(inputs)
-    
-    # Handle DTensor properly to avoid device mismatch errors
-    # in distributed model parallelism scenarios
-    try:
-        from torch.distributed.tensor import DTensor
-        if isinstance(inputs, DTensor):
-            # Get the local tensor and ensure it's on the correct device
-            local_tensor = inputs._local_tensor
-            target_device = inputs.device()
-            if local_tensor.device != target_device:
-                local_tensor = local_tensor.to(target_device)
-            
-            # Perform slice on local tensor
-            start_indices = convert_to_tensor(start_indices).to(shape_dtype)
-            shape_tensor = convert_to_tensor(shape).to(shape_dtype)
-            
-            python_slice = __builtins__["slice"]
-            slices = [
-                python_slice(int(start_index), int(start_index) + int(length))
-                for start_index, length in zip(start_indices, shape_tensor)
-            ]
-            sliced_local = local_tensor[tuple(slices)]
-            # Reconstruct DTensor with the same spec
-            return DTensor.from_local(sliced_local, inputs._spec, reshape=False)
-    except ImportError:
-        pass
-    
-    # ... rest of original function
+# Use convert_to_numpy which handles CUDA/MPS tensors properly
+from keras.src.backend.torch.core import convert_to_numpy
+
+initial_var_values[var_path] = convert_to_numpy(var.value).copy()
+current_value = convert_to_numpy(var)
 ```
 
-### 3. `keras/src/backend/torch/core.py` - `convert_to_tensor` function
+## Usage
 
-**File**: `keras/src/backend/torch/core.py` (around line 243)
+Run the fixed test files instead of the original ones:
 
-**Change**: Added early return for DTensor to preserve DTensor properties without moving tensors between devices.
+```bash
+# For 2 GPU version (requires 2 CUDA GPUs)
+CUDA_VISIBLE_DEVICES=0,1 python test_torch_model_parallel_2gpu_fixed.py
 
-```python
-def convert_to_tensor(x, dtype=None, sparse=None, ragged=None):
-    # ... existing checks ...
-    
-    # Handle DTensor specially - preserve it as-is without moving devices
-    try:
-        from torch.distributed.tensor import DTensor
-        if isinstance(x, DTensor):
-            if dtype is not None:
-                local_dtype = to_torch_dtype(dtype)
-                if x._local_tensor.dtype != local_dtype:
-                    new_local = x._local_tensor.to(dtype=local_dtype)
-                    return DTensor.from_local(new_local, x._spec)
-            return x
-    except ImportError:
-        pass
-    
-    # ... rest of original function
+# For CPU simulation version
+python test_torch_model_parallel_opt125m_fixed.py
 ```
 
 ## Testing
 
-After implementing these fixes, test with:
-```bash
-CUDA_VISIBLE_DEVICES=0,1 python test_torch_model_parallel_2gpu.py
-```
-
-Expected results:
-- No device mismatch errors during forward pass
+After implementing these fixes, verify with:
+- No CUDA tensor to numpy conversion errors
 - Training completes successfully
-- Model parameters are properly sharded across devices
+- Variables can be properly inspected before and after training
+- Forward and backward passes work correctly
 
 ## Notes
 
-- All changes use conditional imports (`try/except ImportError`) to maintain backward compatibility with systems that don't have PyTorch DTensor support
-- The fixes preserve the DTensor's spec and device placement
-- Changes are minimal and focused on the specific issue
+- The `convert_to_numpy()` function in `keras/src/backend/torch/core.py` already handles this correctly
+- This fix ensures compatibility when running on real GPUs (CUDA) or simulated devices
+- The changes are backward compatible with CPU-only environments
 
