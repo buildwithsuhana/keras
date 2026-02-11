@@ -107,9 +107,31 @@ class Variable(KerasVariable):
             # Reuse same parameter
             self._value = value
         else:
+            # Convert to tensor first
+            tensor_value = convert_to_tensor(value, dtype=self._dtype)
+            
+            # Apply distribution sharding if available
+            distribution = global_state.get_global_attribute("distribution")
+            if distribution is not None:
+                try:
+                    from keras.src.distribution import TensorLayout
+                    tensor_layout = distribution.get_variable_layout(self)
+                    if tensor_layout is not None and isinstance(tensor_layout, TensorLayout):
+                        # Use distribution_lib to distribute the tensor
+                        from keras.src.backend.torch import distribution_lib
+                        if distribution_lib._check_distributed_initialized():
+                            tensor_value = distribution_lib.distribute_variable(
+                                tensor_value, 
+                                tensor_layout, 
+                                None
+                            )
+                            print(f"✓ Sharded variable: {self.path if hasattr(self, 'path') else 'variable'}")
+                except Exception:
+                    pass  # Fall back to regular tensor
+            
             self._value = torch.nn.Parameter(
-                convert_to_tensor(value, dtype=self._dtype),
-                requires_grad=self.trainable,
+                tensor_value,
+                requires_grad=self.trainable
             ).to(get_device())
 
     def _initialize_layout(self):

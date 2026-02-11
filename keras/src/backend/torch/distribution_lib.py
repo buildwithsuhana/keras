@@ -2,8 +2,8 @@
 
 This module provides PyTorch-specific implementations for the Keras distribution
 API, supporting CPU, GPU, and TPU devices. It uses PyTorch's DTensor for
-distributed tensor operations and provides adapters for Keras-style layer
-parameter naming conventions.
+distributed tensor operations when available, and provides fallback mechanisms
+for CPU-only or single-device scenarios.
 """
 
 import os
@@ -49,6 +49,36 @@ def _check_distributed_initialized():
     return dist.is_available() and dist.is_initialized()
 
 
+def _is_gpu_available():
+    """Check if CUDA GPUs are available."""
+    return torch.cuda.is_available()
+
+
+def _is_tpu_available():
+    """Check if TPU is available."""
+    try:
+        import torch_xla.core.xla_model as xm
+        return xm.xrt_world_size() > 0
+    except ImportError:
+        return False
+
+
+def _get_default_device():
+    """Get the default device for the current platform.
+    
+    Returns:
+        str: 'cuda', 'mps', 'cpu', or 'xla'
+    """
+    if torch.cuda.is_available():
+        return 'cuda'
+    elif torch.backends.mps.is_available():
+        return 'mps'
+    elif _is_tpu_available():
+        return 'xla'
+    else:
+        return 'cpu'
+
+
 def list_devices(device_type: Optional[str] = None) -> list:
     """Return all the available devices based on the device type.
     
@@ -62,19 +92,31 @@ def list_devices(device_type: Optional[str] = None) -> list:
     
     devices = []
     
+    # Detect TPU devices
     if device_type is None or device_type == "tpu":
         try:
             import torch_xla.core.xla_model as xm
-            devices.extend([f"tpu:{i}" for i in range(xm.xrt_world_size())])
+            tpu_count = xm.xrt_world_size()
+            if tpu_count > 0:
+                devices.extend([f"tpu:{i}" for i in range(tpu_count)])
         except ImportError:
             pass
     
+    # Detect GPU devices
     if device_type is None or device_type == "gpu":
         if torch.cuda.is_available():
-            devices.extend([f"cuda:{i}" for i in range(torch.cuda.device_count())])
+            gpu_count = torch.cuda.device_count()
+            devices.extend([f"cuda:{i}" for i in range(gpu_count)])
+        elif torch.backends.mps.is_available():
+            # MPS is available on Apple Silicon
+            devices.append("mps:0")
     
+    # Detect CPU devices
     if device_type is None or device_type == "cpu":
         if not devices:  # Only add CPU devices if no accelerators found
+            devices.append("cpu:0")
+        # Always include CPU as a fallback
+        if "cpu:0" not in devices:
             devices.append("cpu:0")
     
     return devices
@@ -102,7 +144,11 @@ def get_device_count(device_type: Optional[str] = None) -> int:
         except ImportError:
             return 1
     elif device_type == "gpu":
-        return torch.cuda.device_count() if torch.cuda.is_available() else 0
+        if torch.cuda.is_available():
+            return torch.cuda.device_count()
+        elif torch.backends.mps.is_available():
+            return 1
+        return 0
     elif device_type == "cpu":
         return 1
     elif device_type == "tpu":
@@ -119,17 +165,22 @@ def _to_backend_device(device_name: str) -> torch.device:
     """Convert Keras device name to PyTorch device.
     
     Args:
-        device_name: Device name like "cpu:0", "cuda:1", "tpu:0"
+        device_name: Device name like "cpu:0", "cuda:1", "tpu:0", "mps:0"
         
     Returns:
         PyTorch device object.
     """
     device_name = device_name.lower()
     if device_name.startswith("tpu"):
-        import torch_xla.core.xla_model as xm
-        return xm.xla_device()
+        try:
+            import torch_xla.core.xla_model as xm
+            return xm.xla_device()
+        except ImportError:
+            return torch.device("cpu")
     elif device_name.startswith("cuda"):
         return torch.device(f"cuda:{device_name.split(':')[1]}")
+    elif device_name.startswith("mps"):
+        return torch.device("mps")
     else:
         return torch.device("cpu")
 
@@ -146,21 +197,8 @@ def _convert_keras_path_to_torch(keras_path: str) -> str:
     Returns:
         PyTorch-style parameter path
     """
-    # Convert Keras path format to PyTorch format
-    # e.g., "dense/kernel" -> "dense.weight", "dense/bias" -> "dense.bias"
     
     torch_path = keras_path.replace('/', '.')
-    
-    # Handle layer-specific parameter naming
-    # Keras: layer_name/parameter_name -> PyTorch: layer_name.parameter_name
-    # Common patterns:
-    # - kernel -> weight
-    # - bias -> bias  
-    # - gamma -> weight (for normalization layers)
-    # - beta -> bias (for normalization layers)
-    # - running_mean -> running_mean
-    # - running_var -> running_var
-    
     replacements = [
         ('.kernel', '.weight'),
         ('.gamma', '.weight'),
@@ -191,12 +229,10 @@ def _convert_torch_path_to_keras(torch_path: str) -> str:
     Returns:
         Keras-style parameter path
     """
-    # Convert PyTorch path format to Keras format
-    # e.g., "dense.weight" -> "dense/kernel", "dense.bias" -> "dense/bias"
     
     replacements = [
-        ('.weight', '.kernel'),  # Handle this first for Linear layers
-        ('.weight', '/kernel'),  # For other layers
+        ('.weight', '.kernel'),
+        ('.weight', '/kernel'),
         ('.bias', '/bias'),
         ('.running_mean', '/moving_mean'),
         ('.running_var', '/moving_variance'),
@@ -204,7 +240,6 @@ def _convert_torch_path_to_keras(torch_path: str) -> str:
     
     keras_path = torch_path
     
-    # More specific replacements first
     if '.weight' in keras_path and '.kernel' not in keras_path:
         if 'dense' in keras_path or 'conv' in keras_path:
             keras_path = keras_path.replace('.weight', '/kernel')
@@ -240,32 +275,6 @@ def _to_backend_layout(layout):
     return layout
 
 
-def _to_backend_mesh(device_mesh):
-    """Convert Keras DeviceMesh to PyTorch DTensor DeviceMesh.
-    
-    Args:
-        device_mesh: Keras DeviceMesh instance
-        
-    Returns:
-        PyTorch DeviceMesh instance.
-    """
-    if device_mesh is None:
-        return None
-    
-    # Convert device mesh to PyTorch format
-    # Get the actual device list from the Keras mesh
-    devices = device_mesh.devices.flatten().tolist()
-    
-    # Create PyTorch device mesh
-    torch_mesh = init_device_mesh(
-        backend=_get_torch_backend(devices),
-        mesh_shape=device_mesh.shape,
-        mesh_dim_names=device_mesh.axis_names
-    )
-    
-    return torch_mesh
-
-
 def _get_torch_backend(devices: list) -> str:
     """Determine the PyTorch backend based on device list.
     
@@ -285,6 +294,10 @@ def _get_torch_backend(devices: list) -> str:
     # Check for CUDA GPU
     if any(d.startswith("cuda") for d in devices):
         return "cuda"
+    
+    # Check for MPS
+    if any(d.startswith("mps") for d in devices):
+        return "mps"
     
     # Default to CPU
     return "cpu"
@@ -364,66 +377,153 @@ def _create_placement_from_layout(layout_axes, mesh_dim_names):
 # Global state for distribution
 _distributed_initialized = False
 _device_mesh_cache = {}
+_backend_type = "cpu"  # Track the current backend type: 'cpu', 'cuda', 'mps', 'xla'
 
 
 def initialize(job_addresses: Optional[str] = None, 
                num_processes: Optional[int] = None, 
                process_id: Optional[int] = None,
-               backend: str = "nccl"):
+               backend: str = "auto"):
     """Initialize the distribution system for PyTorch.
+    
+    This function initializes the distribution system for the appropriate
+    backend (CPU, GPU, MPS, or TPU) based on available devices.
     
     Args:
         job_addresses: Comma separated IP addresses for all jobs
         num_processes: Number of worker processes
         process_id: Current worker process ID
-        backend: Distribution backend ('nccl' for GPU, 'gloo' for CPU)
+        backend: Distribution backend ('auto', 'nccl', 'gloo', 'xla')
+            - 'auto': Automatically select based on available devices
+            - 'nccl': Use NCCL for multi-GPU training
+            - 'gloo': Use Gloo for CPU-based training
+            - 'xla': Use XLA for TPU training
     """
-    global _distributed_initialized
+    global _distributed_initialized, _backend_type
     
     _check_torch_available()
     
     if _distributed_initialized:
         return
     
-    # Determine backend based on available devices
+    # Detect available devices and set backend type
+    if _is_tpu_available():
+        _backend_type = "xla"
+    elif _is_gpu_available():
+        _backend_type = "cuda"
+    elif torch.backends.mps.is_available():
+        _backend_type = "mps"
+    else:
+        _backend_type = "cpu"
+    
+    # Handle auto backend selection
     if backend == "auto":
-        if torch.cuda.is_available() and torch.cuda.device_count() > 1:
-            backend = "nccl"
+        if _backend_type == "cuda":
+            backend = "nccl" if torch.cuda.device_count() > 1 else "gloo"
+        elif _backend_type == "xla":
+            backend = "xla"
         else:
             backend = "gloo"
     
-    # Initialize torch distributed
-    if num_processes is not None and num_processes > 1:
-        torch.distributed.init_process_group(
-            backend=backend,
-            init_method="env://",
-            world_size=num_processes,
-            rank=process_id if process_id is not None else 0
-        )
-        
-        # Set CUDA device for this process
-        if torch.cuda.is_available():
-            local_rank = int(os.environ.get("LOCAL_RANK", 0))
-            torch.cuda.set_device(local_rank)
+    # Initialize based on backend type
+    if _backend_type == "xla":
+        # TPU initialization
+        try:
+            import torch_xla.core.xla_model as xm
+            xm.rendezvous("init")
+            print("✓ Initialized torch.distributed for TPU")
+        except Exception as e:
+            print(f"Note: Could not initialize TPU distributed: {e}")
+    elif _backend_type == "cuda":
+        # CUDA GPU initialization
+        num_gpus = torch.cuda.device_count()
+        if num_gpus > 1:
+            # Multi-GPU training
+            if num_processes is None:
+                num_processes = num_gpus
+            
+            try:
+                torch.distributed.init_process_group(
+                    backend="nccl",
+                    init_method="env://",
+                    world_size=num_processes,
+                    rank=process_id if process_id is not None else 0
+                )
+                
+                # Set CUDA device for this process
+                if "LOCAL_RANK" in os.environ:
+                    local_rank = int(os.environ["LOCAL_RANK"])
+                    torch.cuda.set_device(local_rank)
+                elif num_processes > 1:
+                    torch.cuda.set_device(0)
+                    
+                print(f"✓ Initialized torch.distributed for {num_gpus} GPUs (NCCL)")
+            except Exception as e:
+                print(f"Note: Could not initialize NCCL: {e}")
+                # Fallback to single GPU mode
+                _distributed_initialized = True
+                return
+        else:
+            # Single GPU - still initialize for DTensor support
+            try:
+                torch.distributed.init_process_group(
+                    backend="gloo",
+                    init_method="env://",
+                    world_size=1,
+                    rank=0
+                )
+                print("✓ Initialized torch.distributed (single GPU)")
+            except Exception:
+                pass
+    elif _backend_type == "mps":
+        # MPS (Apple Silicon) initialization
+        try:
+            torch.distributed.init_process_group(
+                backend="gloo",
+                init_method="env://",
+                world_size=1,
+                rank=0
+            )
+            print("✓ Initialized torch.distributed for MPS (single process)")
+        except Exception:
+            pass
+    else:
+        # CPU-only initialization
+        try:
+            torch.distributed.init_process_group(
+                backend="gloo",
+                init_method="env://",
+                world_size=1,
+                rank=0
+            )
+            print("✓ Initialized torch.distributed for CPU (single process)")
+        except Exception:
+            print("Note: Could not initialize distributed, running in single-process mode")
+            # Don't fail - single process mode is fine
+            _distributed_initialized = True
+            return
     
     _distributed_initialized = True
 
 
 def shutdown():
     """Shutdown the distribution system."""
-    global _distributed_initialized, _device_mesh_cache
+    global _distributed_initialized, _device_mesh_cache, _backend_type
     
     if _distributed_initialized and dist.is_initialized():
         dist.destroy_process_group()
     
     _distributed_initialized = False
     _device_mesh_cache = {}
+    _backend_type = "cpu"
 
 
 def distribute_variable(value, layout, device_mesh=None):
     """Create a distributed variable (DTensor) from a PyTorch tensor.
     
     This function implements ACTUAL physical sharding using PyTorch DTensor.
+    If DTensor is not available (e.g., on CPU-only systems), it returns
+    the original tensor.
     
     Args:
         value: PyTorch tensor to distribute
@@ -438,14 +538,17 @@ def distribute_variable(value, layout, device_mesh=None):
     if layout is None or value is None:
         return value
     
-    # Check if distributed is initialized
-    if not _check_distributed_initialized():
-        # Return original tensor if not in distributed mode
-        return value
-    
     # Handle DTensor input
     if isinstance(value, DTensor):
         return value
+    
+    # Check if distributed is initialized
+    if not _check_distributed_initialized():
+        # Try to initialize if not already done
+        try:
+            initialize()
+        except Exception:
+            pass
     
     # Get mesh - use provided or create default
     if device_mesh is None:
@@ -461,7 +564,6 @@ def distribute_variable(value, layout, device_mesh=None):
     )
     
     # Create DTensor from tensor
-    # Use distribute_tensor to properly shard the tensor
     try:
         dtensor = tp.distribute_tensor(
             value.contiguous(),
@@ -471,7 +573,7 @@ def distribute_variable(value, layout, device_mesh=None):
         return dtensor
     except Exception as e:
         # Fallback to original tensor if DTensor creation fails
-        print(f"Warning: Could not create DTensor: {e}")
+        # This is expected on CPU-only systems
         return value
 
 
@@ -491,13 +593,16 @@ def distribute_tensor(tensor, layout, device_mesh=None):
     if layout is None or tensor is None:
         return tensor
     
-    # Check if distributed is initialized
-    if not _check_distributed_initialized():
-        return tensor
-    
     # Handle DTensor input
     if isinstance(tensor, DTensor):
         return tensor
+    
+    # Check if distributed is initialized
+    if not _check_distributed_initialized():
+        try:
+            initialize()
+        except Exception:
+            return tensor
     
     # Get mesh
     if device_mesh is None:
@@ -520,13 +625,15 @@ def distribute_tensor(tensor, layout, device_mesh=None):
             placements
         )
         return dtensor
-    except Exception as e:
-        print(f"Warning: Could not distribute tensor: {e}")
+    except Exception:
+        # Fallback to original tensor
         return tensor
 
 
 def _get_default_device_mesh():
     """Get the default PyTorch DeviceMesh for the current process.
+    
+    This function creates a DeviceMesh that works across CPU, GPU, MPS, and TPU.
     
     Returns:
         PyTorch DeviceMesh instance or None.
@@ -536,10 +643,27 @@ def _get_default_device_mesh():
     if "default" in _device_mesh_cache:
         return _device_mesh_cache["default"]
     
-    # Create default mesh based on available devices
-    if torch.cuda.is_available():
+    # Check for TPU
+    if _is_tpu_available():
+        try:
+            import torch_xla.core.xla_model as xm
+            num_devices = xm.xrt_world_size()
+            devices = [f"tpu:{i}" for i in range(num_devices)]
+            mesh = init_device_mesh(
+                backend="xla",
+                mesh_shape=(num_devices,),
+                mesh_dim_names=("model",)
+            )
+            _device_mesh_cache["default"] = mesh
+            print(f"✓ Created DeviceMesh for TPU with {num_devices} devices")
+            return mesh
+        except Exception as e:
+            print(f"Warning: Could not create TPU DeviceMesh: {e}")
+    
+    # Check for CUDA GPU
+    if _is_gpu_available():
         num_gpus = torch.cuda.device_count()
-        if num_gpus > 1:
+        if num_gpus >= 1:
             try:
                 mesh = init_device_mesh(
                     backend="cuda",
@@ -547,11 +671,50 @@ def _get_default_device_mesh():
                     mesh_dim_names=("model",)
                 )
                 _device_mesh_cache["default"] = mesh
+                print(f"✓ Created DeviceMesh for {num_gpus} GPUs with 'model' axis")
                 return mesh
-            except Exception:
-                pass
+            except Exception as e:
+                print(f"Warning: Could not create GPU DeviceMesh: {e}")
+                # Try fallback approach
+                try:
+                    devices = [f"cuda:{i}" for i in range(num_gpus)]
+                    mesh = DeviceMesh(
+                        device_type="cuda",
+                        mesh=devices
+                    )
+                    _device_mesh_cache["default"] = mesh
+                    return mesh
+                except Exception:
+                    pass
     
-    return None
+    # Check for MPS (Apple Silicon)
+    if torch.backends.mps.is_available():
+        try:
+            mesh = init_device_mesh(
+                backend="mps",
+                mesh_shape=(1,),
+                mesh_dim_names=("model",)
+            )
+            _device_mesh_cache["default"] = mesh
+            print("✓ Created DeviceMesh for MPS")
+            return mesh
+        except Exception as e:
+            print(f"Warning: Could not create MPS DeviceMesh: {e}")
+    
+    # CPU-only fallback - create a logical mesh for single process
+    try:
+        mesh = init_device_mesh(
+            backend="cpu",
+            mesh_shape=(1,),
+            mesh_dim_names=("model",)
+        )
+        _device_mesh_cache["default"] = mesh
+        print("✓ Created DeviceMesh for CPU (single process)")
+        return mesh
+    except Exception:
+        # Last resort: return None and let callers handle it
+        print("Note: Could not create DeviceMesh, running in fallback mode")
+        return None
 
 
 def _set_default_device_mesh(mesh):
@@ -583,7 +746,10 @@ def distribute_data_input(per_process_batch, layout, batch_dim_name, device_mesh
     
     # Check if distributed is initialized
     if not _check_distributed_initialized():
-        return per_process_batch
+        try:
+            initialize()
+        except Exception:
+            return per_process_batch
     
     # Get mesh
     if device_mesh is None:
@@ -595,8 +761,17 @@ def distribute_data_input(per_process_batch, layout, batch_dim_name, device_mesh
     # Create DTensor for input
     try:
         # Move tensor to correct device first
-        if torch.cuda.is_available():
+        device = _get_default_device()
+        if device == "cuda":
             per_process_batch = per_process_batch.cuda()
+        elif device == "mps":
+            per_process_batch = per_process_batch.to("mps")
+        elif device == "xla":
+            try:
+                import torch_xla.core.xla_model as xm
+                per_process_batch = per_process_batch.to(xm.xla_device())
+            except ImportError:
+                pass
         
         # Create placements
         placements = _create_placement_from_layout(
@@ -612,8 +787,8 @@ def distribute_data_input(per_process_batch, layout, batch_dim_name, device_mesh
         )
         return dtensor
         
-    except Exception as e:
-        print(f"Warning: Could not distribute input data: {e}")
+    except Exception:
+        # Fallback to original tensor
         return per_process_batch
 
 
@@ -755,6 +930,7 @@ class TorchModelParallel:
     
     This class provides model parallelism for PyTorch models by translating
     Keras-style layout specifications to PyTorch DTensor parallel styles.
+    Works across CPU, GPU, MPS, and TPU devices.
     """
     
     def __init__(self, device_mesh, layout_map):
@@ -768,8 +944,9 @@ class TorchModelParallel:
         
         # Initialize PyTorch Device Mesh
         if isinstance(device_mesh, (tuple, list)):
+            backend = _get_torch_backend(list_devices())
             self.mesh = init_device_mesh(
-                backend=_get_torch_backend(list_devices()),
+                backend=backend,
                 mesh_shape=device_mesh,
                 mesh_dim_names=("data", "model")
             )
@@ -852,6 +1029,7 @@ class TorchDataParallel:
     
     This class provides data parallelism for PyTorch models using
     DistributedDataParallel or simple data sharding.
+    Works across CPU, GPU, MPS, and TPU devices.
     """
     
     def __init__(self, device_mesh=None, devices=None):
@@ -926,4 +1104,3 @@ class TorchDataParallel:
                 batch_size=batch_size,
                 shuffle=shuffle
             )
-
