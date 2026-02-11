@@ -244,6 +244,20 @@ def convert_to_tensor(x, dtype=None, sparse=None, ragged=None):
         raise ValueError("`sparse=True` is not supported with torch backend")
     if ragged:
         raise ValueError("`ragged=True` is not supported with torch backend")
+    
+    # Handle DTensor specially - preserve it as-is without moving devices
+    try:
+        from torch.distributed.tensor import DTensor
+        if isinstance(x, DTensor):
+            if dtype is not None:
+                local_dtype = to_torch_dtype(dtype)
+                if x._local_tensor.dtype != local_dtype:
+                    new_local = x._local_tensor.to(dtype=local_dtype)
+                    return DTensor.from_local(new_local, x._spec)
+            return x
+    except ImportError:
+        pass
+    
     if isinstance(x, Variable) or is_tensor(x):
         if isinstance(x, Variable):
             x = x.value
@@ -636,6 +650,33 @@ def scatter_update(inputs, indices, updates):
 def slice(inputs, start_indices, shape):
     shape_dtype = to_torch_dtype("int64")
     inputs = convert_to_tensor(inputs)
+    
+    # Handle DTensor properly to avoid device mismatch errors
+    # in distributed model parallelism scenarios
+    try:
+        from torch.distributed.tensor import DTensor
+        if isinstance(inputs, DTensor):
+            # Get the local tensor and ensure it's on the correct device
+            local_tensor = inputs._local_tensor
+            target_device = inputs.device()
+            if local_tensor.device != target_device:
+                local_tensor = local_tensor.to(target_device)
+            
+            # Perform slice on local tensor
+            start_indices = convert_to_tensor(start_indices).to(shape_dtype)
+            shape_tensor = convert_to_tensor(shape).to(shape_dtype)
+            
+            python_slice = __builtins__["slice"]
+            slices = [
+                python_slice(int(start_index), int(start_index) + int(length))
+                for start_index, length in zip(start_indices, shape_tensor)
+            ]
+            sliced_local = local_tensor[tuple(slices)]
+            # Reconstruct DTensor with the same spec
+            return DTensor.from_local(sliced_local, inputs._spec, reshape=False)
+    except ImportError:
+        pass
+    
     start_indices = convert_to_tensor(start_indices).to(shape_dtype)
     shape = convert_to_tensor(shape).to(shape_dtype)
 

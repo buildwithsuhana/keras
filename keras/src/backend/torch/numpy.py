@@ -560,6 +560,22 @@ def blackman(x):
 
 def broadcast_to(x, shape):
     x = convert_to_tensor(x)
+    # Handle DTensor properly to avoid device mismatch errors
+    # in distributed model parallelism scenarios
+    try:
+        from torch.distributed.tensor import DTensor
+        if isinstance(x, DTensor):
+            # Get the local tensor and ensure it's on the correct device
+            local_tensor = x._local_tensor
+            target_device = x.device()
+            if local_tensor.device != target_device:
+                local_tensor = local_tensor.to(target_device)
+            # Broadcast the local tensor
+            result = torch.broadcast_to(local_tensor, shape)
+            # Reconstruct DTensor with the same spec
+            return DTensor.from_local(result, x._spec, reshape=False)
+    except ImportError:
+        pass
     return torch.broadcast_to(x, shape)
 
 
