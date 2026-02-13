@@ -109,10 +109,10 @@ class TorchTrainer(base_trainer.Trainer):
             trainable_weights = self.trainable_weights[:]
             gradients = [v.value.grad for v in trainable_weights]
 
-            # Convert gradients to DTensor to match optimizer state variables
-            # This prevents "aten._foreach_add_.List: got mixed torch.Tensor and DTensor" error
-            from keras.src.backend.torch.optimizers.torch_parallel_optimizer import _convert_grads_to_dtensor
-            gradients = _convert_grads_to_dtensor(gradients, trainable_weights)
+            # Note: Gradient conversion to DTensor is now handled inside the
+            # optimizer's _parallel_update_step to properly check optimizer
+            # state variables (which may be DTensors in DataParallel) rather
+            # than model weights (which are not DTensors in DataParallel).
 
             # Update weights
             with torch.no_grad():
