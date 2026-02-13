@@ -240,13 +240,15 @@ def test_model_parallel(epochs=3):
     import keras
     from keras import layers
     from keras.src.distribution import ModelParallel, DeviceMesh, LayoutMap, list_devices
+    from keras.src.backend.torch import distribution_lib as torch_dist_lib
     import numpy as np
     import time
     
     log_section("TEST 3: MODEL PARALLEL (MP)")
     
-    # Check GPU count
-    gpu_count = torch.cuda.device_count()
+    # Check GPU count using Keras backend which properly detects all GPUs across ranks
+    # This is more reliable than torch.cuda.device_count() in distributed settings
+    gpu_count = len(list_devices("gpu"))
     if gpu_count < 2:
         log("⚠ Skipping ModelParallel test: Need >= 2 GPUs")
         log(f"  Available GPUs: {gpu_count}")
