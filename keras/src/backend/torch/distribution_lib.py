@@ -208,7 +208,17 @@ def distribute_variable(tensor, layout=None):
     from keras.src.distribution.distribution_lib import distribution
 
     converted_tensor = convert_to_tensor(tensor)
-    is_float_or_complex = converted_tensor.dtype.is_floating_point or converted_tensor.dtype.is_complex
+    
+    # Check if tensor is already a DTensor and get local tensor for dtype check
+    from keras.src.backend.torch.distribution_lib import is_dtensor, get_dtensor_local
+    local_tensor = None
+    if is_dtensor(converted_tensor):
+        local_tensor = get_dtensor_local(converted_tensor)
+        # Use local tensor's dtype for float/complex check since that's what
+        # PyTorch actually uses when creating Parameters
+        is_float_or_complex = local_tensor.dtype.is_floating_point or local_tensor.dtype.is_complex
+    else:
+        is_float_or_complex = converted_tensor.dtype.is_floating_point or converted_tensor.dtype.is_complex
 
     # Check if distribution is disabled
     if os.environ.get("KERAS_DISTRIBUTION_DISABLE", "0") == "1":
