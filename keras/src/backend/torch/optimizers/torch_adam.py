@@ -15,10 +15,25 @@ class Adam(torch_parallel_optimizer.TorchParallelOptimizer, optimizers.Adam):
         keras_variables = variables
         variables = [v.value for v in variables]
 
+        # Get optimizer state variables (momentum and velocity)
+        # These are the actual DTensors in DataParallel, not the model weights
+        m_list = [
+            self._momentums[self._get_variable_index(variable)].value
+            for variable in keras_variables
+        ]
+        v_list = [
+            self._velocities[self._get_variable_index(variable)].value
+            for variable in keras_variables
+        ]
+        
+        # Combine optimizer state variables to check for DTensor
+        optimizer_state_variables = m_list + v_list
+
         # Convert gradients to DTensor if optimizer states are DTensor
         # This is required for torch._foreach_* operations to work with DTensor
+        # We pass optimizer_state_variables so the function checks the right variables
         grads = torch_parallel_optimizer._convert_grads_to_dtensor(
-            grads, keras_variables
+            grads, keras_variables, optimizer_state_variables
         )
 
         dtype = variables[0].dtype
@@ -28,15 +43,6 @@ class Adam(torch_parallel_optimizer.TorchParallelOptimizer, optimizers.Adam):
         beta_1_power = ops.power(ops.cast(self.beta_1, dtype), local_step)
         beta_2_power = ops.power(ops.cast(self.beta_2, dtype), local_step)
         alpha = lr * ops.sqrt(1 - beta_2_power) / (1 - beta_1_power)
-
-        m_list = [
-            self._momentums[self._get_variable_index(variable)].value
-            for variable in keras_variables
-        ]
-        v_list = [
-            self._velocities[self._get_variable_index(variable)].value
-            for variable in keras_variables
-        ]
 
         torch._foreach_mul_(m_list, self.beta_1)
         torch._foreach_add_(m_list, grads, alpha=1 - self.beta_1)

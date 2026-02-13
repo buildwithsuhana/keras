@@ -15,13 +15,23 @@ class Lion(torch_parallel_optimizer.TorchParallelOptimizer, optimizers.Lion):
         keras_variables = variables
         variables = [v.value for v in variables]
 
-        dtype = variables[0].dtype
-        lr = ops.cast(learning_rate, dtype)
-
+        # Get optimizer state variables (momentum)
         m_list = [
             self._momentums[self._get_variable_index(variable)].value
             for variable in keras_variables
         ]
+        
+        # Combine optimizer state variables to check for DTensor
+        optimizer_state_variables = m_list
+
+        # Convert gradients to DTensor if optimizer states are DTensor
+        # This is required for torch._foreach_* operations to work with DTensor
+        grads = torch_parallel_optimizer._convert_grads_to_dtensor(
+            grads, keras_variables, optimizer_state_variables
+        )
+
+        dtype = variables[0].dtype
+        lr = ops.cast(learning_rate, dtype)
 
         c_t = torch._foreach_mul(m_list, self.beta_1)
         torch._foreach_add_(c_t, grads, alpha=1 - self.beta_1)

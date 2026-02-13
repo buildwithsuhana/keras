@@ -17,13 +17,17 @@ class RMSprop(
         keras_variables = variables
         variables = [v.value for v in variables]
 
-        dtype = variables[0].dtype
-        lr = ops.cast(learning_rate, dtype)
-
+        # Get optimizer state variables (velocities, and optionally average_grads and momentum)
         velocities = [
             self._velocities[self._get_variable_index(variable)].value
             for variable in keras_variables
         ]
+        
+        # Combine optimizer state variables to check for DTensor
+        optimizer_state_variables = velocities[:]
+
+        dtype = variables[0].dtype
+        lr = ops.cast(learning_rate, dtype)
 
         rho = self.rho
 
@@ -40,6 +44,8 @@ class RMSprop(
                 ].value
                 for variable in keras_variables
             ]
+            optimizer_state_variables.extend(average_grads)
+            
             torch._foreach_mul_(average_grads, rho)
             torch._foreach_add_(average_grads, grads, alpha=1 - rho)
             torch._foreach_add_(
@@ -57,8 +63,22 @@ class RMSprop(
                 self._momentums[self._get_variable_index(variable)].value
                 for variable in keras_variables
             ]
+            optimizer_state_variables.extend(momentum_list)
+            
+            # Convert gradients to DTensor if optimizer states are DTensor
+            # This is required for torch._foreach_* operations to work with DTensor
+            grads = torch_parallel_optimizer._convert_grads_to_dtensor(
+                grads, keras_variables, optimizer_state_variables
+            )
+            
             torch._foreach_mul_(momentum_list, self.momentum)
             torch._foreach_add_(momentum_list, increments)
             torch._foreach_add_(variables, momentum_list, alpha=-1)
         else:
+            # Convert gradients to DTensor if optimizer states are DTensor
+            # This is required for torch._foreach_* operations to work with DTensor
+            grads = torch_parallel_optimizer._convert_grads_to_dtensor(
+                grads, keras_variables, optimizer_state_variables
+            )
+            
             torch._foreach_add_(variables, increments, alpha=-1)

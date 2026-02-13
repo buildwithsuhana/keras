@@ -17,10 +17,7 @@ class Adadelta(
         keras_variables = variables
         variables = [v.value for v in variables]
 
-        dtype = variables[0].dtype
-        lr = ops.cast(learning_rate, dtype)
-        rho = self.rho
-
+        # Get optimizer state variables (accumulated_grads and accumulated_delta_vars)
         accumulated_grads = [
             self._accumulated_grads[self._get_variable_index(variable)].value
             for variable in keras_variables
@@ -31,6 +28,20 @@ class Adadelta(
             ].value
             for variable in keras_variables
         ]
+        
+        # Combine optimizer state variables to check for DTensor
+        optimizer_state_variables = accumulated_grads + accumulated_delta_vars
+
+        # Convert gradients to DTensor if optimizer states are DTensor
+        # This is required for torch._foreach_* operations to work with DTensor
+        grads = torch_parallel_optimizer._convert_grads_to_dtensor(
+            grads, keras_variables, optimizer_state_variables
+        )
+
+        dtype = variables[0].dtype
+        lr = ops.cast(learning_rate, dtype)
+        rho = self.rho
+
         torch._foreach_mul_(accumulated_grads, rho)
         torch._foreach_add_(
             accumulated_grads, torch._foreach_mul(grads, grads), alpha=1 - rho

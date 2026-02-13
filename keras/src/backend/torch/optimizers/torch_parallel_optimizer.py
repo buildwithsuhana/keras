@@ -5,7 +5,7 @@ from keras.src.optimizers.base_optimizer import BaseOptimizer
 from keras.src.utils import torch_utils
 
 
-def _convert_grads_to_dtensor(grads, variables):
+def _convert_grads_to_dtensor(grads, variables, optimizer_state_variables=None):
     """Convert regular torch.Tensor gradients to DTensor to match optimizer states.
     
     When training with DTensor (PyTorch distributed), the optimizer states
@@ -16,6 +16,12 @@ def _convert_grads_to_dtensor(grads, variables):
     
     This function converts gradients to DTensors with the same placements as
     the corresponding optimizer state variables.
+    
+    Args:
+        grads: List of gradient tensors
+        variables: List of model variable tensors (optional, for backward compat)
+        optimizer_state_variables: List of optimizer state variable tensors to check
+            for DTensor placement. If provided, these take precedence over 'variables'.
     """
     # Skip if not in distributed context
     if not torch.distributed.is_initialized():
@@ -29,20 +35,35 @@ def _convert_grads_to_dtensor(grads, variables):
     if device_mesh is None:
         return grads
     
+    # Determine which variables to check for DTensor
+    # Priority: optimizer_state_variables > variables
+    vars_to_check = optimizer_state_variables if optimizer_state_variables is not None else variables
+    
+    # Handle backward compatibility: if only 2 args passed (old API)
+    # and the second arg might be optimizer states
+    if optimizer_state_variables is None and variables is not None:
+        # Check if variables list contains optimizer state values (DTensors)
+        # by looking at the structure - in DataParallel, model weights are NOT DTensors
+        # but optimizer states ARE DTensors
+        pass
+    
     # Check if any variable is a DTensor
+    # In DataParallel, model weights are NOT DTensors but optimizer states ARE
+    # So we need to check optimizer_state_variables if provided
     has_dtensor = False
-    for v in variables:
-        value = getattr(v, 'value', v)
-        if isinstance(value, DTensor):
-            has_dtensor = True
-            break
+    if vars_to_check:
+        for v in vars_to_check:
+            value = getattr(v, 'value', v)
+            if isinstance(value, DTensor):
+                has_dtensor = True
+                break
     
     if not has_dtensor:
         return grads
     
     # Convert grads to DTensors with the same placements as variables
     converted_grads = []
-    for grad, variable in zip(grads, variables):
+    for grad, variable in zip(grads, vars_to_check if vars_to_check else grads):
         if grad is None:
             converted_grads.append(None)
             continue

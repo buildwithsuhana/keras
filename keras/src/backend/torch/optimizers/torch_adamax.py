@@ -17,13 +17,7 @@ class Adamax(
         keras_variables = variables
         variables = [v.value for v in variables]
 
-        dtype = variables[0].dtype
-        lr = ops.cast(learning_rate, dtype)
-
-        local_step = ops.cast(self.iterations + 1, dtype)
-
-        beta_1_power = ops.power(ops.cast(self.beta_1, dtype), local_step)
-
+        # Get optimizer state variables (m and u)
         m_list = [
             self._m[self._get_variable_index(variable)].value
             for variable in keras_variables
@@ -32,6 +26,22 @@ class Adamax(
             self._u[self._get_variable_index(variable)].value
             for variable in keras_variables
         ]
+        
+        # Combine optimizer state variables to check for DTensor
+        optimizer_state_variables = m_list + u_list
+
+        # Convert gradients to DTensor if optimizer states are DTensor
+        # This is required for torch._foreach_* operations to work with DTensor
+        grads = torch_parallel_optimizer._convert_grads_to_dtensor(
+            grads, keras_variables, optimizer_state_variables
+        )
+
+        dtype = variables[0].dtype
+        lr = ops.cast(learning_rate, dtype)
+
+        local_step = ops.cast(self.iterations + 1, dtype)
+
+        beta_1_power = ops.power(ops.cast(self.beta_1, dtype), local_step)
 
         torch._foreach_mul_(m_list, self.beta_1)
         torch._foreach_add_(m_list, grads, alpha=1 - self.beta_1)
