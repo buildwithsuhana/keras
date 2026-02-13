@@ -140,7 +140,6 @@ class Variable(KerasVariable):
     def _distribute_parameter(self, tensor):
         from keras.src.backend.torch import distribution_lib
         layout = self._layout
-        active_mesh = distribution_lib._get_default_device_mesh()
         
         # Debug logging
         debug_mode = os.environ.get("KERAS_DISTRIBUTION_DEBUG", "0") == "1"
@@ -155,6 +154,18 @@ class Variable(KerasVariable):
             print(f"DEBUG | [Rank {rank}] _distribute_parameter() for variable")
             print(f"DEBUG | [Rank {rank}]   - variable.path: {getattr(self, 'path', 'N/A')}")
             print(f"DEBUG | [Rank {rank}]   - self._layout: {self._layout}")
+        
+        # CRITICAL FIX: Get the device mesh from the distribution if active_mesh is None
+        # This ensures that the mesh is properly created and set as the default
+        from keras.src.distribution import distribution as keras_distribution
+        current_dist = keras_distribution()
+        
+        active_mesh = None
+        if current_dist is not None and hasattr(current_dist, 'device_mesh'):
+            # Convert Keras DeviceMesh to PyTorch DeviceMesh - this sets the global state
+            active_mesh = distribution_lib._to_backend_mesh(current_dist.device_mesh)
+        
+        if debug_mode:
             print(f"DEBUG | [Rank {rank}]   - active_mesh: {active_mesh}")
         
         # If layout is not set but we have an active mesh, get layout from distribution
