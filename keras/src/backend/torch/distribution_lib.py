@@ -371,36 +371,46 @@ def _create_placement_from_layout(layout_axes, mesh_dim_names, tensor_shape=None
             return tuple([Replicate() for _ in range(len(tensor_shape))])
         return tuple([Replicate() for _ in layout_axes]) if layout_axes else tuple()
     
-    # Determine how many placements we need (one per tensor dimension)
-    if tensor_shape:
-        num_tensor_dims = len(tensor_shape)
-    else:
-        num_tensor_dims = len(layout_axes) if layout_axes else 1
+    # Determine how many placements we need (must match number of mesh dimensions!)
+    # DTensor requires placements to have same length as mesh dimensions
+    num_mesh_dims = len(mesh_dim_names) if mesh_dim_names else 0
     
     # Find which mesh dimension index corresponds to 'model'
     model_mesh_dim = None
     if 'model' in mesh_dim_names:
         model_mesh_dim = mesh_dim_names.index('model')
     
+    # If no mesh dimensions, replicate everything
+    if num_mesh_dims == 0:
+        if tensor_shape:
+            return tuple([Replicate() for _ in range(len(tensor_shape))])
+        return tuple([Replicate() for _ in layout_axes]) if layout_axes else tuple()
+    
+    # For DTensor, placements must have exactly num_mesh_dims elements
+    # We need to figure out which tensor dimension to shard based on the layout
     placements = []
     
-    # Create one placement per tensor dimension
-    # Match layout axes to tensor dimensions by position
-    for i in range(num_tensor_dims):
-        if i < len(layout_axes):
-            axis_name = layout_axes[i]
+    # Find the position of 'model' in the layout axes (if any)
+    model_axis_position = None
+    for i, axis in enumerate(layout_axes):
+        if axis == 'model':
+            model_axis_position = i
+            break
+    
+    # Create one placement per mesh dimension
+    for mesh_dim_idx in range(num_mesh_dims):
+        if model_mesh_dim is not None and mesh_dim_idx == model_mesh_dim:
+            # This mesh dimension is for 'model' - need to find which tensor dim to shard
+            if model_axis_position is not None and tensor_shape:
+                # The tensor dimension matching the layout axis position should be sharded
+                # But we can only shard one dimension, so pick the one at model_axis_position
+                if model_axis_position < len(tensor_shape):
+                    placements.append(Shard(mesh_dim_idx))
+                else:
+                    placements.append(Replicate())
+            else:
+                placements.append(Replicate())
         else:
-            # More tensor dimensions than layout axes - default to replicate
-            axis_name = None
-            
-        if axis_name is None:
-            # This dimension is not sharded - replicate
-            placements.append(Replicate())
-        elif axis_name == 'model' and model_mesh_dim is not None:
-            # Use the mesh dimension for 'model' axis sharding
-            placements.append(Shard(model_mesh_dim))
-        else:
-            # Unknown axis or no mesh - replicate
             placements.append(Replicate())
     
     # Ensure we return a tuple of placements
