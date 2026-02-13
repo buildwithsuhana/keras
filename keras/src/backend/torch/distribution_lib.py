@@ -402,6 +402,31 @@ def _create_placement_from_layout(layout_axes, mesh_dim_names, tensor_shape=None
 _distributed_initialized = False
 _device_mesh_cache = {}
 _backend_type = "cpu"  # Track the current backend type: 'cpu', 'cuda', 'mps', 'xla'
+_dtensor_enabled = True  # Flag to track if DTensor distribution is fully working
+
+
+def _enable_dtensor():
+    """Enable DTensor distribution."""
+    global _dtensor_enabled
+    _dtensor_enabled = True
+
+
+def _disable_dtensor():
+    """Disable DTensor distribution (fallback to regular tensors).
+    
+    This is needed because mixing DTensor and regular tensors in PyTorch
+    operations causes failures. Once any tensor fails DTensor conversion,
+    we must disable it for all subsequent tensors.
+    """
+    global _dtensor_enabled
+    _dtensor_enabled = False
+    print("Note: Disabling DTensor distribution for remaining tensors to avoid mixed tensor operations")
+
+
+def _is_dtensor_enabled():
+    """Check if DTensor distribution is enabled."""
+    global _dtensor_enabled
+    return _dtensor_enabled
 
 
 def _get_or_create_torch_device_mesh(keras_device_mesh):
@@ -679,6 +704,10 @@ def distribute_variable(value, layout, device_mesh=None):
         torch_device_mesh.mesh_dim_names
     )
     
+    # Check if DTensor is enabled (might be disabled due to previous failures)
+    if not _is_dtensor_enabled():
+        return value
+    
     # Create DTensor from tensor
     try:
         # Ensure value is contiguous
@@ -704,6 +733,8 @@ def distribute_variable(value, layout, device_mesh=None):
     except Exception as e:
         # Fallback to original tensor if DTensor creation fails
         # This is expected on CPU-only systems or when mesh is incompatible
+        # Disable DTensor to prevent mixed tensor issues
+        _disable_dtensor()
         print(f"Note: Could not create DTensor: {e}")
         return value
 
@@ -748,6 +779,10 @@ def distribute_tensor(tensor, layout, device_mesh=None):
         device_mesh.mesh_dim_names
     )
     
+    # Check if DTensor is enabled (might be disabled due to previous failures)
+    if not _is_dtensor_enabled():
+        return tensor
+    
     # Create DTensor
     try:
         # Check if tensor dtype is suitable for DTensor
@@ -763,7 +798,9 @@ def distribute_tensor(tensor, layout, device_mesh=None):
             run_check=False
         )
         return dtensor
-    except Exception:
+    except Exception as e:
+        # Disable DTensor to prevent mixed tensor issues
+        _disable_dtensor()
         # Fallback to original tensor
         return tensor
 
@@ -944,6 +981,10 @@ def distribute_data_input(per_process_batch, layout, batch_dim_name, device_mesh
     if device_mesh is None:
         return per_process_batch
     
+    # Check if DTensor is enabled (might be disabled due to previous failures)
+    if not _is_dtensor_enabled():
+        return per_process_batch
+    
     # Create DTensor for input
     try:
         # Move tensor to correct device first
@@ -979,7 +1020,9 @@ def distribute_data_input(per_process_batch, layout, batch_dim_name, device_mesh
         )
         return dtensor
         
-    except Exception:
+    except Exception as e:
+        # Disable DTensor to prevent mixed tensor issues
+        _disable_dtensor()
         # Fallback to original tensor
         return per_process_batch
 
