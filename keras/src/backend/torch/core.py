@@ -315,7 +315,7 @@ def convert_to_tensor(x, dtype=None, sparse=None, ragged=None):
         return x
     
     # Check if we have an active device mesh and should convert to DTensor
-    # This is critical for hybrid DP+MP training where inputs must be DTensors
+    # This is critical for data parallel training where inputs must be DTensors
     device_mesh = _get_default_device_mesh()
     is_mp_distribution = False
     try:
@@ -325,11 +325,22 @@ def convert_to_tensor(x, dtype=None, sparse=None, ragged=None):
     except:
         pass
     
-    if is_tensor(x) and device_mesh is not None and (is_mp_distribution or torch.distributed.is_initialized()):
-        # Convert regular torch.Tensor to DTensor with Replicate placement
-        # This ensures all tensors are DTensors when distributed training is active
-        from torch.distributed._tensor import Replicate
-        return DTensor.from_local(x, device_mesh, [Replicate()])
+    # Convert to DTensor early if distributed is active - handle numpy arrays here too
+    if device_mesh is not None and (is_mp_distribution or torch.distributed.is_initialized()):
+        # Convert numpy arrays or other types to torch tensor first
+        if isinstance(x, np.ndarray):
+            if x.dtype == np.uint32:
+                x = x.astype(np.int64)
+            if standardize_dtype(x.dtype) == "bfloat16":
+                x = x.astype(np.float32)
+                dtype = "bfloat16"
+            dtype = dtype or x.dtype
+            x = torch.as_tensor(x, dtype=to_torch_dtype(dtype), device="cpu")
+        
+        # Now convert to DTensor
+        if isinstance(x, torch.Tensor):
+            from torch.distributed._tensor import Replicate
+            return DTensor.from_local(x, device_mesh, [Replicate()])
     
     if isinstance(x, Variable):
         x = x.value
