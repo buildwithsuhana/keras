@@ -472,8 +472,10 @@ def _reset_dtensor_for_new_model():
     This allows trying DTensor distribution again for a fresh model.
     Called at the start of model creation.
     """
-    global _dtensor_enabled
+    global _dtensor_enabled, _active_mesh
     _dtensor_enabled = True
+    # Also reset active mesh to allow new mesh to be created
+    _active_mesh = None
 
 
 def _get_or_create_torch_device_mesh(keras_device_mesh):
@@ -768,12 +770,13 @@ def distribute_variable(value, layout, device_mesh=None):
             value = torch.tensor(value)
         value = value.contiguous()
         
-        # Skip non-floating point tensors during model building
-        # These are typically shape tensors or indices that shouldn't be DTensors
+        # CRITICAL: Skip non-floating point tensors completely
         # Only floating point tensors can have gradients needed for model parameters
+        # Integer tensors (like shape tensors or indices) should NOT be converted to DTensors
         if not value.is_floating_point() and not value.is_complex():
             # Don't convert to DTensor - just return the original tensor
-            # This prevents the "only Tensors of floating point dtype can require gradients" error
+            # This prevents "only Tensors of floating point dtype can require gradients" error
+            print(f"Note: Skipping DTensor for non-floating point tensor shape {value.shape}, dtype {value.dtype}")
             return value
         
         # Create DTensor using DTensor.from_local (NOT tp.distribute_tensor which doesn't exist)
@@ -785,6 +788,17 @@ def distribute_variable(value, layout, device_mesh=None):
         )
         print(f"✓ Created DTensor with shape {dtensor.shape}, placements {placements}")
         return dtensor
+    except RuntimeError as e:
+        error_msg = str(e)
+        # Check for specific errors that indicate we should disable DTensor
+        if "only Tensors of floating point dtype can require gradients" in error_msg:
+            # Disable DTensor for this model to prevent further errors
+            _disable_dtensor()
+            print(f"Note: Disabling DTensor due to non-floating point tensor error")
+            return value
+        # Fallback to original tensor for other errors
+        print(f"Note: Could not create DTensor for shape {value.shape}, layout {layout.axes}, placements {placements}: {e}")
+        return value
     except Exception as e:
         # Fallback to original tensor if DTensor creation fails
         # This is expected on CPU-only systems or when mesh is incompatible
