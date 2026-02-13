@@ -748,20 +748,13 @@ def distribute_variable(value, layout, device_mesh=None):
             value = torch.tensor(value)
         value = value.contiguous()
         
-        # Handle non-floating point tensors (like int32 token IDs, position IDs)
-        # These need to be REPLICATED across devices, not sharded
+        # Skip non-floating point tensors during model building
+        # These are typically shape tensors or indices that shouldn't be DTensors
+        # Only floating point tensors can have gradients needed for model parameters
         if not value.is_floating_point() and not value.is_complex():
-            # For non-floating point tensors (indices), replicate them across devices
-            # This is needed because embedding lookups need indices on all devices
-            replicated_placements = tuple([Replicate() for _ in placements])
-            dtensor = DTensor.from_local(
-                value,
-                torch_device_mesh,
-                replicated_placements,
-                run_check=False
-            )
-            print(f"✓ Created replicated DTensor for non-floating point tensor shape {dtensor.shape}")
-            return dtensor
+            # Don't convert to DTensor - just return the original tensor
+            # This prevents the "only Tensors of floating point dtype can require gradients" error
+            return value
         
         # Create DTensor using DTensor.from_local (NOT tp.distribute_tensor which doesn't exist)
         dtensor = DTensor.from_local(
