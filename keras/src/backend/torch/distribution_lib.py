@@ -748,14 +748,20 @@ def distribute_variable(value, layout, device_mesh=None):
             value = torch.tensor(value)
         value = value.contiguous()
         
-        # Check if tensor dtype is suitable for DTensor (must be floating point for gradients)
+        # Handle non-floating point tensors (like int32 token IDs, position IDs)
+        # These need to be REPLICATED across devices, not sharded
         if not value.is_floating_point() and not value.is_complex():
-            # Can't create DTensor from non-floating point tensors
-            print(f"Note: Could not create DTensor: non-floating point dtype {value.dtype}")
-            # Disable DTensor globally since we can't properly handle mixed tensors
-            # This prevents the "mixed torch.Tensor and DTensor" error
-            _disable_dtensor()
-            return value
+            # For non-floating point tensors (indices), replicate them across devices
+            # This is needed because embedding lookups need indices on all devices
+            replicated_placements = tuple([Replicate() for _ in placements])
+            dtensor = DTensor.from_local(
+                value,
+                torch_device_mesh,
+                replicated_placements,
+                run_check=False
+            )
+            print(f"✓ Created replicated DTensor for non-floating point tensor shape {dtensor.shape}")
+            return dtensor
         
         # Create DTensor using DTensor.from_local (NOT tp.distribute_tensor which doesn't exist)
         dtensor = DTensor.from_local(
@@ -769,7 +775,6 @@ def distribute_variable(value, layout, device_mesh=None):
     except Exception as e:
         # Fallback to original tensor if DTensor creation fails
         # This is expected on CPU-only systems or when mesh is incompatible
-        # Don't disable DTensor globally - just skip this tensor
         print(f"Note: Could not create DTensor for shape {value.shape}, layout {layout.axes}, placements {placements}: {e}")
         return value
 
