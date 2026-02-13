@@ -422,6 +422,22 @@ _distributed_initialized = False
 _device_mesh_cache = {}
 _backend_type = "cpu"  # Track the current backend type: 'cpu', 'cuda', 'mps', 'xla'
 _dtensor_enabled = True  # Flag to track if DTensor distribution is fully working
+_active_mesh = None  # Track the active mesh used during model creation
+
+
+def _set_active_mesh(mesh):
+    """Set the active mesh used for model creation.
+    
+    This ensures consistent mesh usage between model weights and inputs.
+    """
+    global _active_mesh
+    _active_mesh = mesh
+
+
+def _get_active_mesh():
+    """Get the active mesh used for model creation."""
+    global _active_mesh
+    return _active_mesh
 
 
 def _enable_dtensor():
@@ -516,6 +532,8 @@ def _get_or_create_torch_device_mesh(keras_device_mesh):
             mesh_dim_names=tuple(keras_axis_names)
         )
         _device_mesh_cache[cache_key] = torch_mesh
+        # Set this as the active mesh for consistent usage
+        _set_active_mesh(torch_mesh)
         print(f"✓ Created PyTorch DeviceMesh from Keras DeviceMesh: shape={keras_shape}, axes={keras_axis_names}, device_type={device_type}")
         return torch_mesh
     except Exception as e:
@@ -721,7 +739,9 @@ def distribute_variable(value, layout, device_mesh=None):
         except Exception as e:
             print(f"Note: Could not create DeviceMesh from Keras mesh: {e}")
     
-    # Fallback to default mesh if none available
+    # Fallback to active mesh (from model creation) or default mesh
+    if torch_device_mesh is None:
+        torch_device_mesh = _get_active_mesh()
     if torch_device_mesh is None:
         torch_device_mesh = _get_default_device_mesh()
     
@@ -799,7 +819,9 @@ def distribute_tensor(tensor, layout, device_mesh=None):
         except Exception:
             return tensor
     
-    # Get mesh
+    # Get mesh - prefer active mesh from model creation
+    if device_mesh is None:
+        device_mesh = _get_active_mesh()
     if device_mesh is None:
         device_mesh = _get_default_device_mesh()
     
@@ -858,11 +880,17 @@ def _get_default_device_mesh():
     """Get the default PyTorch DeviceMesh for the current process.
     
     This function creates a DeviceMesh that works across CPU, GPU, MPS, and TPU.
+    First checks if there's an active mesh from model creation.
     
     Returns:
         PyTorch DeviceMesh instance or None.
     """
     global _device_mesh_cache
+    
+    # First check if there's an active mesh from model creation
+    active_mesh = _get_active_mesh()
+    if active_mesh is not None:
+        return active_mesh
     
     if "default" in _device_mesh_cache:
         return _device_mesh_cache["default"]
@@ -1023,7 +1051,9 @@ def distribute_data_input(per_process_batch, layout, batch_dim_name, device_mesh
         except Exception:
             return per_process_batch
     
-    # Get mesh
+    # Get mesh - prefer active mesh from model creation
+    if device_mesh is None:
+        device_mesh = _get_active_mesh()
     if device_mesh is None:
         device_mesh = _get_default_device_mesh()
     

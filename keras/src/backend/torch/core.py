@@ -277,8 +277,11 @@ def convert_to_tensor(x, dtype=None, sparse=None, ragged=None):
             # Check if distributed is initialized and has a device mesh
             from keras.src.backend.torch import distribution_lib
             if distribution_lib._check_distributed_initialized():
-                # Try to get or create device mesh
-                torch_device_mesh = distribution_lib._get_default_device_mesh()
+                # First try to get the active mesh (from model creation)
+                torch_device_mesh = distribution_lib._get_active_mesh()
+                # Fall back to default mesh if no active mesh
+                if torch_device_mesh is None:
+                    torch_device_mesh = distribution_lib._get_default_device_mesh()
                 if torch_device_mesh is not None:
                     # For integer tensors (like token IDs), convert to replicated DTensor
                     # This ensures compatibility with distributed embedding weights
