@@ -31,9 +31,10 @@ class Adam(torch_parallel_optimizer.TorchParallelOptimizer, optimizers.Adam):
 
         # Convert gradients to DTensor if optimizer states are DTensor
         # This is required for torch._foreach_* operations to work with DTensor
-        # We pass optimizer_state_variables so the function checks the right variables
+        # We pass optimizer_state_variables as keyword argument so the function
+        # checks the right variables (optimizer states which ARE DTensors)
         grads = torch_parallel_optimizer._convert_grads_to_dtensor(
-            grads, keras_variables, optimizer_state_variables
+            grads, keras_variables, optimizer_state_variables=optimizer_state_variables
         )
 
         dtype = variables[0].dtype
