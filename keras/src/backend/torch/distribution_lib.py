@@ -358,7 +358,7 @@ def _create_placement_from_layout(layout_axes, mesh_dim_names, tensor_shape=None
         tensor_shape: Optional shape of the tensor to distribute
         
     Returns:
-        List of placements (Shard or Replicate)
+        List of placements (Shard or Replicate) - one per tensor dimension
     """
     from torch.distributed.tensor import Replicate, Shard
     
@@ -367,32 +367,41 @@ def _create_placement_from_layout(layout_axes, mesh_dim_names, tensor_shape=None
     
     # If mesh has no dimensions, everything is replicated
     if num_mesh_dims == 0:
+        if tensor_shape:
+            return tuple([Replicate() for _ in range(len(tensor_shape))])
         return tuple([Replicate() for _ in layout_axes]) if layout_axes else tuple()
     
+    # Determine how many placements we need
+    if tensor_shape:
+        num_dims = len(tensor_shape)
+    else:
+        num_dims = len(layout_axes) if layout_axes else 1
+    
+    # If there's only 1 mesh dimension, we can only shard on that one
+    # Find which layout axis corresponds to 'model' (the only mesh axis)
     placements = []
     
-    # Track which mesh dimensions we've used
-    used_mesh_dims = set()
+    # Map: we have mesh dim 0 as 'model' 
+    # We can only shard one dimension, so find the best match
+    shard_assigned = False
     
-    for i, axis_name in enumerate(layout_axes):
+    for i in range(num_dims):
+        if i < len(layout_axes):
+            axis_name = layout_axes[i]
+        else:
+            axis_name = None
+            
         if axis_name is None:
             # This dimension is not sharded - replicate
             placements.append(Replicate())
+        elif axis_name == 'model' and not shard_assigned and num_mesh_dims > 0:
+            # Use mesh dimension 0 for 'model' axis sharding
+            # This is the only mesh dimension we have
+            placements.append(Shard(0))
+            shard_assigned = True
         else:
-            # This dimension should be sharded
-            if axis_name in mesh_dim_names:
-                mesh_dim = mesh_dim_names.index(axis_name)
-                # Check if this mesh dim is already used
-                if mesh_dim in used_mesh_dims:
-                    # Already used, replicate this dimension
-                    placements.append(Replicate())
-                else:
-                    # Use this mesh dimension for sharding
-                    placements.append(Shard(mesh_dim))
-                    used_mesh_dims.add(mesh_dim)
-            else:
-                # Axis name not in mesh - replicate
-                placements.append(Replicate())
+            # Either 'model' already assigned or other axis - replicate
+            placements.append(Replicate())
     
     # Ensure we return a tuple of placements
     return tuple(placements)
@@ -419,14 +428,26 @@ def _disable_dtensor():
     we must disable it for all subsequent tensors.
     """
     global _dtensor_enabled
-    _dtensor_enabled = False
-    print("Note: Disabling DTensor distribution for remaining tensors to avoid mixed tensor operations")
+    # Only print once to avoid spam
+    if _dtensor_enabled:
+        _dtensor_enabled = False
+        print("Note: Disabling DTensor distribution for remaining tensors to avoid mixed tensor operations")
 
 
 def _is_dtensor_enabled():
     """Check if DTensor distribution is enabled."""
     global _dtensor_enabled
     return _dtensor_enabled
+
+
+def _reset_dtensor_for_new_model():
+    """Reset DTensor enabled flag for building a new model.
+    
+    This allows trying DTensor distribution again for a fresh model.
+    Called at the start of model creation.
+    """
+    global _dtensor_enabled
+    _dtensor_enabled = True
 
 
 def _get_or_create_torch_device_mesh(keras_device_mesh):
@@ -699,9 +720,11 @@ def distribute_variable(value, layout, device_mesh=None):
         return value
     
     # Create placements from layout axes
+    # Pass tensor shape so we create the right number of placements
     placements = _create_placement_from_layout(
         layout.axes, 
-        torch_device_mesh.mesh_dim_names
+        torch_device_mesh.mesh_dim_names,
+        tensor_shape=value.shape
     )
     
     # Check if DTensor is enabled (might be disabled due to previous failures)
@@ -776,7 +799,8 @@ def distribute_tensor(tensor, layout, device_mesh=None):
     # Create placements from layout
     placements = _create_placement_from_layout(
         layout.axes,
-        device_mesh.mesh_dim_names
+        device_mesh.mesh_dim_names,
+        tensor_shape=tensor.shape
     )
     
     # Check if DTensor is enabled (might be disabled due to previous failures)
@@ -1003,7 +1027,8 @@ def distribute_data_input(per_process_batch, layout, batch_dim_name, device_mesh
         # Create placements
         placements = _create_placement_from_layout(
             layout.axes,
-            device_mesh.mesh_dim_names
+            device_mesh.mesh_dim_names,
+            tensor_shape=per_process_batch.shape
         )
         
         # Check if tensor dtype is suitable for DTensor
