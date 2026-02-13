@@ -33,7 +33,20 @@ def list_devices(device_type=None):
                 return devices
         elif dtype in ('gpu', 'cuda'):
             if torch.cuda.is_available():
-                devices.extend([f'cuda:{i}' for i in range(torch.cuda.device_count())])
+                # CRITICAL FIX: In distributed setting, each process can only see its local GPU
+                # due to CUDA_VISIBLE_DEVICES isolation. We need to return ALL GPUs across
+                # all ranks for proper mesh creation in DataParallel.
+                # Use world_size to determine total GPU count when distributed is initialized.
+                if torch.distributed.is_initialized():
+                    world_size = torch.distributed.get_world_size()
+                    # Each rank has 1 GPU due to CUDA_VISIBLE_DEVICES isolation
+                    # Total GPUs = world_size * local_gpus_per_rank
+                    local_gpu_count = torch.cuda.device_count()
+                    total_gpus = world_size * local_gpu_count
+                    # Return all GPU addresses across all ranks
+                    devices.extend([f'cuda:{i}' for i in range(total_gpus)])
+                else:
+                    devices.extend([f'cuda:{i}' for i in range(torch.cuda.device_count())])
                 if device_type in ('gpu', 'cuda'):
                     return devices
         elif dtype == 'cpu':
@@ -53,6 +66,13 @@ def get_device_count(device_type=None):
 
     if device_type in (None, 'gpu', 'cuda'):
         if torch.cuda.is_available():
+            # CRITICAL FIX: In distributed setting, each process can only see its local GPU
+            # due to CUDA_VISIBLE_DEVICES isolation. We need to return total GPUs across
+            # all ranks for proper mesh creation in DataParallel.
+            if torch.distributed.is_initialized():
+                world_size = torch.distributed.get_world_size()
+                local_gpu_count = torch.cuda.device_count()
+                return world_size * local_gpu_count
             return torch.cuda.device_count()
 
     if device_type in (None, 'cpu'):
