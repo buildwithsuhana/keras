@@ -666,11 +666,12 @@ def distribute_variable(value, layout, device_mesh=None):
             value = torch.tensor(value)
         value = value.contiguous()
         
-        # Create DTensor using distribute_tensor
-        dtensor = tp.distribute_tensor(
+        # Create DTensor using DTensor.from_local (NOT tp.distribute_tensor which doesn't exist)
+        dtensor = DTensor.from_local(
             value,
             torch_device_mesh,
-            placements
+            placements,
+            run_check=False
         )
         print(f"✓ Created DTensor with shape {dtensor.shape}, placements {placements}")
         return dtensor
@@ -723,10 +724,12 @@ def distribute_tensor(tensor, layout, device_mesh=None):
     
     # Create DTensor
     try:
-        dtensor = tp.distribute_tensor(
+        # Create DTensor using DTensor.from_local (NOT tp.distribute_tensor which doesn't exist)
+        dtensor = DTensor.from_local(
             tensor.contiguous(),
             device_mesh,
-            placements
+            placements,
+            run_check=False
         )
         return dtensor
     except Exception:
@@ -931,11 +934,12 @@ def distribute_data_input(per_process_batch, layout, batch_dim_name, device_mesh
             device_mesh.mesh_dim_names
         )
         
-        # Create DTensor
-        dtensor = tp.distribute_tensor(
+        # Create DTensor using DTensor.from_local (NOT tp.distribute_tensor which doesn't exist)
+        dtensor = DTensor.from_local(
             per_process_batch.contiguous(),
             device_mesh,
-            placements
+            placements,
+            run_check=False
         )
         return dtensor
         
