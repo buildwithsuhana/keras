@@ -7,6 +7,54 @@ import ml_dtypes
 import numpy as np
 import torch
 
+# Patch torch.nn.Parameter to handle DTensor
+# This is needed because DTensor doesn't support requires_grad for non-floating point tensors
+_original_parameter_init = torch.nn.Parameter.__init__
+
+def _patched_parameter_init(self, data=None, requires_grad=True):
+    """Patched Parameter init to handle DTensors properly."""
+    try:
+        # Check if data is a DTensor
+        from torch.distributed.tensor import DTensor
+        if isinstance(data, DTensor):
+            # Extract the local tensor from DTensor
+            local_data = data._local_tensor
+            # Create parameter with local tensor
+            _original_parameter_init(self, local_data, requires_grad)
+            # Store the DTensor spec for later reconstruction
+            self._keras_dtensor_spec = data._spec
+            self._keras_is_dtensor = True
+            return
+    except ImportError:
+        pass
+    
+    # Original behavior for non-DTensor
+    _original_parameter_init(self, data, requires_grad)
+
+torch.nn.Parameter.__init__ = _patched_parameter_init
+
+# Also patch Parameter.__new__ to handle DTensor data
+_original_parameter_new = torch.nn.Parameter.__new__
+
+def _patched_parameter_new(cls, data=None, requires_grad=True):
+    """Patched Parameter __new__ to handle DTensors properly."""
+    try:
+        from torch.distributed.tensor import DTensor
+        if isinstance(data, DTensor):
+            # Extract the local tensor from DTensor
+            local_data = data._local_tensor
+            result = _original_parameter_new(cls, local_data, requires_grad)
+            # Store the DTensor spec for later reconstruction
+            result._keras_dtensor_spec = data._spec
+            result._keras_is_dtensor = True
+            return result
+    except ImportError:
+        pass
+    
+    return _original_parameter_new(cls, data, requires_grad)
+
+torch.nn.Parameter.__new__ = _patched_parameter_new
+
 from keras.src import tree
 from keras.src.backend.common import KerasVariable
 from keras.src.backend.common import global_state
@@ -99,6 +147,27 @@ def to_torch_dtype(dtype):
     if standardized_dtype is None:
         raise ValueError(f"Unsupported dtype for PyTorch: {dtype}")
     return standardized_dtype
+
+
+def _get_dtensor_from_parameter(param):
+    """Get DTensor from a patched Parameter if available.
+    
+    Args:
+        param: A torch.nn.Parameter that may have been created from a DTensor
+        
+    Returns:
+        DTensor if available, None otherwise
+    """
+    try:
+        from torch.distributed.tensor import DTensor
+        if hasattr(param, '_keras_is_dtensor') and param._keras_is_dtensor:
+            # Reconstruct DTensor from local tensor and spec
+            local_tensor = param.data
+            spec = param._keras_dtensor_spec
+            return DTensor.from_local(local_tensor, spec, run_check=False)
+    except Exception:
+        pass
+    return None
 
 
 class Variable(KerasVariable):
