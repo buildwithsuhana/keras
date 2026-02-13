@@ -183,9 +183,10 @@ class Variable(KerasVariable):
                         print(f"DEBUG | [Rank {rank}]   - tensor_layout: {tensor_layout}")
                         print(f"DEBUG | [Rank {rank}]   - extracted layout: {layout}")
         
-        # Distribute if we have a layout OR an active mesh
-        if layout is not None or active_mesh is not None:
-            # If layout is None but mesh exists, pass empty tuple for replicate
+        # CRITICAL FIX: Always distribute when there's an active mesh, even if layout is None
+        # This ensures consistency - all model weights become DTensors when distributed is active
+        if active_mesh is not None:
+            # If layout is None but mesh exists, use empty tuple for replicate
             actual_layout = layout if layout is not None else ()
             if debug_mode:
                 print(f"DEBUG | [Rank {rank}]   - actual_layout: {actual_layout}")
