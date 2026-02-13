@@ -349,29 +349,49 @@ def _infer_parallel_style(module, param_name: str, sharding_spec: tuple):
     return None
 
 
-def _create_placement_from_layout(layout_axes, mesh_dim_names):
+def _create_placement_from_layout(layout_axes, mesh_dim_names, tensor_shape=None):
     """Create PyTorch DTensor placement from Keras layout axes.
     
     Args:
         layout_axes: Tuple of axis names (e.g., ('model', None))
         mesh_dim_names: Tuple of mesh dimension names (e.g., ('model',))
+        tensor_shape: Optional shape of the tensor to distribute
         
     Returns:
         List of placements (Shard or Replicate)
     """
     from torch.distributed.tensor import Replicate, Shard
     
+    # Get the number of mesh dimensions
+    num_mesh_dims = len(mesh_dim_names) if mesh_dim_names else 0
+    
+    # If mesh has no dimensions, everything is replicated
+    if num_mesh_dims == 0:
+        return tuple([Replicate() for _ in layout_axes]) if layout_axes else tuple()
+    
     placements = []
     
-    for axis_name in layout_axes:
+    # Track which mesh dimensions we've used
+    used_mesh_dims = set()
+    
+    for i, axis_name in enumerate(layout_axes):
         if axis_name is None:
+            # This dimension is not sharded - replicate
             placements.append(Replicate())
         else:
-            # Find the mesh dimension index for this axis
+            # This dimension should be sharded
             if axis_name in mesh_dim_names:
                 mesh_dim = mesh_dim_names.index(axis_name)
-                placements.append(Shard(mesh_dim))
+                # Check if this mesh dim is already used
+                if mesh_dim in used_mesh_dims:
+                    # Already used, replicate this dimension
+                    placements.append(Replicate())
+                else:
+                    # Use this mesh dimension for sharding
+                    placements.append(Shard(mesh_dim))
+                    used_mesh_dims.add(mesh_dim)
             else:
+                # Axis name not in mesh - replicate
                 placements.append(Replicate())
     
     # Ensure we return a tuple of placements
@@ -666,6 +686,12 @@ def distribute_variable(value, layout, device_mesh=None):
             value = torch.tensor(value)
         value = value.contiguous()
         
+        # Check if tensor dtype is suitable for DTensor (must be floating point for gradients)
+        if not value.is_floating_point() and not value.is_complex():
+            # Can't create DTensor from non-floating point tensors
+            print(f"Note: Could not create DTensor: non-floating point dtype {value.dtype}")
+            return value
+        
         # Create DTensor using DTensor.from_local (NOT tp.distribute_tensor which doesn't exist)
         dtensor = DTensor.from_local(
             value,
@@ -724,6 +750,11 @@ def distribute_tensor(tensor, layout, device_mesh=None):
     
     # Create DTensor
     try:
+        # Check if tensor dtype is suitable for DTensor
+        if not tensor.is_floating_point() and not tensor.is_complex():
+            # Can't create DTensor from non-floating point tensors
+            return tensor
+        
         # Create DTensor using DTensor.from_local (NOT tp.distribute_tensor which doesn't exist)
         dtensor = DTensor.from_local(
             tensor.contiguous(),
@@ -933,6 +964,11 @@ def distribute_data_input(per_process_batch, layout, batch_dim_name, device_mesh
             layout.axes,
             device_mesh.mesh_dim_names
         )
+        
+        # Check if tensor dtype is suitable for DTensor
+        if not per_process_batch.is_floating_point() and not per_process_batch.is_complex():
+            # Can't create DTensor from non-floating point tensors
+            return per_process_batch
         
         # Create DTensor using DTensor.from_local (NOT tp.distribute_tensor which doesn't exist)
         dtensor = DTensor.from_local(
