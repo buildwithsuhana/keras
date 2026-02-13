@@ -752,6 +752,9 @@ def distribute_variable(value, layout, device_mesh=None):
         if not value.is_floating_point() and not value.is_complex():
             # Can't create DTensor from non-floating point tensors
             print(f"Note: Could not create DTensor: non-floating point dtype {value.dtype}")
+            # Disable DTensor globally since we can't properly handle mixed tensors
+            # This prevents the "mixed torch.Tensor and DTensor" error
+            _disable_dtensor()
             return value
         
         # Create DTensor using DTensor.from_local (NOT tp.distribute_tensor which doesn't exist)
