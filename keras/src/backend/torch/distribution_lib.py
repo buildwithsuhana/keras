@@ -818,9 +818,25 @@ def distribute_tensor(tensor, layout, device_mesh=None):
     
     # Create DTensor
     try:
+        # Handle integer tensors (like token IDs) - convert to appropriate dtype for DTensor
+        if tensor.dtype in (torch.int32, torch.int64, torch.int16):
+            # For integer tensors used as indices (like token IDs),
+            # we need to replicate them across all devices since they're used for indexing
+            # Create replicated placements for index tensors
+            replicated_placements = tuple([Replicate() for _ in placements])
+            tensor = tensor.contiguous()
+            dtensor = DTensor.from_local(
+                tensor,
+                device_mesh,
+                replicated_placements,
+                run_check=False
+            )
+            return dtensor
+        
         # Check if tensor dtype is suitable for DTensor
         if not tensor.is_floating_point() and not tensor.is_complex():
             # Can't create DTensor from non-floating point tensors
+            # But we need to handle integer indices for embedding lookups
             return tensor
         
         # Create DTensor using DTensor.from_local (NOT tp.distribute_tensor which doesn't exist)
@@ -1038,6 +1054,20 @@ def distribute_data_input(per_process_batch, layout, batch_dim_name, device_mesh
             device_mesh.mesh_dim_names,
             tensor_shape=per_process_batch.shape
         )
+        
+        # Handle integer tensors (like token IDs) - replicate them across devices
+        # This is needed because embedding lookups require indices to be available on all devices
+        if per_process_batch.dtype in (torch.int32, torch.int64, torch.int16):
+            # For integer tensors (token IDs, indices), replicate them
+            replicated_placements = tuple([Replicate() for _ in placements])
+            per_process_batch = per_process_batch.contiguous()
+            dtensor = DTensor.from_local(
+                per_process_batch,
+                device_mesh,
+                replicated_placements,
+                run_check=False
+            )
+            return dtensor
         
         # Check if tensor dtype is suitable for DTensor
         if not per_process_batch.is_floating_point() and not per_process_batch.is_complex():
