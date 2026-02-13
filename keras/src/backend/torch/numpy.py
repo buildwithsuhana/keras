@@ -166,6 +166,47 @@ def subtract(x1, x2):
         x1 = cast(x1, x2.dtype)
     if standardize_dtype(x2.dtype) == "bool":
         x2 = cast(x2, x1.dtype)
+
+    # Handle mixed DTensor and regular tensor operands
+    from keras.src.backend.torch.distribution_lib import (
+        is_dtensor,
+        _get_default_device_mesh,
+        DTensor,
+        Replicate,
+    )
+
+    # Check if we have at least one DTensor
+    x1_is_dtensor = is_dtensor(x1)
+    x2_is_dtensor = is_dtensor(x2)
+    
+    if x1_is_dtensor or x2_is_dtensor:
+        # Get device_mesh from DTensor if available, otherwise from global state
+        if x1_is_dtensor:
+            device_mesh = getattr(x1, 'device_mesh', None)
+            x1_placements = getattr(x1, 'placements', None)
+        elif x2_is_dtensor:
+            device_mesh = getattr(x2, 'device_mesh', None)
+            x2_placements = getattr(x2, 'placements', None)
+        else:
+            device_mesh = None
+        
+        if device_mesh is not None:
+            # Standard case - convert regular tensor to DTensor
+            if x1_is_dtensor and not x2_is_dtensor:
+                placements = x1_placements or [Replicate()]
+                x2 = DTensor.from_local(x2, device_mesh, placements)
+            elif x2_is_dtensor and not x1_is_dtensor:
+                placements = x2_placements or [Replicate()]
+                x1 = DTensor.from_local(x1, device_mesh, placements)
+        else:
+            # device_mesh is None - this can happen during symbolic build
+            # Fallback: extract local tensor from DTensor to avoid mixed tensor errors
+            # This handles the case where is_dtensor might not catch all cases
+            if hasattr(x1, 'to_local'):
+                x1 = x1.to_local()
+            if hasattr(x2, 'to_local'):
+                x2 = x2.to_local()
+
     return torch.subtract(x1, x2)
 
 
