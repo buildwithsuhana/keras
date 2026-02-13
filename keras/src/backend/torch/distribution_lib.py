@@ -384,6 +384,84 @@ _device_mesh_cache = {}
 _backend_type = "cpu"  # Track the current backend type: 'cpu', 'cuda', 'mps', 'xla'
 
 
+def _get_or_create_torch_device_mesh(keras_device_mesh):
+    """Convert Keras DeviceMesh to PyTorch DeviceMesh.
+    
+    This function creates a PyTorch DTensor DeviceMesh from a Keras DeviceMesh.
+    It handles the conversion of device strings and mesh configuration.
+    
+    Args:
+        keras_device_mesh: Keras DeviceMesh instance
+        
+    Returns:
+        PyTorch DeviceMesh instance or None if creation fails.
+    """
+    global _device_mesh_cache
+    
+    if keras_device_mesh is None:
+        return None
+    
+    # Check cache first
+    cache_key = f"keras_mesh_{id(keras_device_mesh)}"
+    if cache_key in _device_mesh_cache:
+        return _device_mesh_cache[cache_key]
+    
+    # Get device information from Keras DeviceMesh
+    keras_devices = keras_device_mesh.devices
+    keras_shape = keras_device_mesh.shape
+    keras_axis_names = keras_device_mesh.axis_names
+    
+    # Determine backend type based on device strings
+    device_type = _get_torch_backend(list(keras_devices.flatten()))
+    
+    # Convert Keras device strings to PyTorch format
+    # Handle the reshape of devices
+    flat_devices = keras_devices.flatten()
+    torch_devices = []
+    for dev in flat_devices:
+        if dev.startswith("cuda"):
+            torch_devices.append(dev)
+        elif dev.startswith("cpu"):
+            # For CPU devices, we need to check if we can use them
+            # PyTorch DTensor typically doesn't work well with multiple CPU devices
+            # without proper process group setup
+            torch_devices.append(dev)
+        elif dev.startswith("tpu"):
+            torch_devices.append(dev)
+        else:
+            torch_devices.append(dev)
+    
+    # Try to create PyTorch DeviceMesh
+    try:
+        # Use init_device_mesh which is the recommended way in PyTorch 2.8+
+        torch_mesh = init_device_mesh(
+            device_type=device_type,
+            mesh_shape=keras_shape,
+            mesh_dim_names=tuple(keras_axis_names)
+        )
+        _device_mesh_cache[cache_key] = torch_mesh
+        print(f"✓ Created PyTorch DeviceMesh from Keras DeviceMesh: shape={keras_shape}, axes={keras_axis_names}, device_type={device_type}")
+        return torch_mesh
+    except Exception as e:
+        print(f"Warning: Could not create PyTorch DeviceMesh: {e}")
+        
+        # Try fallback approach
+        try:
+            # Try with single device
+            if len(torch_devices) == 1:
+                torch_mesh = init_device_mesh(
+                    device_type=device_type,
+                    mesh_shape=(1,),
+                    mesh_dim_names=("model",)
+                )
+                _device_mesh_cache[cache_key] = torch_mesh
+                return torch_mesh
+        except Exception as e2:
+            print(f"Warning: Fallback DeviceMesh creation also failed: {e2}")
+        
+        return None
+
+
 def initialize(job_addresses: Optional[str] = None, 
                num_processes: Optional[int] = None, 
                process_id: Optional[int] = None,
@@ -546,25 +624,39 @@ def distribute_variable(value, layout, device_mesh=None):
     if isinstance(value, DTensor):
         return value
     
-    # Check if distributed is initialized
+    # Check if distributed is initialized - try to initialize if not
     if not _check_distributed_initialized():
-        # Try to initialize if not already done
         try:
             initialize()
         except Exception:
             pass
     
-    # Get mesh - use provided or create default
-    if device_mesh is None:
-        device_mesh = _get_default_device_mesh()
+    # Get mesh - use provided or get from layout's device_mesh
+    torch_device_mesh = None
     
-    if device_mesh is None:
+    if device_mesh is not None:
+        # Use provided PyTorch DeviceMesh
+        torch_device_mesh = device_mesh
+    elif layout.device_mesh is not None:
+        # Try to get or create PyTorch DeviceMesh from Keras DeviceMesh
+        keras_mesh = layout.device_mesh
+        try:
+            torch_device_mesh = _get_or_create_torch_device_mesh(keras_mesh)
+        except Exception as e:
+            print(f"Note: Could not create DeviceMesh from Keras mesh: {e}")
+    
+    # Fallback to default mesh if none available
+    if torch_device_mesh is None:
+        torch_device_mesh = _get_default_device_mesh()
+    
+    if torch_device_mesh is None:
+        print("Note: No DeviceMesh available, skipping DTensor distribution")
         return value
     
     # Create placements from layout axes
     placements = _create_placement_from_layout(
         layout.axes, 
-        device_mesh.mesh_dim_names
+        torch_device_mesh.mesh_dim_names
     )
     
     # Create DTensor from tensor
@@ -577,13 +669,15 @@ def distribute_variable(value, layout, device_mesh=None):
         # Create DTensor using distribute_tensor
         dtensor = tp.distribute_tensor(
             value,
-            device_mesh,
+            torch_device_mesh,
             placements
         )
+        print(f"✓ Created DTensor with shape {dtensor.shape}, placements {placements}")
         return dtensor
     except Exception as e:
         # Fallback to original tensor if DTensor creation fails
         # This is expected on CPU-only systems or when mesh is incompatible
+        print(f"Note: Could not create DTensor: {e}")
         return value
 
 

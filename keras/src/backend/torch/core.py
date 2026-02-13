@@ -119,12 +119,22 @@ class Variable(KerasVariable):
                     if tensor_layout is not None and isinstance(tensor_layout, TensorLayout):
                         # Use distribution_lib to distribute the tensor
                         from keras.src.backend.torch import distribution_lib
-                        if distribution_lib._check_distributed_initialized():
+                        # Try to initialize if not already done (auto-initialize)
+                        if not distribution_lib._check_distributed_initialized():
+                            try:
+                                distribution_lib.initialize()
+                            except Exception:
+                                pass
+                        # Try to distribute the variable (don't check initialization)
+                        try:
                             tensor_value = distribution_lib.distribute_variable(
                                 tensor_value, 
                                 tensor_layout, 
                                 None
                             )
+                        except Exception as e:
+                            # Fall back to regular tensor if DTensor fails
+                            pass
                 except Exception:
                     pass  # Fall back to regular tensor
             
