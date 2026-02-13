@@ -268,6 +268,45 @@ def convert_to_tensor(x, dtype=None, sparse=None, ragged=None):
     except ImportError:
         pass
     
+    # Check if we need to convert to DTensor for distributed training
+    # This handles the case where model weights are DTensors but inputs are not
+    try:
+        from torch.distributed.tensor import DTensor
+        distribution = global_state.get_global_attribute("distribution")
+        if distribution is not None and not isinstance(x, DTensor):
+            # Check if distributed is initialized and has a device mesh
+            from keras.src.backend.torch import distribution_lib
+            if distribution_lib._check_distributed_initialized():
+                # Try to get or create device mesh
+                torch_device_mesh = distribution_lib._get_default_device_mesh()
+                if torch_device_mesh is not None:
+                    # For integer tensors (like token IDs), convert to replicated DTensor
+                    # This ensures compatibility with distributed embedding weights
+                    if isinstance(x, torch.Tensor):
+                        # Check if it's an integer tensor (likely input data like token IDs)
+                        if x.dtype in (torch.int32, torch.int64, torch.int16):
+                            try:
+                                # Create replicated placements for input data
+                                num_mesh_dims = len(torch_device_mesh.mesh_dim_names)
+                                replicated_placements = tuple([distribution_lib.Replicate()] * num_mesh_dims)
+                                dtensor = DTensor.from_local(
+                                    x.contiguous(),
+                                    torch_device_mesh,
+                                    replicated_placements,
+                                    run_check=False
+                                )
+                                # Convert to target dtype if needed
+                                if dtype is not None:
+                                    local_dtype = to_torch_dtype(dtype)
+                                    if dtensor._local_tensor.dtype != local_dtype:
+                                        new_local = dtensor._local_tensor.to(dtype=local_dtype)
+                                        return DTensor.from_local(new_local, dtensor._spec)
+                                return dtensor
+                            except Exception:
+                                pass  # Fall back to regular tensor
+    except ImportError:
+        pass
+    
     if isinstance(x, Variable) or is_tensor(x):
         if isinstance(x, Variable):
             x = x.value
