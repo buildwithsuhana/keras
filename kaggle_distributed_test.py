@@ -512,6 +512,7 @@ def main():
     import torch
     import torch.distributed as dist
     from keras.src.distribution import initialize
+    from keras.distribution import list_devices
     
     # Initialize Keras distribution system FIRST
     # This detects torchrun and sets up the distributed state
@@ -524,7 +525,8 @@ def main():
     test_device_detection()
     test_data_parallel(epochs=3)
     
-    if torch.cuda.device_count() >= 2:
+    # Use Keras list_devices which properly detects all GPUs in distributed mode
+    if len(list_devices("gpu")) >= 2:
         test_model_parallel(epochs=3)
     else:
         log_section("TEST 3: MODEL PARALLEL (SKIPPED)")
