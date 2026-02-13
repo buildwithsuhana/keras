@@ -371,36 +371,36 @@ def _create_placement_from_layout(layout_axes, mesh_dim_names, tensor_shape=None
             return tuple([Replicate() for _ in range(len(tensor_shape))])
         return tuple([Replicate() for _ in layout_axes]) if layout_axes else tuple()
     
-    # Determine how many placements we need
+    # Determine how many placements we need (one per tensor dimension)
     if tensor_shape:
-        num_dims = len(tensor_shape)
+        num_tensor_dims = len(tensor_shape)
     else:
-        num_dims = len(layout_axes) if layout_axes else 1
+        num_tensor_dims = len(layout_axes) if layout_axes else 1
     
-    # If there's only 1 mesh dimension, we can only shard on that one
-    # Find which layout axis corresponds to 'model' (the only mesh axis)
+    # Find which mesh dimension index corresponds to 'model'
+    model_mesh_dim = None
+    if 'model' in mesh_dim_names:
+        model_mesh_dim = mesh_dim_names.index('model')
+    
     placements = []
     
-    # Map: we have mesh dim 0 as 'model' 
-    # We can only shard one dimension, so find the best match
-    shard_assigned = False
-    
-    for i in range(num_dims):
+    # Create one placement per tensor dimension
+    # Match layout axes to tensor dimensions by position
+    for i in range(num_tensor_dims):
         if i < len(layout_axes):
             axis_name = layout_axes[i]
         else:
+            # More tensor dimensions than layout axes - default to replicate
             axis_name = None
             
         if axis_name is None:
             # This dimension is not sharded - replicate
             placements.append(Replicate())
-        elif axis_name == 'model' and not shard_assigned and num_mesh_dims > 0:
-            # Use mesh dimension 0 for 'model' axis sharding
-            # This is the only mesh dimension we have
-            placements.append(Shard(0))
-            shard_assigned = True
+        elif axis_name == 'model' and model_mesh_dim is not None:
+            # Use the mesh dimension for 'model' axis sharding
+            placements.append(Shard(model_mesh_dim))
         else:
-            # Either 'model' already assigned or other axis - replicate
+            # Unknown axis or no mesh - replicate
             placements.append(Replicate())
     
     # Ensure we return a tuple of placements
@@ -756,9 +756,8 @@ def distribute_variable(value, layout, device_mesh=None):
     except Exception as e:
         # Fallback to original tensor if DTensor creation fails
         # This is expected on CPU-only systems or when mesh is incompatible
-        # Disable DTensor to prevent mixed tensor issues
-        _disable_dtensor()
-        print(f"Note: Could not create DTensor: {e}")
+        # Don't disable DTensor globally - just skip this tensor
+        print(f"Note: Could not create DTensor for shape {value.shape}, layout {layout.axes}, placements {placements}: {e}")
         return value
 
 
@@ -823,9 +822,8 @@ def distribute_tensor(tensor, layout, device_mesh=None):
         )
         return dtensor
     except Exception as e:
-        # Disable DTensor to prevent mixed tensor issues
-        _disable_dtensor()
-        # Fallback to original tensor
+        # Don't disable DTensor globally - just skip this tensor
+        print(f"Note: Could not create DTensor for input shape {tensor.shape}, layout {layout.axes}, placements {placements}: {e}")
         return tensor
 
 
@@ -1046,9 +1044,8 @@ def distribute_data_input(per_process_batch, layout, batch_dim_name, device_mesh
         return dtensor
         
     except Exception as e:
-        # Disable DTensor to prevent mixed tensor issues
-        _disable_dtensor()
-        # Fallback to original tensor
+        # Don't disable DTensor globally - just skip this tensor
+        print(f"Note: Could not create DTensor for data input shape {per_process_batch.shape}, layout {layout.axes}, placements {placements}: {e}")
         return per_process_batch
 
 
