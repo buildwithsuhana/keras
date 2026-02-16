@@ -760,69 +760,47 @@ def _convert_structure(x, device_mesh=None, to_dtensor=True, gather_sharded=True
 
     if isinstance(x, torch.Tensor):
         if to_dtensor:
-            # For model parallelism, inputs need to be replicated across model dim
-            # to match the sharded kernel dimensions
-            # CRITICAL FIX: Get the current distribution's device mesh, not the cached one
-            # This ensures inputs use the same mesh as the model weights
+            # CRITICAL FIX: Get the device mesh from the current distribution's scope,
+            # not from global cache. The issue is that after DataParallel scope exits,
+            # the global cache might still have the old mesh. We need to use the mesh
+            # from the currently active distribution (if any), not the last cached one.
             from keras.src.distribution.distribution_lib import distribution, ModelParallel, DataParallel
             
+            # Get the current distribution - this checks the scope, not global cache
             current_dist = distribution()
-            is_mp = isinstance(current_dist, ModelParallel)
-            is_dp = isinstance(current_dist, DataParallel)
-            is_distributed = torch.distributed.is_initialized()
             
-            # Get the device mesh from the current distribution, not from global cache
+            # Only convert to DTensor if we have an active distribution
             if current_dist is not None and hasattr(current_dist, 'device_mesh'):
-                # Convert the current distribution's device mesh to backend mesh
+                # Use the current distribution's device mesh
                 torch_device_mesh = _to_backend_mesh(current_dist.device_mesh)
                 
                 if torch_device_mesh is not None:
                     mesh_ndim = 1
-                    # Check if torch_device_mesh has ndim attribute (it's a PyTorch DeviceMesh)
                     if hasattr(torch_device_mesh, 'mesh'):
                         mesh_ndim = torch_device_mesh.mesh.ndim
                     
-                    # For 1D mesh, use single Replicate()
-                    # For multi-dimensional mesh, replicate on all dimensions
+                    # For multi-dimensional mesh, use matching placements for all dimensions
                     if mesh_ndim == 1:
-                        # Single placement for 1D mesh
                         placements = [Replicate()]
                     else:
-                        # For 2D+ mesh (e.g., ModelParallel with shape (1, 2)),
-                        # we need matching placements for each mesh dimension
-                        # Replicate on all dimensions for input data
                         placements = [Replicate()] * mesh_ndim
                     
-                    # Use the mesh from current distribution
                     return DTensor.from_local(x, torch_device_mesh, placements)
             elif device_mesh is not None:
-                # Fallback to passed device_mesh (for non-distributed cases)
-                # Check if we have a model parallel distribution
-                if _is_model_parallel_distribution():
-                    # Get the actual PyTorch device mesh from global state
-                    # This is critical for multi-dimensional meshes (e.g., 2D mesh for ModelParallel)
-                    torch_device_mesh = _get_default_device_mesh()
-                    
-                    if torch_device_mesh is not None:
-                        mesh_ndim = 1
-                        # Check if torch_device_mesh has ndim attribute (it's a PyTorch DeviceMesh)
-                        if hasattr(torch_device_mesh, 'mesh'):
-                            mesh_ndim = torch_device_mesh.mesh.ndim
-                        
-                        # For 1D mesh, use single Replicate()
-                        # For multi-dimensional mesh, replicate on all dimensions
-                        if mesh_ndim == 1:
-                            # Single placement for 1D mesh
-                            placements = [Replicate()]
-                        else:
-                            # For 2D+ mesh (e.g., ModelParallel with shape (1, 2)),
-                            # we need matching placements for each mesh dimension
-                            # Replicate on all dimensions for input data
-                            placements = [Replicate()] * mesh_ndim
-                        
-                        # Use torch_device_mesh, not the original device_mesh parameter
-                        # This ensures the mesh matches what was set up by _to_backend_mesh
-                        return DTensor.from_local(x, torch_device_mesh, placements)
+                # Fallback for non-distributed cases or when no distribution is active
+                # Check mesh dimensionality
+                if hasattr(device_mesh, 'mesh'):
+                    mesh_ndim = device_mesh.mesh.ndim
+                else:
+                    # device_mesh is a Keras DeviceMesh
+                    mesh_ndim = len(device_mesh.shape)
+                
+                if mesh_ndim == 1:
+                    placements = [Replicate()]
+                else:
+                    placements = [Replicate()] * mesh_ndim
+                
+                return DTensor.from_local(x, device_mesh, placements)
         return x
 
     if isinstance(x, dict):
@@ -852,16 +830,24 @@ def prepare_input_for_distribution(x):
     """
     from keras.src.distribution.distribution_lib import distribution, ModelParallel
     
-    dist = distribution()
+    # Get the current distribution from the scope context, not from global cache
+    current_dist = distribution()
     
     # Check if we have a ModelParallel distribution active
-    is_mp = isinstance(dist, ModelParallel)
+    is_mp = isinstance(current_dist, ModelParallel)
     
     # Also check if torch distributed is initialized
     # Even outside the scope, we might have sharded weights
     is_distributed = torch.distributed.is_initialized()
     
-    device_mesh = _get_default_device_mesh()
+    # CRITICAL FIX: Get the device mesh from the CURRENT distribution, not from
+    # global cache. This ensures inputs use the same mesh as the model weights.
+    if current_dist is not None and hasattr(current_dist, 'device_mesh'):
+        # Use the current distribution's device mesh
+        device_mesh = current_dist.device_mesh
+    else:
+        # Fallback to global cache
+        device_mesh = _get_default_device_mesh()
     
     # Convert to DTensor if:
     # 1. We have a device mesh AND
