@@ -82,31 +82,85 @@ def add(x1, x2):
     
     if x1_is_dtensor or x2_is_dtensor:
         # Get device_mesh from DTensor if available, otherwise from global state
+        device_mesh = None
+        source_dtensor = None
         if x1_is_dtensor:
             device_mesh = getattr(x1, 'device_mesh', None)
-            x1_placements = getattr(x1, 'placements', None)
+            source_dtensor = x1
         elif x2_is_dtensor:
             device_mesh = getattr(x2, 'device_mesh', None)
-            x2_placements = getattr(x2, 'placements', None)
-        else:
-            device_mesh = None
+            source_dtensor = x2
+        
+        # CRITICAL FIX: Fallback to global state if device_mesh is None
+        if device_mesh is None:
+            device_mesh = _get_default_device_mesh()
         
         if device_mesh is not None:
+            # Get mesh dimension to determine correct placements
+            mesh_ndim = 1
+            if hasattr(device_mesh, 'mesh'):
+                mesh_ndim = device_mesh.mesh.ndim
+            
             # Standard case - convert regular tensor to DTensor
+            # Use Replicate() placement that matches the mesh dimensionality
             if x1_is_dtensor and not x2_is_dtensor:
-                placements = x1_placements or [Replicate()]
-                x2 = DTensor.from_local(x2, device_mesh, placements)
+                # Use Replicate() for the input, NOT the kernel's sharding
+                if mesh_ndim == 1:
+                    x2 = DTensor.from_local(x2, device_mesh, [Replicate()])
+                else:
+                    x2 = DTensor.from_local(x2, device_mesh, [Replicate()] * mesh_ndim)
             elif x2_is_dtensor and not x1_is_dtensor:
-                placements = x2_placements or [Replicate()]
-                x1 = DTensor.from_local(x1, device_mesh, placements)
+                # Use Replicate() for the input, NOT the kernel's sharding
+                if mesh_ndim == 1:
+                    x1 = DTensor.from_local(x1, device_mesh, [Replicate()])
+                else:
+                    x1 = DTensor.from_local(x1, device_mesh, [Replicate()] * mesh_ndim)
         else:
             # device_mesh is None - this can happen during symbolic build
-            # Fallback: extract local tensor from DTensor to avoid mixed tensor errors
-            # This handles the case where is_dtensor might not catch all cases
-            if hasattr(x1, 'to_local'):
-                x1 = x1.to_local()
-            if hasattr(x2, 'to_local'):
-                x2 = x2.to_local()
+            # or in multi-process mode with MP where inputs are not converted to DTensors
+            
+            # CRITICAL FIX: When device_mesh is None but we have a DTensor,
+            # we need to create a proper device mesh for the conversion
+            if source_dtensor is not None:
+                from torch.distributed.device_mesh import init_device_mesh
+                import torch.distributed as dist
+                
+                if dist.is_available() and dist.is_initialized():
+                    world_size = dist.get_world_size()
+                    try:
+                        # Create 1D mesh matching the world size
+                        backend_mesh = init_device_mesh(
+                            device_type="cuda",
+                            mesh_shape=(world_size,),
+                            mesh_dim_names=["model"]
+                        )
+                        
+                        # Convert regular tensor to DTensor with Replicate placement
+                        x1_is_dtensor_now = is_dtensor(x1)
+                        x2_is_dtensor_now = is_dtensor(x2)
+                        
+                        if x1_is_dtensor_now and not x2_is_dtensor_now:
+                            x2 = DTensor.from_local(x2, backend_mesh, [Replicate()])
+                        elif x2_is_dtensor_now and not x1_is_dtensor_now:
+                            x1 = DTensor.from_local(x1, backend_mesh, [Replicate()])
+                    except Exception:
+                        # Fallback: extract local tensor from DTensor
+                        if hasattr(x1, 'to_local'):
+                            x1 = x1.to_local()
+                        if hasattr(x2, 'to_local'):
+                            x2 = x2.to_local()
+                else:
+                    # Fallback: extract local tensor from DTensor
+                    if hasattr(x1, 'to_local'):
+                        x1 = x1.to_local()
+                    if hasattr(x2, 'to_local'):
+                        x2 = x2.to_local()
+            else:
+                # No source DTensor and no device_mesh - fallback
+                if hasattr(x1, 'to_local'):
+                    x1 = x1.to_local()
+                if hasattr(x2, 'to_local'):
+                    x2 = x2.to_local()
 
     return torch.add(x1, x2)
 
@@ -228,40 +282,104 @@ def matmul(x1, x2):
     
     if x1_is_dtensor or x2_is_dtensor:
         # Get device_mesh from DTensor if available, otherwise from global state
+        device_mesh = None
+        source_dtensor = None
         if x1_is_dtensor:
             device_mesh = getattr(x1, 'device_mesh', None)
-            x1_placements = getattr(x1, 'placements', None)
+            source_dtensor = x1
         elif x2_is_dtensor:
             device_mesh = getattr(x2, 'device_mesh', None)
-            x2_placements = getattr(x2, 'placements', None)
-        else:
-            device_mesh = None
+            source_dtensor = x2
         
-        # CRITICAL FIX: Fallback to global state if device_mesh is None
+        # CRITICAL FIX: If device_mesh is None, try to get it from global state
         # This handles the case where DTensor's device_mesh attribute is None
-        # which can happen in multi-process mode with ModelParallel
+        # which can happen in multi-process mode
         if device_mesh is None:
             device_mesh = _get_default_device_mesh()
         
         if device_mesh is not None:
+            # Get mesh dimension to determine correct placements
+            mesh_ndim = 1
+            if hasattr(device_mesh, 'mesh'):
+                mesh_ndim = device_mesh.mesh.ndim
+            
             # Standard case - convert regular tensor to DTensor
+            # Use Replicate() placement that matches the mesh dimensionality
             if x1_is_dtensor and not x2_is_dtensor:
                 # x1 is DTensor (kernel), x2 is regular tensor (input)
                 # Use Replicate() for the input, NOT the kernel's sharding
                 # Each rank needs the FULL input to compute with its portion of the sharded kernel
-                x2 = DTensor.from_local(x2, device_mesh, [Replicate()])
+                # Create placements that match mesh ndim
+                if mesh_ndim == 1:
+                    x2 = DTensor.from_local(x2, device_mesh, [Replicate()])
+                else:
+                    x2 = DTensor.from_local(x2, device_mesh, [Replicate()] * mesh_ndim)
             elif x2_is_dtensor and not x1_is_dtensor:
                 # x1 is regular tensor (input), x2 is DTensor (kernel)
                 # Use Replicate() for the input, NOT the kernel's sharding
                 # Each rank needs the FULL input to compute with its portion of the sharded kernel
-                x1 = DTensor.from_local(x1, device_mesh, [Replicate()])
+                if mesh_ndim == 1:
+                    x1 = DTensor.from_local(x1, device_mesh, [Replicate()])
+                else:
+                    x1 = DTensor.from_local(x1, device_mesh, [Replicate()] * mesh_ndim)
         else:
             # device_mesh is None - this can happen during symbolic build
-            # Fallback: extract local tensor from DTensor to avoid mixed tensor errors
-            if hasattr(x1, 'to_local'):
-                x1 = x1.to_local()
-            if hasattr(x2, 'to_local'):
-                x2 = x2.to_local()
+            # or when in multi-process mode with MP where inputs are not converted to DTensors
+            
+            # CRITICAL FIX: When device_mesh is None but we have a DTensor,
+            # we need to create a proper device mesh for the conversion.
+            # This happens in multi-process MP mode where prepare_input_for_distribution
+            # skips DTensor conversion for inputs.
+            if source_dtensor is not None:
+                # Try to get mesh from the DTensor's internal state
+                from torch.distributed.device_mesh import init_device_mesh
+                import torch.distributed as dist
+                
+                if dist.is_available() and dist.is_initialized():
+                    world_size = dist.get_world_size()
+                    # Create a 1D mesh for MP multi-process
+                    # Use the DTensor's placements to determine shard dimensions
+                    placements = getattr(source_dtensor, 'placements', None)
+                    
+                    # Determine mesh dimension name from placements
+                    # If the source has Shard placements, use 'model' axis
+                    mesh_dim_name = "model"
+                    
+                    try:
+                        # Create 1D mesh matching the world size
+                        backend_mesh = init_device_mesh(
+                            device_type="cuda",
+                            mesh_shape=(world_size,),
+                            mesh_dim_names=[mesh_dim_name]
+                        )
+                        
+                        # Now convert the regular tensor to DTensor with Replicate placement
+                        # This allows proper matmul with the sharded kernel
+                        x1_is_dtensor_now = is_dtensor(x1)
+                        x2_is_dtensor_now = is_dtensor(x2)
+                        
+                        if x1_is_dtensor_now and not x2_is_dtensor_now:
+                            x2 = DTensor.from_local(x2, backend_mesh, [Replicate()])
+                        elif x2_is_dtensor_now and not x1_is_dtensor_now:
+                            x1 = DTensor.from_local(x1, backend_mesh, [Replicate()])
+                    except Exception:
+                        # If mesh creation fails, fallback to extracting local tensor
+                        if hasattr(x1, 'to_local'):
+                            x1 = x1.to_local()
+                        if hasattr(x2, 'to_local'):
+                            x2 = x2.to_local()
+                else:
+                    # Fallback: extract local tensor from DTensor to avoid mixed tensor errors
+                    if hasattr(x1, 'to_local'):
+                        x1 = x1.to_local()
+                    if hasattr(x2, 'to_local'):
+                        x2 = x2.to_local()
+            else:
+                # No source DTensor and no device_mesh - fallback
+                if hasattr(x1, 'to_local'):
+                    x1 = x1.to_local()
+                if hasattr(x2, 'to_local'):
+                    x2 = x2.to_local()
 
     def can_use_int_matmul(x1, x2):
         # torch._int_mm only accepts the following conditions:
