@@ -278,6 +278,8 @@ def test_model_parallel(epochs=3):
     
     # Create layout map for sharding
     layout_map = LayoutMap(mesh)
+    # Use a smaller output size that divides evenly by the number of GPUs
+    # This ensures the sharding works correctly
     layout_map["dense.*kernel"] = (None, "model")  # Shard on model axis (dim 1)
     layout_map["dense.*bias"] = ()  # Replicate bias - biases must be replicated!
     
@@ -296,6 +298,7 @@ def test_model_parallel(epochs=3):
     log(f"  Auto-shard dataset: False")
     
     # Create model for sharding demonstration
+    # IMPORTANT: Use output size that divides evenly by num GPUs (e.g., 8 outputs / 2 GPUs = 4 per rank)
     with mp.scope():
         model = keras.Sequential([
             # Using Input layer delays weight initialization of the first Dense layer
@@ -304,7 +307,7 @@ def test_model_parallel(epochs=3):
             layers.Dense(512, activation="relu"),
             layers.Dense(256, activation="relu"),
             layers.Dense(128, activation="relu"),
-            layers.Dense(10)
+            layers.Dense(8)  # Use 8 outputs so it divides evenly by 2 GPUs
         ])
         
         log_section("PHYSICAL STORAGE VERIFICATION")
@@ -393,7 +396,7 @@ def test_model_parallel(epochs=3):
     # Create training data
     batch_size = 32
     x = np.random.random((batch_size, 128)).astype("float32")
-    y = np.random.random((batch_size, 10)).astype("float32")
+    y = np.random.random((batch_size, 8)).astype("float32")  # Match output size of 8
     
     # Training loop
     log(f"Training for {epochs} epochs...")
