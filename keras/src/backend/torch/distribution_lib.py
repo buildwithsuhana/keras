@@ -431,6 +431,9 @@ def _to_backend_mesh(device_mesh):
     
     IMPORTANT: For multi-process setups, each process can only see its local GPU.
     We use init_device_mesh which properly handles this case.
+    
+    For ModelParallel with multi-dimensional meshes, we need to handle the mesh
+    differently to support tensor parallelism across multiple GPUs.
     """
     from torch.distributed.device_mesh import init_device_mesh
     
@@ -456,25 +459,72 @@ def _to_backend_mesh(device_mesh):
             # CRITICAL FIX: Determine the correct mesh dimension name based on
             # the distribution type (DataParallel vs ModelParallel)
             # For DataParallel: use "batch" as the axis name
-            # For ModelParallel: use "model" as the axis name
-            from keras.src.distribution.distribution_lib import distribution, DataParallel
+            # For ModelParallel: use the full mesh structure (can be multi-dimensional)
+            from keras.src.distribution.distribution_lib import distribution, DataParallel, ModelParallel
             current_dist = distribution()
-            if isinstance(current_dist, DataParallel):
-                # DataParallel uses "batch" axis for data parallelism
-                mesh_dim_names = [current_dist.batch_dim_name]
-            else:
-                # ModelParallel or other distributions use "model"
-                mesh_dim_names = ["model"]
             
-            if torch.cuda.is_available():
-                backend_mesh = init_device_mesh(
-                    device_type="cuda",
-                    mesh_shape=(world_size,),
-                    mesh_dim_names=mesh_dim_names
-                )
-                global_state.set_global_attribute(cache_key, backend_mesh)
-                global_state.set_global_attribute("torch_device_mesh", backend_mesh)
-                return backend_mesh
+            # Check if this is ModelParallel with a multi-dimensional mesh
+            is_model_parallel = isinstance(current_dist, ModelParallel)
+            is_multi_dim_mesh = len(device_mesh.axis_names) > 1
+            
+            if is_model_parallel and is_multi_dim_mesh:
+                # For ModelParallel with multi-dimensional mesh, we need to handle it differently
+                # The mesh shape might be (1, num_devices) where num_devices is the model parallel dimension
+                # We need to use the full mesh structure
+                
+                # Get the mesh shape from the Keras DeviceMesh
+                mesh_shape = device_mesh.shape
+                mesh_dim_names = list(device_mesh.axis_names)
+                
+                if torch.cuda.is_available():
+                    # For multi-dimensional mesh in distributed setting, we need to create
+                    # a mesh that spans across all processes
+                    # The key is that each process contributes its local GPU to the mesh
+                    
+                    # For shape (1, 2) with 2 processes, each process has 1 GPU
+                    # We need to map: process 0 -> GPU 0, process 1 -> GPU 1
+                    # Use world_size as the first dimension for the mesh
+                    if len(mesh_shape) == 2 and mesh_shape[1] == world_size:
+                        # This is a (1, world_size) mesh - perfect for distributed training
+                        # Use init_device_mesh with the proper shape
+                        backend_mesh = init_device_mesh(
+                            device_type="cuda",
+                            mesh_shape=mesh_shape,
+                            mesh_dim_names=mesh_dim_names
+                        )
+                    else:
+                        # Fallback: try to use the original mesh structure
+                        # This may not work across processes but let's try
+                        device_ids = list(range(world_size))
+                        mesh_tensor = torch.tensor(device_ids, dtype=torch.int64)
+                        backend_mesh = DeviceMesh(
+                            device_type="cuda",
+                            mesh=mesh_tensor.reshape(mesh_shape),
+                            mesh_dim_names=mesh_dim_names
+                        )
+                    
+                    global_state.set_global_attribute(cache_key, backend_mesh)
+                    global_state.set_global_attribute("torch_device_mesh", backend_mesh)
+                    return backend_mesh
+            else:
+                # DataParallel or single-dimensional mesh
+                # Use 1D mesh where each process has one device
+                if isinstance(current_dist, DataParallel):
+                    # DataParallel uses "batch" axis for data parallelism
+                    mesh_dim_names = [current_dist.batch_dim_name]
+                else:
+                    # ModelParallel with 1D mesh or other distributions use "model"
+                    mesh_dim_names = ["model"]
+                
+                if torch.cuda.is_available():
+                    backend_mesh = init_device_mesh(
+                        device_type="cuda",
+                        mesh_shape=(world_size,),
+                        mesh_dim_names=mesh_dim_names
+                    )
+                    global_state.set_global_attribute(cache_key, backend_mesh)
+                    global_state.set_global_attribute("torch_device_mesh", backend_mesh)
+                    return backend_mesh
     
     # For single-process, create DeviceMesh with all GPUs
     device_type = "cuda" if torch.cuda.is_available() else "cpu"
