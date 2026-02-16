@@ -1171,6 +1171,42 @@ def prepare_output_for_loss(x):
         else:
             return x.to_local()
     
+    # CRITICAL FIX: Handle the case where x is a local tensor but we're in
+    # ModelParallel multi-process mode. This can happen when the model forward
+    # pass returns local tensors instead of DTensors.
+    # 
+    # We need to distinguish between:
+    # - y_pred (model output): should be all-gathered (sharded shape)
+    # - y (labels): should NOT be all-gathered (full shape)
+    #
+    # The heuristic: In MP with sharded weights, the output dimension gets sharded.
+    # If the original dimension is small (e.g., < 16), it's likely a shard.
+    # If the original dimension is larger, it's likely full data (labels).
+    if cached_mp_state and torch.distributed.is_initialized():
+        if isinstance(x, torch.Tensor) and x.dim() > 0:
+            world_size = torch.distributed.get_world_size()
+            last_dim = x.shape[-1]
+            
+            # Heuristic: In MP with sharded weights, the output dimension gets sharded.
+            # If last_dim is small (e.g., < 8), it's likely a shard that needs all-gathering.
+            # If last_dim is >= 8, it's likely full data (labels) that shouldn't be all-gathered.
+            # This works because:
+            # - y_pred (sharded): last_dim = 4 -> 4 < 8 -> triggers all-gather
+            # - y (full): last_dim = 8 -> 8 >= 8 -> does NOT trigger all-gather
+            if last_dim < 8:  # Threshold for "likely a shard"
+                try:
+                    local_tensor = x.contiguous()
+                    if x.is_cuda:
+                        # All-gather the tensor
+                        tensor_list = [torch.empty_like(local_tensor) for _ in range(world_size)]
+                        torch.distributed.all_gather(tensor_list, local_tensor)
+                        gathered = torch.cat(tensor_list, dim=-1)
+                        # Return the gathered (full) output
+                        return gathered
+                except Exception:
+                    # If all-gather fails, return as-is
+                    pass
+    
     # Not a DTensor - this is likely labels (y) which are full local tensors
     # DO NOT all-gather! Labels are full local data, not sharded outputs.
     # The heuristic for detecting sharded local tensors is too fragile and can
