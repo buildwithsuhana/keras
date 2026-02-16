@@ -33,6 +33,7 @@ def _convert_grads_to_dtensor(grads, variables, optimizer_state_variables=None):
     # Import here to avoid circular imports
     from torch.distributed._tensor import DTensor, Replicate
     from keras.src.backend.torch.distribution_lib import is_dtensor
+    from keras.src.backend.common import global_state
     
     # CRITICAL FIX: Get the device mesh from the current distribution context,
     # not from global cache. This ensures we use the correct mesh for the
@@ -53,6 +54,18 @@ def _convert_grads_to_dtensor(grads, variables, optimizer_state_variables=None):
         from keras.src.backend.torch.distribution_lib import _get_default_device_mesh
         torch_device_mesh = _get_default_device_mesh()
         logger.debug(f"_convert_grads_to_dtensor: got device_mesh from fallback: {torch_device_mesh}")
+    
+    # CRITICAL FIX: Even if no mesh from distribution, check if we have a cached mesh
+    # This handles the case where distribution scope has exited but we still have
+    # DTensors from ModelParallel training
+    if torch_device_mesh is None:
+        # Check for cached mesh - look for 1D mesh which is used in multi-process MP
+        cached_mesh = global_state.get_global_attribute("torch_device_mesh", None)
+        if cached_mesh is not None and hasattr(cached_mesh, 'mesh'):
+            # Check if it's a 1D mesh (MP in multi-process uses 1D)
+            if cached_mesh.mesh.ndim == 1:
+                torch_device_mesh = cached_mesh
+                logger.debug(f"_convert_grads_to_dtensor: got device_mesh from global cache: {torch_device_mesh}")
     
     if torch_device_mesh is None:
         return grads

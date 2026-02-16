@@ -1042,9 +1042,35 @@ def prepare_input_for_distribution(x):
 
 
 def prepare_output_for_loss(x):
-    """Convert DTensor outputs to local tensors."""
-    if not _is_model_parallel_distribution():
+    """Convert DTensor outputs to local tensors.
+    
+    For ModelParallel training, we need to handle sharded outputs properly.
+    When the distribution scope is not active but we have distributed initialized,
+    we still need to handle DTensor outputs correctly.
+    """
+    from keras.src.distribution.distribution_lib import distribution, ModelParallel
+    
+    # Check if we have an active ModelParallel distribution OR if we had one
+    # (by checking if the mesh was cached)
+    current_dist = distribution()
+    is_mp = isinstance(current_dist, ModelParallel)
+    
+    # Even if the scope has exited, check if we have a cached ModelParallel mesh
+    if not is_mp and torch.distributed.is_initialized():
+        # Check if there's a cached MP mesh
+        cached_mesh = global_state.get_global_attribute("torch_device_mesh", None)
+        if cached_mesh is not None and hasattr(cached_mesh, 'mesh'):
+            # Check if it's a 1D mesh (which is what MP uses in multi-process)
+            if cached_mesh.mesh.ndim == 1:
+                # This is likely a cached MP mesh, treat as MP
+                is_mp = True
+    
+    if not is_mp:
+        # Not ModelParallel, return as-is
+        if isinstance(x, DTensor):
+            return x.to_local()
         return x
-
+    
+    # For ModelParallel, convert sharded DTensors to local tensors
     return _convert_structure(x, None, to_dtensor=False, gather_sharded=True)
 

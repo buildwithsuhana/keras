@@ -1,31 +1,28 @@
-# TODO: Fix Mixed Tensor Error in PyTorch Distributed Optimizers
+# TODO: Fix ModelParallel Multi-Process Training Error
 
-## Problem
-The error "aten._foreach_add_.List: got mixed torch.Tensor and DTensor" occurs during training with DataParallel because:
-1. Model weights and optimizer states are converted to DTensors
-2. But gradients remain as regular torch.Tensors
-3. When torch._foreach_* operations are called with mixed types, they fail
+## Problem Analysis
+The test fails during ModelParallel training in multi-process mode with error:
+```
+RuntimeError: Attempting to broadcast a dimension of length 4 at -1! 
+Mismatching argument at index 1 had torch.Size([64, 4]); but expected shape should be broadcastable to [32, 8]
+```
 
-## Files to Check/Update
-1. keras/src/backend/torch/optimizers/torch_adam.py - Already has fix, verify
-2. keras/src/backend/torch/optimizers/torch_sgd.py - Already has fix, verify
-3. keras/src/backend/torch/optimizers/torch_rmsprop.py - FIXED: conversion moved to BEFORE usage
-4. keras/src/backend/torch/optimizers/torch_adagrad.py - Already has fix, verify
-5. keras/src/backend/torch/optimizers/torch_adadelta.py - Already has fix, verify
-6. keras/src/backend/torch/optimizers/torch_lion.py - Already has fix, verify
-7. keras/src/backend/torch/optimizers/torch_nadam.py - Already has fix, verify
-8. keras/src/backend/torch/optimizers/torch_adamax.py - Already has fix, verify
+## Root Cause
+The issue is in `torch_parallel_optimizer.py` - when converting gradients to DTensors:
+1. The function tries to get the device mesh from the current distribution
+2. But in multi-process mode with ModelParallel, the optimizer update happens outside the distribution scope
+3. This causes incorrect placements to be used for gradient conversion
 
-## Fixes Applied
-- torch_rmsprop.py: Moved `_convert_grads_to_dtensor()` call to BEFORE the first `torch._foreach_*` operation that uses gradients
+## Fix Plan
+1. Modify `_convert_grads_to_dtensor` in `torch_parallel_optimizer.py` to properly handle multi-process mode
+2. Ensure gradients use the same placements as optimizer states (which are already correctly distributed)
+3. Add proper fallback logic when distribution context is not available
 
-## Key Fix Required
-The `_convert_grads_to_dtensor()` call MUST happen BEFORE any `torch._foreach_*` operations that:
-1. Take both gradients AND optimizer states as arguments
-2. Or operate on optimizer states that were previously updated with gradients
+## Files to Modify
+- `keras/src/backend/torch/optimizers/torch_parallel_optimizer.py`
 
-## Status
-- [x] Review each optimizer file
-- [x] Fix torch_rmsprop.py - move conversion to BEFORE first usage
-- [ ] Test the fix
+## Test Command
+```bash
+torchrun --nproc_per_node=2 python kaggle_distributed_test.py
+```
 
