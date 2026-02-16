@@ -51,6 +51,7 @@ def _convert_grads_to_dtensor(grads, variables, optimizer_state_variables=None):
     reference_dtensor = None
     if vars_to_check:
         for i, v in enumerate(vars_to_check):
+            # Get the actual tensor value - could be wrapped in a Keras Variable
             value = getattr(v, 'value', v)
             logger.debug(f"_convert_grads_to_dtensor: checking var {i}, type={type(value)}, is_dtensor={isinstance(value, DTensor)}")
             if isinstance(value, DTensor):
@@ -69,7 +70,16 @@ def _convert_grads_to_dtensor(grads, variables, optimizer_state_variables=None):
         if grad is None:
             converted_grads.append(None)
             continue
+        
+        # CRITICAL: Check if grad is already a DTensor
+        # This can happen when the model weights are DTensors and the backward
+        # pass automatically creates DTensor gradients
+        if isinstance(grad, DTensor):
+            logger.debug(f"_convert_grads_to_dtensor: grad {i} is already a DTensor, placements={grad.placements}")
+            converted_grads.append(grad)
+            continue
             
+        # Get the actual tensor value from the optimizer state variable
         value = getattr(variable, 'value', variable)
         if isinstance(value, DTensor):
             # Use the same placements as the optimizer state variable
@@ -112,7 +122,8 @@ class TorchParallelOptimizer(BaseOptimizer):
     def _backend_increment_gradient_accumulators(self, grads, acc_grads):
         # Convert grads to DTensors to match accumulated gradients (DTensors)
         # This prevents "aten._foreach_add_.List: got mixed torch.Tensor and DTensor" error
-        converted_grads = _convert_grads_to_dtensor(grads, acc_grads)
+        # Pass acc_grads as optimizer_state_variables to ensure proper DTensor detection
+        converted_grads = _convert_grads_to_dtensor(grads, acc_grads, optimizer_state_variables=acc_grads)
 
         acc_list = [v.value for v in acc_grads]
         torch._foreach_add_(acc_list, converted_grads, alpha=1.0)
