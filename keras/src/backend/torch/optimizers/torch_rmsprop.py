@@ -26,6 +26,13 @@ class RMSprop(
         # Combine optimizer state variables to check for DTensor
         optimizer_state_variables = velocities[:]
 
+        # CRITICAL: Convert gradients to DTensor FIRST, before any operations
+        # This is required for torch._foreach_* operations to work with DTensor
+        # Must be done before any torch._foreach_* call that uses grads
+        grads = torch_parallel_optimizer._convert_grads_to_dtensor(
+            grads, keras_variables, optimizer_state_variables
+        )
+        
         dtype = variables[0].dtype
         lr = ops.cast(learning_rate, dtype)
 
@@ -65,20 +72,8 @@ class RMSprop(
             ]
             optimizer_state_variables.extend(momentum_list)
             
-            # Convert gradients to DTensor if optimizer states are DTensor
-            # This is required for torch._foreach_* operations to work with DTensor
-            grads = torch_parallel_optimizer._convert_grads_to_dtensor(
-                grads, keras_variables, optimizer_state_variables
-            )
-            
             torch._foreach_mul_(momentum_list, self.momentum)
             torch._foreach_add_(momentum_list, increments)
             torch._foreach_add_(variables, momentum_list, alpha=-1)
         else:
-            # Convert gradients to DTensor if optimizer states are DTensor
-            # This is required for torch._foreach_* operations to work with DTensor
-            grads = torch_parallel_optimizer._convert_grads_to_dtensor(
-                grads, keras_variables, optimizer_state_variables
-            )
-            
             torch._foreach_add_(variables, increments, alpha=-1)
