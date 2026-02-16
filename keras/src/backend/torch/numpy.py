@@ -362,24 +362,20 @@ def matmul(x1, x2):
                             x2 = DTensor.from_local(x2, backend_mesh, [Replicate()])
                         elif x2_is_dtensor_now and not x1_is_dtensor_now:
                             x1 = DTensor.from_local(x1, backend_mesh, [Replicate()])
-                    except Exception:
+                    except Exception as e:
                         # If mesh creation fails, fallback to extracting local tensor
-                        if hasattr(x1, 'to_local'):
-                            x1 = x1.to_local()
-                        if hasattr(x2, 'to_local'):
-                            x2 = x2.to_local()
+                        # BUT this causes issues - we need to keep the tensor as-is
+                        # to allow proper handling in prepare_output_for_loss
+                        # Instead of extracting local tensor, try using the DTensor as-is
+                        # and let PyTorch handle the broadcasting
+                        pass
                 else:
-                    # Fallback: extract local tensor from DTensor to avoid mixed tensor errors
-                    if hasattr(x1, 'to_local'):
-                        x1 = x1.to_local()
-                    if hasattr(x2, 'to_local'):
-                        x2 = x2.to_local()
+                    # Not in distributed mode - fallback
+                    pass
             else:
-                # No source DTensor and no device_mesh - fallback
-                if hasattr(x1, 'to_local'):
-                    x1 = x1.to_local()
-                if hasattr(x2, 'to_local'):
-                    x2 = x2.to_local()
+                # No source DTensor and no device_mesh - this shouldn't happen
+                # in MP multi-process mode but handle gracefully
+                pass
 
     def can_use_int_matmul(x1, x2):
         # torch._int_mm only accepts the following conditions:
