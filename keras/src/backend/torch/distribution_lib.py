@@ -383,7 +383,37 @@ def _layout_to_placements(layout, tensor, device_mesh):
 
 
 def _get_default_device_mesh():
-    """Get the default device mesh from global state."""
+    """Get the default device mesh from global state.
+    
+    IMPORTANT: This function must use the same cache key logic as _to_backend_mesh()
+    to ensure we retrieve the correct mesh for the current distribution type
+    (DataParallel vs ModelParallel).
+    """
+    from keras.src.distribution.distribution_lib import distribution, DataParallel, ModelParallel
+    
+    # Build the same cache key as _to_backend_mesh() to ensure we get the right mesh
+    # for the current distribution type
+    current_dist = distribution()
+    
+    # Try to get the device mesh from the current distribution first
+    if current_dist is not None and hasattr(current_dist, 'device_mesh'):
+        device_mesh = current_dist.device_mesh
+        
+        # Build the same cache key as _to_backend_mesh()
+        dist_type = ""
+        if isinstance(current_dist, ModelParallel):
+            dist_type = "MP"
+        elif isinstance(current_dist, DataParallel):
+            dist_type = "DP"
+        else:
+            dist_type = "NONE"
+        
+        cache_key = f"torch_mesh_{device_mesh.shape}_{device_mesh.axis_names}_{dist_type}"
+        cached = global_state.get_global_attribute(cache_key)
+        if cached is not None:
+            return cached
+    
+    # Fallback: try the generic cache key (for backwards compatibility)
     return global_state.get_global_attribute("torch_device_mesh", None)
 
 
