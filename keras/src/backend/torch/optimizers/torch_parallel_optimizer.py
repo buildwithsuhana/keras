@@ -32,13 +32,32 @@ def _convert_grads_to_dtensor(grads, variables, optimizer_state_variables=None):
     
     # Import here to avoid circular imports
     from torch.distributed._tensor import DTensor, Replicate
-    from keras.src.backend.torch.distribution_lib import _get_default_device_mesh, is_dtensor
+    from keras.src.backend.torch.distribution_lib import is_dtensor
     
-    device_mesh = _get_default_device_mesh()
-    if device_mesh is None:
+    # CRITICAL FIX: Get the device mesh from the current distribution context,
+    # not from global cache. This ensures we use the correct mesh for the
+    # current distribution type (DataParallel vs ModelParallel).
+    from keras.src.distribution.distribution_lib import distribution, ModelParallel, DataParallel
+    
+    current_dist = distribution()
+    torch_device_mesh = None
+    
+    # Get the device mesh from the current distribution if available
+    if current_dist is not None and hasattr(current_dist, 'device_mesh'):
+        from keras.src.backend.torch.distribution_lib import _to_backend_mesh
+        torch_device_mesh = _to_backend_mesh(current_dist.device_mesh)
+        logger.debug(f"_convert_grads_to_dtensor: got device_mesh from current_dist: {torch_device_mesh}")
+    
+    if torch_device_mesh is None:
+        # Fallback to _get_default_device_mesh for non-distributed cases
+        from keras.src.backend.torch.distribution_lib import _get_default_device_mesh
+        torch_device_mesh = _get_default_device_mesh()
+        logger.debug(f"_convert_grads_to_dtensor: got device_mesh from fallback: {torch_device_mesh}")
+    
+    if torch_device_mesh is None:
         return grads
     
-    logger.debug(f"_convert_grads_to_dtensor: device_mesh={device_mesh}")
+    logger.debug(f"_convert_grads_to_dtensor: device_mesh={torch_device_mesh}")
     
     # Determine which variables to check for DTensor
     # Priority: optimizer_state_variables > variables
@@ -85,13 +104,13 @@ def _convert_grads_to_dtensor(grads, variables, optimizer_state_variables=None):
             # Use the same placements as the optimizer state variable
             placements = value.placements
             logger.debug(f"_convert_grads_to_dtensor: converting grad {i} with placements={placements}")
-            dtensor = DTensor.from_local(grad, device_mesh, placements)
+            dtensor = DTensor.from_local(grad, torch_device_mesh, placements)
             converted_grads.append(dtensor)
         elif reference_dtensor is not None:
             # Use the placements from the reference DTensor
             placements = reference_dtensor.placements
             logger.debug(f"_convert_grads_to_dtensor: converting grad {i} with reference placements={placements}")
-            dtensor = DTensor.from_local(grad, device_mesh, placements)
+            dtensor = DTensor.from_local(grad, torch_device_mesh, placements)
             converted_grads.append(dtensor)
         else:
             # For non-DTensor variables, replicate the gradient
