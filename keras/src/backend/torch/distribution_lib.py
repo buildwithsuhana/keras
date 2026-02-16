@@ -6,9 +6,11 @@ DTensor API for distributed tensor computing.
 
 import os
 
+import numpy as np
 import torch
 
 from keras.src.backend.common import global_state
+from keras.src.backend.common.variables import standardize_dtype
 from keras.src.backend.torch.core import convert_to_tensor
 
 from torch.distributed._tensor import DTensor, DeviceMesh, Replicate, Shard
@@ -973,6 +975,11 @@ def prepare_input_for_distribution(x):
     converting to DTensors, since the model weights are sharded and each process
     operates on its local portion.
     
+    IMPORTANT: For ModelParallel (tensor parallelism), each rank should receive
+    the FULL batch, not a slice. Only the model weights are sharded across
+    the "model" axis. This is different from DataParallel where the batch IS
+    split across ranks.
+    
     This function checks if we have an active device mesh and distributed
     context, and converts inputs to DTensors accordingly.
     """
@@ -1034,6 +1041,50 @@ def prepare_input_for_distribution(x):
             except:
                 pass
             print(f"DEBUG | [Rank {rank}] prepare_input_for_distribution: skipping DTensor conversion for ModelParallel in multi-process mode (is_mp={is_mp}, cached_mp_multi_process={cached_mp_multi_process})")
+        
+        # CRITICAL FIX: Ensure the input tensor is on the correct CUDA device
+        # In multi-process mode with CUDA_VISIBLE_DEVICES, each process
+        # only sees its local GPU as cuda:0. We need to ensure the local
+        # tensor is on the correct device.
+        if isinstance(x, torch.Tensor):
+            local_rank = 0
+            try:
+                import torch.distributed as dist
+                if dist.is_available() and dist.is_initialized():
+                    local_rank = dist.get_rank()
+            except:
+                pass
+            
+            if torch.cuda.is_available():
+                # Ensure tensor is on the correct CUDA device for this process
+                if x.is_cuda:
+                    current_device = torch.cuda.current_device()
+                    if x.device.index != current_device:
+                        x = x.to(f"cuda:{current_device}")
+                else:
+                    # Tensor is on CPU, move to CUDA
+                    x = x.to(device=f"cuda:{local_rank}")
+        elif isinstance(x, np.ndarray):
+            # Convert numpy array to torch tensor on correct device
+            if torch.cuda.is_available():
+                local_rank = 0
+                try:
+                    import torch.distributed as dist
+                    if dist.is_available() and dist.is_initialized():
+                        local_rank = dist.get_rank()
+                except:
+                    pass
+                
+                # Convert numpy to torch tensor on correct device
+                if x.dtype == np.uint32:
+                    x = x.astype(np.int64)
+                dtype = standardize_dtype(x.dtype)
+                if dtype == "bfloat16":
+                    x = x.astype(np.float32)
+                    dtype = "bfloat16"
+                from keras.src.backend.torch.core import to_torch_dtype
+                x = torch.as_tensor(x, dtype=to_torch_dtype(dtype), device=f"cuda:{local_rank}")
+        
         return x
     
     # CRITICAL FIX: Get the device mesh from the CURRENT distribution, not from
