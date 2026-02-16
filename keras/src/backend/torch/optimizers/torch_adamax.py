@@ -36,6 +36,10 @@ class Adamax(
             grads, keras_variables, optimizer_state_variables
         )
 
+        # Check if we're working with DTensors
+        from torch.distributed._tensor import DTensor
+        use_dtensor = any(isinstance(m, DTensor) for m in m_list) if m_list else False
+        
         dtype = variables[0].dtype
         lr = ops.cast(learning_rate, dtype)
 
@@ -43,11 +47,23 @@ class Adamax(
 
         beta_1_power = ops.power(ops.cast(self.beta_1, dtype), local_step)
 
-        torch._foreach_mul_(m_list, self.beta_1)
-        torch._foreach_add_(m_list, grads, alpha=1 - self.beta_1)
+        # CRITICAL FIX: For DTensor operations, scalars must be converted to tensors
+        if use_dtensor:
+            beta_1_tensor = torch.tensor(self.beta_1, dtype=dtype)
+            beta_2_tensor = torch.tensor(self.beta_2, dtype=dtype)
+            one_minus_beta_1 = torch.tensor(1 - self.beta_1, dtype=dtype)
+            
+            torch._foreach_mul_(m_list, beta_1_tensor)
+            torch._foreach_add_(m_list, grads, alpha=one_minus_beta_1)
 
-        torch._foreach_mul_(u_list, self.beta_2)
-        torch._foreach_maximum_(u_list, torch._foreach_abs(grads))
+            torch._foreach_mul_(u_list, beta_2_tensor)
+            torch._foreach_maximum_(u_list, torch._foreach_abs(grads))
+        else:
+            torch._foreach_mul_(m_list, self.beta_1)
+            torch._foreach_add_(m_list, grads, alpha=1 - self.beta_1)
+
+            torch._foreach_mul_(u_list, self.beta_2)
+            torch._foreach_maximum_(u_list, torch._foreach_abs(grads))
 
         torch._foreach_add_(
             variables,

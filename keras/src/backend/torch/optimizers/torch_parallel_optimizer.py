@@ -39,22 +39,45 @@ def _convert_grads_to_dtensor(grads, variables, optimizer_state_variables=None):
     from keras.src.backend.torch.distribution_lib import is_dtensor
     from keras.src.backend.common import global_state
     
-    # CRITICAL FIX: Get the device mesh from the current distribution context,
-    # not from global cache. This ensures we use the correct mesh for the
-    # current distribution type (DataParallel vs ModelParallel).
-    from keras.src.distribution.distribution_lib import distribution, ModelParallel, DataParallel
-    
-    current_dist = distribution()
+    # CRITICAL FIX: Get the device mesh from optimizer state variables first!
+    # If optimizer states are DTensors, they contain the mesh and placements info
+    # even when the distribution scope has exited.
     torch_device_mesh = None
+    reference_dtensor = None
     
-    # Check if we're in ModelParallel multi-process mode
-    is_mp = isinstance(current_dist, ModelParallel)
+    # First, check if any optimizer state variable is already a DTensor
+    # If so, we can extract the device mesh from it
+    vars_to_check = optimizer_state_variables if optimizer_state_variables is not None else variables
     
-    # Get the device mesh from the current distribution if available
-    if current_dist is not None and hasattr(current_dist, 'device_mesh'):
-        from keras.src.backend.torch.distribution_lib import _to_backend_mesh
-        torch_device_mesh = _to_backend_mesh(current_dist.device_mesh)
-        logger.debug(f"_convert_grads_to_dtensor: got device_mesh from current_dist: {torch_device_mesh}")
+    if vars_to_check:
+        for i, v in enumerate(vars_to_check):
+            # Get the actual tensor value - could be wrapped in a Keras Variable
+            value = getattr(v, 'value', v)
+            if isinstance(value, DTensor):
+                # Found a DTensor - extract device mesh from it
+                # DTensor's device_mesh property gives us the mesh
+                reference_dtensor = value
+                torch_device_mesh = value.device_mesh
+                logger.debug(f"_convert_grads_to_dtensor: extracted device_mesh from DTensor optimizer state: {torch_device_mesh}")
+                break
+    
+    # If we couldn't get mesh from optimizer states, try current distribution
+    if torch_device_mesh is None:
+        # CRITICAL FIX: Get the device mesh from the current distribution context,
+        # not from global cache. This ensures we use the correct mesh for the
+        # current distribution type (DataParallel vs ModelParallel).
+        from keras.src.distribution.distribution_lib import distribution, ModelParallel, DataParallel
+        
+        current_dist = distribution()
+        
+        # Check if we're in ModelParallel multi-process mode
+        is_mp = isinstance(current_dist, ModelParallel)
+        
+        # Get the device mesh from the current distribution if available
+        if current_dist is not None and hasattr(current_dist, 'device_mesh'):
+            from keras.src.backend.torch.distribution_lib import _to_backend_mesh
+            torch_device_mesh = _to_backend_mesh(current_dist.device_mesh)
+            logger.debug(f"_convert_grads_to_dtensor: got device_mesh from current_dist: {torch_device_mesh}")
     
     if torch_device_mesh is None:
         # Fallback to _get_default_device_mesh for non-distributed cases
@@ -79,15 +102,10 @@ def _convert_grads_to_dtensor(grads, variables, optimizer_state_variables=None):
     
     logger.debug(f"_convert_grads_to_dtensor: device_mesh={torch_device_mesh}")
     
-    # Determine which variables to check for DTensor
-    # Priority: optimizer_state_variables > variables
-    vars_to_check = optimizer_state_variables if optimizer_state_variables is not None else variables
-    
-    # Check if any variable is a DTensor
+    # Check if any variable is a DTensor (redo check with found mesh)
     # In DataParallel, model weights are NOT DTensors but optimizer states ARE
     # So we need to check optimizer_state_variables if provided
     has_dtensor = False
-    reference_dtensor = None
     if vars_to_check:
         for i, v in enumerate(vars_to_check):
             # Get the actual tensor value - could be wrapped in a Keras Variable
@@ -95,7 +113,8 @@ def _convert_grads_to_dtensor(grads, variables, optimizer_state_variables=None):
             logger.debug(f"_convert_grads_to_dtensor: checking var {i}, type={type(value)}, is_dtensor={isinstance(value, DTensor)}")
             if isinstance(value, DTensor):
                 has_dtensor = True
-                reference_dtensor = value
+                if reference_dtensor is None:
+                    reference_dtensor = value
                 logger.debug(f"_convert_grads_to_dtensor: found DTensor at index {i}, placements={value.placements}")
                 break
     
@@ -180,7 +199,7 @@ def _convert_grads_to_dtensor(grads, variables, optimizer_state_variables=None):
             dtensor = DTensor.from_local(grad, torch_device_mesh, placements)
             converted_grads.append(dtensor)
         else:
-            # For non-DTensor variables, replicate the gradient
+            # For non-DTensor variables, keep the gradient as-is
             logger.debug(f"_convert_grads_to_dtensor: keeping grad {i} as-is (non-DTensor variable)")
             converted_grads.append(grad)
     
@@ -202,7 +221,18 @@ class TorchParallelOptimizer(BaseOptimizer):
         acc_list = [
             v.value for v in self._accumulated_gradients if v is not None
         ]
-        torch._foreach_mul_(acc_list, 0.0)
+        if acc_list:
+            # Check if we're working with DTensors
+            from torch.distributed._tensor import DTensor
+            use_dtensor = any(isinstance(a, DTensor) for a in acc_list)
+            
+            if use_dtensor:
+                # CRITICAL FIX: For DTensor operations, scalars must be converted to tensors
+                dtype = acc_list[0].dtype
+                zero_tensor = torch.tensor(0.0, dtype=dtype)
+                torch._foreach_mul_(acc_list, zero_tensor)
+            else:
+                torch._foreach_mul_(acc_list, 0.0)
 
     @torch_utils.no_grad
     def _backend_increment_gradient_accumulators(self, grads, acc_grads):
@@ -212,5 +242,15 @@ class TorchParallelOptimizer(BaseOptimizer):
         converted_grads = _convert_grads_to_dtensor(grads, acc_grads, optimizer_state_variables=acc_grads)
 
         acc_list = [v.value for v in acc_grads]
-        torch._foreach_add_(acc_list, converted_grads, alpha=1.0)
+        
+        # Check if we're working with DTensors
+        from torch.distributed._tensor import DTensor
+        use_dtensor = any(isinstance(a, DTensor) for a in acc_list)
+        
+        if use_dtensor:
+            # CRITICAL FIX: For DTensor operations, alpha must be a tensor
+            alpha_tensor = torch.tensor(1.0, dtype=converted_grads[0].dtype if converted_grads else acc_list[0].dtype)
+            torch._foreach_add_(acc_list, converted_grads, alpha=alpha_tensor)
+        else:
+            torch._foreach_add_(acc_list, converted_grads, alpha=1.0)
 

@@ -38,14 +38,28 @@ class Adadelta(
             grads, keras_variables, optimizer_state_variables
         )
 
+        # Check if we're working with DTensors
+        from torch.distributed._tensor import DTensor
+        use_dtensor = any(isinstance(a, DTensor) for a in accumulated_grads) if accumulated_grads else False
+        
         dtype = variables[0].dtype
         lr = ops.cast(learning_rate, dtype)
         rho = self.rho
 
-        torch._foreach_mul_(accumulated_grads, rho)
-        torch._foreach_add_(
-            accumulated_grads, torch._foreach_mul(grads, grads), alpha=1 - rho
-        )
+        # CRITICAL FIX: For DTensor operations, scalars must be converted to tensors
+        if use_dtensor:
+            rho_tensor = torch.tensor(rho, dtype=dtype)
+            one_minus_rho = torch.tensor(1 - rho, dtype=dtype)
+            
+            torch._foreach_mul_(accumulated_grads, rho_tensor)
+            torch._foreach_add_(
+                accumulated_grads, torch._foreach_mul(grads, grads), alpha=one_minus_rho
+            )
+        else:
+            torch._foreach_mul_(accumulated_grads, rho)
+            torch._foreach_add_(
+                accumulated_grads, torch._foreach_mul(grads, grads), alpha=1 - rho
+            )
 
         def rms(x):
             return torch._foreach_sqrt(torch._foreach_add(x, self.epsilon))
@@ -57,11 +71,20 @@ class Adadelta(
             ),
             -1,
         )
-        torch._foreach_mul_(accumulated_delta_vars, rho)
-        torch._foreach_add_(
-            accumulated_delta_vars,
-            torch._foreach_mul(delta_vars, delta_vars),
-            alpha=1 - rho,
-        )
+        
+        if use_dtensor:
+            torch._foreach_mul_(accumulated_delta_vars, rho_tensor)
+            torch._foreach_add_(
+                accumulated_delta_vars,
+                torch._foreach_mul(delta_vars, delta_vars),
+                alpha=one_minus_rho,
+            )
+        else:
+            torch._foreach_mul_(accumulated_delta_vars, rho)
+            torch._foreach_add_(
+                accumulated_delta_vars,
+                torch._foreach_mul(delta_vars, delta_vars),
+                alpha=1 - rho,
+            )
 
         torch._foreach_add_(variables, delta_vars, alpha=lr)

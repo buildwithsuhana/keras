@@ -35,6 +35,10 @@ class Nadam(torch_parallel_optimizer.TorchParallelOptimizer, optimizers.Nadam):
             grads, keras_variables, optimizer_state_variables
         )
 
+        # Check if we're working with DTensors
+        from torch.distributed._tensor import DTensor
+        use_dtensor = any(isinstance(m, DTensor) for m in m_list) if m_list else False
+        
         dtype = variables[0].dtype
         lr = ops.cast(learning_rate, dtype)
 
@@ -51,13 +55,28 @@ class Nadam(torch_parallel_optimizer.TorchParallelOptimizer, optimizers.Nadam):
 
         self._u_product.assign(u_product_t)
 
-        torch._foreach_mul_(m_list, self.beta_1)
-        torch._foreach_add_(m_list, grads, alpha=1 - self.beta_1)
+        # CRITICAL FIX: For DTensor operations, scalars must be converted to tensors
+        if use_dtensor:
+            beta_1_tensor = torch.tensor(self.beta_1, dtype=dtype)
+            beta_2_tensor = torch.tensor(self.beta_2, dtype=dtype)
+            one_minus_beta_1 = torch.tensor(1 - self.beta_1, dtype=dtype)
+            one_minus_beta_2 = torch.tensor(1 - self.beta_2, dtype=dtype)
+            
+            torch._foreach_mul_(m_list, beta_1_tensor)
+            torch._foreach_add_(m_list, grads, alpha=one_minus_beta_1)
 
-        torch._foreach_mul_(v_list, self.beta_2)
-        torch._foreach_add_(
-            v_list, torch._foreach_mul(grads, grads), alpha=1 - self.beta_2
-        )
+            torch._foreach_mul_(v_list, beta_2_tensor)
+            torch._foreach_add_(
+                v_list, torch._foreach_mul(grads, grads), alpha=one_minus_beta_2
+            )
+        else:
+            torch._foreach_mul_(m_list, self.beta_1)
+            torch._foreach_add_(m_list, grads, alpha=1 - self.beta_1)
+
+            torch._foreach_mul_(v_list, self.beta_2)
+            torch._foreach_add_(
+                v_list, torch._foreach_mul(grads, grads), alpha=1 - self.beta_2
+            )
 
         m_hat_list = torch._foreach_add(
             torch._foreach_div(

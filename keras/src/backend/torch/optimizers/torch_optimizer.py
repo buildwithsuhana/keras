@@ -39,7 +39,21 @@ class TorchOptimizer(BaseOptimizer):
         if self.weight_decay is None:
             return
 
-        torch._foreach_mul_(
-            [v.value for v in variables if self._use_weight_decay(v)],
-            1 - self.weight_decay * self._get_current_learning_rate(),
-        )
+        var_list = [v.value for v in variables if self._use_weight_decay(v)]
+        if not var_list:
+            return
+            
+        # Check if we're working with DTensors
+        from torch.distributed._tensor import DTensor
+        use_dtensor = any(isinstance(v, DTensor) for v in var_list)
+        
+        if use_dtensor:
+            # CRITICAL FIX: For DTensor operations, scalars must be converted to tensors
+            dtype = var_list[0].dtype
+            decay_factor = torch.tensor(1 - self.weight_decay * self._get_current_learning_rate(), dtype=dtype)
+            torch._foreach_mul_(var_list, decay_factor)
+        else:
+            torch._foreach_mul_(
+                var_list,
+                1 - self.weight_decay * self._get_current_learning_rate(),
+            )

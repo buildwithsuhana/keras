@@ -33,15 +33,29 @@ class RMSprop(
             grads, keras_variables, optimizer_state_variables
         )
         
+        # Check if we're working with DTensors
+        from torch.distributed._tensor import DTensor
+        use_dtensor = any(isinstance(v, DTensor) for v in velocities) if velocities else False
+        
         dtype = variables[0].dtype
         lr = ops.cast(learning_rate, dtype)
 
         rho = self.rho
 
-        torch._foreach_mul_(velocities, rho)
-        torch._foreach_add_(
-            velocities, torch._foreach_mul(grads, grads), alpha=1 - rho
-        )
+        # CRITICAL FIX: For DTensor operations, scalars must be converted to tensors
+        if use_dtensor:
+            rho_tensor = torch.tensor(rho, dtype=dtype)
+            one_minus_rho = torch.tensor(1 - rho, dtype=dtype)
+            
+            torch._foreach_mul_(velocities, rho_tensor)
+            torch._foreach_add_(
+                velocities, torch._foreach_mul(grads, grads), alpha=one_minus_rho
+            )
+        else:
+            torch._foreach_mul_(velocities, rho)
+            torch._foreach_add_(
+                velocities, torch._foreach_mul(grads, grads), alpha=1 - rho
+            )
 
         denominators = torch._foreach_add(velocities, self.epsilon)
         if self.centered:
@@ -53,8 +67,15 @@ class RMSprop(
             ]
             optimizer_state_variables.extend(average_grads)
             
-            torch._foreach_mul_(average_grads, rho)
-            torch._foreach_add_(average_grads, grads, alpha=1 - rho)
+            # Check again for DTensor since average_grads might be different
+            use_dtensor = use_dtensor or any(isinstance(a, DTensor) for a in average_grads) if average_grads else use_dtensor
+            
+            if use_dtensor:
+                torch._foreach_mul_(average_grads, rho_tensor)
+                torch._foreach_add_(average_grads, grads, alpha=one_minus_rho)
+            else:
+                torch._foreach_mul_(average_grads, rho)
+                torch._foreach_add_(average_grads, grads, alpha=1 - rho)
             torch._foreach_add_(
                 denominators,
                 torch._foreach_mul(average_grads, average_grads),
@@ -72,8 +93,17 @@ class RMSprop(
             ]
             optimizer_state_variables.extend(momentum_list)
             
-            torch._foreach_mul_(momentum_list, self.momentum)
-            torch._foreach_add_(momentum_list, increments)
-            torch._foreach_add_(variables, momentum_list, alpha=-1)
+            # Check again for DTensor since momentum_list might be different
+            use_dtensor = use_dtensor or any(isinstance(m, DTensor) for m in momentum_list) if momentum_list else use_dtensor
+            
+            if use_dtensor:
+                momentum_tensor = torch.tensor(self.momentum, dtype=dtype)
+                torch._foreach_mul_(momentum_list, momentum_tensor)
+                torch._foreach_add_(momentum_list, increments)
+                torch._foreach_add_(variables, momentum_list, alpha=-1)
+            else:
+                torch._foreach_mul_(momentum_list, self.momentum)
+                torch._foreach_add_(momentum_list, increments)
+                torch._foreach_add_(variables, momentum_list, alpha=-1)
         else:
             torch._foreach_add_(variables, increments, alpha=-1)
