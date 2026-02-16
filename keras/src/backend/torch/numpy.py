@@ -240,11 +240,15 @@ def matmul(x1, x2):
         if device_mesh is not None:
             # Standard case - convert regular tensor to DTensor
             if x1_is_dtensor and not x2_is_dtensor:
-                placements = x1_placements or [Replicate()]
-                x2 = DTensor.from_local(x2, device_mesh, placements)
+                # x1 is DTensor (kernel), x2 is regular tensor (input)
+                # Use Replicate() for the input, NOT the kernel's sharding
+                # Each rank needs the FULL input to compute with its portion of the sharded kernel
+                x2 = DTensor.from_local(x2, device_mesh, [Replicate()])
             elif x2_is_dtensor and not x1_is_dtensor:
-                placements = x2_placements or [Replicate()]
-                x1 = DTensor.from_local(x1, device_mesh, placements)
+                # x1 is regular tensor (input), x2 is DTensor (kernel)
+                # Use Replicate() for the input, NOT the kernel's sharding
+                # Each rank needs the FULL input to compute with its portion of the sharded kernel
+                x1 = DTensor.from_local(x1, device_mesh, [Replicate()])
         else:
             # device_mesh is None - this can happen during symbolic build
             # Fallback: extract local tensor from DTensor to avoid mixed tensor errors
