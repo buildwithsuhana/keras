@@ -1217,16 +1217,45 @@ def prepare_output_for_loss(x):
         local_shape = local_tensor.shape
         
         # Check if this is a sharded DTensor by comparing local vs global shape
-        # If the last dimension is different, it's sharded
+        # OR if it has Partial(sum) placement which requires all-reduce
         global_shape = x.shape
+        
+        # Check for Partial placement - this indicates the output needs all-reduce
+        # (e.g., from ColwiseParallel/RowwiseParallel in tensor parallelism)
+        has_partial = any(isinstance(p, torch.distributed._tensor.api._dtensor_spec.Placement) and 
+                         type(p).__name__ == 'Partial' for p in x.placements)
+        
+        # Also check explicitly for Partial using isinstance
+        from torch.distributed._tensor.placement_types import Partial
+        has_partial = has_partial or any(isinstance(p, Partial) for p in x.placements)
+        
         is_sharded = (len(local_shape) > 0 and len(global_shape) > 0 and 
                       local_shape[-1] != global_shape[-1])
         
-        if debug_mode:
-            print(f"DEBUG | [Rank {rank}] prepare_output_for_loss: is_sharded = {is_sharded} (local={local_shape}, global={global_shape})")
+        # Need all-gather/reduce if:
+        # 1. Tensor is sharded (local shape != global shape on some dimension)
+        # 2. OR tensor has Partial placement (needs all-reduce for proper output)
+        needs_all_gather = is_sharded or has_partial
         
-        if is_sharded:
-            # This is a sharded DTensor - all-gather it
+        if debug_mode:
+            print(f"DEBUG | [Rank {rank}] prepare_output_for_loss: is_sharded = {is_sharded}, has_partial = {has_partial}, needs_all_gather = {needs_all_gather} (local={local_shape}, global={global_shape})")
+        
+        if needs_all_gather:
+            # Check if it's Partial placement - need to all-reduce instead of all-gather
+            if has_partial:
+                # For Partial placement, we need to all-reduce to get the correct output
+                # This handles the case where ColwiseParallel/RowwiseParallel produces
+                # Partial(sum) output that needs to be summed across all ranks
+                if debug_mode:
+                    print(f"DEBUG | [Rank {rank}] prepare_output_for_loss: all-reducing DTensor with Partial placement")
+                
+                # All-reduce the local tensor to get the correct output
+                # This sums the partial outputs across all ranks
+                output = local_tensor.clone()
+                torch.distributed.all_reduce(output)
+                return output
+            
+            # For Shard placement - all-gather the tensor
             try:
                 # Determine shard dimension from placements or infer from shape difference
                 shard_dim = None
