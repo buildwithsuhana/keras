@@ -372,15 +372,17 @@ def _layout_to_placements(layout, tensor, device_mesh):
     else:
         layout_axes = layout
     
-    # For 1D mesh, return exactly 1 placement
+# For 1D mesh, return exactly 1 placement
     if mesh_ndim == 1:
         # Look for 'model' axis in the layout
         if layout_axes is not None:
             for i, axis in enumerate(layout_axes):
                 if axis == 'model':
-                    # Found 'model' axis at layout position i
-                    # Shard on TENSOR dimension i (not mesh dimension)
-                    return [Shard(i)]
+                    # CRITICAL FIX: For 1D mesh, always use Shard(0) regardless of layout position
+                    # The 1D mesh only has one dimension (the 'model' axis), so we can only
+                    # shard on dimension 0 of the tensor. Using a higher dimension would cause
+                    # "Sharding dim X greater than tensor ndim" errors.
+                    return [Shard(0)]
         # No 'model' axis found or layout is None - replicate
         return [Replicate()]
     else:
