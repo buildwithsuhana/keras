@@ -544,53 +544,32 @@ def _to_backend_mesh(device_mesh):
                 print(f"DEBUG | [Rank {rank}] _to_backend_mesh: is_model_parallel={is_model_parallel}, is_multi_dim_mesh={is_multi_dim_mesh}, world_size={world_size}")
             
             if is_model_parallel and is_multi_dim_mesh:
-                # For ModelParallel with multi-dimensional mesh, we need to handle it differently
-                # The mesh shape might be (1, num_devices) where num_devices is the model parallel dimension
-                # We need to use the full mesh structure
+                # For ModelParallel with multi-dimensional mesh in multi-process mode,
+                # we need to fall back to 1D mesh because each process can only see
+                # its local GPU due to CUDA_VISIBLE_DEVICES isolation.
+                #
+                # The 2D mesh (batch, model) requires multiple GPUs visible per process,
+                # but in multi-process mode each process only has 1 GPU.
+                #
+                # Instead, we create a 1D mesh and use the placement logic to handle
+                # the sharding. This ensures consistency between inputs and model weights.
                 
-                # Get the mesh shape from the Keras DeviceMesh
-                mesh_shape = device_mesh.shape
-                mesh_dim_names = list(device_mesh.axis_names)
+                # Get the mesh dimension names - use "model" for MP
+                mesh_dim_names = ["model"]
                 
                 if debug_mode:
-                    print(f"DEBUG | [Rank {rank}] _to_backend_mesh: creating 2D mesh with shape={mesh_shape}, dim_names={mesh_dim_names}")
+                    print(f"DEBUG | [Rank {rank}] _to_backend_mesh: creating 1D mesh for MP in multi-process mode (fallback from 2D)")
                 
                 if torch.cuda.is_available():
-                    # CRITICAL FIX: For multi-dimensional mesh in distributed setting with ModelParallel,
-                    # we need to create a mesh that properly represents the 2D structure.
-                    # 
-                    # When we have shape=(1, 2) with 2 processes:
-                    # - Process 0 has GPU 0, Process 1 has GPU 1
-                    # - The mesh should be [[0], [1]] in PyTorch's representation
-                    #   where the first dim is the batch (size 1) and second dim is model (size 2)
-                    #
-                    # With init_device_mesh, we need to provide the correct shape that matches
-                    # the number of available GPUs per process
-                    
-                    # The key insight: each process contributes its local GPU to the mesh
-                    # For shape (1, 2), we want a 2D mesh where:
-                    # - batch dimension = 1 (each process handles full batch)
-                    # - model dimension = 2 (two GPUs for model parallelism)
-                    #
-                    # But since each process only sees 1 GPU, we need to create a mesh
-                    # that accounts for this. The trick is to use the proper shape.
-                    
-                    # Actually, the correct approach for multi-process ModelParallel is:
-                    # Each process should have its own mesh that represents the local device
-                    # For world_size=2 with mesh_shape=(1, 2), each process has 1 GPU
-                    # We need to create a 2D mesh where the local GPU is mapped correctly
-                    
-                    # Let's create the mesh such that it works across processes
-                    # The mesh shape should be (1, world_size) for proper 2D representation
-                    # where world_size is the number of processes
+                    # Create 1D mesh with world_size (each process has 1 GPU)
                     backend_mesh = init_device_mesh(
                         device_type="cuda",
-                        mesh_shape=mesh_shape,
+                        mesh_shape=(world_size,),
                         mesh_dim_names=mesh_dim_names
                     )
                     
                     if debug_mode:
-                        print(f"DEBUG | [Rank {rank}] _to_backend_mesh: created 2D mesh: {backend_mesh}")
+                        print(f"DEBUG | [Rank {rank}] _to_backend_mesh: created 1D mesh for MP: {backend_mesh}")
                     
                     global_state.set_global_attribute(cache_key, backend_mesh)
                     global_state.set_global_attribute("torch_device_mesh", backend_mesh)
