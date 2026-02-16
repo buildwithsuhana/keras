@@ -1142,6 +1142,18 @@ def prepare_output_for_loss(x):
     global _MP_MULTI_PROCESS_STATE
     cached_mp_state = _MP_MULTI_PROCESS_STATE
     
+    # Debug: print the global state
+    debug_mode = os.environ.get("KERAS_DISTRIBUTION_DEBUG", "0") == "1"
+    if debug_mode:
+        rank = 0
+        try:
+            import torch.distributed as dist
+            if dist.is_available() and dist.is_initialized():
+                rank = dist.get_rank()
+        except:
+            pass
+        print(f"DEBUG | [Rank {rank}] prepare_output_for_loss START: cached_mp_state={cached_mp_state}, x_type={type(x).__name__}, x_shape={getattr(x, 'shape', 'N/A')}")
+    
     # Even if the scope has exited, check if we have a cached ModelParallel mesh
     # or if we cached the MP multi-process state
     if not is_mp and torch.distributed.is_initialized():
@@ -1153,6 +1165,9 @@ def prepare_output_for_loss(x):
             if cached_mesh is not None and hasattr(cached_mesh, 'mesh'):
                 if cached_mesh.mesh.ndim == 1:
                     is_mp = True
+    
+    if debug_mode:
+        print(f"DEBUG | [Rank {rank}] prepare_output_for_loss AFTER CHECK: is_mp={is_mp}, cached_mp_state={cached_mp_state}")
     
     if not is_mp:
         if isinstance(x, DTensor):
@@ -1193,6 +1208,9 @@ def prepare_output_for_loss(x):
             # This works because:
             # - y_pred (sharded): last_dim = 4 -> 4 < 8 -> triggers all-gather
             # - y (full): last_dim = 8 -> 8 >= 8 -> does NOT trigger all-gather
+            if debug_mode:
+                print(f"DEBUG | [Rank {rank}] prepare_output_for_loss: last_dim={last_dim}, checking if {last_dim} < 8 = {last_dim < 8}")
+            
             if last_dim < 8:  # Threshold for "likely a shard"
                 try:
                     local_tensor = x.contiguous()
