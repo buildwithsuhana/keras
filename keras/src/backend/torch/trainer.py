@@ -27,6 +27,9 @@ class TorchTrainer(base_trainer.Trainer):
         # Cache for torch.compile decision - set during fit/evaluate/predict
         # when distribution scope is still active
         self._torch_compile_disabled_for_mp = False
+        # Cache for ModelParallel multi-process mode - used to skip input DTensor
+        # conversion during training when distribution scope isn't available
+        self._is_mp_multi_process = False
 
     def _parallelize_if_needed(self):
         """Parallelize the model if ModelParallel distribution is active.
@@ -130,6 +133,37 @@ class TorchTrainer(base_trainer.Trainer):
                 "in multi-process training."
             )
             self._torch_compile_disabled_for_mp = True
+
+    def _cache_mp_multi_process_state(self):
+        """Cache whether we're in ModelParallel multi-process mode.
+        
+        This method should be called at the start of fit/evaluate/predict when
+        the distribution scope is still active. It caches the state so that
+        prepare_input_for_distribution can use it later when the scope has exited
+        (e.g., during torch.compile traced execution).
+        """
+        if self._is_mp_multi_process:
+            # Already cached
+            return
+            
+        from keras.src.distribution.distribution_lib import distribution, ModelParallel
+        import torch.distributed as dist
+        
+        current_dist = distribution()
+        is_mp = isinstance(current_dist, ModelParallel)
+        is_distributed = dist.is_available() and dist.is_initialized()
+        
+        # Cache the state for later use
+        self._is_mp_multi_process = is_mp and is_distributed
+        
+        # Also set the global state so prepare_input_for_distribution can access it
+        from keras.src.backend.torch import distribution_lib as torch_dist_lib
+        torch_dist_lib.set_mp_multi_process_state(self._is_mp_multi_process)
+        
+        if self._is_mp_multi_process:
+            import os
+            if os.environ.get("KERAS_DISTRIBUTION_DEBUG", "0") == "1":
+                print("DEBUG | Cached _is_mp_multi_process=True for later use in prepare_input_for_distribution")
 
     def train_step(self, data):
         x, y, sample_weight = data_adapter_utils.unpack_x_y_sample_weight(data)
@@ -346,6 +380,8 @@ class TorchTrainer(base_trainer.Trainer):
         # Check if torch.compile should be disabled for ModelParallel in multi-process
         # This must be done while the distribution scope is still active
         self._check_and_disable_torch_compile_for_mp()
+        # Cache MP multi-process state while distribution scope is still active
+        self._cache_mp_multi_process_state()
         self._symbolic_build(iterator=epoch_iterator)
         epoch_iterator.reset()
 
@@ -476,6 +512,8 @@ class TorchTrainer(base_trainer.Trainer):
         # Check if torch.compile should be disabled for ModelParallel in multi-process
         # This must be done while the distribution scope is still active
         self._check_and_disable_torch_compile_for_mp()
+        # Cache MP multi-process state while distribution scope is still active
+        self._cache_mp_multi_process_state()
         self._symbolic_build(iterator=epoch_iterator)
         epoch_iterator.reset()
 
@@ -528,6 +566,8 @@ class TorchTrainer(base_trainer.Trainer):
         # Check if torch.compile should be disabled for ModelParallel in multi-process
         # This must be done while the distribution scope is still active
         self._check_and_disable_torch_compile_for_mp()
+        # Cache MP multi-process state while distribution scope is still active
+        self._cache_mp_multi_process_state()
         # Container that configures and calls callbacks.
         if not isinstance(callbacks, callbacks_module.CallbackList):
             callbacks = callbacks_module.CallbackList(

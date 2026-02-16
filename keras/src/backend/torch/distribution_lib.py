@@ -17,6 +17,27 @@ from torch.distributed.tensor.parallel import parallelize_module, ColwiseParalle
 
 TENSOR_PARALLEL_AVAILABLE = True
 
+# Global variable to cache ModelParallel multi-process state
+# This is set by TorchTrainer when entering fit/evaluate/predict
+# and checked by prepare_input_for_distribution during training
+_MP_MULTI_PROCESS_STATE = False
+
+
+def set_mp_multi_process_state(is_mp_multi_process):
+    """Set the cached ModelParallel multi-process state.
+    
+    This should be called by TorchTrainer at the start of fit/evaluate/predict
+    when the distribution scope is still active.
+    
+    Args:
+        is_mp_multi_process: Boolean indicating if we're in MP multi-process mode
+    """
+    global _MP_MULTI_PROCESS_STATE
+    _MP_MULTI_PROCESS_STATE = is_mp_multi_process
+    debug_mode = os.environ.get("KERAS_DISTRIBUTION_DEBUG", "0") == "1"
+    if debug_mode:
+        print(f"DEBUG | set_mp_multi_process_state: {_MP_MULTI_PROCESS_STATE}")
+
 
 def list_devices(device_type=None):
     """Return all available devices based on device type."""
@@ -982,6 +1003,16 @@ def prepare_input_for_distribution(x):
     # Even outside the scope, we might have sharded weights
     is_distributed = torch.distributed.is_initialized()
     
+    # CRITICAL FIX: Check the cached ModelParallel multi-process state.
+    # This is set by TorchTrainer at the start of fit/evaluate/predict when
+    # the distribution scope is still active, and is used when the scope
+    # is not available (e.g., during torch.compile traced execution).
+    global _MP_MULTI_PROCESS_STATE
+    cached_mp_multi_process = _MP_MULTI_PROCESS_STATE
+    
+    if debug_mode:
+        print(f"DEBUG | [Rank {rank}] prepare_input_for_distribution: cached_mp_multi_process={cached_mp_multi_process}")
+    
     # CRITICAL FIX: For ModelParallel in multi-process mode, do NOT convert inputs
     # to DTensors. Each process should keep its inputs local. The model weights
     # are sharded across devices, and each process only needs its local input
@@ -991,7 +1022,9 @@ def prepare_input_for_distribution(x):
     # mismatch when operating with sharded weights (e.g., trying to broadcast
     # a replicated input with shape [batch, 8] against sharded weights with
     # shape [batch/2, 4] on each rank).
-    if is_mp and is_distributed:
+    #
+    # Check both the active distribution AND the cached state
+    if (is_mp or cached_mp_multi_process) and is_distributed:
         if debug_mode:
             rank = 0
             try:
@@ -1000,7 +1033,7 @@ def prepare_input_for_distribution(x):
                     rank = dist.get_rank()
             except:
                 pass
-            print(f"DEBUG | [Rank {rank}] prepare_input_for_distribution: skipping DTensor conversion for ModelParallel in multi-process mode")
+            print(f"DEBUG | [Rank {rank}] prepare_input_for_distribution: skipping DTensor conversion for ModelParallel in multi-process mode (is_mp={is_mp}, cached_mp_multi_process={cached_mp_multi_process})")
         return x
     
     # CRITICAL FIX: Get the device mesh from the CURRENT distribution, not from
