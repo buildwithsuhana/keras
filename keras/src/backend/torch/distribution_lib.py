@@ -1323,39 +1323,20 @@ def prepare_output_for_loss(x):
     # pass returns local tensors instead of DTensors.
     # 
     # We need to distinguish between:
-    # - y_pred (model output): should be all-gathered (sharded shape)
-    # - y (labels): should NOT be all-gathered (full shape)
+    # - y_pred (model output): should be all-gathered (DTensor or has DTensor shape)
+    # - y (labels): should NOT be all-gathered (full local shape)
+    # - x (inputs): should NOT be all-gathered (full local shape)
     #
-    # The heuristic: In MP with sharded weights, the output dimension gets sharded.
-    # If the original dimension is small (e.g., < 16), it's likely a shard.
-    # If the original dimension is larger, it's likely full data (labels).
+    # The safest approach: only process tensors that are ACTUALLY DTensors.
+    # Plain tensors (like labels and inputs) should be returned as-is.
+    # The heuristic-based detection is too fragile and causes issues.
     if cached_mp_state and torch.distributed.is_initialized():
-        if isinstance(x, torch.Tensor) and x.dim() > 0:
-            world_size = torch.distributed.get_world_size()
-            last_dim = x.shape[-1]
-            
-            # Heuristic: In MP with sharded weights, the output dimension gets sharded.
-            # If last_dim is small (e.g., < 8), it's likely a shard that needs all-gathering.
-            # If last_dim is >= 8, it's likely full data (labels) that shouldn't be all-gathered.
-            # This works because:
-            # - y_pred (sharded): last_dim = 4 -> 4 < 8 -> triggers all-gather
-            # - y (full): last_dim = 8 -> 8 >= 8 -> does NOT trigger all-gather
-            if debug_mode:
-                print(f"DEBUG | [Rank {rank}] prepare_output_for_loss: last_dim={last_dim}, checking if {last_dim} < 8 = {last_dim < 8}")
-            
-            if last_dim < 8:  # Threshold for "likely a shard" (exclude boundary case!)
-                try:
-                    local_tensor = x.contiguous()
-                    if x.is_cuda:
-                        # All-gather the tensor
-                        tensor_list = [torch.empty_like(local_tensor) for _ in range(world_size)]
-                        torch.distributed.all_gather(tensor_list, local_tensor)
-                        gathered = torch.cat(tensor_list, dim=-1)
-                        # Return the gathered (full) output
-                        return gathered
-                except Exception:
-                    # If all-gather fails, return as-is
-                    pass
+        # In MP multi-process mode, only process if x is actually a DTensor
+        # Don't try to heuristic-detect sharded local tensors - it causes bugs
+        # where labels get incorrectly all-gathered
+        if debug_mode:
+            print(f"DEBUG | [Rank {rank}] prepare_output_for_loss: MP mode, x is not DTensor, returning as-is (labels/inputs should not be processed)")
+        return x
     
     # Not a DTensor - this is likely labels (y) which are full local tensors
     # DO NOT all-gather! Labels are full local data, not sharded outputs.
