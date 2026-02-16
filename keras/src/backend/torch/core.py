@@ -325,44 +325,69 @@ def convert_to_tensor(x, dtype=None, sparse=None, ragged=None):
                 return DTensor.from_local(local_x, x.device_mesh, x.placements)
         return x
     
-    # Check if we have an active device mesh and should convert to DTensor
-    # This is critical for data parallel training where inputs must be DTensors
-    device_mesh = _get_default_device_mesh()
-    is_mp_distribution = False
-    try:
-        from keras.src.distribution.distribution_lib import distribution, ModelParallel
-        dist = distribution()
-        is_mp_distribution = isinstance(dist, ModelParallel)
-    except:
-        pass
+    # CRITICAL FIX: Check if we're in ModelParallel multi-process mode
+    # In this mode, we should NOT convert inputs to DTensors because:
+    # 1. Each process has local inputs (not replicated)
+    # 2. Model weights are sharded DTensors
+    # 3. Converting inputs to DTensors causes shape mismatch during forward pass
+    #    (e.g., trying to broadcast a replicated [32, 8] input with sharded weights [128, 4])
+    from keras.src.backend.torch import distribution_lib as torch_dist_lib
+    is_mp_multi_process = torch_dist_lib._MP_MULTI_PROCESS_STATE
     
-    # Convert to DTensor early if distributed is active - handle numpy arrays here too
-    if device_mesh is not None and (is_mp_distribution or torch.distributed.is_initialized()):
-        # Convert numpy arrays or other types to torch tensor first
-        if isinstance(x, np.ndarray):
-            if x.dtype == np.uint32:
-                x = x.astype(np.int64)
-            if standardize_dtype(x.dtype) == "bfloat16":
-                x = x.astype(np.float32)
-                dtype = "bfloat16"
-            dtype = dtype or x.dtype
-            
-            # CRITICAL FIX: In multi-process distributed training, each process has
-            # a different GPU visible as cuda:0 due to CUDA_VISIBLE_DEVICES isolation.
-            # We need to create the tensor on the correct local device, not CPU.
-            # Get the current local device from torch.cuda.current_device()
-            if torch.cuda.is_available() and torch.distributed.is_initialized():
-                # Use the current device (which is set correctly in initialize())
-                local_device = f"cuda:{torch.cuda.current_device()}"
-            else:
-                local_device = get_device()
-            
-            x = torch.as_tensor(x, dtype=to_torch_dtype(dtype), device=local_device)
+    # Also check if distributed is initialized and if there's a cached MP mesh
+    is_mp_cached = False
+    if torch.distributed.is_initialized():
+        from keras.src.backend.common import global_state
+        cached_mesh = global_state.get_global_attribute("torch_device_mesh", None)
+        if cached_mesh is not None and hasattr(cached_mesh, 'mesh'):
+            # Check if it's a 1D mesh (which is what MP uses in multi-process)
+            if cached_mesh.mesh.ndim == 1:
+                is_mp_cached = True
+    
+    # Skip DTensor conversion for ModelParallel in multi-process mode
+    if is_mp_multi_process or is_mp_cached:
+        # For ModelParallel multi-process, we don't convert inputs to DTensors
+        # The inputs should remain as local tensors
+        pass
+    else:
+        # Check if we have an active device mesh and should convert to DTensor
+        # This is critical for data parallel training where inputs must be DTensors
+        device_mesh = _get_default_device_mesh()
+        is_mp_distribution = False
+        try:
+            from keras.src.distribution.distribution_lib import distribution, ModelParallel
+            dist = distribution()
+            is_mp_distribution = isinstance(dist, ModelParallel)
+        except:
+            pass
         
-        # Now convert to DTensor
-        if isinstance(x, torch.Tensor):
-            from torch.distributed._tensor import Replicate
-            return DTensor.from_local(x, device_mesh, [Replicate()])
+        # Convert to DTensor early if distributed is active - handle numpy arrays here too
+        if device_mesh is not None and (is_mp_distribution or torch.distributed.is_initialized()):
+            # Convert numpy arrays or other types to torch tensor first
+            if isinstance(x, np.ndarray):
+                if x.dtype == np.uint32:
+                    x = x.astype(np.int64)
+                if standardize_dtype(x.dtype) == "bfloat16":
+                    x = x.astype(np.float32)
+                    dtype = "bfloat16"
+                dtype = dtype or x.dtype
+                
+                # CRITICAL FIX: In multi-process distributed training, each process has
+                # a different GPU visible as cuda:0 due to CUDA_VISIBLE_DEVICES isolation.
+                # We need to create the tensor on the correct local device, not CPU.
+                # Get the current local device from torch.cuda.current_device()
+                if torch.cuda.is_available() and torch.distributed.is_initialized():
+                    # Use the current device (which is set correctly in initialize())
+                    local_device = f"cuda:{torch.cuda.current_device()}"
+                else:
+                    local_device = get_device()
+                
+                x = torch.as_tensor(x, dtype=to_torch_dtype(dtype), device=local_device)
+            
+            # Now convert to DTensor
+            if isinstance(x, torch.Tensor):
+                from torch.distributed._tensor import Replicate
+                return DTensor.from_local(x, device_mesh, [Replicate()])
     
     if isinstance(x, Variable):
         x = x.value
