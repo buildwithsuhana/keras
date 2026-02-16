@@ -69,6 +69,27 @@ class TorchTrainer(base_trainer.Trainer):
             )
             self.jit_compile = False
 
+        # CRITICAL FIX: Disable torch.compile for ModelParallel in multi-process mode.
+        # torch.compile uses fake tensors for tracing which doesn't work well with
+        # DTensor operations when weights are sharded across multiple processes.
+        # The sharding propagator fails during tracing because it can't handle
+        # the shape mismatch between replicated inputs and sharded weights.
+        if self.jit_compile:
+            from keras.src.distribution.distribution_lib import distribution, ModelParallel
+            import torch.distributed as dist
+            
+            current_dist = distribution()
+            is_mp = isinstance(current_dist, ModelParallel)
+            is_distributed = dist.is_available() and dist.is_initialized()
+            
+            if is_mp and is_distributed:
+                warnings.warn(
+                    "Disabling torch.compile for ModelParallel in multi-process mode. "
+                    "torch.compile does not support DTensor operations with sharded weights "
+                    "in multi-process training."
+                )
+                return False
+
         return self.jit_compile
 
     def train_step(self, data):
