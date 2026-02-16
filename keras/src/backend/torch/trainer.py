@@ -24,6 +24,9 @@ class TorchTrainer(base_trainer.Trainer):
         self.test_function = None
         self.predict_function = None
         self._torch_module_parallelized = False
+        # Cache for torch.compile decision - set during fit/evaluate/predict
+        # when distribution scope is still active
+        self._torch_compile_disabled_for_mp = False
 
     def _parallelize_if_needed(self):
         """Parallelize the model if ModelParallel distribution is active.
@@ -74,23 +77,43 @@ class TorchTrainer(base_trainer.Trainer):
         # DTensor operations when weights are sharded across multiple processes.
         # The sharding propagator fails during tracing because it can't handle
         # the shape mismatch between replicated inputs and sharded weights.
-        if self.jit_compile:
-            from keras.src.distribution.distribution_lib import distribution, ModelParallel
-            import torch.distributed as dist
-            
-            current_dist = distribution()
-            is_mp = isinstance(current_dist, ModelParallel)
-            is_distributed = dist.is_available() and dist.is_initialized()
-            
-            if is_mp and is_distributed:
-                warnings.warn(
-                    "Disabling torch.compile for ModelParallel in multi-process mode. "
-                    "torch.compile does not support DTensor operations with sharded weights "
-                    "in multi-process training."
-                )
-                return False
+        #
+        # Use the cached value that was set during fit/evaluate/predict when
+        # the distribution scope was still active.
+        if self.jit_compile and self._torch_compile_disabled_for_mp:
+            return False
 
         return self.jit_compile
+
+    def _check_and_disable_torch_compile_for_mp(self):
+        """Check if torch.compile should be disabled for ModelParallel in multi-process.
+        
+        This method should be called at the start of fit/evaluate/predict when
+        the distribution scope is still active. It caches the decision so that
+        _should_torch_compile() can use it later when the scope has exited.
+        """
+        if self._torch_compile_disabled_for_mp:
+            # Already checked and disabled
+            return
+            
+        if not self.jit_compile:
+            # torch.compile not enabled, nothing to do
+            return
+            
+        from keras.src.distribution.distribution_lib import distribution, ModelParallel
+        import torch.distributed as dist
+        
+        current_dist = distribution()
+        is_mp = isinstance(current_dist, ModelParallel)
+        is_distributed = dist.is_available() and dist.is_initialized()
+        
+        if is_mp and is_distributed:
+            warnings.warn(
+                "Disabling torch.compile for ModelParallel in multi-process mode. "
+                "torch.compile does not support DTensor operations with sharded weights "
+                "in multi-process training."
+            )
+            self._torch_compile_disabled_for_mp = True
 
     def train_step(self, data):
         x, y, sample_weight = data_adapter_utils.unpack_x_y_sample_weight(data)
@@ -304,6 +327,9 @@ class TorchTrainer(base_trainer.Trainer):
         )
 
         self._parallelize_if_needed()
+        # Check if torch.compile should be disabled for ModelParallel in multi-process
+        # This must be done while the distribution scope is still active
+        self._check_and_disable_torch_compile_for_mp()
         self._symbolic_build(iterator=epoch_iterator)
         epoch_iterator.reset()
 
@@ -431,6 +457,9 @@ class TorchTrainer(base_trainer.Trainer):
             )
 
         self._parallelize_if_needed()
+        # Check if torch.compile should be disabled for ModelParallel in multi-process
+        # This must be done while the distribution scope is still active
+        self._check_and_disable_torch_compile_for_mp()
         self._symbolic_build(iterator=epoch_iterator)
         epoch_iterator.reset()
 
@@ -480,6 +509,9 @@ class TorchTrainer(base_trainer.Trainer):
         )
 
         self._parallelize_if_needed()
+        # Check if torch.compile should be disabled for ModelParallel in multi-process
+        # This must be done while the distribution scope is still active
+        self._check_and_disable_torch_compile_for_mp()
         # Container that configures and calls callbacks.
         if not isinstance(callbacks, callbacks_module.CallbackList):
             callbacks = callbacks_module.CallbackList(
