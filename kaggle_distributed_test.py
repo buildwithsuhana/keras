@@ -88,21 +88,26 @@ def setup_environment():
         # Get number of available GPUs
         gpu_count = torch.cuda.device_count() if torch.cuda.is_available() else 0
         
-        # For multi-process training, ensure we don't exceed available GPUs
-        # If world_size > gpu_count, only the first gpu_count processes can use GPUs
-        # Other processes should use CPU
-        if torch.cuda.is_available() and local_rank < gpu_count:
-            # This process has a GPU
+        # In multi-process training with proper CUDA_VISIBLE_DEVICES isolation,
+        # each process should see exactly 1 GPU as cuda:0
+        # We don't need to check gpu_count > world_size - that's handled by the
+        # process launcher (torchrun) via CUDA_VISIBLE_DEVICES
+        if torch.cuda.is_available():
+            # Set this process to use the GPU that torchrun assigned
+            # With proper CUDA_VISIBLE_DEVICES, each process sees its own GPU as cuda:0
             torch.cuda.set_device(local_rank)
+            
+            # Get the actual GPU this process is using
+            actual_gpu = torch.cuda.current_device()
+            log(f"[initialize() Rank {local_rank}] Set CUDA device to GPU {actual_gpu} (visible as 0), num_gpus={gpu_count}")
             log(f"✓ PyTorch distributed initialized via torchrun")
             log(f"  Local rank: {local_rank}, World size: {world_size}")
-            log(f"  Device: cuda:{local_rank}")
+            log(f"  Device: cuda:{actual_gpu}")
         else:
-            # This process will use CPU (no GPU available for this rank)
+            # This process will use CPU
             log(f"✓ PyTorch distributed initialized via torchrun (CPU mode)")
             log(f"  Local rank: {local_rank}, World size: {world_size}")
-            log(f"  Device: CPU (no GPU available for this rank)")
-            log(f"  Note: Only {gpu_count} GPUs available for {world_size} processes")
+            log(f"  Device: CPU")
     else:
         log("Running in single-process mode")
     
