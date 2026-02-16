@@ -453,12 +453,24 @@ def _to_backend_mesh(device_mesh):
         world_size = torch.distributed.get_world_size()
         if world_size > 1:
             # Each process has its own local GPU
-            # Create a 1D mesh for the model parallelism dimension
+            # CRITICAL FIX: Determine the correct mesh dimension name based on
+            # the distribution type (DataParallel vs ModelParallel)
+            # For DataParallel: use "batch" as the axis name
+            # For ModelParallel: use "model" as the axis name
+            from keras.src.distribution.distribution_lib import distribution, DataParallel
+            current_dist = distribution()
+            if isinstance(current_dist, DataParallel):
+                # DataParallel uses "batch" axis for data parallelism
+                mesh_dim_names = [current_dist.batch_dim_name]
+            else:
+                # ModelParallel or other distributions use "model"
+                mesh_dim_names = ["model"]
+            
             if torch.cuda.is_available():
                 backend_mesh = init_device_mesh(
                     device_type="cuda",
                     mesh_shape=(world_size,),
-                    mesh_dim_names=["model"]
+                    mesh_dim_names=mesh_dim_names
                 )
                 global_state.set_global_attribute(cache_key, backend_mesh)
                 global_state.set_global_attribute("torch_device_mesh", backend_mesh)
