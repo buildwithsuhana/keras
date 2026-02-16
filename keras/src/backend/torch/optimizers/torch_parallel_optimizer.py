@@ -23,47 +23,49 @@ def _convert_grads_to_dtensor(grads, variables, optimizer_state_variables=None):
         optimizer_state_variables: List of optimizer state variable tensors to check
             for DTensor placement. If provided, these take precedence over 'variables'.
     """
+    import logging
+    logger = logging.getLogger(__name__)
+    
     # Skip if not in distributed context
     if not torch.distributed.is_initialized():
         return grads
     
     # Import here to avoid circular imports
     from torch.distributed._tensor import DTensor, Replicate
-    from keras.src.backend.torch.distribution_lib import _get_default_device_mesh
+    from keras.src.backend.torch.distribution_lib import _get_default_device_mesh, is_dtensor
     
     device_mesh = _get_default_device_mesh()
     if device_mesh is None:
         return grads
     
+    logger.debug(f"_convert_grads_to_dtensor: device_mesh={device_mesh}")
+    
     # Determine which variables to check for DTensor
     # Priority: optimizer_state_variables > variables
     vars_to_check = optimizer_state_variables if optimizer_state_variables is not None else variables
-    
-    # Handle backward compatibility: if only 2 args passed (old API)
-    # and the second arg might be optimizer states
-    if optimizer_state_variables is None and variables is not None:
-        # Check if variables list contains optimizer state values (DTensors)
-        # by looking at the structure - in DataParallel, model weights are NOT DTensors
-        # but optimizer states ARE DTensors
-        pass
     
     # Check if any variable is a DTensor
     # In DataParallel, model weights are NOT DTensors but optimizer states ARE
     # So we need to check optimizer_state_variables if provided
     has_dtensor = False
+    reference_dtensor = None
     if vars_to_check:
-        for v in vars_to_check:
+        for i, v in enumerate(vars_to_check):
             value = getattr(v, 'value', v)
+            logger.debug(f"_convert_grads_to_dtensor: checking var {i}, type={type(value)}, is_dtensor={isinstance(value, DTensor)}")
             if isinstance(value, DTensor):
                 has_dtensor = True
+                reference_dtensor = value
+                logger.debug(f"_convert_grads_to_dtensor: found DTensor at index {i}, placements={value.placements}")
                 break
     
     if not has_dtensor:
+        logger.debug("_convert_grads_to_dtensor: no DTensor found in variables, returning grads as-is")
         return grads
     
     # Convert grads to DTensors with the same placements as variables
     converted_grads = []
-    for grad, variable in zip(grads, vars_to_check if vars_to_check else grads):
+    for i, (grad, variable) in enumerate(zip(grads, vars_to_check if vars_to_check else grads)):
         if grad is None:
             converted_grads.append(None)
             continue
@@ -72,12 +74,21 @@ def _convert_grads_to_dtensor(grads, variables, optimizer_state_variables=None):
         if isinstance(value, DTensor):
             # Use the same placements as the optimizer state variable
             placements = value.placements
+            logger.debug(f"_convert_grads_to_dtensor: converting grad {i} with placements={placements}")
+            dtensor = DTensor.from_local(grad, device_mesh, placements)
+            converted_grads.append(dtensor)
+        elif reference_dtensor is not None:
+            # Use the placements from the reference DTensor
+            placements = reference_dtensor.placements
+            logger.debug(f"_convert_grads_to_dtensor: converting grad {i} with reference placements={placements}")
             dtensor = DTensor.from_local(grad, device_mesh, placements)
             converted_grads.append(dtensor)
         else:
             # For non-DTensor variables, replicate the gradient
+            logger.debug(f"_convert_grads_to_dtensor: keeping grad {i} as-is (non-DTensor variable)")
             converted_grads.append(grad)
     
+    logger.debug(f"_convert_grads_to_dtensor: converted {len(converted_grads)} grads")
     return converted_grads
 
 
