@@ -437,7 +437,21 @@ def _to_backend_mesh(device_mesh):
     """
     from torch.distributed.device_mesh import init_device_mesh
     
-    cache_key = f"torch_mesh_{device_mesh.shape}_{device_mesh.axis_names}"
+    # Get the current distribution to ensure we're caching the right mesh
+    from keras.src.distribution.distribution_lib import distribution, DataParallel, ModelParallel
+    current_dist = distribution()
+    
+    # Build a more specific cache key that includes the distribution type
+    # This ensures different distributions get different cache entries
+    dist_type = ""
+    if isinstance(current_dist, ModelParallel):
+        dist_type = "MP"
+    elif isinstance(current_dist, DataParallel):
+        dist_type = "DP"
+    else:
+        dist_type = "NONE"
+    
+    cache_key = f"torch_mesh_{device_mesh.shape}_{device_mesh.axis_names}_{dist_type}"
     cached = global_state.get_global_attribute(cache_key)
     if cached is not None:
         global_state.set_global_attribute("torch_device_mesh", cached)
@@ -748,7 +762,41 @@ def _convert_structure(x, device_mesh=None, to_dtensor=True, gather_sharded=True
         if to_dtensor:
             # For model parallelism, inputs need to be replicated across model dim
             # to match the sharded kernel dimensions
-            if device_mesh is not None:
+            # CRITICAL FIX: Get the current distribution's device mesh, not the cached one
+            # This ensures inputs use the same mesh as the model weights
+            from keras.src.distribution.distribution_lib import distribution, ModelParallel, DataParallel
+            
+            current_dist = distribution()
+            is_mp = isinstance(current_dist, ModelParallel)
+            is_dp = isinstance(current_dist, DataParallel)
+            is_distributed = torch.distributed.is_initialized()
+            
+            # Get the device mesh from the current distribution, not from global cache
+            if current_dist is not None and hasattr(current_dist, 'device_mesh'):
+                # Convert the current distribution's device mesh to backend mesh
+                torch_device_mesh = _to_backend_mesh(current_dist.device_mesh)
+                
+                if torch_device_mesh is not None:
+                    mesh_ndim = 1
+                    # Check if torch_device_mesh has ndim attribute (it's a PyTorch DeviceMesh)
+                    if hasattr(torch_device_mesh, 'mesh'):
+                        mesh_ndim = torch_device_mesh.mesh.ndim
+                    
+                    # For 1D mesh, use single Replicate()
+                    # For multi-dimensional mesh, replicate on all dimensions
+                    if mesh_ndim == 1:
+                        # Single placement for 1D mesh
+                        placements = [Replicate()]
+                    else:
+                        # For 2D+ mesh (e.g., ModelParallel with shape (1, 2)),
+                        # we need matching placements for each mesh dimension
+                        # Replicate on all dimensions for input data
+                        placements = [Replicate()] * mesh_ndim
+                    
+                    # Use the mesh from current distribution
+                    return DTensor.from_local(x, torch_device_mesh, placements)
+            elif device_mesh is not None:
+                # Fallback to passed device_mesh (for non-distributed cases)
                 # Check if we have a model parallel distribution
                 if _is_model_parallel_distribution():
                     # Get the actual PyTorch device mesh from global state
