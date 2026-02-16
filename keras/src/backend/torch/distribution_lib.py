@@ -947,8 +947,10 @@ def _is_model_parallel_distribution():
 def prepare_input_for_distribution(x):
     """Convert inputs to DTensors when model has DTensor weights.
     
-    For model parallelism with sharded weights, inputs need to be replicated
-    across the model dimension to match the sharded kernel dimensions.
+    For model parallelism with sharded weights, inputs need to be handled carefully.
+    In multi-process mode, each process should keep its inputs local rather than
+    converting to DTensors, since the model weights are sharded and each process
+    operates on its local portion.
     
     This function checks if we have an active device mesh and distributed
     context, and converts inputs to DTensors accordingly.
@@ -979,6 +981,27 @@ def prepare_input_for_distribution(x):
     # Also check if torch distributed is initialized
     # Even outside the scope, we might have sharded weights
     is_distributed = torch.distributed.is_initialized()
+    
+    # CRITICAL FIX: For ModelParallel in multi-process mode, do NOT convert inputs
+    # to DTensors. Each process should keep its inputs local. The model weights
+    # are sharded across devices, and each process only needs its local input
+    # to compute with its portion of the sharded weights.
+    #
+    # Converting inputs to DTensors with Replicate() placement causes shape
+    # mismatch when operating with sharded weights (e.g., trying to broadcast
+    # a replicated input with shape [batch, 8] against sharded weights with
+    # shape [batch/2, 4] on each rank).
+    if is_mp and is_distributed:
+        if debug_mode:
+            rank = 0
+            try:
+                import torch.distributed as dist
+                if dist.is_available() and dist.is_initialized():
+                    rank = dist.get_rank()
+            except:
+                pass
+            print(f"DEBUG | [Rank {rank}] prepare_input_for_distribution: skipping DTensor conversion for ModelParallel in multi-process mode")
+        return x
     
     # CRITICAL FIX: Get the device mesh from the CURRENT distribution, not from
     # global cache. This ensures inputs use the same mesh as the model weights.
@@ -1011,6 +1034,7 @@ def prepare_input_for_distribution(x):
     # Convert to DTensor if:
     # 1. We have a device mesh AND
     # 2. Either ModelParallel is active OR distributed is initialized
+    # Note: For ModelParallel in multi-process mode, we skip this as handled above
     if torch_device_mesh is not None and (is_mp or is_distributed):
         return _convert_structure(x, torch_device_mesh, to_dtensor=True, gather_sharded=False)
     
