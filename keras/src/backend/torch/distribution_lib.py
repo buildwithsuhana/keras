@@ -895,19 +895,33 @@ def _convert_structure(x, device_mesh=None, to_dtensor=True, gather_sharded=True
                 # tensor is on the correct device before creating the DTensor.
                 local_tensor = x
                 
-                # Get the correct local device for this process
-                # In distributed mode with CUDA_VISIBLE_DEVICES, each process
-                # only sees one GPU, which is cuda:0 from that process's perspective
-                if torch.distributed.is_initialized() and torch.cuda.is_available():
-                    # Get the current device for this process (set during initialize())
-                    local_device = torch.cuda.current_device()
-                    # If tensor is not on the correct CUDA device, move it
-                    if x.is_cuda:
-                        if x.device.index != local_device:
-                            local_tensor = x.to(f"cuda:{local_device}")
+                # Handle both numpy arrays and torch tensors - ensure they're on the right device
+                if isinstance(x, np.ndarray):
+                    # Convert numpy array to torch tensor first, then handle device
+                    if x.dtype == np.uint32:
+                        x = x.astype(np.int64)
+                    if standardize_dtype(x.dtype) == "bfloat16":
+                        x = x.astype(np.float32)
+                        dtype = "bfloat16"
+                    dtype = dtype or x.dtype
+                    
+                    # Get the correct local device for this process
+                    if torch.distributed.is_initialized() and torch.cuda.is_available():
+                        local_device = f"cuda:{torch.cuda.current_device()}"
                     else:
-                        # Tensor is on CPU, move it to the correct CUDA device
-                        local_tensor = x.to(f"cuda:{local_device}")
+                        local_device = get_device()
+                    
+                    local_tensor = torch.as_tensor(x, dtype=to_torch_dtype(dtype), device=local_device)
+                elif isinstance(x, torch.Tensor):
+                    # For existing torch tensors, ensure they're on the correct device
+                    if torch.distributed.is_initialized() and torch.cuda.is_available():
+                        local_device = torch.cuda.current_device()
+                        if x.is_cuda:
+                            if x.device.index != local_device:
+                                local_tensor = x.to(f"cuda:{local_device}")
+                        else:
+                            # Tensor is on CPU or different device, move to correct CUDA device
+                            local_tensor = x.to(f"cuda:{local_device}")
                 
                 return DTensor.from_local(local_tensor, torch_device_mesh, placements)
             
