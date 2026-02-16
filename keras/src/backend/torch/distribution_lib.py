@@ -1285,9 +1285,9 @@ def prepare_output_for_loss(x):
             # - y_pred (sharded): last_dim = 4 -> 4 < 8 -> triggers all-gather
             # - y (full): last_dim = 8 -> 8 >= 8 -> does NOT trigger all-gather
             if debug_mode:
-                print(f"DEBUG | [Rank {rank}] prepare_output_for_loss: last_dim={last_dim}, checking if {last_dim} <= 8 = {last_dim <= 8}")
+                print(f"DEBUG | [Rank {rank}] prepare_output_for_loss: last_dim={last_dim}, checking if {last_dim} < 8 = {last_dim < 8}")
             
-            if last_dim <= 8:  # Threshold for "likely a shard" (include boundary case)
+            if last_dim < 8:  # Threshold for "likely a shard" (exclude boundary case!)
                 try:
                     local_tensor = x.contiguous()
                     if x.is_cuda:
