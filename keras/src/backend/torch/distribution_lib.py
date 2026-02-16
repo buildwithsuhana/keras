@@ -818,6 +818,35 @@ def _all_gather_with_grad(local_tensor, shard_dim):
     return _AllGatherWithGradient.apply(local_tensor, shard_dim)
 
 
+class _AllReduceWithGradient(torch.autograd.Function):
+    """Custom autograd function for all-reduce with proper gradient flow.
+    
+    This is needed for ModelParallel training where the output has Partial placement
+    and needs to be all-reduced across ranks. Using plain torch.distributed.all_reduce
+    breaks the autograd graph and causes gradient shape mismatches.
+    """
+
+    @staticmethod
+    def forward(ctx, tensor):
+        output = tensor.clone()
+        torch.distributed.all_reduce(output)
+        return output
+
+    @staticmethod
+    def backward(ctx, grad_output):
+        # For all-reduce, the gradient should be the same shape as output
+        # and should be all-reduced again (or just kept as-is since each rank
+        # gets the full gradient)
+        # Actually, for proper gradient flow in all-reduce, we just return
+        # the gradient as-is since each rank computes gradients locally
+        return grad_output
+
+
+def _all_reduce_with_grad(tensor):
+    """Perform all-reduce with proper gradient flow for ModelParallel."""
+    return _AllReduceWithGradient.apply(tensor)
+
+
 def _convert_structure(x, device_mesh=None, to_dtensor=True, gather_sharded=True):
     """Unified recursive structure converter for DTensor operations."""
     if x is None:
@@ -1246,11 +1275,10 @@ def prepare_output_for_loss(x):
                 if debug_mode:
                     print(f"DEBUG | [Rank {rank}] prepare_output_for_loss: all-reducing DTensor with Partial placement")
                 
-                # All-reduce the local tensor to get the correct output
-                # This sums the partial outputs across all ranks
-                output = local_tensor.clone()
-                torch.distributed.all_reduce(output)
-                return output
+                # CRITICAL FIX: Use custom autograd function to preserve gradients
+                # Using plain torch.distributed.all_reduce breaks the autograd graph
+                # and causes gradient shape mismatches in optimizer
+                return _all_reduce_with_grad(local_tensor)
             
             # For Shard placement - all-gather the tensor
             try:
