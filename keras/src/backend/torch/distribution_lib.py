@@ -891,12 +891,23 @@ def _convert_structure(x, device_mesh=None, to_dtensor=True, gather_sharded=True
                 
                 # CRITICAL FIX: Ensure the local tensor is on the correct device
                 # In multi-process mode with CUDA_VISIBLE_DEVICES, each process
-                # only sees its local GPU as cuda:0
+                # only sees its local GPU as cuda:0. We need to ensure the local
+                # tensor is on the correct device before creating the DTensor.
                 local_tensor = x
-                if x.is_cuda:
-                    # The tensor should already be on the correct local GPU (cuda:0)
-                    # after being created/converted in the trainer
-                    pass  # Keep as-is, it's already on the correct local device
+                
+                # Get the correct local device for this process
+                # In distributed mode with CUDA_VISIBLE_DEVICES, each process
+                # only sees one GPU, which is cuda:0 from that process's perspective
+                if torch.distributed.is_initialized() and torch.cuda.is_available():
+                    # Get the current device for this process (set during initialize())
+                    local_device = torch.cuda.current_device()
+                    # If tensor is not on the correct CUDA device, move it
+                    if x.is_cuda:
+                        if x.device.index != local_device:
+                            local_tensor = x.to(f"cuda:{local_device}")
+                    else:
+                        # Tensor is on CPU, move it to the correct CUDA device
+                        local_tensor = x.to(f"cuda:{local_device}")
                 
                 return DTensor.from_local(local_tensor, torch_device_mesh, placements)
             

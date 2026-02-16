@@ -346,7 +346,18 @@ def convert_to_tensor(x, dtype=None, sparse=None, ragged=None):
                 x = x.astype(np.float32)
                 dtype = "bfloat16"
             dtype = dtype or x.dtype
-            x = torch.as_tensor(x, dtype=to_torch_dtype(dtype), device="cpu")
+            
+            # CRITICAL FIX: In multi-process distributed training, each process has
+            # a different GPU visible as cuda:0 due to CUDA_VISIBLE_DEVICES isolation.
+            # We need to create the tensor on the correct local device, not CPU.
+            # Get the current local device from torch.cuda.current_device()
+            if torch.cuda.is_available() and torch.distributed.is_initialized():
+                # Use the current device (which is set correctly in initialize())
+                local_device = f"cuda:{torch.cuda.current_device()}"
+            else:
+                local_device = get_device()
+            
+            x = torch.as_tensor(x, dtype=to_torch_dtype(dtype), device=local_device)
         
         # Now convert to DTensor
         if isinstance(x, torch.Tensor):
