@@ -237,6 +237,12 @@ def matmul(x1, x2):
         else:
             device_mesh = None
         
+        # CRITICAL FIX: Fallback to global state if device_mesh is None
+        # This handles the case where DTensor's device_mesh attribute is None
+        # which can happen in multi-process mode with ModelParallel
+        if device_mesh is None:
+            device_mesh = _get_default_device_mesh()
+        
         if device_mesh is not None:
             # Standard case - convert regular tensor to DTensor
             if x1_is_dtensor and not x2_is_dtensor:
