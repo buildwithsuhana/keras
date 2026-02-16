@@ -1222,12 +1222,9 @@ def prepare_output_for_loss(x):
         
         # Check for Partial placement - this indicates the output needs all-reduce
         # (e.g., from ColwiseParallel/RowwiseParallel in tensor parallelism)
-        has_partial = any(isinstance(p, torch.distributed._tensor.api._dtensor_spec.Placement) and 
-                         type(p).__name__ == 'Partial' for p in x.placements)
-        
-        # Also check explicitly for Partial using isinstance
+        # Use the public API from torch.distributed._tensor.placement_types
         from torch.distributed._tensor.placement_types import Partial
-        has_partial = has_partial or any(isinstance(p, Partial) for p in x.placements)
+        has_partial = any(isinstance(p, Partial) for p in x.placements)
         
         is_sharded = (len(local_shape) > 0 and len(global_shape) > 0 and 
                       local_shape[-1] != global_shape[-1])
