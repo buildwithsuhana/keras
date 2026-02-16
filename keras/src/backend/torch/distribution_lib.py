@@ -799,39 +799,41 @@ def _convert_structure(x, device_mesh=None, to_dtensor=True, gather_sharded=True
             # Get the current distribution - this checks the scope, not global cache
             current_dist = distribution()
             
-            # Only convert to DTensor if we have an active distribution
+            # CRITICAL FIX: For ModelParallel with multi-dimensional mesh, we need to
+            # use the same mesh as the model weights. The _to_backend_mesh function
+            # should return the correct 2D mesh for ModelParallel.
+            torch_device_mesh = None
+            
             if current_dist is not None and hasattr(current_dist, 'device_mesh'):
                 # Use the current distribution's device mesh
                 torch_device_mesh = _to_backend_mesh(current_dist.device_mesh)
-                
-                if torch_device_mesh is not None:
-                    mesh_ndim = 1
-                    if hasattr(torch_device_mesh, 'mesh'):
-                        mesh_ndim = torch_device_mesh.mesh.ndim
-                    
-                    # For multi-dimensional mesh, use matching placements for all dimensions
-                    if mesh_ndim == 1:
-                        placements = [Replicate()]
-                    else:
-                        placements = [Replicate()] * mesh_ndim
-                    
-                    return DTensor.from_local(x, torch_device_mesh, placements)
             elif device_mesh is not None:
                 # Fallback for non-distributed cases or when no distribution is active
                 # Check mesh dimensionality
                 if hasattr(device_mesh, 'mesh'):
-                    mesh_ndim = device_mesh.mesh.ndim
+                    # This is already a PyTorch DeviceMesh
+                    torch_device_mesh = device_mesh
                 else:
-                    # device_mesh is a Keras DeviceMesh
-                    mesh_ndim = len(device_mesh.shape)
+                    # This is a Keras DeviceMesh
+                    torch_device_mesh = _to_backend_mesh(device_mesh)
+            
+            if torch_device_mesh is not None:
+                mesh_ndim = 1
+                if hasattr(torch_device_mesh, 'mesh'):
+                    mesh_ndim = torch_device_mesh.mesh.ndim
                 
+                # CRITICAL FIX: For multi-dimensional mesh (ModelParallel), we need
+                # to use the correct number of placements that matches the mesh ndim.
+                # This ensures inputs use the same mesh as model weights.
                 if mesh_ndim == 1:
                     placements = [Replicate()]
                 else:
                     placements = [Replicate()] * mesh_ndim
                 
-                return DTensor.from_local(x, device_mesh, placements)
-        return x
+                return DTensor.from_local(x, torch_device_mesh, placements)
+            
+            # If no mesh available, return as-is
+            return x
 
     if isinstance(x, dict):
         return {k: _convert_structure(v, device_mesh, to_dtensor, gather_sharded) for k, v in x.items()}
@@ -872,18 +874,32 @@ def prepare_input_for_distribution(x):
     
     # CRITICAL FIX: Get the device mesh from the CURRENT distribution, not from
     # global cache. This ensures inputs use the same mesh as the model weights.
+    # We need to use _to_backend_mesh to convert the Keras DeviceMesh to PyTorch DeviceMesh
+    # with the correct cache key for ModelParallel.
     if current_dist is not None and hasattr(current_dist, 'device_mesh'):
-        # Use the current distribution's device mesh
-        device_mesh = current_dist.device_mesh
+        # Use _to_backend_mesh to get the correct 2D mesh for ModelParallel
+        torch_device_mesh = _to_backend_mesh(current_dist.device_mesh)
     else:
         # Fallback to global cache
-        device_mesh = _get_default_device_mesh()
+        torch_device_mesh = _get_default_device_mesh()
+    
+    # Debug logging
+    debug_mode = os.environ.get("KERAS_DISTRIBUTION_DEBUG", "0") == "1"
+    if debug_mode and torch_device_mesh is not None:
+        rank = 0
+        try:
+            import torch.distributed as dist
+            if dist.is_available() and dist.is_initialized():
+                rank = dist.get_rank()
+        except:
+            pass
+        print(f"DEBUG | [Rank {rank}] prepare_input_for_distribution: torch_device_mesh={torch_device_mesh}, is_mp={is_mp}")
     
     # Convert to DTensor if:
     # 1. We have a device mesh AND
     # 2. Either ModelParallel is active OR distributed is initialized
-    if device_mesh is not None and (is_mp or is_distributed):
-        return _convert_structure(x, device_mesh, to_dtensor=True, gather_sharded=False)
+    if torch_device_mesh is not None and (is_mp or is_distributed):
+        return _convert_structure(x, torch_device_mesh, to_dtensor=True, gather_sharded=False)
     
     return x
 
