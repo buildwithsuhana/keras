@@ -77,11 +77,27 @@ class TorchTrainer(base_trainer.Trainer):
         # DTensor operations when weights are sharded across multiple processes.
         # The sharding propagator fails during tracing because it can't handle
         # the shape mismatch between replicated inputs and sharded weights.
-        #
-        # Use the cached value that was set during fit/evaluate/predict when
-        # the distribution scope was still active.
-        if self.jit_compile and self._torch_compile_disabled_for_mp:
-            return False
+        if self.jit_compile:
+            import torch.distributed as dist
+            
+            # Check if distributed is initialized (multi-process mode)
+            if dist.is_available() and dist.is_initialized():
+                # In multi-process mode, check if there's a cached ModelParallel mesh
+                # from a previous distribution scope. We can detect this by checking
+                # if the global state has a torch mesh with 1D shape (which is what
+                # ModelParallel uses in multi-process mode).
+                from keras.src.backend.common import global_state
+                cached_mesh = global_state.get_global_attribute("torch_device_mesh", None)
+                if cached_mesh is not None and hasattr(cached_mesh, 'mesh'):
+                    # Check if it's a 1D mesh (ModelParallel in multi-process mode)
+                    if cached_mesh.mesh.ndim == 1:
+                        # This is ModelParallel in multi-process mode - disable torch.compile
+                        warnings.warn(
+                            "Disabling torch.compile for ModelParallel in multi-process mode. "
+                            "torch.compile does not support DTensor operations with sharded weights "
+                            "in multi-process training."
+                        )
+                        return False
 
         return self.jit_compile
 
