@@ -18,10 +18,6 @@ from torch.distributed._tensor.api import distribute_tensor as torch_distribute_
 from torch.distributed.tensor.parallel import parallelize_module, ColwiseParallel, RowwiseParallel
 
 TENSOR_PARALLEL_AVAILABLE = True
-
-# Global variable to cache ModelParallel multi-process state
-# This is set by TorchTrainer when entering fit/evaluate/predict
-# and checked by prepare_input_for_distribution during training
 _MP_MULTI_PROCESS_STATE = False
 
 
@@ -1167,8 +1163,16 @@ def prepare_output_for_loss(x):
                     is_mp = True
     
     if debug_mode:
-        print(f"DEBUG | [Rank {rank}] prepare_output_for_loss AFTER CHECK: is_mp={is_mp}, cached_mp_state={cached_mp_state}")
+        rank = 0
+        try:
+            import torch.distributed as dist
+            if dist.is_available() and dist.is_initialized():
+                rank = dist.get_rank()
+        except:
+            pass
+        print(f"DEBUG | [Rank {rank}] prepare_output_for_loss AFTER CHECK: is_mp={is_mp}, cached_mp_state={cached_mp_state}, dist_init={torch.distributed.is_initialized()}")
     
+    # If not MP mode, just convert DTensor to local tensor if needed
     if not is_mp:
         if isinstance(x, DTensor):
             return x.to_local()
@@ -1178,13 +1182,85 @@ def prepare_output_for_loss(x):
     # - y_pred: DTensor with sharded placements -> all-gather
     # - y: local tensor with full shape -> return as-is (DO NOT all-gather!)
     
+    # CRITICAL FIX: Check for DTensor using duck typing in case of module mismatch
+    # Sometimes DTensor can be imported from different modules
+    is_dtensor = hasattr(x, 'placements') and hasattr(x, 'to_local') and hasattr(x, 'shape')
+    
+    if debug_mode:
+        rank = 0
+        try:
+            import torch.distributed as dist
+            if dist.is_available() and dist.is_initialized():
+                rank = dist.get_rank()
+        except:
+            pass
+        print(f"DEBUG | [Rank {rank}] prepare_output_for_loss: is_dtensor={is_dtensor}, x_type={type(x).__name__}")
+    
     # Check if x is a DTensor - this is the model output that needs all-gather
-    if isinstance(x, DTensor):
-        if not all(isinstance(p, Replicate) for p in x.placements):
+    if is_dtensor:
+        # Debug: print the placements and local shape
+        if debug_mode:
+            rank = 0
+            try:
+                import torch.distributed as dist
+                if dist.is_available() and dist.is_initialized():
+                    rank = dist.get_rank()
+            except:
+                pass
+            local_shape = x.to_local().shape
+            print(f"DEBUG | [Rank {rank}] prepare_output_for_loss: DTensor placements = {x.placements}, local_shape = {local_shape}, global_shape = {x.shape}")
+        
+        # Get local tensor shape to determine if sharding is applied
+        local_tensor = x.to_local()
+        local_shape = local_tensor.shape
+        
+        # Check if this is a sharded DTensor by comparing local vs global shape
+        # If the last dimension is different, it's sharded
+        global_shape = x.shape
+        is_sharded = (len(local_shape) > 0 and len(global_shape) > 0 and 
+                      local_shape[-1] != global_shape[-1])
+        
+        if debug_mode:
+            print(f"DEBUG | [Rank {rank}] prepare_output_for_loss: is_sharded = {is_sharded} (local={local_shape}, global={global_shape})")
+        
+        if is_sharded:
             # This is a sharded DTensor - all-gather it
-            return _convert_structure(x, None, to_dtensor=False, gather_sharded=True)
+            try:
+                # Determine shard dimension from placements or infer from shape difference
+                shard_dim = None
+                for i, p in enumerate(x.placements):
+                    if isinstance(p, Shard):
+                        shard_dim = p.dim
+                        break
+                
+                if shard_dim is None:
+                    # Infer from shape difference
+                    for i in range(len(local_shape)):
+                        if i < len(global_shape) and local_shape[i] != global_shape[i]:
+                            shard_dim = i
+                            break
+                
+                if shard_dim is None:
+                    shard_dim = -1  # Default to last dimension
+                
+                if debug_mode:
+                    print(f"DEBUG | [Rank {rank}] prepare_output_for_loss: all-gathering local_tensor shape {local_shape} on dim {shard_dim}")
+                
+                world_size = torch.distributed.get_world_size()
+                # All-gather with proper gradient flow
+                if local_tensor.requires_grad:
+                    return _all_gather_with_grad(local_tensor, shard_dim)
+                else:
+                    output = [torch.empty_like(local_tensor) for _ in range(world_size)]
+                    torch.distributed.all_gather(output, local_tensor.contiguous())
+                    return torch.cat(output, dim=shard_dim)
+            except Exception as e:
+                if debug_mode:
+                    print(f"DEBUG | [Rank {rank}] prepare_output_for_loss: all-gather failed: {e}")
+                return local_tensor
         else:
-            return x.to_local()
+            # DTensor with same local and global shape (replicated) - just get local tensor
+            return local_tensor
     
     # CRITICAL FIX: Handle the case where x is a local tensor but we're in
     # ModelParallel multi-process mode. This can happen when the model forward
@@ -1209,9 +1285,9 @@ def prepare_output_for_loss(x):
             # - y_pred (sharded): last_dim = 4 -> 4 < 8 -> triggers all-gather
             # - y (full): last_dim = 8 -> 8 >= 8 -> does NOT trigger all-gather
             if debug_mode:
-                print(f"DEBUG | [Rank {rank}] prepare_output_for_loss: last_dim={last_dim}, checking if {last_dim} < 8 = {last_dim < 8}")
+                print(f"DEBUG | [Rank {rank}] prepare_output_for_loss: last_dim={last_dim}, checking if {last_dim} <= 8 = {last_dim <= 8}")
             
-            if last_dim < 8:  # Threshold for "likely a shard"
+            if last_dim <= 8:  # Threshold for "likely a shard" (include boundary case)
                 try:
                     local_tensor = x.contiguous()
                     if x.is_cuda:
