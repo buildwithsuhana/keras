@@ -1124,25 +1124,32 @@ def prepare_output_for_loss(x):
     we still need to handle DTensor outputs correctly.
     
     IMPORTANT: In ModelParallel multi-process mode:
-    - y_pred (model outputs) are local tensors with sharded shape (need all-gather)
-    - y (labels) are local tensors with full shape (should NOT be all-gathered)
+    - y_pred (model outputs) may be:
+      - A DTensor with sharded placements -> all-gather to full shape
+      - A local tensor with sharded shape (from fallback in matmul) -> all-gather to full
+    - y (labels) are local tensors with full shape -> return as-is
     
-    This function only all-gathers when the tensor is actually a DTensor with
-    sharded placements. Plain local tensors (like labels) are returned as-is.
+    This function all-gathers DTensors with sharded placements and local tensors
+    that appear to have sharded shape (last dim doesn't match expected full size).
+    Plain local tensors with full shape (like labels) are returned as-is.
     """
     from keras.src.distribution.distribution_lib import distribution, ModelParallel
     
-    # Check if we have an active ModelParallel distribution OR if we had one
-    # (by checking if the mesh was cached OR by checking the cached MP state)
+    # Check if we have an active ModelParallel distribution
     current_dist = distribution()
     is_mp = isinstance(current_dist, ModelParallel)
+    
+    # Also check the cached MP multi-process state.
+    # This is set by TorchTrainer at the start of fit/evaluate/predict when
+    # the distribution scope is still active, and is used when the scope
+    # has exited (e.g., during loss computation).
+    global _MP_MULTI_PROCESS_STATE
+    cached_mp_state = _MP_MULTI_PROCESS_STATE
     
     # Even if the scope has exited, check if we have a cached ModelParallel mesh
     # or if we cached the MP multi-process state
     if not is_mp and torch.distributed.is_initialized():
-        # First check the cached MP multi-process state (set by TorchTrainer)
-        global _MP_MULTI_PROCESS_STATE
-        if _MP_MULTI_PROCESS_STATE:
+        if cached_mp_state:
             is_mp = True
         else:
             # Fallback: check if there's a cached MP mesh
@@ -1158,14 +1165,68 @@ def prepare_output_for_loss(x):
             return x.to_local()
         return x
     
-    # For ModelParallel: only convert DTensors, leave local tensors as-is
-    # This is critical because:
-    # - y_pred: may be a DTensor with sharded placements -> all-gather to full
-    # - y (labels): is a local tensor with full shape -> return as-is
-    if isinstance(x, DTensor):
-        # Convert sharded DTensors to local tensors with all-gather
-        return _convert_structure(x, None, to_dtensor=False, gather_sharded=True)
+    # For ModelParallel: 
+    # - y_pred: DTensor with sharded OR local tensor with sharded shape -> all-gather
+    # - y: local tensor with full shape -> return as-is
     
-    # Not a DTensor - return as-is (e.g., labels with full shape)
+    # Check if x is a DTensor - if so, it's likely the model output that needs all-gather
+    if isinstance(x, DTensor):
+        # Check if it has sharded placements
+        if not all(isinstance(p, Replicate) for p in x.placements):
+            # This is a sharded DTensor (model output) - all-gather it
+            return _convert_structure(x, None, to_dtensor=False, gather_sharded=True)
+        else:
+            # Replicated DTensor, just return local
+            return x.to_local()
+    
+    # Check if x is a local tensor in MP multi-process mode
+    # In MP multi-process mode, model outputs might be local tensors with sharded shape
+    # (when matmul falls back to local computation)
+    if isinstance(x, torch.Tensor) and not isinstance(x, DTensor):
+        # Check if we're in MP multi-process mode
+        if torch.distributed.is_initialized():
+            world_size = torch.distributed.get_world_size()
+            
+            # Check if we have the MP mesh cached (indicates MP multi-process)
+            cached_mesh = global_state.get_global_attribute("torch_device_mesh", None)
+            is_mp_mesh = False
+            if cached_mesh is not None and hasattr(cached_mesh, 'mesh'):
+                # 1D mesh indicates MP in multi-process mode
+                if cached_mesh.mesh.ndim == 1:
+                    is_mp_mesh = True
+            
+            # If this looks like MP multi-process, check if tensor is likely sharded
+            if (is_mp_mesh or cached_mp_state) and world_size > 1:
+                # This is a local tensor in MP mode - check if it looks sharded
+                # Model outputs have sharded last dimension, labels have full last dimension
+                # We can detect by checking if the last dim is smaller than what it 
+                # would be for the full tensor
+                if x.is_cuda and x.dim() > 0:
+                    last_dim = x.shape[-1]
+                    
+                    # Heuristic: if last_dim * world_size is a reasonable size,
+                    # this is likely a sharded output
+                    potential_full_size = last_dim * world_size
+                    
+                    # Check if it looks like a sharded output
+                    # Common output sizes are powers of 2 or multiples of 8
+                    is_likely_sharded = (
+                        (potential_full_size % 8 == 0 and potential_full_size <= 4096) or
+                        (potential_full_size in [8, 16, 32, 64, 128, 256, 512, 1024, 2048]) or
+                        last_dim <= 64
+                    )
+                    
+                    if is_likely_sharded:
+                        # This looks like a sharded model output! Perform all-gather.
+                        shard_dim = x.dim() - 1
+                        
+                        try:
+                            return _all_gather_with_grad(x.contiguous(), shard_dim)
+                        except Exception:
+                            # If all-gather fails, return as-is
+                            return x
+    
+    # Not a DTensor and not a sharded local tensor - this is likely labels
+    # Return as-is (full size local tensor)
     return x
 
