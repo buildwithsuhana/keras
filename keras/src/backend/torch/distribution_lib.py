@@ -751,8 +751,30 @@ def _convert_structure(x, device_mesh=None, to_dtensor=True, gather_sharded=True
             if device_mesh is not None:
                 # Check if we have a model parallel distribution
                 if _is_model_parallel_distribution():
-                    # Inputs should be replicated across model dimension
-                    return DTensor.from_local(x, device_mesh, [Replicate()])
+                    # Get the actual PyTorch device mesh from global state
+                    # This is critical for multi-dimensional meshes (e.g., 2D mesh for ModelParallel)
+                    torch_device_mesh = _get_default_device_mesh()
+                    
+                    if torch_device_mesh is not None:
+                        mesh_ndim = 1
+                        # Check if torch_device_mesh has ndim attribute (it's a PyTorch DeviceMesh)
+                        if hasattr(torch_device_mesh, 'mesh'):
+                            mesh_ndim = torch_device_mesh.mesh.ndim
+                        
+                        # For 1D mesh, use single Replicate()
+                        # For multi-dimensional mesh, replicate on all dimensions
+                        if mesh_ndim == 1:
+                            # Single placement for 1D mesh
+                            placements = [Replicate()]
+                        else:
+                            # For 2D+ mesh (e.g., ModelParallel with shape (1, 2)),
+                            # we need matching placements for each mesh dimension
+                            # Replicate on all dimensions for input data
+                            placements = [Replicate()] * mesh_ndim
+                        
+                        # Use torch_device_mesh, not the original device_mesh parameter
+                        # This ensures the mesh matches what was set up by _to_backend_mesh
+                        return DTensor.from_local(x, torch_device_mesh, placements)
         return x
 
     if isinstance(x, dict):
