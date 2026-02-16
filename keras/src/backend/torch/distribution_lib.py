@@ -843,36 +843,47 @@ def _convert_structure(x, device_mesh=None, to_dtensor=True, gather_sharded=True
 
     if isinstance(x, torch.Tensor):
         if to_dtensor:
-            # CRITICAL FIX: Get the device mesh from the current distribution's scope,
-            # not from global cache. The issue is that after DataParallel scope exits,
-            # the global cache might still have the old mesh. We need to use the mesh
-            # from the currently active distribution (if any), not the last cached one.
+            # CRITICAL FIX: Check if we're in ModelParallel multi-process mode
+            # In this mode, we should NOT convert inputs to DTensors because:
+            # 1. Each process has local inputs (not replicated)
+            # 2. Model weights are sharded DTensors
+            # 3. Converting inputs to DTensors causes shape mismatch during forward pass
+            global _MP_MULTI_PROCESS_STATE
+            is_mp_multi_process = _MP_MULTI_PROCESS_STATE
+            
+            # Also check if there's a cached 1D mesh (which indicates MP multi-process)
+            is_mp_cached = False
+            if torch.distributed.is_initialized():
+                cached_mesh = global_state.get_global_attribute("torch_device_mesh", None)
+                if cached_mesh is not None and hasattr(cached_mesh, 'mesh'):
+                    if cached_mesh.mesh.ndim == 1:
+                        is_mp_cached = True
+            
+            # Skip DTensor conversion for ModelParallel in multi-process mode
+            if is_mp_multi_process or is_mp_cached:
+                # Just ensure tensor is on correct device and return as-is
+                if torch.distributed.is_initialized() and torch.cuda.is_available():
+                    local_device = torch.cuda.current_device()
+                    if x.is_cuda:
+                        if x.device.index != local_device:
+                            x = x.to(f"cuda:{local_device}")
+                    else:
+                        x = x.to(f"cuda:{local_device}")
+                return x
+            
+            # For non-MP cases, continue with DTensor conversion
+            # Get the device mesh from the current distribution's scope
             from keras.src.distribution.distribution_lib import distribution, ModelParallel, DataParallel
             
             # Get the current distribution - this checks the scope, not global cache
             current_dist = distribution()
             
-            # CRITICAL FIX: For ModelParallel with multi-dimensional mesh, we need to
-            # use the same mesh as the model weights. The _to_backend_mesh function
-            # should return the correct 2D mesh for ModelParallel.
+            # Get the device mesh - use current distribution if available
             torch_device_mesh = None
             
             if current_dist is not None and hasattr(current_dist, 'device_mesh'):
-                # Use the current distribution's device mesh - this is the correct approach
-                # because we want inputs to match the model weights' mesh
+                # Use the current distribution's device mesh
                 torch_device_mesh = _to_backend_mesh(current_dist.device_mesh)
-                
-                # Debug: Log which mesh we're using
-                debug_mode = os.environ.get("KERAS_DISTRIBUTION_DEBUG", "0") == "1"
-                if debug_mode:
-                    rank = 0
-                    try:
-                        import torch.distributed as dist
-                        if dist.is_available() and dist.is_initialized():
-                            rank = dist.get_rank()
-                    except:
-                        pass
-                    print(f"DEBUG | [Rank {rank}] _convert_structure: using current_dist mesh: {torch_device_mesh}")
             elif device_mesh is not None:
                 # Fallback for non-distributed cases or when no distribution is active
                 # Check mesh dimensionality
@@ -882,40 +893,20 @@ def _convert_structure(x, device_mesh=None, to_dtensor=True, gather_sharded=True
                 else:
                     # This is a Keras DeviceMesh
                     torch_device_mesh = _to_backend_mesh(device_mesh)
-                
-                # CRITICAL FIX: Don't use global cache if current_dist is ModelParallel
-                # The global cache might have a stale DataParallel mesh
-                if current_dist is not None and isinstance(current_dist, ModelParallel):
-                    # We're in ModelParallel but couldn't get the right mesh from current_dist
-                    # This shouldn't happen, but let's be safe and not use wrong mesh
-                    debug_mode = os.environ.get("KERAS_DISTRIBUTION_DEBUG", "0") == "1"
-                    if debug_mode:
-                        print(f"DEBUG | [Rank 0] _convert_structure: WARNING - current_dist is MP but mesh came from fallback")
-                    # Return as-is to avoid cross-mesh operations
-                    return x
             
             if torch_device_mesh is not None:
                 mesh_ndim = 1
                 if hasattr(torch_device_mesh, 'mesh'):
                     mesh_ndim = torch_device_mesh.mesh.ndim
                 
-                # CRITICAL FIX: For multi-dimensional mesh (ModelParallel), we need
-                # to use the correct number of placements that matches the mesh ndim.
-                # This ensures inputs use the same mesh as model weights.
-                # 
-                # For multi-process with 2D mesh, inputs should be replicated across
-                # both dimensions (batch and model) to match the full model parallelism.
+                # Determine placements based on mesh ndim
                 if mesh_ndim == 1:
                     placements = [Replicate()]
                 else:
-                    # For 2D mesh in multi-process mode, replicate on all dimensions
-                    # This ensures the input is available on all devices for model parallelism
+                    # For multi-dimensional mesh, replicate on all dimensions
                     placements = [Replicate()] * mesh_ndim
                 
-                # CRITICAL FIX: Ensure the local tensor is on the correct device
-                # In multi-process mode with CUDA_VISIBLE_DEVICES, each process
-                # only sees its local GPU as cuda:0. We need to ensure the local
-                # tensor is on the correct device before creating the DTensor.
+                # Ensure the local tensor is on the correct device
                 local_tensor = x
                 
                 # Handle both numpy arrays and torch tensors - ensure they're on the right device
