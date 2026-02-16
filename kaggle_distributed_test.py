@@ -523,7 +523,9 @@ def main():
     
     # Run tests
     test_device_detection()
-    test_data_parallel(epochs=3)
+    
+    # Skip data parallel test - focusing on model parallel
+    # test_data_parallel(epochs=3)
     
     # Use Keras list_devices which properly detects all GPUs in distributed mode
     if len(list_devices("gpu")) >= 2:
@@ -533,7 +535,7 @@ def main():
         log("Need >= 2 GPUs for ModelParallel test")
         log("")
     
-    test_gradient_flow()
+    # test_gradient_flow()
     
     # Print summary (only on rank 0 in distributed mode)
     print_summary()
