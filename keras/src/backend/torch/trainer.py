@@ -177,7 +177,8 @@ class TorchTrainer(base_trainer.Trainer):
 
         y_pred = distribution_lib.prepare_output_for_loss(y_pred)
         y = distribution_lib.prepare_output_for_loss(y)
-        x = distribution_lib.prepare_output_for_loss(x)
+        # Note: x is NOT passed through prepare_output_for_loss - it's the input data
+        # and should remain as-is for loss computation
         # Call torch.nn.Module.zero_grad() to clear the leftover gradients
         # for the weights from the previous train step.
         self.zero_grad()
@@ -230,7 +231,7 @@ class TorchTrainer(base_trainer.Trainer):
             y_pred = self(x)
         y_pred = distribution_lib.prepare_output_for_loss(y_pred)
         y = distribution_lib.prepare_output_for_loss(y)
-        x = distribution_lib.prepare_output_for_loss(x)
+        # Note: x is NOT passed through prepare_output_for_loss - it's the input data
         loss = self._compute_loss(
             x=x, y=y, y_pred=y_pred, sample_weight=sample_weight, training=False
         )
