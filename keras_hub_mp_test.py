@@ -174,8 +174,11 @@ def test_keras_hub_model_parallel(epochs=1, use_preset=True):
     # LayoutMap keys use '.' separator with regex (e.g., 'embeddings.token_embedding.embeddings')
     
     # Embedding layers - variable name is 'embeddings' not 'kernel'
+    # NOTE: Position embeddings MUST be replicated (not sharded) because PyTorch DTensor
+    # doesn't support the aten.alias operation used internally by PositionEmbedding.
+    # Sharding position embeddings provides minimal memory savings anyway since they're small.
     layout_map["embeddings.token_embedding.embeddings"] = (None, "model")  # Token embeddings
-    layout_map["embeddings.position_embedding.embeddings"] = ("model",)  # Position embeddings
+    layout_map["embeddings.position_embedding.embeddings"] = ()  # Position embeddings - REPLICATED (not sharded)
     
     # Transformer decoder layers - attention weights
     layout_map["transformer_layer_.*.attention.query.kernel"] = (None, "model")
@@ -205,7 +208,7 @@ def test_keras_hub_model_parallel(epochs=1, use_preset=True):
     
     log("✓ LayoutMap configured:")
     log("  - embeddings.token_embedding.embeddings: (None, 'model')")
-    log("  - embeddings.position_embedding.embeddings: ('model',)")
+    log("  - embeddings.position_embedding.embeddings: () [replicated]")
     log("  - transformer_layer_*.attention.*.kernel: (None, 'model')")
     log("  - transformer_layer_*.feedforward.*.kernel: (None, 'model')")
     log("  - Layer norms (gamma/beta): () [replicated]")
@@ -502,7 +505,7 @@ def main():
     """Main entry point."""
     import torch.distributed as dist
     from keras.src.distribution import initialize
-    from keras.distribution import list_devices
+    from keras.src.distribution import list_devices
     
     # Initialize Keras distribution system
     initialize()
