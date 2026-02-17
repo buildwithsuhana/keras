@@ -188,16 +188,38 @@ def test_keras_hub_model_parallel(epochs=1, use_preset=True):
     layout_map["transformer_layer_.*.feedforward.up.kernel"] = (None, "model")
     layout_map["transformer_layer_.*.feedforward.down.kernel"] = (None, "model")
     
-    # Layer norms - should be replicated (no sharding)
-    layout_map["transformer_layer_.*.attention.layer_norm"] = ()
-    layout_map["transformer_layer_.*.feedforward.layer_norm"] = ()
-    layout_map["layer_norm"] = ()
+    # CRITICAL FIX: Layer norms - use more specific patterns to avoid conflicts
+    # The path in OPT model is: transformer_layer_0/self_attention_layer_norm/gamma
+    # This uses 'self_attention_layer_norm' (with underscore), not 'attention.layer_norm'
+    # So we need patterns that match both naming conventions
+    # More specific patterns first
+    
+    # For OPT/transformer models with self_attention_layer_norm naming
+    layout_map["transformer_layer_.*.self_attention_layer_norm.gamma"] = ()
+    layout_map["transformer_layer_.*.self_attention_layer_norm.beta"] = ()
+    layout_map["transformer_layer_.*.self_feedforward_layer_norm.gamma"] = ()
+    layout_map["transformer_layer_.*.self_feedforward_layer_norm.beta"] = ()
+    
+    # For alternative naming (attention.layer_norm)
+    layout_map["transformer_layer_.*.attention.layer_norm.gamma"] = ()
+    layout_map["transformer_layer_.*.attention.layer_norm.beta"] = ()
+    layout_map["transformer_layer_.*.feedforward.layer_norm.gamma"] = ()
+    layout_map["transformer_layer_.*.feedforward.layer_norm.beta"] = ()
+    
+    # For output layer norms (after attention)
+    layout_map["transformer_layer_.*.attention_output.layer_norm.gamma"] = ()
+    layout_map["transformer_layer_.*.attention_output.layer_norm.beta"] = ()
+    
+    # Embeddings layer norms
+    layout_map["embeddings.layer_norm.gamma"] = ()
+    layout_map["embeddings.layer_norm.beta"] = ()
     
     log("✓ LayoutMap configured:")
     log("  - embeddings.token_embedding.embeddings: (None, 'model')")
+    log("  - embeddings.position_embedding.embeddings: ('model',)")
     log("  - transformer_layer_*.attention.*.kernel: (None, 'model')")
     log("  - transformer_layer_*.feedforward.*.kernel: (None, 'model')")
-    log("  - Layer norms: () [replicated]")
+    log("  - Layer norms (gamma/beta): () [replicated]")
     
     # Create ModelParallel distribution
     mp = ModelParallel(
