@@ -562,9 +562,12 @@ class DataParallel(Distribution):
             from keras.src.distribution.distribution_lib import TensorLayout
             return TensorLayout([], self.device_mesh)
 
-        # Otherwise, create a replicated layout (shard spec of [None, None, ...]).
-        # This ensures variables are mirrored across devices rather than sharded.
-        variable_shard_spec = [None] * len(variable_shape)
+        # CRITICAL FIX: Return empty tuple () instead of [None] * len(variable_shape)
+        # When DataParallel is active, ALL variables should be converted to DTensors
+        # (replicated), to ensure consistency and compatibility with the distributed
+        # training infrastructure. The empty tuple () triggers DTensor conversion
+        # with Replicate placement in the torch backend's distribute_variable function.
+        variable_shard_spec = ()
         
         from keras.src.distribution.distribution_lib import TensorLayout
         return TensorLayout(variable_shard_spec, self.device_mesh)
