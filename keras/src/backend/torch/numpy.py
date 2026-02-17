@@ -2009,6 +2009,13 @@ def swapaxes(x, axis1, axis2):
 
 
 def take(x, indices, axis=None):
+    from keras.src.backend.torch.distribution_lib import (
+        is_dtensor,
+        _get_default_device_mesh,
+        DTensor,
+        Replicate,
+        dtensor_from_local,
+    )
     x = convert_to_tensor(x)
     indices = convert_to_tensor(indices).long()
     # Correct the indices using "fill" mode which is the same as in jax
