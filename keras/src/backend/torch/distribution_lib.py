@@ -327,13 +327,19 @@ def distribute_variable(tensor, layout=None):
                 return torch.nn.Parameter(dtensor) if is_float_or_complex else dtensor
             
             # Handle case where tensor is not yet a DTensor
-            if placements and any(isinstance(p, Shard) for p in placements):
+            if placements:
+                # CRITICAL FIX: Always create DTensor when placements is specified,
+                # regardless of whether it's Sharded or Replicated.
+                # This ensures all variables (even replicated ones) become DTensors,
+                # which is necessary for compatibility with sharded variables.
+                # For example, when token_embedding (sharded DTensor) is added to
+                # position_embedding (replicated DTensor), both must be DTensors.
                 dtensor = torch_distribute_tensor(converted_tensor, device_mesh, placements)
                 if debug_mode:
-                    print(f"DEBUG | [Rank {rank}]   - Created DTensor with local shape: {dtensor.to_local().shape}")
+                    print(f"DEBUG | [Rank {rank}]   - Created DTensor with placements: {placements}")
                 return torch.nn.Parameter(dtensor) if is_float_or_complex else dtensor
             elif debug_mode:
-                print(f"DEBUG | [Rank {rank}]   - No sharding placements, returning as-is or replicated")
+                print(f"DEBUG | [Rank {rank}]   - No placements, returning as-is")
 
     if debug_mode:
         print(f"DEBUG | [Rank {rank}]   - No distribution active, returning regular tensor")
