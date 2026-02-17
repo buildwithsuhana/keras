@@ -895,9 +895,14 @@ class LayoutMap(collections.abc.MutableMapping):
         if key in self._layout_map:
             return self._layout_map[key]
 
+        # Normalize the key by replacing '/' with '.' to match the convention
+        # used in LayoutMap keys (e.g., 'dense.kernel' vs actual path
+        # 'dense/kernel')
+        normalized_key = key.replace("/", ".")
+
         matching_keys = []
         for k in self._layout_map:
-            if re.search(k, key):
+            if re.search(k, normalized_key):
                 matching_keys.append(k)
         if len(matching_keys) > 1:
             raise ValueError(

@@ -167,35 +167,34 @@ def test_keras_hub_model_parallel(epochs=1, use_preset=True):
     # Create layout map for sharding
     # For transformer models, we typically shard the embedding and output dimensions
     layout_map = LayoutMap(mesh)
-    
+
     # Shard the kernel weights across model axis
     # These patterns will match layers in OPT model:
-    # - embeddings.token_embedding.kernel -> token embeddings
-    # - transformer_layer_*.attention.*.kernel -> attention weights
-    # - transformer_layer_*.feedforward.*.kernel -> FFN weights
-    # - layer_norm -> layer normalization (replicated)
+    # Note: Variable paths use '/' separator (e.g., 'embeddings/token_embedding/embeddings')
+    # LayoutMap keys use '.' separator with regex (e.g., 'embeddings.token_embedding.embeddings')
     
-    layout_map["embeddings.token_embedding.kernel"] = (None, "model")  # Token embeddings
-    layout_map["embeddings.position_embedding.kernel"] = ("model",)  # Position embeddings
+    # Embedding layers - variable name is 'embeddings' not 'kernel'
+    layout_map["embeddings.token_embedding.embeddings"] = (None, "model")  # Token embeddings
+    layout_map["embeddings.position_embedding.embeddings"] = ("model",)  # Position embeddings
     
     # Transformer decoder layers - attention weights
-    layout_map["transformer_layer_*.attention.query.kernel"] = (None, "model")
-    layout_map["transformer_layer_*.attention.key.kernel"] = (None, "model")
-    layout_map["transformer_layer_*.attention.value.kernel"] = (None, "model")
-    layout_map["transformer_layer_*.attention.output.kernel"] = (None, "model")
+    layout_map["transformer_layer_.*.attention.query.kernel"] = (None, "model")
+    layout_map["transformer_layer_.*.attention.key.kernel"] = (None, "model")
+    layout_map["transformer_layer_.*.attention.value.kernel"] = (None, "model")
+    layout_map["transformer_layer_.*.attention.output.kernel"] = (None, "model")
     
     # Transformer decoder layers - feedforward weights
-    layout_map["transformer_layer_*.feedforward.gate.kernel"] = (None, "model")
-    layout_map["transformer_layer_*.feedforward.up.kernel"] = (None, "model")
-    layout_map["transformer_layer_*.feedforward.down.kernel"] = (None, "model")
+    layout_map["transformer_layer_.*.feedforward.gate.kernel"] = (None, "model")
+    layout_map["transformer_layer_.*.feedforward.up.kernel"] = (None, "model")
+    layout_map["transformer_layer_.*.feedforward.down.kernel"] = (None, "model")
     
     # Layer norms - should be replicated (no sharding)
-    layout_map["transformer_layer_*.attention.layer_norm"] = ()
-    layout_map["transformer_layer_*.feedforward.layer_norm"] = ()
+    layout_map["transformer_layer_.*.attention.layer_norm"] = ()
+    layout_map["transformer_layer_.*.feedforward.layer_norm"] = ()
     layout_map["layer_norm"] = ()
     
     log("✓ LayoutMap configured:")
-    log("  - embeddings.token_embedding.kernel: (None, 'model')")
+    log("  - embeddings.token_embedding.embeddings: (None, 'model')")
     log("  - transformer_layer_*.attention.*.kernel: (None, 'model')")
     log("  - transformer_layer_*.feedforward.*.kernel: (None, 'model')")
     log("  - Layer norms: () [replicated]")
