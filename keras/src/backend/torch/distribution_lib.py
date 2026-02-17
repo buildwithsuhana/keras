@@ -978,38 +978,30 @@ def _convert_structure(x, device_mesh=None, to_dtensor=True, gather_sharded=True
 
     if isinstance(x, torch.Tensor):
         if to_dtensor:
-            # CRITICAL FIX: Check if we're in ModelParallel multi-process mode
-            # In this mode, we should NOT convert inputs to DTensors because:
-            # 1. Each process has local inputs (not replicated)
-            # 2. Model weights are sharded DTensors
-            # 3. Converting inputs to DTensors causes shape mismatch during forward pass
             global _MP_MULTI_PROCESS_STATE
             is_mp_multi_process = _MP_MULTI_PROCESS_STATE
             
-            # Also check if there's a cached 1D mesh (which indicates MP multi-process)
-            is_mp_cached = False
-            if torch.distributed.is_initialized():
-                cached_mesh = global_state.get_global_attribute("torch_device_mesh", None)
-                if cached_mesh is not None and hasattr(cached_mesh, 'mesh'):
-                    if cached_mesh.mesh.ndim == 1:
-                        is_mp_cached = True
-            
-            # CRITICAL FIX: For ModelParallel in multi-process mode, we now convert to DTensors
-            # with Replicate placement. This is handled by prepare_input_for_distribution,
-            # so we should continue with normal DTensor conversion here.
-            # The check below is kept for edge cases but we now prefer conversion.
-            if (is_mp_multi_process or is_mp_cached) and to_dtensor:
-                # We MUST convert inputs to DTensors with Replicate placement
-                # so they are compatible with sharded weight DTensors.
+            # --- START FIX ---
+            # If we are in multi-process MP mode, we MUST convert to DTensor
+            # even if it was previously skipped.
+            if is_mp_multi_process and not isinstance(x, DTensor):
                 from torch.distributed._tensor import distribute_tensor as torch_distribute_tensor
-                # Use the provided torch_device_mesh (already determined in parent logic)
+                
+                # Use cached mesh or determine from current distribution
+                torch_device_mesh = device_mesh
+                if torch_device_mesh is None:
+                    from keras.src.distribution.distribution_lib import distribution
+                    current_dist = distribution()
+                    if current_dist:
+                        torch_device_mesh = _to_backend_mesh(current_dist.device_mesh)
+                
                 if torch_device_mesh is not None:
+                    # Input data must be replicated across all ranks
                     placements = [Replicate()] * torch_device_mesh.mesh.ndim
-                    # Ensure tensor is on the correct local device before wrapping
-                    if torch.cuda.is_available():
-                        local_device = f"cuda:{torch.cuda.current_device()}"
-                        x = x.to(local_device)
-                    return torch_distribute_tensor(x, torch_device_mesh, placements)
+                    # Ensure tensor is on correct local device
+                    local_device = f"cuda:{torch.cuda.current_device()}"
+                    x_local = x.to(local_device)
+                    return torch_distribute_tensor(x_local, torch_device_mesh, placements)
             
             # For non-MP cases, continue with DTensor conversion
             # Get the device mesh from the current distribution's scope
