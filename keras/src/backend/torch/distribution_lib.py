@@ -1185,11 +1185,16 @@ def prepare_output_for_loss(x):
             pass
         print(f"DEBUG | [Rank {rank}] prepare_output_for_loss START: cached_mp_state={cached_mp_state}, x_type={type(x).__name__}, x_shape={getattr(x, 'shape', 'N/A')}")
     
-    # CRITICAL FIX: In MP multi-process mode, skip all processing and return as-is
-    # This avoids issues with all-reduce/all-gather that cause shape mismatches
+    # CRITICAL FIX: In MP multi-process mode, we need to convert DTensor to local tensor
+    # Returning DTensor as-is causes "aten.sub.Tensor: got mixed torch.Tensor and DTensor" 
+    # errors during loss computation because PyTorch can't mix DTensors with regular tensors.
     if cached_mp_state and torch.distributed.is_initialized():
         if debug_mode:
-            print(f"DEBUG | [Rank {rank}] prepare_output_for_loss: MP multi-process mode - returning x as-is")
+            print(f"DEBUG | [Rank {rank}] prepare_output_for_loss: MP multi-process mode - converting DTensor to local tensor")
+        
+        # Check if x is a DTensor-like object and convert to local tensor
+        if hasattr(x, 'placements') and hasattr(x, 'to_local') and hasattr(x, 'shape'):
+            return x.to_local()
         return x
     
     # Even if the scope has exited, check if we have a cached ModelParallel mesh
