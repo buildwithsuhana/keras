@@ -393,7 +393,11 @@ class TorchTrainer(base_trainer.Trainer):
         # Check if torch.compile should be disabled for ModelParallel in multi-process
         # This must be done while the distribution scope is still active
         self._check_and_disable_torch_compile_for_mp()
-        # Cache MP multi-process state while distribution scope is still active
+        # CRITICAL FIX: Cache MP multi-process state BEFORE _symbolic_build and
+        # make_train_function. This ensures the state is available during
+        # torch.compile tracing which runs train_step to get the graph.
+        # Previously this was called after _symbolic_build, which caused issues
+        # because torch.compile runs train_step BEFORE _symbolic_build completes.
         self._cache_mp_multi_process_state()
         self._symbolic_build(iterator=epoch_iterator)
         epoch_iterator.reset()
@@ -525,7 +529,9 @@ class TorchTrainer(base_trainer.Trainer):
         # Check if torch.compile should be disabled for ModelParallel in multi-process
         # This must be done while the distribution scope is still active
         self._check_and_disable_torch_compile_for_mp()
-        # Cache MP multi-process state while distribution scope is still active
+        # CRITICAL FIX: Cache MP multi-process state BEFORE _symbolic_build and
+        # make_test_function. This ensures the state is available during
+        # torch.compile tracing which runs test_step to get the graph.
         self._cache_mp_multi_process_state()
         self._symbolic_build(iterator=epoch_iterator)
         epoch_iterator.reset()
@@ -579,7 +585,9 @@ class TorchTrainer(base_trainer.Trainer):
         # Check if torch.compile should be disabled for ModelParallel in multi-process
         # This must be done while the distribution scope is still active
         self._check_and_disable_torch_compile_for_mp()
-        # Cache MP multi-process state while distribution scope is still active
+        # CRITICAL FIX: Cache MP multi-process state BEFORE making the predict
+        # function. This ensures the state is available during torch.compile
+        # tracing which runs predict_step to get the graph.
         self._cache_mp_multi_process_state()
         # Container that configures and calls callbacks.
         if not isinstance(callbacks, callbacks_module.CallbackList):
