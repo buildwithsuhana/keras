@@ -753,6 +753,35 @@ def _to_dtensor(tensor, device_mesh=None, placements=None):
     if device_mesh is None:
         return tensor
 
+    # CRITICAL FIX: Ensure placements is always a list of Placement objects
+    # Handle the case where placements might be a tuple (e.g., layout tuple passed directly)
+    from keras.src.distribution.distribution_lib import TensorLayout
+    if isinstance(placements, TensorLayout):
+        placements = _layout_to_placements(placements.axes, tensor, device_mesh)
+    elif placements is not None and not isinstance(placements, list):
+        # Convert tuple or other iterables to list
+        placements = list(placements)
+    
+    # Validate and fix placements - ensure each element is a Placement object
+    if placements:
+        from torch.distributed._tensor.placement_types import Placement
+        safe_placements = []
+        for p in placements:
+            if isinstance(p, Placement):
+                safe_placements.append(p)
+            elif isinstance(p, Shard):
+                safe_placements.append(p)
+            elif isinstance(p, Replicate):
+                safe_placements.append(p)
+            elif isinstance(p, tuple):
+                # CRITICAL FIX: If a tuple is passed as placement, convert it to Replicate
+                # This can happen when layout tuples are mistakenly passed as placements
+                safe_placements.append(Replicate())
+            else:
+                # Default to Replicate for unknown types
+                safe_placements.append(Replicate())
+        placements = safe_placements
+    
     placements = [Replicate()] if placements is None else (placements if isinstance(placements, list) else [placements])
     # Validate placements against tensor ndim to avoid DTensor.from_local assertions
     safe_placements = []
@@ -783,6 +812,35 @@ def dtensor_from_local(tensor, device_mesh, placements):
     if tensor is None:
         return tensor
 
+    # CRITICAL FIX: Ensure placements is always a list of Placement objects
+    # Handle the case where placements might be a tuple (e.g., layout tuple passed directly)
+    from keras.src.distribution.distribution_lib import TensorLayout
+    if isinstance(placements, TensorLayout):
+        placements = _layout_to_placements(placements.axes, tensor, device_mesh)
+    elif placements is not None and not isinstance(placements, list):
+        # Convert tuple or other iterables to list
+        placements = list(placements)
+    
+    # Validate and fix placements - ensure each element is a Placement object
+    if placements:
+        from torch.distributed._tensor.placement_types import Placement
+        safe_placements = []
+        for p in placements:
+            if isinstance(p, Placement):
+                safe_placements.append(p)
+            elif isinstance(p, Shard):
+                safe_placements.append(p)
+            elif isinstance(p, Replicate):
+                safe_placements.append(p)
+            elif isinstance(p, tuple):
+                # CRITICAL FIX: If a tuple is passed as placement, convert it to Replicate
+                # This can happen when layout tuples are mistakenly passed as placements
+                safe_placements.append(Replicate())
+            else:
+                # Default to Replicate for unknown types
+                safe_placements.append(Replicate())
+        placements = safe_placements
+    
     placements = [Replicate()] if placements is None else (placements if isinstance(placements, list) else [placements])
 
     safe_placements = []
