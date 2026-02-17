@@ -981,97 +981,72 @@ def _convert_structure(x, device_mesh=None, to_dtensor=True, gather_sharded=True
             global _MP_MULTI_PROCESS_STATE
             is_mp_multi_process = _MP_MULTI_PROCESS_STATE
             
-            # --- START FIX ---
-            # If we are in multi-process MP mode, we MUST convert to DTensor
-            # even if it was previously skipped.
-            if is_mp_multi_process and not isinstance(x, DTensor):
-                from torch.distributed._tensor import distribute_tensor as torch_distribute_tensor
+            # Also check if there's a cached 1D mesh (which indicates MP multi-process)
+            is_mp_cached = False
+            if torch.distributed.is_initialized():
+                cached_mesh = global_state.get_global_attribute("torch_device_mesh", None)
+                if cached_mesh is not None and hasattr(cached_mesh, 'mesh'):
+                    if cached_mesh.mesh.ndim == 1:
+                        is_mp_cached = True
+            
+            # --- START CRITICAL FIX ---
+            # In multi-process ModelParallel mode, inputs MUST be converted to DTensors
+            # with Replicate placement to be compatible with sharded weight DTensors.
+            if (is_mp_multi_process or is_mp_cached) and not isinstance(x, DTensor):
+                from keras.src.distribution.distribution_lib import distribution
+                current_dist = distribution()
+                torch_device_mesh = None
                 
-                # Use cached mesh or determine from current distribution
-                torch_device_mesh = device_mesh
-                if torch_device_mesh is None:
-                    from keras.src.distribution.distribution_lib import distribution
-                    current_dist = distribution()
-                    if current_dist:
-                        torch_device_mesh = _to_backend_mesh(current_dist.device_mesh)
+                if current_dist is not None and hasattr(current_dist, 'device_mesh'):
+                    torch_device_mesh = _to_backend_mesh(current_dist.device_mesh)
                 
                 if torch_device_mesh is not None:
-                    # Input data must be replicated across all ranks
+                    # Inputs must be REPLICATED across the mesh so each rank 
+                    # has the full batch to use with its sharded weights.
                     placements = [Replicate()] * torch_device_mesh.mesh.ndim
-                    # Ensure tensor is on correct local device
-                    local_device = f"cuda:{torch.cuda.current_device()}"
-                    x_local = x.to(local_device)
-                    return torch_distribute_tensor(x_local, torch_device_mesh, placements)
-            
-            # For non-MP cases, continue with DTensor conversion
-            # Get the device mesh from the current distribution's scope
-            from keras.src.distribution.distribution_lib import distribution, ModelParallel, DataParallel
-            
-            # Get the current distribution - this checks the scope, not global cache
+                    
+                    # Ensure tensor is on the correct local GPU before wrapping
+                    if torch.cuda.is_available():
+                        local_device = f"cuda:{torch.cuda.current_device()}"
+                        x = x.to(local_device)
+                    
+                    return torch_distribute_tensor(x, torch_device_mesh, placements)
+            # --- END CRITICAL FIX ---
+
+            # For non-MP cases, continue with normal DTensor conversion
+            from keras.src.distribution.distribution_lib import distribution
             current_dist = distribution()
-            
-            # Get the device mesh - use current distribution if available
             torch_device_mesh = None
             
             if current_dist is not None and hasattr(current_dist, 'device_mesh'):
-                # Use the current distribution's device mesh
                 torch_device_mesh = _to_backend_mesh(current_dist.device_mesh)
             elif device_mesh is not None:
-                # Fallback for non-distributed cases or when no distribution is active
-                # Check mesh dimensionality
                 if hasattr(device_mesh, 'mesh'):
-                    # This is already a PyTorch DeviceMesh
                     torch_device_mesh = device_mesh
                 else:
-                    # This is a Keras DeviceMesh
                     torch_device_mesh = _to_backend_mesh(device_mesh)
             
             if torch_device_mesh is not None:
-                mesh_ndim = 1
-                if hasattr(torch_device_mesh, 'mesh'):
-                    mesh_ndim = torch_device_mesh.mesh.ndim
+                mesh_ndim = torch_device_mesh.mesh.ndim if hasattr(torch_device_mesh, 'mesh') else 1
+                placements = [Replicate()] * mesh_ndim
                 
-                # Determine placements based on mesh ndim
-                if mesh_ndim == 1:
-                    placements = [Replicate()]
-                else:
-                    # For multi-dimensional mesh, replicate on all dimensions
-                    placements = [Replicate()] * mesh_ndim
-                
-                # Ensure the local tensor is on the correct device
                 local_tensor = x
-                
-                # Handle both numpy arrays and torch tensors - ensure they're on the right device
                 if isinstance(x, np.ndarray):
-                    # Convert numpy array to torch tensor first, then handle device
                     if x.dtype == np.uint32:
                         x = x.astype(np.int64)
-                    if standardize_dtype(x.dtype) == "bfloat16":
+                    dtype = standardize_dtype(x.dtype)
+                    if dtype == "bfloat16":
                         x = x.astype(np.float32)
                         dtype = "bfloat16"
-                    dtype = dtype or x.dtype
                     
-                    # Get the correct local device for this process
-                    if torch.distributed.is_initialized() and torch.cuda.is_available():
-                        local_device = f"cuda:{torch.cuda.current_device()}"
-                    else:
-                        local_device = get_device()
-                    
-                    local_tensor = torch.as_tensor(x, dtype=to_torch_dtype(dtype), device=local_device)
+                    local_device = f"cuda:{torch.cuda.current_device()}" if torch.cuda.is_available() else get_device()
+                    local_tensor = torch.as_tensor(x, dtype=to_torch_dtype(dtype or x.dtype), device=local_device)
                 elif isinstance(x, torch.Tensor):
-                    # For existing torch tensors, ensure they're on the correct device
                     if torch.distributed.is_initialized() and torch.cuda.is_available():
                         local_device = torch.cuda.current_device()
-                        if x.is_cuda:
-                            if x.device.index != local_device:
-                                local_tensor = x.to(f"cuda:{local_device}")
-                        else:
-                            # Tensor is on CPU or different device, move to correct CUDA device
-                            local_tensor = x.to(f"cuda:{local_device}")
+                        local_tensor = x.to(f"cuda:{local_device}")
                 
                 return dtensor_from_local(local_tensor, torch_device_mesh, placements)
-            
-            # If no mesh available, return as-is
             return x
 
     if isinstance(x, dict):
