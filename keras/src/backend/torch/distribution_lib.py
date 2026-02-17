@@ -960,6 +960,10 @@ def _convert_structure(x, device_mesh=None, to_dtensor=True, gather_sharded=True
     if x is None:
         return x
 
+    # Debug helper
+    debug_mode = os.environ.get("KERAS_DISTRIBUTION_DEBUG", "0") == "1"
+    rank = torch.distributed.get_rank() if torch.distributed.is_initialized() else 0
+
     if isinstance(x, DTensor):
         if not to_dtensor:
             if gather_sharded and not all(isinstance(p, Replicate) for p in x.placements):
@@ -976,44 +980,12 @@ def _convert_structure(x, device_mesh=None, to_dtensor=True, gather_sharded=True
             return x.to_local()
         return x
 
-    if isinstance(x, torch.Tensor):
+    if isinstance(x, (torch.Tensor, np.ndarray)):
         if to_dtensor:
             global _MP_MULTI_PROCESS_STATE
             is_mp_multi_process = _MP_MULTI_PROCESS_STATE
             
-            # Also check if there's a cached 1D mesh (which indicates MP multi-process)
-            is_mp_cached = False
-            if torch.distributed.is_initialized():
-                cached_mesh = global_state.get_global_attribute("torch_device_mesh", None)
-                if cached_mesh is not None and hasattr(cached_mesh, 'mesh'):
-                    if cached_mesh.mesh.ndim == 1:
-                        is_mp_cached = True
-            
-            # --- START CRITICAL FIX ---
-            # In multi-process ModelParallel mode, inputs MUST be converted to DTensors
-            # with Replicate placement to be compatible with sharded weight DTensors.
-            if (is_mp_multi_process or is_mp_cached) and not isinstance(x, DTensor):
-                from keras.src.distribution.distribution_lib import distribution
-                current_dist = distribution()
-                torch_device_mesh = None
-                
-                if current_dist is not None and hasattr(current_dist, 'device_mesh'):
-                    torch_device_mesh = _to_backend_mesh(current_dist.device_mesh)
-                
-                if torch_device_mesh is not None:
-                    # Inputs must be REPLICATED across the mesh so each rank 
-                    # has the full batch to use with its sharded weights.
-                    placements = [Replicate()] * torch_device_mesh.mesh.ndim
-                    
-                    # Ensure tensor is on the correct local GPU before wrapping
-                    if torch.cuda.is_available():
-                        local_device = f"cuda:{torch.cuda.current_device()}"
-                        x = x.to(local_device)
-                    
-                    return torch_distribute_tensor(x, torch_device_mesh, placements)
-            # --- END CRITICAL FIX ---
-
-            # For non-MP cases, continue with normal DTensor conversion
+            # Identify current distribution and mesh
             from keras.src.distribution.distribution_lib import distribution
             current_dist = distribution()
             torch_device_mesh = None
@@ -1021,32 +993,33 @@ def _convert_structure(x, device_mesh=None, to_dtensor=True, gather_sharded=True
             if current_dist is not None and hasattr(current_dist, 'device_mesh'):
                 torch_device_mesh = _to_backend_mesh(current_dist.device_mesh)
             elif device_mesh is not None:
-                if hasattr(device_mesh, 'mesh'):
-                    torch_device_mesh = device_mesh
-                else:
-                    torch_device_mesh = _to_backend_mesh(device_mesh)
-            
-            if torch_device_mesh is not None:
-                mesh_ndim = torch_device_mesh.mesh.ndim if hasattr(torch_device_mesh, 'mesh') else 1
-                placements = [Replicate()] * mesh_ndim
+                torch_device_mesh = device_mesh if hasattr(device_mesh, 'mesh') else _to_backend_mesh(device_mesh)
+
+            # CRITICAL FIX: If we have a mesh and distributed is on, we MUST convert to DTensor.
+            # Mixed tensors are prohibited in PyTorch distributed ops.
+            if torch_device_mesh is not None and torch.distributed.is_initialized():
+                if debug_mode:
+                    print(f"DEBUG | [Rank {rank}] _convert_structure: Promoting {type(x)} to DTensor (Mesh: {torch_device_mesh.mesh_dim_names})")
                 
-                local_tensor = x
+                # Ensure we have a torch.Tensor on the correct local device
+                local_device = f"cuda:{torch.cuda.current_device()}"
                 if isinstance(x, np.ndarray):
-                    if x.dtype == np.uint32:
-                        x = x.astype(np.int64)
+                    if x.dtype == np.uint32: x = x.astype(np.int64)
                     dtype = standardize_dtype(x.dtype)
-                    if dtype == "bfloat16":
+                    if dtype == "bfloat16": 
                         x = x.astype(np.float32)
                         dtype = "bfloat16"
-                    
-                    local_device = f"cuda:{torch.cuda.current_device()}" if torch.cuda.is_available() else get_device()
-                    local_tensor = torch.as_tensor(x, dtype=to_torch_dtype(dtype or x.dtype), device=local_device)
-                elif isinstance(x, torch.Tensor):
-                    if torch.distributed.is_initialized() and torch.cuda.is_available():
-                        local_device = torch.cuda.current_device()
-                        local_tensor = x.to(f"cuda:{local_device}")
+                    local_tensor = torch.as_tensor(x, dtype=to_torch_dtype(dtype), device=local_device)
+                else:
+                    local_tensor = x.to(local_device) if x.device.type != "cuda" or x.device.index != torch.cuda.current_device() else x
                 
-                return dtensor_from_local(local_tensor, torch_device_mesh, placements)
+                # Inputs for ModelParallel must be Replicated
+                placements = [Replicate()] * torch_device_mesh.mesh.ndim
+                return torch_distribute_tensor(local_tensor, torch_device_mesh, placements)
+
+            # Fallback for CPU/Single-process
+            if isinstance(x, np.ndarray):
+                return convert_to_tensor(x)
             return x
 
     if isinstance(x, dict):
