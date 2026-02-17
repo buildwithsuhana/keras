@@ -1162,8 +1162,18 @@ def prepare_output_for_loss(x):
     CRITICAL FIX: In ModelParallel multi-process mode, skip this function entirely
     to avoid issues with DTensor handling. The trainer should not call this function
     in MP multi-process mode.
+    
+    CRITICAL FIX 2: This function should ONLY process y_pred (model outputs),
+    NOT y (labels). Labels are local tensors and should never be processed.
+    If x is NOT a DTensor, return it as-is immediately.
     """
     from keras.src.distribution.distribution_lib import distribution, ModelParallel
+    
+    # CRITICAL FIX: If x is not a DTensor, return it as-is immediately
+    # This handles the case where y (labels) are passed to this function
+    # Labels are always local tensors and should never be converted
+    if not isinstance(x, DTensor) and not (hasattr(x, 'placements') and hasattr(x, 'to_local')):
+        return x
     
     # Check if we have an active ModelParallel distribution
     current_dist = distribution()
