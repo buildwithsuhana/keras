@@ -960,7 +960,7 @@ def _convert_structure(x, device_mesh=None, to_dtensor=True, gather_sharded=True
     if x is None:
         return x
 
-    # Debug helper
+    # Debug info
     debug_mode = os.environ.get("KERAS_DISTRIBUTION_DEBUG", "0") == "1"
     rank = torch.distributed.get_rank() if torch.distributed.is_initialized() else 0
 
@@ -985,7 +985,7 @@ def _convert_structure(x, device_mesh=None, to_dtensor=True, gather_sharded=True
             global _MP_MULTI_PROCESS_STATE
             is_mp_multi_process = _MP_MULTI_PROCESS_STATE
             
-            # Identify current distribution and mesh
+            # Identify the backend mesh
             from keras.src.distribution.distribution_lib import distribution
             current_dist = distribution()
             torch_device_mesh = None
@@ -995,13 +995,13 @@ def _convert_structure(x, device_mesh=None, to_dtensor=True, gather_sharded=True
             elif device_mesh is not None:
                 torch_device_mesh = device_mesh if hasattr(device_mesh, 'mesh') else _to_backend_mesh(device_mesh)
 
-            # CRITICAL FIX: If we have a mesh and distributed is on, we MUST convert to DTensor.
-            # Mixed tensors are prohibited in PyTorch distributed ops.
+            # CRITICAL FIX: If a mesh exists and we are distributed, we MUST return a DTensor.
+            # Mixed tensors cause crashes in PyTorch distributed operators.
             if torch_device_mesh is not None and torch.distributed.is_initialized():
                 if debug_mode:
-                    print(f"DEBUG | [Rank {rank}] _convert_structure: Promoting {type(x)} to DTensor (Mesh: {torch_device_mesh.mesh_dim_names})")
+                    print(f"DEBUG | [Rank {rank}] _convert_structure: Promoting {type(x)} to DTensor")
                 
-                # Ensure we have a torch.Tensor on the correct local device
+                # Ensure we have a torch.Tensor on the correct local GPU
                 local_device = f"cuda:{torch.cuda.current_device()}"
                 if isinstance(x, np.ndarray):
                     if x.dtype == np.uint32: x = x.astype(np.int64)
@@ -1011,13 +1011,14 @@ def _convert_structure(x, device_mesh=None, to_dtensor=True, gather_sharded=True
                         dtype = "bfloat16"
                     local_tensor = torch.as_tensor(x, dtype=to_torch_dtype(dtype), device=local_device)
                 else:
+                    # Move standard tensor to local GPU if needed
                     local_tensor = x.to(local_device) if x.device.type != "cuda" or x.device.index != torch.cuda.current_device() else x
                 
-                # Inputs for ModelParallel must be Replicated
+                # Inputs for ModelParallel must be Replicated across the mesh
                 placements = [Replicate()] * torch_device_mesh.mesh.ndim
                 return torch_distribute_tensor(local_tensor, torch_device_mesh, placements)
 
-            # Fallback for CPU/Single-process
+            # Fallback for non-distributed (CPU / Single-process)
             if isinstance(x, np.ndarray):
                 return convert_to_tensor(x)
             return x

@@ -1,4 +1,5 @@
 import os
+# Set backend to torch
 os.environ["KERAS_BACKEND"] = "torch"
 os.environ["KERAS_DISTRIBUTION_DEBUG"] = "1"
 
@@ -19,6 +20,7 @@ def test_opt_model_parallel():
     mesh = DeviceMesh(shape=(1, len(devices)), axis_names=["batch", "model"], devices=devices)
     
     layout_map = LayoutMap(mesh)
+    # Token embeddings sharded, Position embeddings replicated DTensor
     layout_map["embeddings.token_embedding.embeddings"] = (None, "model")
     layout_map["embeddings.position_embedding.embeddings"] = (None, None)
     layout_map["transformer_layer_.*.attention.*.kernel"] = (None, "model")
@@ -26,6 +28,8 @@ def test_opt_model_parallel():
     layout_map[".*layer_norm.*"] = ()
 
     mp = ModelParallel(layout_map=layout_map, batch_dim_name="batch", auto_shard_dataset=False)
+    
+    # Sync backend state
     set_mp_multi_process_state(True)
 
     with mp.scope():
@@ -35,20 +39,20 @@ def test_opt_model_parallel():
             hidden_dim=128, intermediate_dim=256, max_sequence_length=32
         )
         
-        # Build BEFORE compile to ensure sharding metadata is attached to all weights
+        # CRITICAL: Build inside scope so weights are created as DTensors
         log("Building model...")
         model.build({"token_ids": (4, 16), "padding_mask": (4, 16)})
         
         model.compile(optimizer=keras.optimizers.Adam(1e-3), loss="mse")
 
-    # Raw Numpy inputs - Backend will now correctly wrap these as Replicated DTensors
+    # Raw Numpy inputs - Backend _convert_structure will handle DTensor wrapping
     x = {
         "token_ids": np.random.randint(0, 50265, size=(4, 16), dtype="int32"),
         "padding_mask": np.ones((4, 16), dtype="int32"),
     }
     y = np.random.random((4, 16, 128)).astype("float32")
 
-    log("Starting training...")
+    log("Starting fit...")
     with mp.scope():
         model.fit(x, y, epochs=1, verbose=0)
     
