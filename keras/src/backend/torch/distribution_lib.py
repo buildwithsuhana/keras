@@ -1198,14 +1198,14 @@ def prepare_output_for_loss(x):
     # CRITICAL FIX: In MP multi-process mode, we need to convert DTensor to local tensor
     # Returning DTensor as-is causes "aten.sub.Tensor: got mixed torch.Tensor and DTensor" 
     # errors during loss computation because PyTorch can't mix DTensors with regular tensors.
-    if cached_mp_state and torch.distributed.is_initialized():
-        if debug_mode:
-            print(f"DEBUG | [Rank {rank}] prepare_output_for_loss: MP multi-process mode - converting DTensor to local tensor")
-        
-        # Check if x is a DTensor-like object and convert to local tensor
-        if hasattr(x, 'placements') and hasattr(x, 'to_local') and hasattr(x, 'shape'):
-            return x.to_local()
-        return x
+    # NOTE: previously we returned early here for cached MP multi-process state
+    # which converted DTensor outputs to local shards. That caused label/output
+    # shape mismatches when computing the loss (labels are full local tensors).
+    # Instead, fall through to the standard DTensor handling below which will
+    # perform an all-gather or all-reduce when needed. We keep the debug
+    # message for visibility but DO NOT return early.
+    if cached_mp_state and torch.distributed.is_initialized() and debug_mode:
+        print(f"DEBUG | [Rank {rank}] prepare_output_for_loss: MP multi-process mode active (cached), proceeding to DTensor handling")
     
     # Even if the scope has exited, check if we have a cached ModelParallel mesh
     # or if we cached the MP multi-process state
