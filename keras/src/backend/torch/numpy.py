@@ -2032,6 +2032,48 @@ def nonzero(x):
 
 def not_equal(x1, x2):
     x1, x2 = convert_to_tensor(x1), convert_to_tensor(x2)
+    # Handle mixed DTensor and regular tensor operands
+    from keras.src.backend.torch.distribution_lib import (
+        is_dtensor,
+        _get_default_device_mesh,
+        DTensor,
+        Replicate,
+        dtensor_from_local,
+    )
+
+    # Check if we have at least one DTensor
+    x1_is_dtensor = is_dtensor(x1)
+    x2_is_dtensor = is_dtensor(x2)
+    
+    if x1_is_dtensor or x2_is_dtensor:
+        # Get device_mesh from DTensor if available, otherwise from global state
+        device_mesh = None
+        if x1_is_dtensor:
+            device_mesh = getattr(x1, 'device_mesh', None)
+        elif x2_is_dtensor:
+            device_mesh = getattr(x2, 'device_mesh', None)
+        
+        # CRITICAL FIX: Fallback to global state if device_mesh is None
+        if device_mesh is None:
+            device_mesh = _get_default_device_mesh()
+        
+        if device_mesh is not None:
+            # Get mesh dimension to determine correct placements
+            mesh_ndim = 1
+            if hasattr(device_mesh, 'mesh'):
+                mesh_ndim = device_mesh.mesh.ndim
+            
+            # Standard case - convert regular tensor to DTensor
+            if x1_is_dtensor and not x2_is_dtensor:
+                if mesh_ndim == 1:
+                    x2 = dtensor_from_local(x2, device_mesh, [Replicate()])
+                else:
+                    x2 = dtensor_from_local(x2, device_mesh, [Replicate()] * mesh_ndim)
+            elif x2_is_dtensor and not x1_is_dtensor:
+                if mesh_ndim == 1:
+                    x1 = dtensor_from_local(x1, device_mesh, [Replicate()])
+                else:
+                    x1 = dtensor_from_local(x1, device_mesh, [Replicate()] * mesh_ndim)
     return torch.not_equal(x1, x2)
 
 
