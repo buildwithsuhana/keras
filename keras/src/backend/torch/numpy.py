@@ -903,6 +903,53 @@ def blackman(x):
 
 def broadcast_to(x, shape):
     x = convert_to_tensor(x)
+    
+    # CRITICAL FIX: Handle DTensor input properly
+    # When input is already a DTensor, we need to use DTensor's methods
+    # to broadcast, not torch.broadcast_to which creates a regular tensor
+    from keras.src.backend.torch.distribution_lib import (
+        is_dtensor,
+    )
+    
+    x_is_dtensor = is_dtensor(x)
+    
+    if x_is_dtensor:
+        # Input is already a DTensor - use DTensor's broadcast method
+        # Get the device mesh and placements from the input DTensor
+        device_mesh = getattr(x, 'device_mesh', None)
+        placements = getattr(x, 'placements', None)
+        
+        if device_mesh is not None and placements is not None:
+            # Use DTensor's full_tensor() to get the full tensor, then broadcast
+            # This preserves DTensor properties
+            # For broadcast, we need to get the full tensor first
+            # Then use DTensor.from_local with the new shape
+            
+            # Get local tensor
+            local_tensor = x.to_local()
+            
+            # Broadcast the local tensor to the new shape
+            result = torch.broadcast_to(local_tensor, shape)
+            
+            # Convert back to DTensor with Replicate placement since
+            # broadcast creates a full tensor (not sharded)
+            from torch.distributed._tensor import Replicate
+            from keras.src.backend.torch.distribution_lib import dtensor_from_local
+            
+            # Use Replicate for broadcast output since it has full shape
+            mesh_ndim = 1
+            if hasattr(device_mesh, 'mesh'):
+                mesh_ndim = device_mesh.mesh.ndim
+            
+            new_placements = [Replicate()] * mesh_ndim
+            result = dtensor_from_local(result, device_mesh, new_placements)
+            return result
+        else:
+            # Fallback: extract local tensor and use torch.broadcast_to
+            result = torch.broadcast_to(x.to_local(), shape)
+            return result
+    
+    # For non-DTensor inputs, use the existing logic
     result = torch.broadcast_to(x, shape)
     
     # CRITICAL FIX: Handle DTensor conversion for internal tensors (e.g., causal masks)
