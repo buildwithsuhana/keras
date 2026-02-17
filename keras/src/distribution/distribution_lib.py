@@ -750,7 +750,16 @@ class ModelParallel(Distribution):
         # return an empty axes list.
         if len(variable.shape) == 0:
             return TensorLayout([], self.device_mesh)
-        variable_shard_spec = [None] * len(variable.shape)
+        
+        # CRITICAL FIX: Return empty tuple () instead of [None] * len(variable.shape)
+        # When ModelParallel is active, ALL variables should be converted to DTensors
+        # (either sharded or replicated), even if they don't match any pattern in
+        # the layout_map. This ensures compatibility between variables - e.g.,
+        # when token_embedding (sharded DTensor) is added to position_embedding
+        # (replicated DTensor), both must be DTensors for the operation to work.
+        # The empty tuple () triggers DTensor conversion with Replicate placement
+        # in the torch backend's distribute_variable function.
+        variable_shard_spec = ()
         return TensorLayout(variable_shard_spec, self.device_mesh)
 
     def get_tensor_layout(self, path):
