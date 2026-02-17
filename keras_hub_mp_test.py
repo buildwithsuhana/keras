@@ -205,6 +205,10 @@ def test_keras_hub_model_parallel(epochs=1, use_preset=True):
     log(f"✓ ModelParallel created: batch_dim={mp.batch_dim_name}")
     log(f"  Auto-shard dataset: False")
     
+    # CRITICAL FIX: Set the multi-process state BEFORE any model operations
+    # This enables proper DTensor conversion for inputs in multi-process ModelParallel mode
+    set_mp_multi_process_state(True)
+    
     # Import keras_hub
     try:
         import keras_hub
@@ -214,6 +218,8 @@ def test_keras_hub_model_parallel(epochs=1, use_preset=True):
         return False
     
     # Create model - either from preset or custom
+    # CRITICAL FIX: Build the model INSIDE the scope BEFORE compiling
+    # This ensures variables are created and distributed as DTensors before fit() is called
     with mp.scope():
         if use_preset:
             try:
@@ -250,6 +256,13 @@ def test_keras_hub_model_parallel(epochs=1, use_preset=True):
         total_params = model.count_params()
         log(f"✓ Model created with {total_params:,} parameters")
         
+        # CRITICAL FIX: Build the model with explicit input shapes inside the scope
+        # This ensures all variables are created as DTensors BEFORE fit() is called
+        batch_size = 4
+        seq_length = 16
+        model.build({"token_ids": (batch_size, seq_length), "padding_mask": (batch_size, seq_length)})
+        log(f"✓ Model built with input shape: token_ids=({batch_size}, {seq_length})")
+        
         # Compile model
         optimizer = keras.optimizers.Adam(learning_rate=0.001)
         model.compile(optimizer=optimizer, loss="mse")
@@ -257,10 +270,6 @@ def test_keras_hub_model_parallel(epochs=1, use_preset=True):
     # Verify weight sharding
     log_section("PHYSICAL STORAGE VERIFICATION")
     verify_weight_sharding(model, rank)
-    
-    # CRITICAL FIX: Set the multi-process state so the backend handles inputs correctly
-    # This enables proper DTensor conversion for inputs in multi-process ModelParallel mode
-    set_mp_multi_process_state(True)
     
     # Create dummy input data
     batch_size = 4
