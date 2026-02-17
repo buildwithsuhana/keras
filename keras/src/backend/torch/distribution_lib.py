@@ -1158,6 +1158,10 @@ def prepare_output_for_loss(x):
     
     This function all-gathers ONLY when the tensor is a DTensor with sharded placements.
     Plain local tensors (like labels) are returned as-is to preserve correct shape.
+    
+    CRITICAL FIX: In ModelParallel multi-process mode, skip this function entirely
+    to avoid issues with DTensor handling. The trainer should not call this function
+    in MP multi-process mode.
     """
     from keras.src.distribution.distribution_lib import distribution, ModelParallel
     
@@ -1180,6 +1184,13 @@ def prepare_output_for_loss(x):
         except:
             pass
         print(f"DEBUG | [Rank {rank}] prepare_output_for_loss START: cached_mp_state={cached_mp_state}, x_type={type(x).__name__}, x_shape={getattr(x, 'shape', 'N/A')}")
+    
+    # CRITICAL FIX: In MP multi-process mode, skip all processing and return as-is
+    # This avoids issues with all-reduce/all-gather that cause shape mismatches
+    if cached_mp_state and torch.distributed.is_initialized():
+        if debug_mode:
+            print(f"DEBUG | [Rank {rank}] prepare_output_for_loss: MP multi-process mode - returning x as-is")
+        return x
     
     # Even if the scope has exited, check if we have a cached ModelParallel mesh
     # or if we cached the MP multi-process state
@@ -1318,29 +1329,7 @@ def prepare_output_for_loss(x):
             # DTensor with same local and global shape (replicated) - just get local tensor
             return local_tensor
     
-    # CRITICAL FIX: Handle the case where x is a local tensor but we're in
-    # ModelParallel multi-process mode. This can happen when the model forward
-    # pass returns local tensors instead of DTensors.
-    # 
-    # We need to distinguish between:
-    # - y_pred (model output): should be all-gathered (DTensor or has DTensor shape)
-    # - y (labels): should NOT be all-gathered (full local shape)
-    # - x (inputs): should NOT be all-gathered (full local shape)
-    #
-    # The safest approach: only process tensors that are ACTUALLY DTensors.
-    # Plain tensors (like labels and inputs) should be returned as-is.
-    # The heuristic-based detection is too fragile and causes issues.
-    if cached_mp_state and torch.distributed.is_initialized():
-        # In MP multi-process mode, only process if x is actually a DTensor
-        # Don't try to heuristic-detect sharded local tensors - it causes bugs
-        # where labels get incorrectly all-gathered
-        if debug_mode:
-            print(f"DEBUG | [Rank {rank}] prepare_output_for_loss: MP mode, x is not DTensor, returning as-is (labels/inputs should not be processed)")
-        return x
-    
     # Not a DTensor - this is likely labels (y) which are full local tensors
     # DO NOT all-gather! Labels are full local data, not sharded outputs.
-    # The heuristic for detecting sharded local tensors is too fragile and can
-    # incorrectly identify labels as sharded outputs.
     return x
 
