@@ -1245,6 +1245,9 @@ def equal(x1, x2):
     x1_is_dtensor = is_dtensor(x1)
     x2_is_dtensor = is_dtensor(x2)
     
+    # Track if we need to convert result to DTensor
+    needs_dtensor_result = False
+    
     if x1_is_dtensor or x2_is_dtensor:
         # Get device_mesh from DTensor if available, otherwise from global state
         device_mesh = None
@@ -1258,6 +1261,7 @@ def equal(x1, x2):
             device_mesh = _get_default_device_mesh()
         
         if device_mesh is not None:
+            needs_dtensor_result = True
             # Get mesh dimension to determine correct placements
             mesh_ndim = 1
             if hasattr(device_mesh, 'mesh'):
@@ -1275,7 +1279,25 @@ def equal(x1, x2):
                 else:
                     x1 = dtensor_from_local(x1, device_mesh, [Replicate()] * mesh_ndim)
     
-    return torch.eq(x1, x2)
+    # CRITICAL FIX: Auto-detect distributed context even without DTensor inputs
+    if not needs_dtensor_result:
+        device_mesh = _get_default_device_mesh()
+        if device_mesh is not None:
+            import torch.distributed as dist
+            if dist.is_available() and dist.is_initialized():
+                needs_dtensor_result = True
+    
+    result = torch.eq(x1, x2)
+    
+    # Convert result to DTensor when we have an active device mesh
+    if needs_dtensor_result and device_mesh is not None:
+        mesh_ndim = 1
+        if hasattr(device_mesh, 'mesh'):
+            mesh_ndim = device_mesh.mesh.ndim
+        placements = [Replicate()] * mesh_ndim
+        result = dtensor_from_local(result, device_mesh, placements)
+    
+    return result
 
 
 def exp(x):
@@ -1391,6 +1413,10 @@ def greater(x1, x2):
     x1_is_dtensor = is_dtensor(x1)
     x2_is_dtensor = is_dtensor(x2)
     
+    # Track if we need to convert result to DTensor
+    # This handles both: 1) inputs are DTensors, AND 2) we're in distributed context
+    needs_dtensor_result = False
+    
     if x1_is_dtensor or x2_is_dtensor:
         # Get device_mesh from DTensor if available, otherwise from global state
         device_mesh = None
@@ -1404,6 +1430,7 @@ def greater(x1, x2):
             device_mesh = _get_default_device_mesh()
         
         if device_mesh is not None:
+            needs_dtensor_result = True
             # Get mesh dimension to determine correct placements
             mesh_ndim = 1
             if hasattr(device_mesh, 'mesh'):
@@ -1421,7 +1448,31 @@ def greater(x1, x2):
                 else:
                     x1 = dtensor_from_local(x1, device_mesh, [Replicate()] * mesh_ndim)
     
-    return torch.greater(x1, x2)
+    # CRITICAL FIX: Auto-detect distributed context even without DTensor inputs
+    # This handles the case where causal mask is computed inside the model
+    # but inputs aren't DTensors (e.g., multi-process MP mode)
+    if not needs_dtensor_result:
+        # Try to get device_mesh from global state
+        device_mesh = _get_default_device_mesh()
+        if device_mesh is not None:
+            # Check if distributed is initialized
+            import torch.distributed as dist
+            if dist.is_available() and dist.is_initialized():
+                needs_dtensor_result = True
+    
+    result = torch.greater(x1, x2)
+    
+    # CRITICAL FIX: Convert result to DTensor when we have an active device mesh
+    # This ensures comparison results (like causal masks) are DTensors
+    if needs_dtensor_result and device_mesh is not None:
+        # Get mesh dimension
+        mesh_ndim = 1
+        if hasattr(device_mesh, 'mesh'):
+            mesh_ndim = device_mesh.mesh.ndim
+        placements = [Replicate()] * mesh_ndim
+        result = dtensor_from_local(result, device_mesh, placements)
+    
+    return result
 
 
 def greater_equal(x1, x2):
@@ -1440,6 +1491,10 @@ def greater_equal(x1, x2):
     x1_is_dtensor = is_dtensor(x1)
     x2_is_dtensor = is_dtensor(x2)
     
+    # Track if we need to convert result to DTensor
+    # This handles both: 1) inputs are DTensors, AND 2) we're in distributed context
+    needs_dtensor_result = False
+    
     if x1_is_dtensor or x2_is_dtensor:
         # Get device_mesh from DTensor if available, otherwise from global state
         device_mesh = None
@@ -1453,6 +1508,7 @@ def greater_equal(x1, x2):
             device_mesh = _get_default_device_mesh()
         
         if device_mesh is not None:
+            needs_dtensor_result = True
             # Get mesh dimension to determine correct placements
             mesh_ndim = 1
             if hasattr(device_mesh, 'mesh'):
@@ -1470,7 +1526,31 @@ def greater_equal(x1, x2):
                 else:
                     x1 = dtensor_from_local(x1, device_mesh, [Replicate()] * mesh_ndim)
     
-    return torch.greater_equal(x1, x2)
+    # CRITICAL FIX: Auto-detect distributed context even without DTensor inputs
+    # This handles the case where causal mask is computed inside the model
+    # but inputs aren't DTensors (e.g., multi-process MP mode)
+    if not needs_dtensor_result:
+        # Try to get device_mesh from global state
+        device_mesh = _get_default_device_mesh()
+        if device_mesh is not None:
+            # Check if distributed is initialized
+            import torch.distributed as dist
+            if dist.is_available() and dist.is_initialized():
+                needs_dtensor_result = True
+    
+    result = torch.greater_equal(x1, x2)
+    
+    # CRITICAL FIX: Convert result to DTensor when we have an active device mesh
+    # This ensures comparison results (like causal masks) are DTensors
+    if needs_dtensor_result and device_mesh is not None:
+        # Get mesh dimension
+        mesh_ndim = 1
+        if hasattr(device_mesh, 'mesh'):
+            mesh_ndim = device_mesh.mesh.ndim
+        placements = [Replicate()] * mesh_ndim
+        result = dtensor_from_local(result, device_mesh, placements)
+    
+    return result
 
 
 def hstack(xs):
@@ -1610,6 +1690,9 @@ def less(x1, x2):
     x1_is_dtensor = is_dtensor(x1)
     x2_is_dtensor = is_dtensor(x2)
     
+    # Track if we need to convert result to DTensor
+    needs_dtensor_result = False
+    
     if x1_is_dtensor or x2_is_dtensor:
         # Get device_mesh from DTensor if available, otherwise from global state
         device_mesh = None
@@ -1623,6 +1706,7 @@ def less(x1, x2):
             device_mesh = _get_default_device_mesh()
         
         if device_mesh is not None:
+            needs_dtensor_result = True
             # Get mesh dimension to determine correct placements
             mesh_ndim = 1
             if hasattr(device_mesh, 'mesh'):
@@ -1640,7 +1724,25 @@ def less(x1, x2):
                 else:
                     x1 = dtensor_from_local(x1, device_mesh, [Replicate()] * mesh_ndim)
     
-    return torch.less(x1, x2)
+    # CRITICAL FIX: Auto-detect distributed context even without DTensor inputs
+    if not needs_dtensor_result:
+        device_mesh = _get_default_device_mesh()
+        if device_mesh is not None:
+            import torch.distributed as dist
+            if dist.is_available() and dist.is_initialized():
+                needs_dtensor_result = True
+    
+    result = torch.less(x1, x2)
+    
+    # Convert result to DTensor when we have an active device mesh
+    if needs_dtensor_result and device_mesh is not None:
+        mesh_ndim = 1
+        if hasattr(device_mesh, 'mesh'):
+            mesh_ndim = device_mesh.mesh.ndim
+        placements = [Replicate()] * mesh_ndim
+        result = dtensor_from_local(result, device_mesh, placements)
+    
+    return result
 
 
 def less_equal(x1, x2):
@@ -1659,6 +1761,9 @@ def less_equal(x1, x2):
     x1_is_dtensor = is_dtensor(x1)
     x2_is_dtensor = is_dtensor(x2)
     
+    # Track if we need to convert result to DTensor
+    needs_dtensor_result = False
+    
     if x1_is_dtensor or x2_is_dtensor:
         # Get device_mesh from DTensor if available, otherwise from global state
         device_mesh = None
@@ -1672,6 +1777,7 @@ def less_equal(x1, x2):
             device_mesh = _get_default_device_mesh()
         
         if device_mesh is not None:
+            needs_dtensor_result = True
             # Get mesh dimension to determine correct placements
             mesh_ndim = 1
             if hasattr(device_mesh, 'mesh'):
@@ -1689,7 +1795,25 @@ def less_equal(x1, x2):
                 else:
                     x1 = dtensor_from_local(x1, device_mesh, [Replicate()] * mesh_ndim)
     
-    return torch.less_equal(x1, x2)
+    # CRITICAL FIX: Auto-detect distributed context even without DTensor inputs
+    if not needs_dtensor_result:
+        device_mesh = _get_default_device_mesh()
+        if device_mesh is not None:
+            import torch.distributed as dist
+            if dist.is_available() and dist.is_initialized():
+                needs_dtensor_result = True
+    
+    result = torch.less_equal(x1, x2)
+    
+    # Convert result to DTensor when we have an active device mesh
+    if needs_dtensor_result and device_mesh is not None:
+        mesh_ndim = 1
+        if hasattr(device_mesh, 'mesh'):
+            mesh_ndim = device_mesh.mesh.ndim
+        placements = [Replicate()] * mesh_ndim
+        result = dtensor_from_local(result, device_mesh, placements)
+    
+    return result
 
 
 def linspace(
@@ -2045,6 +2169,9 @@ def not_equal(x1, x2):
     x1_is_dtensor = is_dtensor(x1)
     x2_is_dtensor = is_dtensor(x2)
     
+    # Track if we need to convert result to DTensor
+    needs_dtensor_result = False
+    
     if x1_is_dtensor or x2_is_dtensor:
         # Get device_mesh from DTensor if available, otherwise from global state
         device_mesh = None
@@ -2058,6 +2185,7 @@ def not_equal(x1, x2):
             device_mesh = _get_default_device_mesh()
         
         if device_mesh is not None:
+            needs_dtensor_result = True
             # Get mesh dimension to determine correct placements
             mesh_ndim = 1
             if hasattr(device_mesh, 'mesh'):
@@ -2074,7 +2202,26 @@ def not_equal(x1, x2):
                     x1 = dtensor_from_local(x1, device_mesh, [Replicate()])
                 else:
                     x1 = dtensor_from_local(x1, device_mesh, [Replicate()] * mesh_ndim)
-    return torch.not_equal(x1, x2)
+    
+    # CRITICAL FIX: Auto-detect distributed context even without DTensor inputs
+    if not needs_dtensor_result:
+        device_mesh = _get_default_device_mesh()
+        if device_mesh is not None:
+            import torch.distributed as dist
+            if dist.is_available() and dist.is_initialized():
+                needs_dtensor_result = True
+    
+    result = torch.not_equal(x1, x2)
+    
+    # Convert result to DTensor when we have an active device mesh
+    if needs_dtensor_result and device_mesh is not None:
+        mesh_ndim = 1
+        if hasattr(device_mesh, 'mesh'):
+            mesh_ndim = device_mesh.mesh.ndim
+        placements = [Replicate()] * mesh_ndim
+        result = dtensor_from_local(result, device_mesh, placements)
+    
+    return result
 
 
 def ones_like(x, dtype=None):
