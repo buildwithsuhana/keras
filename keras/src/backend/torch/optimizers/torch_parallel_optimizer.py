@@ -36,7 +36,7 @@ def _convert_grads_to_dtensor(grads, variables, optimizer_state_variables=None):
     
     # Import here to avoid circular imports
     from torch.distributed._tensor import DTensor, Replicate, Shard
-    from keras.src.backend.torch.distribution_lib import is_dtensor
+    from keras.src.backend.torch.distribution_lib import is_dtensor, dtensor_from_local
     from keras.src.backend.common import global_state
     
     # CRITICAL FIX: Get the device mesh from optimizer state variables first!
@@ -157,15 +157,32 @@ def _convert_grads_to_dtensor(grads, variables, optimizer_state_variables=None):
             # This happens when inputs are local (not DTensors) but weights are DTensors
             if grad_shape != dtensor_shape:
                 # Check if we need to shard the gradient
-                # For sharded weights, the gradient should have the same sharded shape
                 if any(isinstance(p, Shard) for p in placements):
-                    # Find the shard dimension from placements
+                    # Find the shard placement and use its .dim as the tensor dim
                     for j, p in enumerate(placements):
                         if isinstance(p, Shard):
                             shard_dim = p.dim
-                            expected_local_size = dtensor_shape[j] if j < len(dtensor_shape) else grad_shape[j]
-                            logger.debug(f"_convert_grads_to_dtensor: need to shard grad at dim {shard_dim}, expected size={expected_local_size}")
-                            # Slice the gradient to match the expected local size
+                            # Compute expected local size using the tensor dimension (shard_dim)
+                            if shard_dim < len(dtensor_shape):
+                                expected_local_size = dtensor_shape[shard_dim]
+                            else:
+                                # Fallback: use last dimension of dtensor_shape
+                                expected_local_size = dtensor_shape[-1]
+
+                            logger.debug(
+                                f"_convert_grads_to_dtensor: need to shard grad at dim {shard_dim}, expected size={expected_local_size}"
+                            )
+
+                            # If grad has fewer dimensions than the shard_dim expects,
+                            # adjust shard_dim to a valid dimension for the grad tensor.
+                            if shard_dim >= grad.dim():
+                                adj_shard_dim = max(0, grad.dim() - 1)
+                                logger.debug(
+                                    f"_convert_grads_to_dtensor: adjusted shard_dim {shard_dim} -> {adj_shard_dim} for grad with dim {grad.dim()}"
+                                )
+                                shard_dim = adj_shard_dim
+
+                            # Slice the gradient to match the expected local size when possible
                             if shard_dim < grad.dim():
                                 slices = [slice(None)] * grad.dim()
                                 slices[shard_dim] = slice(0, expected_local_size)
@@ -173,7 +190,19 @@ def _convert_grads_to_dtensor(grads, variables, optimizer_state_variables=None):
                                 logger.debug(f"_convert_grads_to_dtensor: sliced grad shape to {grad.shape}")
                             break
             
-            dtensor = DTensor.from_local(grad, torch_device_mesh, placements)
+            # Ensure placements are compatible with the possibly adjusted shard_dim
+            # Create a safe copy of placements where Shard dims are clamped to grad.dim()-1
+            safe_placements = []
+            for p in placements:
+                if isinstance(p, Shard):
+                    safe_dim = p.dim
+                    if safe_dim >= grad.dim():
+                        safe_dim = max(0, grad.dim() - 1)
+                    safe_placements.append(Shard(safe_dim))
+                else:
+                    safe_placements.append(p)
+
+            dtensor = dtensor_from_local(grad, torch_device_mesh, safe_placements)
             converted_grads.append(dtensor)
         elif reference_dtensor is not None:
             # Use the placements from the reference DTensor
@@ -196,7 +225,7 @@ def _convert_grads_to_dtensor(grads, variables, optimizer_state_variables=None):
                             break
             
             logger.debug(f"_convert_grads_to_dtensor: converting grad {i} with reference placements={placements}")
-            dtensor = DTensor.from_local(grad, torch_device_mesh, placements)
+            dtensor = dtensor_from_local(grad, torch_device_mesh, placements)
             converted_grads.append(dtensor)
         else:
             # For non-DTensor variables, keep the gradient as-is

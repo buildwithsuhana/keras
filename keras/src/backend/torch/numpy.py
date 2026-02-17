@@ -74,6 +74,7 @@ def add(x1, x2):
         _get_default_device_mesh,
         DTensor,
         Replicate,
+        dtensor_from_local,
     )
 
     # Check if we have at least one DTensor
@@ -106,15 +107,15 @@ def add(x1, x2):
             if x1_is_dtensor and not x2_is_dtensor:
                 # Use Replicate() for the input, NOT the kernel's sharding
                 if mesh_ndim == 1:
-                    x2 = DTensor.from_local(x2, device_mesh, [Replicate()])
+                    x2 = dtensor_from_local(x2, device_mesh, [Replicate()])
                 else:
-                    x2 = DTensor.from_local(x2, device_mesh, [Replicate()] * mesh_ndim)
+                    x2 = dtensor_from_local(x2, device_mesh, [Replicate()] * mesh_ndim)
             elif x2_is_dtensor and not x1_is_dtensor:
                 # Use Replicate() for the input, NOT the kernel's sharding
                 if mesh_ndim == 1:
-                    x1 = DTensor.from_local(x1, device_mesh, [Replicate()])
+                    x1 = dtensor_from_local(x1, device_mesh, [Replicate()])
                 else:
-                    x1 = DTensor.from_local(x1, device_mesh, [Replicate()] * mesh_ndim)
+                    x1 = dtensor_from_local(x1, device_mesh, [Replicate()] * mesh_ndim)
         else:
             # device_mesh is None - this can happen during symbolic build
             # or in multi-process mode with MP where inputs are not converted to DTensors
@@ -140,9 +141,9 @@ def add(x1, x2):
                         x2_is_dtensor_now = is_dtensor(x2)
                         
                         if x1_is_dtensor_now and not x2_is_dtensor_now:
-                            x2 = DTensor.from_local(x2, backend_mesh, [Replicate()])
+                            x2 = dtensor_from_local(x2, backend_mesh, [Replicate()])
                         elif x2_is_dtensor_now and not x1_is_dtensor_now:
-                            x1 = DTensor.from_local(x1, backend_mesh, [Replicate()])
+                            x1 = dtensor_from_local(x1, backend_mesh, [Replicate()])
                     except Exception:
                         # Fallback: extract local tensor from DTensor
                         if hasattr(x1, 'to_local'):
@@ -174,6 +175,7 @@ def einsum(subscripts, *operands, **kwargs):
         _get_default_device_mesh,
         DTensor,
         Replicate,
+        dtensor_from_local,
     )
 
     # Check if we have at least one DTensor
@@ -191,7 +193,7 @@ def einsum(subscripts, *operands, **kwargs):
             for i, (op, is_d) in enumerate(zip(operands, operands_is_dtensor)):
                 if not is_d:
                     placements = [Replicate()]
-                    operands[i] = DTensor.from_local(op, device_mesh, placements)
+                    operands[i] = dtensor_from_local(op, device_mesh, placements)
         else:
             # device_mesh is None - fallback to local tensors
             for i, (op, is_d) in enumerate(zip(operands, operands_is_dtensor)):
@@ -227,6 +229,7 @@ def subtract(x1, x2):
         _get_default_device_mesh,
         DTensor,
         Replicate,
+        dtensor_from_local,
     )
 
     # Check if we have at least one DTensor
@@ -248,10 +251,10 @@ def subtract(x1, x2):
             # Standard case - convert regular tensor to DTensor
             if x1_is_dtensor and not x2_is_dtensor:
                 placements = x1_placements or [Replicate()]
-                x2 = DTensor.from_local(x2, device_mesh, placements)
+                x2 = dtensor_from_local(x2, device_mesh, placements)
             elif x2_is_dtensor and not x1_is_dtensor:
                 placements = x2_placements or [Replicate()]
-                x1 = DTensor.from_local(x1, device_mesh, placements)
+                x1 = dtensor_from_local(x1, device_mesh, placements)
         else:
             # device_mesh is None - this can happen during symbolic build
             # Fallback: extract local tensor from DTensor to avoid mixed tensor errors
@@ -274,6 +277,7 @@ def matmul(x1, x2):
         _get_default_device_mesh,
         DTensor,
         Replicate,
+        dtensor_from_local,
     )
 
     # Check if we have at least one DTensor
@@ -311,17 +315,17 @@ def matmul(x1, x2):
                 # Each rank needs the FULL input to compute with its portion of the sharded kernel
                 # Create placements that match mesh ndim
                 if mesh_ndim == 1:
-                    x2 = DTensor.from_local(x2, device_mesh, [Replicate()])
+                    x2 = dtensor_from_local(x2, device_mesh, [Replicate()])
                 else:
-                    x2 = DTensor.from_local(x2, device_mesh, [Replicate()] * mesh_ndim)
+                    x2 = dtensor_from_local(x2, device_mesh, [Replicate()] * mesh_ndim)
             elif x2_is_dtensor and not x1_is_dtensor:
                 # x1 is regular tensor (input), x2 is DTensor (kernel)
                 # Use Replicate() for the input, NOT the kernel's sharding
                 # Each rank needs the FULL input to compute with its portion of the sharded kernel
                 if mesh_ndim == 1:
-                    x1 = DTensor.from_local(x1, device_mesh, [Replicate()])
+                    x1 = dtensor_from_local(x1, device_mesh, [Replicate()])
                 else:
-                    x1 = DTensor.from_local(x1, device_mesh, [Replicate()] * mesh_ndim)
+                    x1 = dtensor_from_local(x1, device_mesh, [Replicate()] * mesh_ndim)
         else:
             # device_mesh is None - this can happen during symbolic build
             # or when in multi-process mode with MP where inputs are not converted to DTensors
@@ -359,9 +363,9 @@ def matmul(x1, x2):
                         x2_is_dtensor_now = is_dtensor(x2)
                         
                         if x1_is_dtensor_now and not x2_is_dtensor_now:
-                            x2 = DTensor.from_local(x2, backend_mesh, [Replicate()])
+                            x2 = dtensor_from_local(x2, backend_mesh, [Replicate()])
                         elif x2_is_dtensor_now and not x1_is_dtensor_now:
-                            x1 = DTensor.from_local(x1, backend_mesh, [Replicate()])
+                            x1 = dtensor_from_local(x1, backend_mesh, [Replicate()])
                     except Exception as e:
                         # If mesh creation fails, fallback to extracting local tensor
                         # BUT this causes issues - we need to keep the tensor as-is
@@ -439,6 +443,7 @@ def multiply(x1, x2):
         _get_default_device_mesh,
         DTensor,
         Replicate,
+        dtensor_from_local,
     )
 
     # Check if we have at least one DTensor
@@ -460,10 +465,10 @@ def multiply(x1, x2):
             # Standard case - convert regular tensor to DTensor
             if x1_is_dtensor and not x2_is_dtensor:
                 placements = x1_placements or [Replicate()]
-                x2 = DTensor.from_local(x2, device_mesh, placements)
+                x2 = dtensor_from_local(x2, device_mesh, placements)
             elif x2_is_dtensor and not x1_is_dtensor:
                 placements = x2_placements or [Replicate()]
-                x1 = DTensor.from_local(x1, device_mesh, placements)
+                x1 = dtensor_from_local(x1, device_mesh, placements)
         else:
             # device_mesh is None - this can happen during symbolic build
             # Fallback: extract local tensor from DTensor to avoid mixed tensor errors
@@ -1073,6 +1078,7 @@ def dot(x1, x2):
         _get_default_device_mesh,
         DTensor,
         Replicate,
+        dtensor_from_local,
     )
 
     # Check if we have at least one DTensor
@@ -1094,10 +1100,10 @@ def dot(x1, x2):
             # Standard case - convert regular tensor to DTensor
             if x1_is_dtensor and not x2_is_dtensor:
                 placements = x1_placements or [Replicate()]
-                x2 = DTensor.from_local(x2, device_mesh, placements)
+                x2 = dtensor_from_local(x2, device_mesh, placements)
             elif x2_is_dtensor and not x1_is_dtensor:
                 placements = x2_placements or [Replicate()]
-                x1 = DTensor.from_local(x1, device_mesh, placements)
+                x1 = dtensor_from_local(x1, device_mesh, placements)
         else:
             # device_mesh is None - this can happen during symbolic build
             # Fallback: extract local tensor from DTensor to avoid mixed tensor errors
@@ -2041,10 +2047,10 @@ def take(x, indices, axis=None):
                 # Convert regular tensor to DTensor to match the other operand
                 if x_is_dtensor and not indices_is_dtensor:
                     placements = x_placements or [Replicate()]
-                    indices = DTensor.from_local(indices, device_mesh, placements)
+                    indices = dtensor_from_local(indices, device_mesh, placements)
                 elif indices_is_dtensor and not x_is_dtensor:
                     placements = indices_placements or [Replicate()]
-                    x = DTensor.from_local(x, device_mesh, placements)
+                    x = dtensor_from_local(x, device_mesh, placements)
             else:
                 # device_mesh is None - this can happen during symbolic build
                 # Extract local tensor from DTensor to avoid mixed tensor errors
@@ -2101,6 +2107,7 @@ def tensordot(x1, x2, axes=2):
         _get_default_device_mesh,
         DTensor,
         Replicate,
+        dtensor_from_local,
     )
 
     # Check if we have at least one DTensor
@@ -2122,10 +2129,10 @@ def tensordot(x1, x2, axes=2):
             # Standard case - convert regular tensor to DTensor
             if x1_is_dtensor and not x2_is_dtensor:
                 placements = x1_placements or [Replicate()]
-                x2 = DTensor.from_local(x2, device_mesh, placements)
+                x2 = dtensor_from_local(x2, device_mesh, placements)
             elif x2_is_dtensor and not x1_is_dtensor:
                 placements = x2_placements or [Replicate()]
-                x1 = DTensor.from_local(x1, device_mesh, placements)
+                x1 = dtensor_from_local(x1, device_mesh, placements)
         else:
             # device_mesh is None - this can happen during symbolic build
             # Fallback: extract local tensor from DTensor to avoid mixed tensor errors

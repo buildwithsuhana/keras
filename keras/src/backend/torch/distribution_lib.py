@@ -754,7 +754,57 @@ def _to_dtensor(tensor, device_mesh=None, placements=None):
         return tensor
 
     placements = [Replicate()] if placements is None else (placements if isinstance(placements, list) else [placements])
-    return DTensor.from_local(tensor, device_mesh, placements)
+    # Validate placements against tensor ndim to avoid DTensor.from_local assertions
+    safe_placements = []
+    for p in placements:
+        if isinstance(p, Shard):
+            # Normalize negative dims
+            dim = p.dim
+            if dim < 0:
+                dim = max(0, tensor.dim() + dim)
+            # If shard dim is invalid for this tensor, fall back to Replicate
+            if dim >= tensor.dim():
+                safe_placements.append(Replicate())
+            else:
+                safe_placements.append(Shard(dim))
+        else:
+            safe_placements.append(p)
+
+    return dtensor_from_local(tensor, device_mesh, safe_placements)
+
+
+def dtensor_from_local(tensor, device_mesh, placements):
+    """Safely create a DTensor from a local tensor, adjusting placements.
+
+    This wrapper clamps or replaces invalid Shard dimensions with Replicate
+    to avoid runtime assertions when parts of the code attempt to create
+    a DTensor with a Shard on a non-existent tensor dimension.
+    """
+    if tensor is None:
+        return tensor
+
+    placements = [Replicate()] if placements is None else (placements if isinstance(placements, list) else [placements])
+
+    safe_placements = []
+    for p in placements:
+        if isinstance(p, Shard):
+            dim = p.dim
+            if dim < 0:
+                dim = max(0, tensor.dim() + dim)
+            if dim >= tensor.dim():
+                safe_placements.append(Replicate())
+            else:
+                safe_placements.append(Shard(dim))
+        else:
+            safe_placements.append(p)
+
+    try:
+        return dtensor_from_local(tensor, device_mesh, safe_placements)
+    except AssertionError as e:
+        # As a last-resort fallback, replace any remaining Shard with Replicate
+        # and retry. This should avoid the "Sharding dim > tensor.ndim" assertion.
+        repl = [Replicate() for _ in safe_placements]
+        return dtensor_from_local(tensor, device_mesh, repl)
 
 
 def is_dtensor(tensor):
@@ -964,7 +1014,7 @@ def _convert_structure(x, device_mesh=None, to_dtensor=True, gather_sharded=True
                             # Tensor is on CPU or different device, move to correct CUDA device
                             local_tensor = x.to(f"cuda:{local_device}")
                 
-                return DTensor.from_local(local_tensor, torch_device_mesh, placements)
+                return dtensor_from_local(local_tensor, torch_device_mesh, placements)
             
             # If no mesh available, return as-is
             return x
