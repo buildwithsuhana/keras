@@ -344,6 +344,18 @@ def convert_to_tensor(x, dtype=None, sparse=None, ragged=None):
             if cached_mesh.mesh.ndim == 1:
                 is_mp_cached = True
     
+    # DEBUG: Add debug logging for DTensor conversion
+    debug_mode = os.environ.get("KERAS_DISTRIBUTION_DEBUG", "0") == "1"
+    if debug_mode:
+        rank = 0
+        try:
+            import torch.distributed as dist
+            if dist.is_available() and dist.is_initialized():
+                rank = dist.get_rank()
+        except:
+            pass
+        print(f"DEBUG | [Rank {rank}] convert_to_tensor called: type(x)={type(x).__name__}, is_mp_multi_process={is_mp_multi_process}, is_mp_cached={is_mp_cached}, dist_init={torch.distributed.is_initialized()}")
+    
     # Skip DTensor conversion for ModelParallel in multi-process mode
     if is_mp_multi_process or is_mp_cached:
         # For ModelParallel multi-process, we don't convert inputs to DTensors
@@ -361,8 +373,14 @@ def convert_to_tensor(x, dtype=None, sparse=None, ragged=None):
         except:
             pass
         
-        # Convert to DTensor early if distributed is active - handle numpy arrays here too
-        if device_mesh is not None and (is_mp_distribution or torch.distributed.is_initialized()):
+        # DEBUG: Add debug logging for device mesh detection
+        if debug_mode:
+            print(f"DEBUG | [Rank {rank}] convert_to_tensor: device_mesh={device_mesh is not None}, is_mp_distribution={is_mp_distribution}")
+        
+        # CRITICAL FIX: Always promote tensors to DTensors when there's an active device mesh
+        # and distributed is initialized. This ensures internal tensors (like attention masks)
+        # created inside layer operations are DTensors, avoiding mixed tensor errors.
+        if device_mesh is not None and torch.distributed.is_initialized():
             # Convert numpy arrays or other types to torch tensor first
             if isinstance(x, np.ndarray):
                 if x.dtype == np.uint32:
@@ -382,11 +400,18 @@ def convert_to_tensor(x, dtype=None, sparse=None, ragged=None):
                 else:
                     local_device = get_device()
                 
+                if debug_mode:
+                    print(f"DEBUG | [Rank {rank}] convert_to_tensor: converting np.ndarray to DTensor on device {local_device}")
+                
                 x = torch.as_tensor(x, dtype=to_torch_dtype(dtype), device=local_device)
             
-            # Now convert to DTensor
+            # Now convert to DTensor - this is the key fix for the mixed tensor error
             if isinstance(x, torch.Tensor):
                 from torch.distributed._tensor import Replicate
+                
+                if debug_mode:
+                    print(f"DEBUG | [Rank {rank}] convert_to_tensor: promoting torch.Tensor to DTensor with Replicate placement")
+                
                 return dtensor_from_local(x, device_mesh, [Replicate()])
     
     if isinstance(x, Variable):

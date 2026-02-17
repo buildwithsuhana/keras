@@ -997,6 +997,9 @@ def _convert_structure(x, device_mesh=None, to_dtensor=True, gather_sharded=True
     debug_mode = os.environ.get("KERAS_DISTRIBUTION_DEBUG", "0") == "1"
     rank = torch.distributed.get_rank() if torch.distributed.is_initialized() else 0
 
+    if debug_mode:
+        print(f"DEBUG | [Rank {rank}] _convert_structure called: type(x)={type(x).__name__}, to_dtensor={to_dtensor}, x_is_dtensor={isinstance(x, DTensor)}")
+
     if isinstance(x, DTensor):
         if not to_dtensor:
             if gather_sharded and not all(isinstance(p, Replicate) for p in x.placements):
