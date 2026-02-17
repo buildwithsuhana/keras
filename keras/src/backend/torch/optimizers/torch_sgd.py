@@ -64,7 +64,6 @@ class SGD(torch_parallel_optimizer.TorchParallelOptimizer, optimizers.SGD):
                     else:
                         grads_local.append(g)
                 
-                # Also convert variables to local if they're DTensors
                 variables_local = []
                 for v in variables:
                     if isinstance(v, DTensor):
