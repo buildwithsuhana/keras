@@ -262,10 +262,6 @@ def test_keras_hub_model_parallel(epochs=1, use_preset=True):
         seq_length = 16
         model.build({"token_ids": (batch_size, seq_length), "padding_mask": (batch_size, seq_length)})
         log(f"✓ Model built with input shape: token_ids=({batch_size}, {seq_length})")
-        
-        # Compile model
-        optimizer = keras.optimizers.Adam(learning_rate=0.001)
-        model.compile(optimizer=optimizer, loss="mse")
     
     # Verify weight sharding
     log_section("PHYSICAL STORAGE VERIFICATION")
