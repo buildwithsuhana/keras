@@ -1014,7 +1014,49 @@ def _convert_structure(x, device_mesh=None, to_dtensor=True, gather_sharded=True
         return x
 
     if isinstance(x, (torch.Tensor, np.ndarray)):
-        if to_dtensor:
+        # CRITICAL FIX: Automatically detect if we should convert to DTensor
+        # even when to_dtensor is not explicitly set to True.
+        # This handles internal tensors (like causal masks) that are created
+        # inside layer operations and need to be DTensors when a DeviceMesh is active.
+        
+        # First, determine if we should convert to DTensor
+        should_convert = to_dtensor
+        
+        # If to_dtensor is False, check if we have an active DeviceMesh
+        # that would require DTensor conversion for proper operation
+        if not should_convert:
+            # Check if there's an active DeviceMesh via multiple methods
+            from keras.src.distribution.distribution_lib import distribution, ModelParallel
+            
+            current_dist = distribution()
+            is_mp = isinstance(current_dist, ModelParallel) if current_dist else False
+            
+            # Check cached MP multi-process state
+            global _MP_MULTI_PROCESS_STATE
+            cached_mp_state = _MP_MULTI_PROCESS_STATE
+            
+            # Check if torch distributed is initialized
+            is_distributed = torch.distributed.is_initialized()
+            
+            # Get device mesh from various sources
+            torch_device_mesh = None
+            
+            # Try current distribution first
+            if current_dist is not None and hasattr(current_dist, 'device_mesh'):
+                torch_device_mesh = _to_backend_mesh(current_dist.device_mesh)
+            
+            # Fallback to cached mesh
+            if torch_device_mesh is None:
+                torch_device_mesh = _get_default_device_mesh()
+            
+            # If we have a mesh and distributed is active, we need to convert
+            if torch_device_mesh is not None and is_distributed:
+                should_convert = True
+            
+            if debug_mode and should_convert:
+                print(f"DEBUG | [Rank {rank}] _convert_structure: Auto-detected need to convert to DTensor (mesh={torch_device_mesh is not None}, dist={is_distributed}, mp={is_mp}, cached_mp={cached_mp_state})")
+        
+        if should_convert:
             global _MP_MULTI_PROCESS_STATE
             is_mp_multi_process = _MP_MULTI_PROCESS_STATE
             
@@ -1027,6 +1069,10 @@ def _convert_structure(x, device_mesh=None, to_dtensor=True, gather_sharded=True
                 torch_device_mesh = _to_backend_mesh(current_dist.device_mesh)
             elif device_mesh is not None:
                 torch_device_mesh = device_mesh if hasattr(device_mesh, 'mesh') else _to_backend_mesh(device_mesh)
+            
+            # Fallback to get default mesh if still None
+            if torch_device_mesh is None:
+                torch_device_mesh = _get_default_device_mesh()
 
             # CRITICAL FIX: If a mesh exists and we are distributed, we MUST return a DTensor.
             # Mixed tensors cause crashes in PyTorch distributed operators.
@@ -1051,10 +1097,10 @@ def _convert_structure(x, device_mesh=None, to_dtensor=True, gather_sharded=True
                 placements = [Replicate()] * torch_device_mesh.mesh.ndim
                 return torch_distribute_tensor(local_tensor, torch_device_mesh, placements)
 
-            # Fallback for non-distributed (CPU / Single-process)
-            if isinstance(x, np.ndarray):
-                return convert_to_tensor(x)
-            return x
+        # Fallback for non-distributed (CPU / Single-process)
+        if isinstance(x, np.ndarray):
+            return convert_to_tensor(x)
+        return x
 
     if isinstance(x, dict):
         return {k: _convert_structure(v, device_mesh, to_dtensor, gather_sharded) for k, v in x.items()}

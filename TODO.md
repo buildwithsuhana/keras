@@ -1,32 +1,50 @@
-# TODO: Fix ModelParallel Multi-Process Input Sharding Issue
+# Plan: Fix Mixed torch.Tensor and DTensor Error in Keras Torch Backend
 
-## Problem
-When running ModelParallel with multi-process (e.g., 2 GPUs), the training fails with:
-```
-RuntimeError: a and b must have same reduction dim, but got [32, 256] X [128, 512].
-```
+## Information Gathered
 
-This happens because:
-1. The kernel weights are correctly sharded as DTensors
-2. The inputs are correctly kept as local tensors (not DTensors)
-3. But the matmul operation is failing due to shape mismatch
+### Problem Analysis
+1. **Root Cause**: When using ModelParallel distribution with PyTorch DTensor, internal tensors created by layers (like causal masks in TransformerDecoder) are regular `torch.Tensor` objects, not `DTensor`.
 
-## Root Cause
-The issue is in the `_layout_to_placements` function. When the 2D mesh (shape=(1,2)) falls back to 1D mesh in multi-process mode, the layout conversion doesn't properly handle the case where:
-- Input is a local tensor [batch, input_dim]
-- Kernel is sharded DTensor [input_dim, units/shard]
+2. **Failure Point**: When these regular tensors (causal masks) are used in operations with DTensor weights/inputs, PyTorch crashes with: "aten.sub.Tensor: got mixed torch.Tensor and DTensor"
 
-The DTensor sharding propagation is computing wrong intermediate shapes during tracing.
+3. **Current Flow**:
+   - User inputs → `prepare_input_for_distribution()` → `_convert_structure()` → Converted to DTensors
+   - Internal tensors (causal masks) → Created using `ops.arange`, `ops.broadcast_to` → Regular torch.Tensor
+   - These regular tensors are used in attention operations with DTensor weights → **CRASH**
 
-## Solution Plan
+### Key Files Involved
+- `keras/src/backend/torch/distribution_lib.py` - Contains `_convert_structure()` which needs modification
 
-1. **Fix `_layout_to_placements` in `distribution_lib.py`**:
-   - Ensure correct placement mapping when falling back from 2D to 1D mesh
-   - The placement should shard on tensor dimension 1 (output dimension) using the single mesh dimension
+### The Fix Location
+The fix should be in `_convert_structure()` function. The current implementation:
+- Already has logic to convert torch.Tensor to DTensor when device_mesh exists
+- However, it only applies this when `to_dtensor=True` is explicitly passed
 
-2. **Test the fix**:
-   - Run the distributed test with ModelParallel
+The fix should automatically promote tensors to DTensors when:
+1. A DeviceMesh is active
+2. Distributed is initialized
+3. The tensor is a regular torch.Tensor (not already a DTensor)
 
-## Files to Modify
-- `keras/src/backend/torch/distribution_lib.py`
+## Plan
+
+### Step 1: Modify `_convert_structure` Function
+Modify the `_convert_structure` function in `keras/src/backend/torch/distribution_lib.py` to automatically promote regular torch.Tensor to DTensor when:
+- A device mesh is available (from `_get_default_device_mesh()`)
+- Distributed is initialized
+- The tensor is a regular torch.Tensor
+
+Key changes:
+1. Add detection of device mesh using `_get_default_device_mesh()` 
+2. When a torch.Tensor is detected and a mesh exists with distributed initialized, automatically convert to DTensor with Replicate placement
+3. Handle numpy arrays similarly (they are also regular tensors that need conversion)
+
+### Step 2: Test the Fix
+Run the MP test to verify the fix works
+
+## Dependent Files
+- `keras/src/backend/torch/distribution_lib.py` - Main file to modify
+
+## Followup Steps
+1. Run the test with the fix to verify it resolves the mixed tensor error
+2. Ensure no regressions in single-process or non-distributed scenarios
 
