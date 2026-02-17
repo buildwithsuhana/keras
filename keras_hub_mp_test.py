@@ -135,6 +135,7 @@ def test_keras_hub_model_parallel(epochs=1, use_preset=True):
     import torch.distributed as dist
     import keras
     from keras.src.distribution import ModelParallel, DeviceMesh, LayoutMap, list_devices
+    from keras.src.backend.torch.distribution_lib import set_mp_multi_process_state
     import numpy as np
     import time
     
@@ -164,20 +165,7 @@ def test_keras_hub_model_parallel(epochs=1, use_preset=True):
     )
     log(f"✓ DeviceMesh created: shape={mesh.shape}, axes={mesh.axis_names}")
     
-    # Create layout map for sharding
-    # For transformer models, we typically shard the embedding and output dimensions
     layout_map = LayoutMap(mesh)
-
-    # Shard the kernel weights across model axis
-    # These patterns will match layers in OPT model:
-    # Note: Variable paths use '/' separator (e.g., 'embeddings/token_embedding/embeddings')
-    # LayoutMap keys use '.' separator with regex (e.g., 'embeddings.token_embedding.embeddings')
-    
-    # Embedding layers - variable name is 'embeddings' not 'kernel'
-    # NOTE: Position embeddings MUST be a replicated DTensor (not just a local tensor) because
-    # PyTorch DTensor doesn't support the aten.alias operation used internally by PositionEmbedding
-    # when sharded. Using (None, None) ensures it's a replicated DTensor across all devices.
-    # This is required because TokenEmbedding + PositionEmbedding operation needs both to be DTensors.
     layout_map["embeddings.token_embedding.embeddings"] = (None, "model")  # Token embeddings - sharded
     layout_map["embeddings.position_embedding.embeddings"] = (None, None)  # Position embeddings - REPLICATED DTensor
     
@@ -192,12 +180,6 @@ def test_keras_hub_model_parallel(epochs=1, use_preset=True):
     layout_map["transformer_layer_.*.feedforward.up.kernel"] = (None, "model")
     layout_map["transformer_layer_.*.feedforward.down.kernel"] = (None, "model")
     
-    # Layer norms - use NON-OVERLAPPING patterns that won't conflict
-    # OPT model uses: self_attention_layer_norm and self_feedforward_layer_norm
-    # The key names in the path use underscores (e.g., self_attention_layer_norm)
-    # We need patterns that don't overlap with attention.* patterns
-    
-    # For self_attention_layer_norm only (OPT uses this)
     layout_map["transformer_layer_.*.self_attention_layer_norm.gamma"] = ()
     layout_map["transformer_layer_.*.self_attention_layer_norm.beta"] = ()
     layout_map["transformer_layer_.*.self_feedforward_layer_norm.gamma"] = ()
@@ -276,6 +258,10 @@ def test_keras_hub_model_parallel(epochs=1, use_preset=True):
     log_section("PHYSICAL STORAGE VERIFICATION")
     verify_weight_sharding(model, rank)
     
+    # CRITICAL FIX: Set the multi-process state so the backend handles inputs correctly
+    # This enables proper DTensor conversion for inputs in multi-process ModelParallel mode
+    set_mp_multi_process_state(True)
+    
     # Create dummy input data
     batch_size = 4
     seq_length = 16
@@ -285,6 +271,11 @@ def test_keras_hub_model_parallel(epochs=1, use_preset=True):
         "padding_mask": np.ones((batch_size, seq_length), dtype="int32"),
     }
     y = np.random.random((batch_size, seq_length, model.hidden_dim)).astype("float32")
+    
+    # CRITICAL FIX: Explicitly build the model with the input shape inside the scope
+    # This ensures variables are created and distributed before fit() is called
+    with mp.scope():
+        model.build({"token_ids": (batch_size, seq_length), "padding_mask": (batch_size, seq_length)})
     
     log(f"Training data: token_ids_shape={x['token_ids'].shape}")
     
