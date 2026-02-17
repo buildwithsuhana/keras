@@ -188,27 +188,16 @@ def test_keras_hub_model_parallel(epochs=1, use_preset=True):
     layout_map["transformer_layer_.*.feedforward.up.kernel"] = (None, "model")
     layout_map["transformer_layer_.*.feedforward.down.kernel"] = (None, "model")
     
-    # CRITICAL FIX: Layer norms - use more specific patterns to avoid conflicts
-    # The path in OPT model is: transformer_layer_0/self_attention_layer_norm/gamma
-    # This uses 'self_attention_layer_norm' (with underscore), not 'attention.layer_norm'
-    # So we need patterns that match both naming conventions
-    # More specific patterns first
+    # Layer norms - use NON-OVERLAPPING patterns that won't conflict
+    # OPT model uses: self_attention_layer_norm and self_feedforward_layer_norm
+    # The key names in the path use underscores (e.g., self_attention_layer_norm)
+    # We need patterns that don't overlap with attention.* patterns
     
-    # For OPT/transformer models with self_attention_layer_norm naming
+    # For self_attention_layer_norm only (OPT uses this)
     layout_map["transformer_layer_.*.self_attention_layer_norm.gamma"] = ()
     layout_map["transformer_layer_.*.self_attention_layer_norm.beta"] = ()
     layout_map["transformer_layer_.*.self_feedforward_layer_norm.gamma"] = ()
     layout_map["transformer_layer_.*.self_feedforward_layer_norm.beta"] = ()
-    
-    # For alternative naming (attention.layer_norm)
-    layout_map["transformer_layer_.*.attention.layer_norm.gamma"] = ()
-    layout_map["transformer_layer_.*.attention.layer_norm.beta"] = ()
-    layout_map["transformer_layer_.*.feedforward.layer_norm.gamma"] = ()
-    layout_map["transformer_layer_.*.feedforward.layer_norm.beta"] = ()
-    
-    # For output layer norms (after attention)
-    layout_map["transformer_layer_.*.attention_output.layer_norm.gamma"] = ()
-    layout_map["transformer_layer_.*.attention_output.layer_norm.beta"] = ()
     
     # Embeddings layer norms
     layout_map["embeddings.layer_norm.gamma"] = ()
