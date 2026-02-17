@@ -420,12 +420,39 @@ def _get_default_device_mesh():
     If the current distribution is ModelParallel but we have a cached DataParallel mesh
     (or vice versa), we should not use that cached mesh as it will cause cross-mesh
     operations which DTensor does not support.
+    
+    CRITICAL FIX 2: Even when the distribution scope is not active (e.g., during
+    model forward pass when computing causal masks), we should still detect if
+    ModelParallel is active by checking the _MP_MULTI_PROCESS_STATE global flag.
     """
     from keras.src.distribution.distribution_lib import distribution, DataParallel, ModelParallel
     
     # Build the same cache key as _to_backend_mesh() to ensure we get the right mesh
     # for the current distribution type
     current_dist = distribution()
+    
+    # Check if we have a cached ModelParallel multi-process state
+    # This is set by TorchTrainer at the start of fit/evaluate/predict when
+    # the distribution scope is still active, and is used when the scope
+    # is not available (e.g., during torch.compile traced execution or
+    # when computing causal masks inside the model).
+    global _MP_MULTI_PROCESS_STATE
+    is_mp_multi_process = _MP_MULTI_PROCESS_STATE
+    
+    # CRITICAL FIX: Also check if torch distributed is initialized with MP
+    # This handles the case where we're in a multi-process MP context but
+    # the distribution scope has exited
+    is_distributed = torch.distributed.is_initialized()
+    
+    # Try to detect ModelParallel from cached mesh if distributed is initialized
+    if current_dist is None and is_distributed:
+        cached_mesh = global_state.get_global_attribute("torch_device_mesh", None)
+        if cached_mesh is not None and hasattr(cached_mesh, 'mesh'):
+            # If we have a cached 1D mesh and distributed is initialized,
+            # this is likely ModelParallel
+            if cached_mesh.mesh.ndim == 1:
+                # This is likely ModelParallel - return the cached mesh
+                return cached_mesh
     
     # CRITICAL FIX: First check if current distribution is active and has a mesh
     if current_dist is not None and hasattr(current_dist, 'device_mesh'):
