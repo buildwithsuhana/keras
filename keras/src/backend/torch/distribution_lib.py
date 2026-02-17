@@ -998,18 +998,18 @@ def _convert_structure(x, device_mesh=None, to_dtensor=True, gather_sharded=True
             # with Replicate placement. This is handled by prepare_input_for_distribution,
             # so we should continue with normal DTensor conversion here.
             # The check below is kept for edge cases but we now prefer conversion.
-            if is_mp_multi_process or is_mp_cached:
-                # For now, we still skip in _convert_structure to avoid double conversion
-                # The main conversion happens in prepare_input_for_distribution
-                # Just ensure tensor is on correct device and return as-is
-                if torch.distributed.is_initialized() and torch.cuda.is_available():
-                    local_device = torch.cuda.current_device()
-                    if x.is_cuda:
-                        if x.device.index != local_device:
-                            x = x.to(f"cuda:{local_device}")
-                    else:
-                        x = x.to(f"cuda:{local_device}")
-                return x
+            if (is_mp_multi_process or is_mp_cached) and to_dtensor:
+                # We MUST convert inputs to DTensors with Replicate placement
+                # so they are compatible with sharded weight DTensors.
+                from torch.distributed._tensor import distribute_tensor as torch_distribute_tensor
+                # Use the provided torch_device_mesh (already determined in parent logic)
+                if torch_device_mesh is not None:
+                    placements = [Replicate()] * torch_device_mesh.mesh.ndim
+                    # Ensure tensor is on the correct local device before wrapping
+                    if torch.cuda.is_available():
+                        local_device = f"cuda:{torch.cuda.current_device()}"
+                        x = x.to(local_device)
+                    return torch_distribute_tensor(x, torch_device_mesh, placements)
             
             # For non-MP cases, continue with DTensor conversion
             # Get the device mesh from the current distribution's scope
