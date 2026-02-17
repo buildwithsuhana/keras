@@ -899,8 +899,28 @@ def dtensor_from_local(tensor, device_mesh, placements):
 
 
 def is_dtensor(tensor):
-    """Check if a tensor is a DTensor."""
-    return isinstance(tensor, DTensor)
+    """Check if a tensor is a DTensor.
+    
+    This function uses both isinstance check and duck-typing for reliable detection.
+    Duck-typing is used as a fallback because DTensor might be imported from different
+    modules in some cases.
+    """
+    # First try isinstance check (most reliable)
+    try:
+        if isinstance(tensor, DTensor):
+            return True
+    except TypeError:
+        # DTensor might not be importable in some contexts
+        pass
+    
+    # Duck-typing fallback: DTensor has these distinctive methods/attributes
+    # that regular tensors don't have
+    if hasattr(tensor, 'to_local') and hasattr(tensor, 'placements') and hasattr(tensor, 'device_mesh'):
+        # Additional check: to_local should be callable
+        if callable(getattr(tensor, 'to_local', None)):
+            return True
+    
+    return False
 
 
 def dtensor_to_local(tensor):
@@ -908,7 +928,8 @@ def dtensor_to_local(tensor):
     if tensor is None:
         return tensor
 
-    if isinstance(tensor, DTensor):
+    # Use the improved is_dtensor function for reliable detection
+    if is_dtensor(tensor):
         return tensor.to_local()
     if isinstance(tensor, dict):
         return {k: dtensor_to_local(v) for k, v in tensor.items()}
@@ -1317,7 +1338,8 @@ def prepare_output_for_loss(x):
     # CRITICAL FIX: If x is not a DTensor, return it as-is immediately
     # This handles the case where y (labels) are passed to this function
     # Labels are always local tensors and should never be converted
-    if not isinstance(x, DTensor) and not (hasattr(x, 'placements') and hasattr(x, 'to_local')):
+    # Use is_dtensor for reliable detection
+    if not is_dtensor(x):
         return x
     
     # Check if we have an active ModelParallel distribution
@@ -1376,7 +1398,7 @@ def prepare_output_for_loss(x):
     
     # If not MP mode, just convert DTensor to local tensor if needed
     if not is_mp:
-        if isinstance(x, DTensor):
+        if is_dtensor(x):
             return x.to_local()
         return x
     
