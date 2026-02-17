@@ -168,7 +168,10 @@ class TorchTrainer(base_trainer.Trainer):
     def train_step(self, data):
         x, y, sample_weight = data_adapter_utils.unpack_x_y_sample_weight(data)
         x = distribution_lib.prepare_input_for_distribution(x)
-        y = distribution_lib.prepare_input_for_distribution(y)
+        # NOTE: y (labels) should NOT be passed through prepare_input_for_distribution!
+        # That function is only for inputs (x), not for labels.
+        # Labels are local tensors that should remain as-is.
+        
         # Compute predictions
         if self._call_has_training_arg:
             y_pred = self(x, training=True)
@@ -176,9 +179,12 @@ class TorchTrainer(base_trainer.Trainer):
             y_pred = self(x)
 
         y_pred = distribution_lib.prepare_output_for_loss(y_pred)
-        y = distribution_lib.prepare_output_for_loss(y)
-        # Note: x is NOT passed through prepare_output_for_loss - it's the input data
-        # and should remain as-is for loss computation
+        # NOTE: y (labels) should NOT be passed through prepare_output_for_loss!
+        # That function is only for model outputs (y_pred), not for labels.
+        # Labels are local tensors that should remain as-is for loss computation.
+        # In ModelParallel multi-process mode, y_pred is a DTensor that needs to be
+        # converted to local tensor via all-gather, but y is already a local tensor.
+        
         # Call torch.nn.Module.zero_grad() to clear the leftover gradients
         # for the weights from the previous train step.
         self.zero_grad()
@@ -224,13 +230,19 @@ class TorchTrainer(base_trainer.Trainer):
             sample_weight,
         ) = data_adapter_utils.unpack_x_y_sample_weight(data)
         x = distribution_lib.prepare_input_for_distribution(x)
-        y = distribution_lib.prepare_input_for_distribution(y)
+        # NOTE: y (labels) should NOT be passed through prepare_input_for_distribution!
+        # That function is only for inputs (x), not for labels.
+        # Labels are local tensors that should remain as-is.
+        
         if self._call_has_training_arg:
             y_pred = self(x, training=False)
         else:
             y_pred = self(x)
         y_pred = distribution_lib.prepare_output_for_loss(y_pred)
-        y = distribution_lib.prepare_output_for_loss(y)
+        # NOTE: y (labels) should NOT be passed through prepare_output_for_loss!
+        # That function is only for model outputs (y_pred), not for labels.
+        # Labels are local tensors that should remain as-is for loss computation.
+        
         # Note: x is NOT passed through prepare_output_for_loss - it's the input data
         loss = self._compute_loss(
             x=x, y=y, y_pred=y_pred, sample_weight=sample_weight, training=False
