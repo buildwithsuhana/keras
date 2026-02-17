@@ -15,6 +15,7 @@ from keras.src.backend.torch.core import convert_to_tensor, get_device, to_torch
 
 from torch.distributed._tensor import DTensor, DeviceMesh, Replicate, Shard
 from torch.distributed._tensor.api import distribute_tensor as torch_distribute_tensor
+from torch.distributed._tensor.api import dtensor_from_local as torch_dtensor_from_local
 from torch.distributed.tensor.parallel import parallelize_module, ColwiseParallel, RowwiseParallel
 
 TENSOR_PARALLEL_AVAILABLE = True
@@ -799,12 +800,12 @@ def dtensor_from_local(tensor, device_mesh, placements):
             safe_placements.append(p)
 
     try:
-        return dtensor_from_local(tensor, device_mesh, safe_placements)
+        return torch_dtensor_from_local(tensor, device_mesh, safe_placements)
     except AssertionError as e:
         # As a last-resort fallback, replace any remaining Shard with Replicate
         # and retry. This should avoid the "Sharding dim > tensor.ndim" assertion.
         repl = [Replicate() for _ in safe_placements]
-        return dtensor_from_local(tensor, device_mesh, repl)
+        return torch_dtensor_from_local(tensor, device_mesh, repl)
 
 
 def is_dtensor(tensor):
