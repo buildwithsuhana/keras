@@ -16,7 +16,7 @@ from keras.src.backend.torch.core import convert_to_tensor, get_device, to_torch
 from torch.distributed._tensor import DTensor, DeviceMesh, Replicate, Shard
 from torch.distributed._tensor.api import distribute_tensor as torch_distribute_tensor
 from torch.distributed.tensor.parallel import parallelize_module, ColwiseParallel, RowwiseParallel
-global _MP_MULTI_PROCESS_STATE
+
 TENSOR_PARALLEL_AVAILABLE = True
 _MP_MULTI_PROCESS_STATE = False
 
