@@ -1146,17 +1146,16 @@ def prepare_input_for_distribution(x):
     if debug_mode:
         print(f"DEBUG | [Rank {rank}] prepare_input_for_distribution: cached_mp_multi_process={cached_mp_multi_process}")
     
-    # CRITICAL FIX: For ModelParallel in multi-process mode, do NOT convert inputs
-    # to DTensors. Each process should keep its inputs local. The model weights
-    # are sharded across devices, and each process only needs its local input
-    # to compute with its portion of the sharded weights.
+    # CRITICAL FIX: For ModelParallel in multi-process mode, convert inputs to DTensors
+    # with REPLICATE placement. Each rank needs the full input because model weights
+    # are sharded across the "model" axis, and each rank computes with its portion
+    # of the sharded weights.
     #
-    # The key is that inputs should NOT be distributed - they should stay as local
-    # tensors on each rank. The Dense layer will automatically handle the DTensor
-    # weights because PyTorch's DTensor matmul can broadcast a local input with
-    # sharded weights.
+    # The key difference from single-process:
+    # - In single-process MP: inputs can be on different devices, need proper device placement
+    # - In multi-process MP: each process has its own GPU, inputs should be Replicated DTensors
     #
-    # Check both the active distribution AND the cached state
+    # We must convert inputs to DTensors with Replicate() placement, NOT skip conversion.
     if (is_mp or cached_mp_multi_process) and is_distributed:
         if debug_mode:
             rank = 0
@@ -1166,12 +1165,26 @@ def prepare_input_for_distribution(x):
                     rank = dist.get_rank()
             except:
                 pass
-            print(f"DEBUG | [Rank {rank}] prepare_input_for_distribution: skipping DTensor conversion for ModelParallel in multi-process mode (is_mp={is_mp}, cached_mp_multi_process={cached_mp_multi_process})")
+            print(f"DEBUG | [Rank {rank}] prepare_input_for_distribution: Converting to DTensor with Replicate placement for ModelParallel in multi-process mode (is_mp={is_mp}, cached_mp_multi_process={cached_mp_multi_process})")
         
-        # CRITICAL FIX: Ensure the input tensor is on the correct CUDA device
-        # In multi-process mode with CUDA_VISIBLE_DEVICES, each process
-        # only sees its local GPU as cuda:0. We need to ensure the local
-        # tensor is on the correct device.
+        # Get the device mesh for DTensor conversion
+        torch_device_mesh = None
+        
+        # Try to get the mesh from current distribution first
+        if current_dist is not None and hasattr(current_dist, 'device_mesh'):
+            torch_device_mesh = _to_backend_mesh(current_dist.device_mesh)
+        
+        # Fallback to cached mesh if needed
+        if torch_device_mesh is None:
+            torch_device_mesh = global_state.get_global_attribute("torch_device_mesh", None)
+        
+        if torch_device_mesh is not None:
+            # CRITICAL FIX: Convert input to DTensor with REPLICATE placement
+            # This ensures the input is a DTensor so operations like token_emb + position_emb work
+            # The input is replicated (each rank has full input), not sharded
+            return _convert_structure(x, torch_device_mesh, to_dtensor=True, gather_sharded=False)
+        
+        # If no mesh available, just ensure tensor is on correct device and return
         if isinstance(x, torch.Tensor):
             local_rank = 0
             try:
@@ -1182,16 +1195,13 @@ def prepare_input_for_distribution(x):
                 pass
             
             if torch.cuda.is_available():
-                # Ensure tensor is on the correct CUDA device for this process
+                current_device = torch.cuda.current_device()
                 if x.is_cuda:
-                    current_device = torch.cuda.current_device()
                     if x.device.index != current_device:
                         x = x.to(f"cuda:{current_device}")
                 else:
-                    # Tensor is on CPU, move to CUDA
                     x = x.to(device=f"cuda:{local_rank}")
         elif isinstance(x, np.ndarray):
-            # Convert numpy array to torch tensor on correct device
             if torch.cuda.is_available():
                 local_rank = 0
                 try:
@@ -1201,7 +1211,6 @@ def prepare_input_for_distribution(x):
                 except:
                     pass
                 
-                # Convert numpy to torch tensor on correct device
                 if x.dtype == np.uint32:
                     x = x.astype(np.int64)
                 dtype = standardize_dtype(x.dtype)
