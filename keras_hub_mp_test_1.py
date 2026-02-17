@@ -55,7 +55,7 @@ def test_opt_model_parallel():
 
     # 2. Custom Training Step (Bypasses DataAdapter/DataLoader stripping)
     log("Starting Custom Training Step...")
-    
+    import contextlib
     @torch.compile(backend="eager") # Optional: helps in distributed debugging
     def train_step(data, target):
         with torch.amp.autocast('cuda') if torch.cuda.is_available() else contextlib.nullcontext():
