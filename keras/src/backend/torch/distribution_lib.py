@@ -994,8 +994,13 @@ def _convert_structure(x, device_mesh=None, to_dtensor=True, gather_sharded=True
                     if cached_mesh.mesh.ndim == 1:
                         is_mp_cached = True
             
-            # Skip DTensor conversion for ModelParallel in multi-process mode
+            # CRITICAL FIX: For ModelParallel in multi-process mode, we now convert to DTensors
+            # with Replicate placement. This is handled by prepare_input_for_distribution,
+            # so we should continue with normal DTensor conversion here.
+            # The check below is kept for edge cases but we now prefer conversion.
             if is_mp_multi_process or is_mp_cached:
+                # For now, we still skip in _convert_structure to avoid double conversion
+                # The main conversion happens in prepare_input_for_distribution
                 # Just ensure tensor is on correct device and return as-is
                 if torch.distributed.is_initialized() and torch.cuda.is_available():
                     local_device = torch.cuda.current_device()
