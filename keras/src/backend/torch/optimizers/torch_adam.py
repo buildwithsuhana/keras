@@ -130,8 +130,10 @@ class Adam(torch_parallel_optimizer.TorchParallelOptimizer, optimizers.Adam):
                 if isinstance(v_orig, DTensor):
                     # Get the placements from the original DTensor
                     placements = v_orig.placements
+                    # Set requires_grad on the local tensor before creating DTensor
+                    v_local = v_local.requires_grad_(v_orig.requires_grad)
                     # Create a new DTensor from the local tensor with the original placements
-                    variables[i] = v_orig.from_local(v_local, v_orig.device_mesh, placements, requires_grad=v_orig.requires_grad)
+                    variables[i] = v_orig.from_local(v_local, v_orig.device_mesh, placements)
                 # else: variables[i] already points to the same tensor
             
         elif use_dtensor:

@@ -135,7 +135,9 @@ class RMSprop(
             for i, (v_local, v_orig) in enumerate(zip(variables_local, variables)):
                 if isinstance(v_orig, DTensor):
                     placements = v_orig.placements
-                    variables[i] = v_orig.from_local(v_local, v_orig.device_mesh, placements, requires_grad=v_orig.requires_grad)
+                    # Set requires_grad on the local tensor before creating DTensor
+                    v_local = v_local.requires_grad_(v_orig.requires_grad)
+                    variables[i] = v_orig.from_local(v_local, v_orig.device_mesh, placements)
                     
         elif use_dtensor:
             # All are DTensors - convert scalars to tensors
