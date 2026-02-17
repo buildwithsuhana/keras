@@ -656,28 +656,20 @@ def arange(start, stop=None, step=None, dtype=None):
     # newly created tensors (like those from arange) are also converted to DTensors
     # to avoid "got mixed torch.Tensor and DTensor" errors.
     from keras.src.backend.torch.distribution_lib import (
-        is_dtensor,
         _get_default_device_mesh,
-        DTensor,
-        Replicate,
-        dtensor_from_local,
     )
     
-    # Check if any of the input operands are DTensors
-    input_is_dtensor = is_dtensor(start) or is_dtensor(stop) if stop is not None else is_dtensor(start)
-    if step is not None:
-        input_is_dtensor = input_is_dtensor or is_dtensor(step)
-    
-    if input_is_dtensor:
-        # Get device_mesh from global state or create one
-        device_mesh = _get_default_device_mesh()
-        if device_mesh is not None:
-            # Get mesh dimension
-            mesh_ndim = 1
-            if hasattr(device_mesh, 'mesh'):
-                mesh_ndim = device_mesh.mesh.ndim
-            placements = [Replicate()] * mesh_ndim
-            result = dtensor_from_local(result, device_mesh, placements)
+    # Check if we have an active device mesh
+    device_mesh = _get_default_device_mesh()
+    if device_mesh is not None:
+        # Get mesh dimension
+        mesh_ndim = 1
+        if hasattr(device_mesh, 'mesh'):
+            mesh_ndim = device_mesh.mesh.ndim
+        from torch.distributed._tensor import Replicate
+        from keras.src.backend.torch.distribution_lib import dtensor_from_local
+        placements = [Replicate()] * mesh_ndim
+        result = dtensor_from_local(result, device_mesh, placements)
     
     return result
 
@@ -918,24 +910,20 @@ def broadcast_to(x, shape):
     # newly created tensors (like those from broadcast_to) are also converted to DTensors
     # to avoid "got mixed torch.Tensor and DTensor" errors.
     from keras.src.backend.torch.distribution_lib import (
-        is_dtensor,
         _get_default_device_mesh,
-        DTensor,
-        Replicate,
-        dtensor_from_local,
     )
     
-    # Check if input is a DTensor
-    if is_dtensor(x):
-        # Get device_mesh from global state
-        device_mesh = _get_default_device_mesh()
-        if device_mesh is not None:
-            # Get mesh dimension
-            mesh_ndim = 1
-            if hasattr(device_mesh, 'mesh'):
-                mesh_ndim = device_mesh.mesh.ndim
-            placements = [Replicate()] * mesh_ndim
-            result = dtensor_from_local(result, device_mesh, placements)
+    # Check if we have an active device mesh
+    device_mesh = _get_default_device_mesh()
+    if device_mesh is not None:
+        # Get mesh dimension
+        mesh_ndim = 1
+        if hasattr(device_mesh, 'mesh'):
+            mesh_ndim = device_mesh.mesh.ndim
+        from torch.distributed._tensor import Replicate
+        from keras.src.backend.torch.distribution_lib import dtensor_from_local
+        placements = [Replicate()] * mesh_ndim
+        result = dtensor_from_local(result, device_mesh, placements)
     
     return result
 
@@ -1227,24 +1215,20 @@ def expand_dims(x, axis):
     # When we're in a distributed context with DTensors, we need to ensure that
     # newly created tensors are also converted to DTensors
     from keras.src.backend.torch.distribution_lib import (
-        is_dtensor,
         _get_default_device_mesh,
-        DTensor,
-        Replicate,
-        dtensor_from_local,
     )
     
-    # Check if input is a DTensor
-    if is_dtensor(x):
-        # Get device_mesh from global state
-        device_mesh = _get_default_device_mesh()
-        if device_mesh is not None:
-            # Get mesh dimension
-            mesh_ndim = 1
-            if hasattr(device_mesh, 'mesh'):
-                mesh_ndim = device_mesh.mesh.ndim
-            placements = [Replicate()] * mesh_ndim
-            x = dtensor_from_local(x, device_mesh, placements)
+    # Check if we have an active device mesh
+    device_mesh = _get_default_device_mesh()
+    if device_mesh is not None:
+        # Get mesh dimension
+        mesh_ndim = 1
+        if hasattr(device_mesh, 'mesh'):
+            mesh_ndim = device_mesh.mesh.ndim
+        from torch.distributed._tensor import Replicate
+        from keras.src.backend.torch.distribution_lib import dtensor_from_local
+        placements = [Replicate()] * mesh_ndim
+        x = dtensor_from_local(x, device_mesh, placements)
     
     return x
 
