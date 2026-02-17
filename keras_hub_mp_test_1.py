@@ -30,7 +30,7 @@ def test_opt_model_parallel():
     
     layout_map = LayoutMap(mesh)
     layout_map["embeddings.token_embedding.embeddings"] = (None, "model")
-    layout_map["embeddings.position_embedding.embeddings"] = (None, "model")
+    # layout_map["embeddings.position_embedding.embeddings"] = (None, "model")
     layout_map["transformer_layer_.*.attention.*.kernel"] = (None, "model")
     layout_map["transformer_layer_.*.feedforward.*.kernel"] = (None, "model")
     layout_map[".*layer_norm.*"] = ()
