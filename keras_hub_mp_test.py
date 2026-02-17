@@ -109,7 +109,7 @@ def setup_environment():
 def test_device_detection():
     """Test device detection."""
     import torch
-    from keras.distribution import list_devices
+    from keras.src.distribution import list_devices
     
     log_section("TEST 1: DEVICE DETECTION")
     
@@ -174,11 +174,12 @@ def test_keras_hub_model_parallel(epochs=1, use_preset=True):
     # LayoutMap keys use '.' separator with regex (e.g., 'embeddings.token_embedding.embeddings')
     
     # Embedding layers - variable name is 'embeddings' not 'kernel'
-    # NOTE: Position embeddings MUST be replicated (not sharded) because PyTorch DTensor
-    # doesn't support the aten.alias operation used internally by PositionEmbedding.
-    # Sharding position embeddings provides minimal memory savings anyway since they're small.
-    layout_map["embeddings.token_embedding.embeddings"] = (None, "model")  # Token embeddings
-    layout_map["embeddings.position_embedding.embeddings"] = ()  # Position embeddings - REPLICATED (not sharded)
+    # NOTE: Position embeddings MUST be a replicated DTensor (not just a local tensor) because
+    # PyTorch DTensor doesn't support the aten.alias operation used internally by PositionEmbedding
+    # when sharded. Using (None, None) ensures it's a replicated DTensor across all devices.
+    # This is required because TokenEmbedding + PositionEmbedding operation needs both to be DTensors.
+    layout_map["embeddings.token_embedding.embeddings"] = (None, "model")  # Token embeddings - sharded
+    layout_map["embeddings.position_embedding.embeddings"] = (None, None)  # Position embeddings - REPLICATED DTensor
     
     # Transformer decoder layers - attention weights
     layout_map["transformer_layer_.*.attention.query.kernel"] = (None, "model")
@@ -207,8 +208,8 @@ def test_keras_hub_model_parallel(epochs=1, use_preset=True):
     layout_map["embeddings.layer_norm.beta"] = ()
     
     log("✓ LayoutMap configured:")
-    log("  - embeddings.token_embedding.embeddings: (None, 'model')")
-    log("  - embeddings.position_embedding.embeddings: () [replicated]")
+    log("  - embeddings.token_embedding.embeddings: (None, 'model') [sharded]")
+    log("  - embeddings.position_embedding.embeddings: (None, None) [replicated DTensor]")
     log("  - transformer_layer_*.attention.*.kernel: (None, 'model')")
     log("  - transformer_layer_*.feedforward.*.kernel: (None, 'model')")
     log("  - Layer norms (gamma/beta): () [replicated]")
