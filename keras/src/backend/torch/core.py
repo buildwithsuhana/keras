@@ -477,6 +477,14 @@ def is_tensor(x):
 def shape(x):
     # Convert from `torch.Size` to plain tuple.
     # DTensor has a shape attribute that gives the global shape
+    # When using DTensor with sharded dimensions, we need to convert
+    # DTensor shape values to Python integers to avoid issues with
+    # subsequent operations (like ops.arange) that don't handle DTensor scalars.
+    from keras.src.backend.torch.distribution_lib import is_dtensor
+    if is_dtensor(x):
+        # For DTensors, extract the global shape and convert to Python ints
+        # x.shape gives the global shape for DTensor
+        return tuple(int(dim) for dim in x.shape)
     return tuple(x.shape)
 
 
