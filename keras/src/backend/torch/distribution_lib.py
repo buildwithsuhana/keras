@@ -495,10 +495,17 @@ def _get_default_device_mesh():
     generic_cached = global_state.get_global_attribute("torch_device_mesh", None)
     if generic_cached is not None and current_dist is not None:
         if isinstance(current_dist, ModelParallel):
-            if hasattr(generic_cached, 'mesh') and generic_cached.mesh.ndim == 1:
-                return None
+            if hasattr(generic_cached, "mesh") and generic_cached.mesh.ndim == 1:
+                # In multi-process mode, ModelParallel uses a 1D mesh.
+                # We should only return None if we are NOT in multi-process mode.
+                if not (
+                    torch.distributed.is_available()
+                    and torch.distributed.is_initialized()
+                    and torch.distributed.get_world_size() > 1
+                ):
+                    return None
         elif isinstance(current_dist, DataParallel):
-            if hasattr(generic_cached, 'mesh') and generic_cached.mesh.ndim > 1:
+            if hasattr(generic_cached, "mesh") and generic_cached.mesh.ndim > 1:
                 return None
     
     return generic_cached
@@ -908,6 +915,17 @@ def dtensor_from_local(tensor, device_mesh, placements):
             safe_placements.append(p)
 
     try:
+        # CRITICAL FIX: Ensure the local tensor is on the correct device for the mesh.
+        # In multi-process mode, each rank sees its own GPU as cuda:0 (usually).
+        # PyTorch DTensor.from_local requires the local tensor to be on the mesh's device.
+        if torch.cuda.is_available() and device_mesh.device_type == "cuda":
+            # Map to the rank's specific assigned GPU (visible as 0 or mapped via current_device)
+            local_device = torch.device(f"cuda:{torch.cuda.current_device()}")
+            if tensor.device != local_device:
+                tensor = tensor.to(local_device)
+        elif device_mesh.device_type == "cpu" and tensor.device.type != "cpu":
+            tensor = tensor.to("cpu")
+
         return DTensor.from_local(tensor, device_mesh, safe_placements)
     except AssertionError as e:
         # As a last-resort fallback, replace any remaining Shard with Replicate

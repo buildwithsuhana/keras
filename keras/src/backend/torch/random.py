@@ -34,7 +34,7 @@ def normal(shape, mean=0.0, stddev=1.0, dtype=None, seed=None):
             mean, stddev, size=shape, dtype=dtype, device=get_device()
         )
     generator = torch_seed_generator(seed)
-    return torch.normal(
+    result = torch.normal(
         mean,
         stddev,
         size=shape,
@@ -43,6 +43,24 @@ def normal(shape, mean=0.0, stddev=1.0, dtype=None, seed=None):
         device=get_device(),
     )
 
+    # CRITICAL FIX: Handle DTensor conversion for internal tensors
+    from keras.src.backend.torch.distribution_lib import (
+        _get_default_device_mesh,
+    )
+
+    device_mesh = _get_default_device_mesh()
+    if device_mesh is not None:
+        mesh_ndim = 1
+        if hasattr(device_mesh, "mesh"):
+            mesh_ndim = device_mesh.mesh.ndim
+        from torch.distributed._tensor import Replicate
+        from keras.src.backend.torch.distribution_lib import dtensor_from_local
+
+        placements = [Replicate()] * mesh_ndim
+        result = dtensor_from_local(result, device_mesh, placements)
+
+    return result
+
 
 def categorical(logits, num_samples, dtype="int32", seed=None):
     logits = convert_to_tensor(logits)
@@ -50,18 +68,37 @@ def categorical(logits, num_samples, dtype="int32", seed=None):
     probs = torch.softmax(logits, dim=-1)
     # Do not use generator during symbolic execution.
     if get_device() == "meta":
-        return torch.multinomial(
+        result = torch.multinomial(
             probs,
             num_samples,
             replacement=True,
         ).type(dtype)
-    generator = torch_seed_generator(seed)
-    return torch.multinomial(
-        probs,
-        num_samples,
-        replacement=True,
-        generator=generator,
-    ).type(dtype)
+    else:
+        generator = torch_seed_generator(seed)
+        result = torch.multinomial(
+            probs,
+            num_samples,
+            replacement=True,
+            generator=generator,
+        ).type(dtype)
+
+    # CRITICAL FIX: Handle DTensor conversion for internal tensors
+    from keras.src.backend.torch.distribution_lib import (
+        _get_default_device_mesh,
+    )
+
+    device_mesh = _get_default_device_mesh()
+    if device_mesh is not None:
+        mesh_ndim = 1
+        if hasattr(device_mesh, "mesh"):
+            mesh_ndim = device_mesh.mesh.ndim
+        from torch.distributed._tensor import Replicate
+        from keras.src.backend.torch.distribution_lib import dtensor_from_local
+
+        placements = [Replicate()] * mesh_ndim
+        result = dtensor_from_local(result, device_mesh, placements)
+
+    return result
 
 
 def uniform(shape, minval=0.0, maxval=1.0, dtype=None, seed=None):
@@ -79,33 +116,70 @@ def uniform(shape, minval=0.0, maxval=1.0, dtype=None, seed=None):
             size=shape, generator=generator, dtype=dtype, device=get_device()
         )
 
-    output = (maxval - minval) * rand_tensor + minval
+    result = (maxval - minval) * rand_tensor + minval
+
+    # CRITICAL FIX: Handle DTensor conversion for internal tensors
+    from keras.src.backend.torch.distribution_lib import (
+        _get_default_device_mesh,
+    )
+
+    device_mesh = _get_default_device_mesh()
+    if device_mesh is not None:
+        mesh_ndim = 1
+        if hasattr(device_mesh, "mesh"):
+            mesh_ndim = device_mesh.mesh.ndim
+        from torch.distributed._tensor import Replicate
+        from keras.src.backend.torch.distribution_lib import dtensor_from_local
+
+        placements = [Replicate()] * mesh_ndim
+        result = dtensor_from_local(result, device_mesh, placements)
+    else:
+        result = result
 
     if len(requested_shape) == 0:
-        return output[0]
-    return output
+        return result[0]
+    return result
 
 
 def randint(shape, minval, maxval, dtype="int32", seed=None):
     dtype = to_torch_dtype(dtype)
     # Do not use generator during symbolic execution.
     if get_device() == "meta":
-        return torch.randint(
+        result = torch.randint(
             low=minval,
             high=maxval,
             size=shape,
             dtype=dtype,
             device=get_device(),
         )
-    generator = torch_seed_generator(seed)
-    return torch.randint(
-        low=minval,
-        high=maxval,
-        size=shape,
-        generator=generator,
-        dtype=dtype,
-        device=get_device(),
+    else:
+        generator = torch_seed_generator(seed)
+        result = torch.randint(
+            low=minval,
+            high=maxval,
+            size=shape,
+            generator=generator,
+            dtype=dtype,
+            device=get_device(),
+        )
+
+    # CRITICAL FIX: Handle DTensor conversion for internal tensors
+    from keras.src.backend.torch.distribution_lib import (
+        _get_default_device_mesh,
     )
+
+    device_mesh = _get_default_device_mesh()
+    if device_mesh is not None:
+        mesh_ndim = 1
+        if hasattr(device_mesh, "mesh"):
+            mesh_ndim = device_mesh.mesh.ndim
+        from torch.distributed._tensor import Replicate
+        from keras.src.backend.torch.distribution_lib import dtensor_from_local
+
+        placements = [Replicate()] * mesh_ndim
+        result = dtensor_from_local(result, device_mesh, placements)
+
+    return result
 
 
 def truncated_normal(shape, mean=0.0, stddev=1.0, dtype=None, seed=None):
@@ -118,6 +192,9 @@ def truncated_normal(shape, mean=0.0, stddev=1.0, dtype=None, seed=None):
     trunc_x = torch.empty(shape, dtype=dtype, device=get_device())
     trunc_x.data.copy_(x.gather(-1, indexes).squeeze(-1))
     trunc_x.data.mul_(stddev).add_(mean)
+    
+    # normal() already handles DTensor promotion, so trunc_x might already be a DTensor
+    # if normal() returns a DTensor. However, gather/copy_ on DTensor might need care.
     return trunc_x
 
 
@@ -203,9 +280,26 @@ def gamma(shape, alpha, dtype=None, seed=None):
         first_seed, second_seed = draw_seed(seed)
         torch.manual_seed(first_seed + second_seed)
     gamma_distribution = torch.distributions.gamma.Gamma(alpha, beta)
-    sample = gamma_distribution.sample().type(dtype)
+    result = gamma_distribution.sample().type(dtype)
     torch.random.set_rng_state(prev_rng_state)
-    return sample
+
+    # CRITICAL FIX: Handle DTensor conversion for internal tensors
+    from keras.src.backend.torch.distribution_lib import (
+        _get_default_device_mesh,
+    )
+
+    device_mesh = _get_default_device_mesh()
+    if device_mesh is not None:
+        mesh_ndim = 1
+        if hasattr(device_mesh, "mesh"):
+            mesh_ndim = device_mesh.mesh.ndim
+        from torch.distributed._tensor import Replicate
+        from keras.src.backend.torch.distribution_lib import dtensor_from_local
+
+        placements = [Replicate()] * mesh_ndim
+        result = dtensor_from_local(result, device_mesh, placements)
+
+    return result
 
 
 def binomial(shape, counts, probabilities, dtype=None, seed=None):
@@ -221,9 +315,26 @@ def binomial(shape, counts, probabilities, dtype=None, seed=None):
     binomial_distribution = torch.distributions.binomial.Binomial(
         total_count=counts, probs=probabilities
     )
-    sample = binomial_distribution.sample().type(dtype)
+    result = binomial_distribution.sample().type(dtype)
     torch.random.set_rng_state(prev_rng_state)
-    return sample
+
+    # CRITICAL FIX: Handle DTensor conversion for internal tensors
+    from keras.src.backend.torch.distribution_lib import (
+        _get_default_device_mesh,
+    )
+
+    device_mesh = _get_default_device_mesh()
+    if device_mesh is not None:
+        mesh_ndim = 1
+        if hasattr(device_mesh, "mesh"):
+            mesh_ndim = device_mesh.mesh.ndim
+        from torch.distributed._tensor import Replicate
+        from keras.src.backend.torch.distribution_lib import dtensor_from_local
+
+        placements = [Replicate()] * mesh_ndim
+        result = dtensor_from_local(result, device_mesh, placements)
+
+    return result
 
 
 def beta(shape, alpha, beta, dtype=None, seed=None):
@@ -239,6 +350,23 @@ def beta(shape, alpha, beta, dtype=None, seed=None):
     beta_distribution = torch.distributions.beta.Beta(
         concentration1=alpha, concentration0=beta
     )
-    sample = beta_distribution.sample().type(dtype)
+    result = beta_distribution.sample().type(dtype)
     torch.random.set_rng_state(prev_rng_state)
-    return sample
+
+    # CRITICAL FIX: Handle DTensor conversion for internal tensors
+    from keras.src.backend.torch.distribution_lib import (
+        _get_default_device_mesh,
+    )
+
+    device_mesh = _get_default_device_mesh()
+    if device_mesh is not None:
+        mesh_ndim = 1
+        if hasattr(device_mesh, "mesh"):
+            mesh_ndim = device_mesh.mesh.ndim
+        from torch.distributed._tensor import Replicate
+        from keras.src.backend.torch.distribution_lib import dtensor_from_local
+
+        placements = [Replicate()] * mesh_ndim
+        result = dtensor_from_local(result, device_mesh, placements)
+
+    return result

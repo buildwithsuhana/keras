@@ -546,20 +546,78 @@ def ones(shape, dtype=None):
     dtype = to_torch_dtype(dtype or config.floatx())
     if isinstance(shape, int):
         shape = (shape,)
-    return torch.ones(size=shape, dtype=dtype, device=get_device())
+    result = torch.ones(size=shape, dtype=dtype, device=get_device())
+
+    # CRITICAL FIX: Handle DTensor conversion for internal tensors
+    from keras.src.backend.torch.distribution_lib import (
+        _get_default_device_mesh,
+    )
+
+    device_mesh = _get_default_device_mesh()
+    if device_mesh is not None:
+        mesh_ndim = 1
+        if hasattr(device_mesh, "mesh"):
+            mesh_ndim = device_mesh.mesh.ndim
+        from torch.distributed._tensor import Replicate
+        from keras.src.backend.torch.distribution_lib import dtensor_from_local
+
+        placements = [Replicate()] * mesh_ndim
+        result = dtensor_from_local(result, device_mesh, placements)
+
+    return result
 
 
 def zeros(shape, dtype=None):
     dtype = to_torch_dtype(dtype or config.floatx())
     if isinstance(shape, int):
         shape = (shape,)
-    return torch.zeros(size=shape, dtype=dtype, device=get_device())
+    result = torch.zeros(size=shape, dtype=dtype, device=get_device())
+
+    # CRITICAL FIX: Handle DTensor conversion for internal tensors
+    from keras.src.backend.torch.distribution_lib import (
+        _get_default_device_mesh,
+    )
+
+    device_mesh = _get_default_device_mesh()
+    if device_mesh is not None:
+        mesh_ndim = 1
+        if hasattr(device_mesh, "mesh"):
+            mesh_ndim = device_mesh.mesh.ndim
+        from torch.distributed._tensor import Replicate
+        from keras.src.backend.torch.distribution_lib import dtensor_from_local
+
+        placements = [Replicate()] * mesh_ndim
+        result = dtensor_from_local(result, device_mesh, placements)
+
+    return result
 
 
 def zeros_like(x, dtype=None):
     x = convert_to_tensor(x)
     dtype = to_torch_dtype(dtype or x.dtype)
-    return torch.zeros_like(x, dtype=dtype)
+    result = torch.zeros_like(x, dtype=dtype)
+
+    # CRITICAL FIX: Handle DTensor conversion for internal tensors
+    from keras.src.backend.torch.distribution_lib import (
+        is_dtensor,
+        _get_default_device_mesh,
+    )
+
+    if not is_dtensor(result):
+        device_mesh = _get_default_device_mesh()
+        if device_mesh is not None:
+            mesh_ndim = 1
+            if hasattr(device_mesh, "mesh"):
+                mesh_ndim = device_mesh.mesh.ndim
+            from torch.distributed._tensor import Replicate
+            from keras.src.backend.torch.distribution_lib import (
+                dtensor_from_local,
+            )
+
+            placements = [Replicate()] * mesh_ndim
+            result = dtensor_from_local(result, device_mesh, placements)
+
+    return result
 
 
 def absolute(x):
@@ -1380,10 +1438,29 @@ def full(shape, fill_value, dtype=None):
         # `torch.full` only supports scala `fill_value`.
         expand_size = len(shape) - len(fill_value.shape)
         tile_shape = tuple(shape[:expand_size]) + (1,) * len(fill_value.shape)
-        return torch.tile(fill_value, tile_shape)
-    return torch.full(
-        size=shape, fill_value=fill_value, dtype=dtype, device=get_device()
+        result = torch.tile(fill_value, tile_shape)
+    else:
+        result = torch.full(
+            size=shape, fill_value=fill_value, dtype=dtype, device=get_device()
+        )
+
+    # CRITICAL FIX: Handle DTensor conversion for internal tensors
+    from keras.src.backend.torch.distribution_lib import (
+        _get_default_device_mesh,
     )
+
+    device_mesh = _get_default_device_mesh()
+    if device_mesh is not None:
+        mesh_ndim = 1
+        if hasattr(device_mesh, "mesh"):
+            mesh_ndim = device_mesh.mesh.ndim
+        from torch.distributed._tensor import Replicate
+        from keras.src.backend.torch.distribution_lib import dtensor_from_local
+
+        placements = [Replicate()] * mesh_ndim
+        result = dtensor_from_local(result, device_mesh, placements)
+
+    return result
 
 
 def full_like(x, fill_value, dtype=None):
@@ -1852,18 +1929,35 @@ def linspace(
             steps = steps.unsqueeze(-1)
 
         # increments from `start` to `stop` in each dimension
-        linspace = start[None] + steps * (stop - start)[None]
+        result = start[None] + steps * (stop - start)[None]
     else:
-        linspace = torch.linspace(
+        result = torch.linspace(
             start=start,
             end=stop,
             steps=num,
             dtype=dtype,
             device=get_device(),
         )
+
+    # CRITICAL FIX: Handle DTensor conversion for internal tensors
+    from keras.src.backend.torch.distribution_lib import (
+        _get_default_device_mesh,
+    )
+
+    device_mesh = _get_default_device_mesh()
+    if device_mesh is not None:
+        mesh_ndim = 1
+        if hasattr(device_mesh, "mesh"):
+            mesh_ndim = device_mesh.mesh.ndim
+        from torch.distributed._tensor import Replicate
+        from keras.src.backend.torch.distribution_lib import dtensor_from_local
+
+        placements = [Replicate()] * mesh_ndim
+        result = dtensor_from_local(result, device_mesh, placements)
+
     if retstep is True:
-        return (linspace, step)
-    return linspace
+        return (result, step)
+    return result
 
 
 def log(x):
@@ -1953,14 +2047,14 @@ def logspace(start, stop, num=50, endpoint=True, base=10, dtype=None, axis=0):
             steps = steps.unsqueeze(-1)
 
         # increments from `start` to `stop` in each dimension
-        linspace = start[None] + steps * (stop - start)[None]
-        logspace = base**linspace
+        linspace_res = start[None] + steps * (stop - start)[None]
+        result = base**linspace_res
     else:
         compute_dtype = dtype
         # TODO: torch.logspace doesn't support float16 with cpu
         if get_device() == "cpu" and dtype == torch.float16:
             compute_dtype = torch.float32
-        logspace = cast(
+        result = cast(
             torch.logspace(
                 start=start,
                 end=stop,
@@ -1971,21 +2065,99 @@ def logspace(start, stop, num=50, endpoint=True, base=10, dtype=None, axis=0):
             ),
             dtype,
         )
-    return logspace
+
+    # CRITICAL FIX: Handle DTensor conversion for internal tensors
+    from keras.src.backend.torch.distribution_lib import (
+        _get_default_device_mesh,
+    )
+
+    device_mesh = _get_default_device_mesh()
+    if device_mesh is not None:
+        mesh_ndim = 1
+        if hasattr(device_mesh, "mesh"):
+            mesh_ndim = device_mesh.mesh.ndim
+        from torch.distributed._tensor import Replicate
+        from keras.src.backend.torch.distribution_lib import dtensor_from_local
+
+        placements = [Replicate()] * mesh_ndim
+        result = dtensor_from_local(result, device_mesh, placements)
+
+    return result
 
 
 def maximum(x1, x2):
-    if not isinstance(x1, (int, float)):
-        x1 = convert_to_tensor(x1)
-    if not isinstance(x2, (int, float)):
-        x2 = convert_to_tensor(x2)
-    dtype = dtypes.result_type(
-        getattr(x1, "dtype", type(x1)),
-        getattr(x2, "dtype", type(x2)),
+    x1, x2 = convert_to_tensor(x1), convert_to_tensor(x2)
+
+    # Handle mixed DTensor and regular tensor operands
+    from keras.src.backend.torch.distribution_lib import (
+        is_dtensor,
+        _get_default_device_mesh,
+        DTensor,
+        Replicate,
+        dtensor_from_local,
     )
-    x1 = convert_to_tensor(x1, dtype)
-    x2 = convert_to_tensor(x2, dtype)
-    return torch.maximum(x1, x2)
+
+    # Check if we have at least one DTensor
+    x1_is_dtensor = is_dtensor(x1)
+    x2_is_dtensor = is_dtensor(x2)
+    
+    # Track if we need to convert result to DTensor
+    needs_dtensor_result = False
+    
+    if x1_is_dtensor or x2_is_dtensor:
+        # Get device_mesh from DTensor if available, otherwise from global state
+        device_mesh = None
+        if x1_is_dtensor:
+            device_mesh = getattr(x1, "device_mesh", None)
+        elif x2_is_dtensor:
+            device_mesh = getattr(x2, "device_mesh", None)
+        
+        # CRITICAL FIX: Fallback to global state if device_mesh is None
+        if device_mesh is None:
+            device_mesh = _get_default_device_mesh()
+        
+        if device_mesh is not None:
+            needs_dtensor_result = True
+            # Get mesh dimension to determine correct placements
+            mesh_ndim = 1
+            if hasattr(device_mesh, 'mesh'):
+                mesh_ndim = device_mesh.mesh.ndim
+            
+            # Standard case - convert regular tensor to DTensor
+            if x1_is_dtensor and not x2_is_dtensor:
+                if mesh_ndim == 1:
+                    x2 = dtensor_from_local(x2, device_mesh, [Replicate()])
+                else:
+                    x2 = dtensor_from_local(x2, device_mesh, [Replicate()] * mesh_ndim)
+            elif x2_is_dtensor and not x1_is_dtensor:
+                if mesh_ndim == 1:
+                    x1 = dtensor_from_local(x1, device_mesh, [Replicate()])
+                else:
+                    x1 = dtensor_from_local(x1, device_mesh, [Replicate()] * mesh_ndim)
+    
+    # Auto-detect distributed context even without DTensor inputs
+    if not needs_dtensor_result:
+        device_mesh = _get_default_device_mesh()
+        if device_mesh is not None:
+            import torch.distributed as dist
+            if dist.is_available() and dist.is_initialized():
+                needs_dtensor_result = True
+    
+    result = torch.maximum(x1, x2)
+    
+    # Convert result to DTensor when we have an active device mesh
+    if needs_dtensor_result and device_mesh is not None:
+        mesh_ndim = 1
+        if hasattr(device_mesh, 'mesh'):
+            mesh_ndim = device_mesh.mesh.ndim
+        
+        if not is_dtensor(result):
+            if mesh_ndim == 1:
+                result = dtensor_from_local(result, device_mesh, [Replicate()])
+            else:
+                result = dtensor_from_local(result, device_mesh, [Replicate()] * mesh_ndim)
+    
+    return result
 
 
 def median(x, axis=None, keepdims=False):
@@ -2061,17 +2233,78 @@ def min(x, axis=None, keepdims=False, initial=None):
 
 
 def minimum(x1, x2):
-    if not isinstance(x1, (int, float)):
-        x1 = convert_to_tensor(x1)
-    if not isinstance(x2, (int, float)):
-        x2 = convert_to_tensor(x2)
-    dtype = dtypes.result_type(
-        getattr(x1, "dtype", type(x1)),
-        getattr(x2, "dtype", type(x2)),
+    x1, x2 = convert_to_tensor(x1), convert_to_tensor(x2)
+
+    # Handle mixed DTensor and regular tensor operands
+    from keras.src.backend.torch.distribution_lib import (
+        is_dtensor,
+        _get_default_device_mesh,
+        DTensor,
+        Replicate,
+        dtensor_from_local,
     )
-    x1 = convert_to_tensor(x1, dtype)
-    x2 = convert_to_tensor(x2, dtype)
-    return torch.minimum(x1, x2)
+
+    # Check if we have at least one DTensor
+    x1_is_dtensor = is_dtensor(x1)
+    x2_is_dtensor = is_dtensor(x2)
+    
+    # Track if we need to convert result to DTensor
+    needs_dtensor_result = False
+    
+    if x1_is_dtensor or x2_is_dtensor:
+        # Get device_mesh from DTensor if available, otherwise from global state
+        device_mesh = None
+        if x1_is_dtensor:
+            device_mesh = getattr(x1, "device_mesh", None)
+        elif x2_is_dtensor:
+            device_mesh = getattr(x2, "device_mesh", None)
+        
+        # CRITICAL FIX: Fallback to global state if device_mesh is None
+        if device_mesh is None:
+            device_mesh = _get_default_device_mesh()
+        
+        if device_mesh is not None:
+            needs_dtensor_result = True
+            # Get mesh dimension to determine correct placements
+            mesh_ndim = 1
+            if hasattr(device_mesh, 'mesh'):
+                mesh_ndim = device_mesh.mesh.ndim
+            
+            # Standard case - convert regular tensor to DTensor
+            if x1_is_dtensor and not x2_is_dtensor:
+                if mesh_ndim == 1:
+                    x2 = dtensor_from_local(x2, device_mesh, [Replicate()])
+                else:
+                    x2 = dtensor_from_local(x2, device_mesh, [Replicate()] * mesh_ndim)
+            elif x2_is_dtensor and not x1_is_dtensor:
+                if mesh_ndim == 1:
+                    x1 = dtensor_from_local(x1, device_mesh, [Replicate()])
+                else:
+                    x1 = dtensor_from_local(x1, device_mesh, [Replicate()] * mesh_ndim)
+    
+    # Auto-detect distributed context even without DTensor inputs
+    if not needs_dtensor_result:
+        device_mesh = _get_default_device_mesh()
+        if device_mesh is not None:
+            import torch.distributed as dist
+            if dist.is_available() and dist.is_initialized():
+                needs_dtensor_result = True
+    
+    result = torch.minimum(x1, x2)
+    
+    # Convert result to DTensor when we have an active device mesh
+    if needs_dtensor_result and device_mesh is not None:
+        mesh_ndim = 1
+        if hasattr(device_mesh, 'mesh'):
+            mesh_ndim = device_mesh.mesh.ndim
+        
+        if not is_dtensor(result):
+            if mesh_ndim == 1:
+                result = dtensor_from_local(result, device_mesh, [Replicate()])
+            else:
+                result = dtensor_from_local(result, device_mesh, [Replicate()] * mesh_ndim)
+    
+    return result
 
 
 def mod(x1, x2):
@@ -2227,7 +2460,29 @@ def not_equal(x1, x2):
 def ones_like(x, dtype=None):
     x = convert_to_tensor(x)
     dtype = to_torch_dtype(dtype or x.dtype)
-    return torch.ones_like(x, dtype=dtype)
+    result = torch.ones_like(x, dtype=dtype)
+
+    # CRITICAL FIX: Handle DTensor conversion for internal tensors
+    from keras.src.backend.torch.distribution_lib import (
+        is_dtensor,
+        _get_default_device_mesh,
+    )
+
+    if not is_dtensor(result):
+        device_mesh = _get_default_device_mesh()
+        if device_mesh is not None:
+            mesh_ndim = 1
+            if hasattr(device_mesh, "mesh"):
+                mesh_ndim = device_mesh.mesh.ndim
+            from torch.distributed._tensor import Replicate
+            from keras.src.backend.torch.distribution_lib import (
+                dtensor_from_local,
+            )
+
+            placements = [Replicate()] * mesh_ndim
+            result = dtensor_from_local(result, device_mesh, placements)
+
+    return result
 
 
 def outer(x1, x2):
