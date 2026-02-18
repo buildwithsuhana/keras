@@ -487,7 +487,10 @@ def _get_default_device_mesh():
         if cached is not None:
             return cached
 
-        return None  # Signal that we need to convert
+        # CRITICAL FIX: If mesh is not yet created for this distribution, create it.
+        # This ensures that convert_to_tensor() can always promote to DTensor
+        # when a distribution is active.
+        return _to_backend_mesh(device_mesh)
 
     generic_cached = global_state.get_global_attribute("torch_device_mesh", None)
     if generic_cached is not None and current_dist is not None:

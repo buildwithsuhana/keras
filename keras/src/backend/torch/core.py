@@ -409,6 +409,14 @@ def convert_to_tensor(x, dtype=None, sparse=None, ragged=None):
             if debug_mode:
                 print(f"DEBUG | [Rank {rank}] convert_to_tensor: promoting torch.Tensor to DTensor with Replicate placement")
             
+            # CRITICAL FIX: Ensure tensor is on the correct local device before creating DTensor
+            if torch.cuda.is_available() and torch.distributed.is_initialized():
+                local_device = f"cuda:{torch.cuda.current_device()}"
+                if x.device.type != "cuda" or x.device.index != torch.cuda.current_device():
+                    x = x.to(local_device)
+            elif x.device.type != "cpu":
+                x = x.to("cpu")
+            
             return dtensor_from_local(x, device_mesh, [Replicate()])
     
     # If x is already a torch.Tensor but not converted above (not in MP mode),
