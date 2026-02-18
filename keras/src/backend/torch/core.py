@@ -523,13 +523,14 @@ def cast(x, dtype):
     from keras.src.backend.torch.distribution_lib import DTensor, dtensor_from_local
     is_dtensor, local_x = _get_dtensor_info(x)
     if is_dtensor:
+        if x.dtype == dtype:
+            return x
         local_x = local_x.to(dtype)
         return dtensor_from_local(local_x, x.device_mesh, x.placements)
     if is_tensor(x):
-        if x.dtype == dtype:
-            return x
-        else:
-            return x.to(dtype)
+        if x.dtype != dtype:
+            x = x.to(dtype)
+        return convert_to_tensor(x)
     return convert_to_tensor(x, dtype)
 
 
@@ -549,10 +550,12 @@ def compute_output_spec(fn, *args, **kwargs):
                 for i, e in enumerate(shape):
                     if e is None:
                         shape[i] = fill_value
-            return torch.ones(
-                size=shape,
-                dtype=TORCH_DTYPES[x.dtype],
-                device=get_device(),
+            return convert_to_tensor(
+                torch.ones(
+                    size=shape,
+                    dtype=TORCH_DTYPES[x.dtype],
+                    device=get_device(),
+                )
             )
         return x
 

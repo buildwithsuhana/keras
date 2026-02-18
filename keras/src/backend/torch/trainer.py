@@ -39,8 +39,8 @@ class TorchTrainer(base_trainer.Trainer):
         """
         if self._torch_module_parallelized:
             return
-        from keras.src.backend.torch.distribution_lib import parallelize_torch_module, _get_default_device_mesh, TENSOR_PARALLEL_AVAILABLE
-        from keras.src.distribution.distribution_lib import distribution,ModelParallel
+        from keras.src.backend.torch.distribution_lib import parallelize_torch_module, _get_default_device_mesh, TENSOR_PARALLEL_AVAILABLE, _to_backend_mesh
+        from keras.src.distribution.distribution_lib import distribution, ModelParallel
         if not TENSOR_PARALLEL_AVAILABLE:
             return
         dist = distribution()
@@ -48,7 +48,13 @@ class TorchTrainer(base_trainer.Trainer):
             return
         if not hasattr(dist, '_layout_map') or not dist._layout_map:
             return
+        
         device_mesh = _get_default_device_mesh()
+        if device_mesh is None:
+            # Create the mesh from the distribution if it's missing
+            if hasattr(dist, 'device_mesh'):
+                device_mesh = _to_backend_mesh(dist.device_mesh)
+            
         if device_mesh is None:
             return  
         if hasattr(self, '_torch_layers'):
