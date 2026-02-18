@@ -424,6 +424,11 @@ def _get_default_device_mesh():
     CRITICAL FIX 2: Even when the distribution scope is not active (e.g., during
     model forward pass when computing causal masks), we should still detect if
     ModelParallel is active by checking the _MP_MULTI_PROCESS_STATE global flag.
+    
+    CRITICAL FIX 3: This function should ALSO return the cached mesh when
+    distributed is initialized but current_dist is None. This handles the case
+    where distribute_tensor is called during model forward pass AFTER the 
+    distribution scope has exited but we still have a valid cached mesh.
     """
     from keras.src.distribution.distribution_lib import distribution, DataParallel, ModelParallel
     
@@ -443,6 +448,16 @@ def _get_default_device_mesh():
     # This handles the case where we're in a multi-process MP context but
     # the distribution scope has exited
     is_distributed = torch.distributed.is_initialized()
+    
+    # CRITICAL FIX: Check for cached mesh FIRST, before checking current_dist.
+    # This handles the case where we're in multi-process mode but the distribution
+    # scope has exited (e.g., during model forward pass). We should return the
+    # cached mesh if it exists.
+    if is_distributed:
+        cached_mesh = global_state.get_global_attribute("torch_device_mesh", None)
+        if cached_mesh is not None and hasattr(cached_mesh, 'mesh'):
+            # Return the cached mesh - it's valid for this distributed context
+            return cached_mesh
     
     # Try to detect ModelParallel from cached mesh if distributed is initialized
     if current_dist is None and is_distributed:
@@ -1511,6 +1526,8 @@ def prepare_output_for_loss(x):
         else:
             # DTensor with same local and global shape (replicated) - just get local tensor
             return local_tensor
+    
+    
     
     # Not a DTensor - this is likely labels (y) which are full local tensors
     # DO NOT all-gather! Labels are full local data, not sharded outputs.
