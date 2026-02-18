@@ -219,18 +219,55 @@ class Variable(KerasVariable):
     def _direct_assign(self, value):
         with torch.no_grad():
             # Handle DTensor: extract local tensor if needed
-            from keras.src.backend.torch.distribution_lib import is_dtensor
-            if is_dtensor(value):
-                # Extract local tensor from DTensor
-                value = value.to_local()
+            from keras.src.backend.torch.distribution_lib import is_dtensor, dtensor_from_local
             
-            # Also handle if self._value is a DTensor
-            if hasattr(self._value, 'to_local'):
-                # self._value is a DTensor, extract its local tensor for copying
-                self_local = self._value.to_local()
-                self_local.copy_(value)
+            # CRITICAL FIX: Robust handling of DTensor assignment.
+            # If self._value is a DTensor (sharded or replicated), we must ensure
+            # 'value' is compatible for copy_.
+            if is_dtensor(self._value):
+                # If value is also a DTensor, redistribute it to match self._value
+                if is_dtensor(value):
+                    if (self._value.device_mesh != value.device_mesh or 
+                        self._value.placements != value.placements):
+                        value = value.redistribute(self._value.device_mesh, self._value.placements)
+                    self._value.copy_(value)
+                else:
+                    # value is a regular tensor.
+                    # If it has the same shape as the GLOBAL DTensor, we should distribute/shard it.
+                    if value.shape == self._value.shape:
+                        # Ensure value is on the correct device for the mesh
+                        if self._value.device_mesh.device_type == "cuda" and not value.is_cuda:
+                            value = value.to(f"cuda:{torch.cuda.current_device()}")
+                        elif self._value.device_mesh.device_type == "cpu" and value.is_cuda:
+                            value = value.to("cpu")
+                            
+                        # Convert full regular tensor to DTensor matching self._value
+                        # Use torch_distribute_tensor from distribution_lib
+                        from keras.src.backend.torch.distribution_lib import torch_distribute_tensor
+                        value_dtensor = torch_distribute_tensor(value, self._value.device_mesh, self._value.placements)
+                        self._value.copy_(value_dtensor)
+                    else:
+                        # value might be a local shard already.
+                        self_local = self._value.to_local()
+                        if value.shape == self_local.shape:
+                            self_local.copy_(value)
+                        else:
+                            # Fallback: try to copy as-is, let PyTorch raise error if incompatible
+                            self_local.copy_(value)
             else:
                 # self._value is a regular torch.Tensor
+                if is_dtensor(value):
+                    # Extract local tensor from DTensor
+                    value = value.to_local()
+                
+                # Check for shape mismatch before copy_
+                if self._value.shape != value.shape:
+                    # Try to broadcast value to self._value shape if they are compatible
+                    try:
+                        value = value.broadcast_to(self._value.shape)
+                    except:
+                        pass
+                
                 self._value.copy_(value)
 
     def _convert_to_tensor(self, value, dtype=None):

@@ -133,8 +133,6 @@ def uniform(shape, minval=0.0, maxval=1.0, dtype=None, seed=None):
 
         placements = [Replicate()] * mesh_ndim
         result = dtensor_from_local(result, device_mesh, placements)
-    else:
-        result = result
 
     if len(requested_shape) == 0:
         return result[0]
@@ -186,16 +184,16 @@ def truncated_normal(shape, mean=0.0, stddev=1.0, dtype=None, seed=None):
     dtype = to_torch_dtype(dtype)
     # Take a larger standard normal dist, discard values outside 2 * stddev
     # Offset by mean and stddev
+    # normal() already handles DTensor promotion if needed
     x = normal(tuple(shape) + (4,), mean=0, stddev=1, dtype=dtype, seed=seed)
     valid = (x > -2) & (x < 2)
     indexes = valid.max(-1, keepdim=True)[1]
-    trunc_x = torch.empty(shape, dtype=dtype, device=get_device())
-    trunc_x.data.copy_(x.gather(-1, indexes).squeeze(-1))
-    trunc_x.data.mul_(stddev).add_(mean)
     
-    # normal() already handles DTensor promotion, so trunc_x might already be a DTensor
-    # if normal() returns a DTensor. However, gather/copy_ on DTensor might need care.
-    return trunc_x
+    # x.gather on DTensor returns a DTensor.
+    result = x.gather(-1, indexes).squeeze(-1)
+    result = result * stddev + mean
+    
+    return result
 
 
 def _get_concrete_noise_shape(inputs, noise_shape):
@@ -219,23 +217,17 @@ def dropout(inputs, rate, noise_shape=None, seed=None):
     ):
         keep_prob = 1.0 - rate
         noise_shape = _get_concrete_noise_shape(inputs, noise_shape)
-        keep_prob_matrix = torch.full(
-            noise_shape, keep_prob, device=get_device()
-        )
-        generator = torch_seed_generator(seed)
+        
+        # Use uniform() which is already patched for DTensor promotion
+        mask = uniform(noise_shape, minval=0.0, maxval=1.0, seed=seed) < keep_prob
 
-        # Do not use generator during symbolic execution.
-        if get_device() == "meta":
-            mask = torch.bernoulli(keep_prob_matrix)
-        else:
-            mask = torch.bernoulli(keep_prob_matrix, generator=generator)
-
-        mask = mask.bool()
-        mask = torch.broadcast_to(mask, inputs.shape)
+        if noise_shape != inputs.shape:
+            mask = torch.broadcast_to(mask, inputs.shape)
+            
         return torch.where(
             mask,
             inputs / keep_prob,
-            torch.zeros_like(inputs, dtype=inputs.dtype),
+            torch.zeros_like(inputs),
         )
     # Fast path, unseeded (since torch doesn't support seeding dropout!!!!)
     # Using the above implementation is possible, but much slower.
