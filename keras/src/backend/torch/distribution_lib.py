@@ -1096,9 +1096,6 @@ def _convert_structure(x, device_mesh=None, to_dtensor=True, gather_sharded=True
                 print(f"DEBUG | [Rank {rank}] _convert_structure: Auto-detected need to convert to DTensor (mesh={torch_device_mesh is not None}, dist={is_distributed}, mp={is_mp}, cached_mp={cached_mp_state})")
         
         if should_convert:
-            _MP_MULTI_PROCESS_STATE
-            is_mp_multi_process = _MP_MULTI_PROCESS_STATE
-            
             # Identify the backend mesh
             from keras.src.distribution.distribution_lib import distribution
             current_dist = distribution()
