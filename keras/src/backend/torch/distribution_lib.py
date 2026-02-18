@@ -1408,7 +1408,8 @@ def prepare_output_for_loss(x):
     
     # CRITICAL FIX: Check for DTensor using duck typing in case of module mismatch
     # Sometimes DTensor can be imported from different modules
-    is_dtensor = hasattr(x, 'placements') and hasattr(x, 'to_local') and hasattr(x, 'shape')
+    # Use different variable name to avoid shadowing the module-level is_dtensor function
+    x_is_dtensor = hasattr(x, 'placements') and hasattr(x, 'to_local') and hasattr(x, 'shape')
     
     if debug_mode:
         rank = 0
@@ -1418,10 +1419,10 @@ def prepare_output_for_loss(x):
                 rank = dist.get_rank()
         except:
             pass
-        print(f"DEBUG | [Rank {rank}] prepare_output_for_loss: is_dtensor={is_dtensor}, x_type={type(x).__name__}")
+        print(f"DEBUG | [Rank {rank}] prepare_output_for_loss: is_dtensor={x_is_dtensor}, x_type={type(x).__name__}")
     
     # Check if x is a DTensor - this is the model output that needs all-gather
-    if is_dtensor:
+    if x_is_dtensor:
         # Debug: print the placements and local shape
         if debug_mode:
             rank = 0
