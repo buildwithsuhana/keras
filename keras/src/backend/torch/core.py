@@ -411,6 +411,11 @@ def convert_to_tensor(x, dtype=None, sparse=None, ragged=None):
             
             return dtensor_from_local(x, device_mesh, [Replicate()])
     
+    # If x is already a torch.Tensor but not converted above (not in MP mode),
+    # just return it as-is
+    if isinstance(x, torch.Tensor):
+        return x
+    
     if isinstance(x, Variable):
         x = x.value
     
