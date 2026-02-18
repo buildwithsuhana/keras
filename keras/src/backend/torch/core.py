@@ -831,6 +831,34 @@ def slice(inputs, start_indices, shape):
     start_indices = convert_to_tensor(start_indices).to(shape_dtype)
     shape = convert_to_tensor(shape).to(shape_dtype)
 
+    # CRITICAL FIX: Handle DTensor properly to avoid aten.alias.default error
+    # DTensor doesn't support view operations (like slice) without registered sharding
+    from keras.src.backend.torch.distribution_lib import is_dtensor
+    if is_dtensor(inputs):
+        # For DTensor, we need to extract local tensor, slice it, and convert back
+        # This avoids the view/alias operation that DTensor doesn't support
+        from keras.src.backend.torch.distribution_lib import (
+            get_dtensor_local,
+            dtensor_from_local,
+        )
+        
+        # Get the local tensor and its device mesh/placements
+        local_inputs = inputs.to_local()
+        device_mesh = inputs.device_mesh
+        placements = inputs.placements
+        
+        # Perform slice on local tensor
+        python_slice = __builtins__["slice"]
+        slices = tuple(
+            python_slice(int(start_index), int(start_index) + int(length))
+            for start_index, length in zip(start_indices, shape)
+        )
+        local_result = local_inputs[slices]
+        
+        # Convert back to DTensor with same placements
+        return dtensor_from_local(local_result, device_mesh, placements)
+    
+    # Original code for non-DTensor inputs
     python_slice = __builtins__["slice"]
     slices = tuple(
         python_slice(start_index, start_index + length)
