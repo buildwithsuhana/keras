@@ -2545,6 +2545,42 @@ def take(x, indices, axis=None):
         indices + x_dim,
         indices,
     )
+    
+    # CRITICAL FIX: Handle DTensor for the general case
+    # Check if we have DTensors and need to handle them
+    x_is_dtensor = is_dtensor(x)
+    indices_is_dtensor = is_dtensor(indices)
+    
+    if x_is_dtensor or indices_is_dtensor:
+        # Get device_mesh from DTensor if available
+        device_mesh = None
+        if x_is_dtensor:
+            device_mesh = getattr(x, 'device_mesh', None)
+        elif indices_is_dtensor:
+            device_mesh = getattr(indices, 'device_mesh', None)
+        
+        # Fallback to global state if device_mesh is None
+        if device_mesh is None:
+            device_mesh = _get_default_device_mesh()
+        
+        if device_mesh is not None:
+            # Get mesh dimension
+            mesh_ndim = 1
+            if hasattr(device_mesh, 'mesh'):
+                mesh_ndim = device_mesh.mesh.ndim
+            
+            # Convert regular tensors to DTensors to match
+            if x_is_dtensor and not indices_is_dtensor:
+                if mesh_ndim == 1:
+                    indices = dtensor_from_local(indices, device_mesh, [Replicate()])
+                else:
+                    indices = dtensor_from_local(indices, device_mesh, [Replicate()] * mesh_ndim)
+            elif indices_is_dtensor and not x_is_dtensor:
+                if mesh_ndim == 1:
+                    x = dtensor_from_local(x, device_mesh, [Replicate()])
+                else:
+                    x = dtensor_from_local(x, device_mesh, [Replicate()] * mesh_ndim)
+    
     if x.ndim == 2 and axis == 0:
         # This case is equivalent to embedding lookup.
         # Handle DTensor: when x is DTensor, we need to ensure indices is also
