@@ -444,43 +444,29 @@ def _get_default_device_mesh():
     global _MP_MULTI_PROCESS_STATE
     is_mp_multi_process = _MP_MULTI_PROCESS_STATE
     
-    # CRITICAL FIX: Also check if torch distributed is initialized with MP
-    # This handles the case where we're in a multi-process MP context but
-    # the distribution scope has exited
+    # CRITICAL FIX: Also check if torch distributed is initialized
     is_distributed = torch.distributed.is_initialized()
     
-    # CRITICAL FIX: Check for cached mesh FIRST, before checking current_dist.
+    # CRITICAL FIX: Check for cached mesh FIRST.
     # This handles the case where we're in multi-process mode but the distribution
     # scope has exited (e.g., during model forward pass). We should return the
     # cached mesh if it exists.
     if is_distributed:
         cached_mesh = global_state.get_global_attribute("torch_device_mesh", None)
         if cached_mesh is not None and hasattr(cached_mesh, 'mesh'):
-            # Return the cached mesh - it's valid for this distributed context
+            # If we're in multi-process MP mode (cached flag), we need a 1D mesh.
+            if is_mp_multi_process and cached_mesh.mesh.ndim == 1:
+                return cached_mesh
+            # If we have any valid mesh and we're distributed, it's better than None
+            # because regular tensors cause mixed-tensor errors.
             return cached_mesh
     
-    # Try to detect ModelParallel from cached mesh if distributed is initialized
-    if current_dist is None and is_distributed:
-        cached_mesh = global_state.get_global_attribute("torch_device_mesh", None)
-        if cached_mesh is not None and hasattr(cached_mesh, 'mesh'):
-            # If we have a cached 1D mesh and distributed is initialized,
-            # this is likely ModelParallel
-            if cached_mesh.mesh.ndim == 1:
-                # This is likely ModelParallel - return the cached mesh
-                return cached_mesh
-    
-    # CRITICAL FIX: First check if current distribution is active and has a mesh
+    # Try to detect ModelParallel from current distribution scope
     if current_dist is not None and hasattr(current_dist, 'device_mesh'):
         device_mesh = current_dist.device_mesh
         
         # Build the same cache key as _to_backend_mesh()
-        dist_type = ""
-        if isinstance(current_dist, ModelParallel):
-            dist_type = "MP"
-        elif isinstance(current_dist, DataParallel):
-            dist_type = "DP"
-        else:
-            dist_type = "NONE"
+        dist_type = "MP" if isinstance(current_dist, ModelParallel) else ("DP" if isinstance(current_dist, DataParallel) else "NONE")
         
         cache_key = f"torch_mesh_{device_mesh.shape}_{device_mesh.axis_names}_{dist_type}"
         cached = global_state.get_global_attribute(cache_key)
@@ -492,23 +478,13 @@ def _get_default_device_mesh():
         # when a distribution is active.
         return _to_backend_mesh(device_mesh)
 
-    generic_cached = global_state.get_global_attribute("torch_device_mesh", None)
-    if generic_cached is not None and current_dist is not None:
-        if isinstance(current_dist, ModelParallel):
-            if hasattr(generic_cached, "mesh") and generic_cached.mesh.ndim == 1:
-                # In multi-process mode, ModelParallel uses a 1D mesh.
-                # We should only return None if we are NOT in multi-process mode.
-                if not (
-                    torch.distributed.is_available()
-                    and torch.distributed.is_initialized()
-                    and torch.distributed.get_world_size() > 1
-                ):
-                    return None
-        elif isinstance(current_dist, DataParallel):
-            if hasattr(generic_cached, "mesh") and generic_cached.mesh.ndim > 1:
-                return None
-    
-    return generic_cached
+    # Fallback to generic cached mesh if distributed is initialized
+    if is_distributed:
+        generic_cached = global_state.get_global_attribute("torch_device_mesh", None)
+        if generic_cached is not None and hasattr(generic_cached, 'mesh'):
+            return generic_cached
+            
+    return None
 
 
 def _axis_names_to_placements(axis_names, device_mesh):
@@ -918,13 +894,15 @@ def dtensor_from_local(tensor, device_mesh, placements):
         # CRITICAL FIX: Ensure the local tensor is on the correct device for the mesh.
         # In multi-process mode, each rank sees its own GPU as cuda:0 (usually).
         # PyTorch DTensor.from_local requires the local tensor to be on the mesh's device.
-        if torch.cuda.is_available() and device_mesh.device_type == "cuda":
-            # Map to the rank's specific assigned GPU (visible as 0 or mapped via current_device)
-            local_device = torch.device(f"cuda:{torch.cuda.current_device()}")
-            if tensor.device != local_device:
-                tensor = tensor.to(local_device)
-        elif device_mesh.device_type == "cpu" and tensor.device.type != "cpu":
-            tensor = tensor.to("cpu")
+        # EXCEPTION: "meta" tensors should stay on "meta" device during symbolic build.
+        if tensor.device.type != "meta":
+            if torch.cuda.is_available() and device_mesh.device_type == "cuda":
+                # Map to the rank's specific assigned GPU (visible as 0 or mapped via current_device)
+                local_device = torch.device(f"cuda:{torch.cuda.current_device()}")
+                if tensor.device != local_device:
+                    tensor = tensor.to(local_device)
+            elif device_mesh.device_type == "cpu" and tensor.device.type != "cpu":
+                tensor = tensor.to("cpu")
 
         return DTensor.from_local(tensor, device_mesh, safe_placements)
     except AssertionError as e:
@@ -941,7 +919,14 @@ def is_dtensor(tensor):
     Duck-typing is used as a fallback because DTensor might be imported from different
     modules in some cases.
     """
-    # First try isinstance check (most reliable)
+    if tensor is None:
+        return False
+        
+    # Handle torch.nn.Parameter by checking its underlying data
+    if isinstance(tensor, torch.nn.Parameter):
+        return is_dtensor(tensor.data)
+        
+    # First try isinstance check (most reliable if DTensor is imported correctly)
     try:
         if isinstance(tensor, DTensor):
             return True
@@ -952,8 +937,8 @@ def is_dtensor(tensor):
     # Duck-typing fallback: DTensor has these distinctive methods/attributes
     # that regular tensors don't have
     if hasattr(tensor, 'to_local') and hasattr(tensor, 'placements') and hasattr(tensor, 'device_mesh'):
-        # Additional check: to_local should be callable
-        if callable(getattr(tensor, 'to_local', None)):
+        # Additional check: to_local and redistribute should be present
+        if callable(getattr(tensor, 'to_local', None)) and callable(getattr(tensor, 'redistribute', None)):
             return True
     
     return False
@@ -966,6 +951,8 @@ def dtensor_to_local(tensor):
 
     # Use the improved is_dtensor function for reliable detection
     if is_dtensor(tensor):
+        if isinstance(tensor, torch.nn.Parameter):
+            return tensor.data.to_local()
         return tensor.to_local()
     if isinstance(tensor, dict):
         return {k: dtensor_to_local(v) for k, v in tensor.items()}
