@@ -944,6 +944,24 @@ def is_dtensor(tensor):
     return False
 
 
+def get_dtensor_mesh(tensor):
+    """Get the device mesh from a DTensor or Parameter wrapping a DTensor."""
+    if tensor is None:
+        return None
+    if isinstance(tensor, torch.nn.Parameter):
+        return get_dtensor_mesh(tensor.data)
+    return getattr(tensor, 'device_mesh', None)
+
+
+def get_dtensor_placements(tensor):
+    """Get the placements from a DTensor or Parameter wrapping a DTensor."""
+    if tensor is None:
+        return None
+    if isinstance(tensor, torch.nn.Parameter):
+        return get_dtensor_placements(tensor.data)
+    return getattr(tensor, 'placements', None)
+
+
 def dtensor_to_local(tensor):
     """Convert DTensor to local tensor format."""
     if tensor is None:
@@ -1541,4 +1559,3 @@ def prepare_output_for_loss(x):
     # Not a DTensor - this is likely labels (y) which are full local tensors
     # DO NOT all-gather! Labels are full local data, not sharded outputs.
     return x
-

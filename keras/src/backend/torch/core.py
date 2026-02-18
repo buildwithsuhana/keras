@@ -219,7 +219,12 @@ class Variable(KerasVariable):
     def _direct_assign(self, value):
         with torch.no_grad():
             # Handle DTensor: extract local tensor if needed
-            from keras.src.backend.torch.distribution_lib import is_dtensor, dtensor_from_local
+            from keras.src.backend.torch.distribution_lib import (
+                is_dtensor,
+                dtensor_from_local,
+                get_dtensor_mesh,
+                get_dtensor_placements,
+            )
             
             # CRITICAL FIX: Robust handling of DTensor assignment.
             # If self._value is a DTensor (sharded or replicated), we must ensure
@@ -227,28 +232,36 @@ class Variable(KerasVariable):
             if is_dtensor(self._value):
                 # If value is also a DTensor, redistribute it to match self._value
                 if is_dtensor(value):
-                    if (self._value.device_mesh != value.device_mesh or 
-                        self._value.placements != value.placements):
-                        value = value.redistribute(self._value.device_mesh, self._value.placements)
+                    target_mesh = get_dtensor_mesh(self._value)
+                    target_placements = get_dtensor_placements(self._value)
+                    
+                    if (get_dtensor_mesh(value) != target_mesh or 
+                        get_dtensor_placements(value) != target_placements):
+                        # Redistribution might need data unwrap if it's a Parameter
+                        v = value.data if isinstance(value, torch.nn.Parameter) else value
+                        value = v.redistribute(target_mesh, target_placements)
                     self._value.copy_(value)
                 else:
                     # value is a regular tensor.
                     # If it has the same shape as the GLOBAL DTensor, we should distribute/shard it.
                     if value.shape == self._value.shape:
+                        target_mesh = get_dtensor_mesh(self._value)
+                        target_placements = get_dtensor_placements(self._value)
+                        
                         # Ensure value is on the correct device for the mesh
-                        if self._value.device_mesh.device_type == "cuda" and not value.is_cuda:
+                        if target_mesh.device_type == "cuda" and not value.is_cuda:
                             value = value.to(f"cuda:{torch.cuda.current_device()}")
-                        elif self._value.device_mesh.device_type == "cpu" and value.is_cuda:
+                        elif target_mesh.device_type == "cpu" and value.is_cuda:
                             value = value.to("cpu")
                             
                         # Convert full regular tensor to DTensor matching self._value
-                        # Use torch_distribute_tensor from distribution_lib
                         from keras.src.backend.torch.distribution_lib import torch_distribute_tensor
-                        value_dtensor = torch_distribute_tensor(value, self._value.device_mesh, self._value.placements)
+                        value_dtensor = torch_distribute_tensor(value, target_mesh, target_placements)
                         self._value.copy_(value_dtensor)
                     else:
                         # value might be a local shard already.
-                        self_local = self._value.to_local()
+                        from keras.src.backend.torch.distribution_lib import dtensor_to_local
+                        self_local = dtensor_to_local(self._value)
                         if value.shape == self_local.shape:
                             self_local.copy_(value)
                         else:
@@ -258,7 +271,8 @@ class Variable(KerasVariable):
                 # self._value is a regular torch.Tensor
                 if is_dtensor(value):
                     # Extract local tensor from DTensor
-                    value = value.to_local()
+                    from keras.src.backend.torch.distribution_lib import dtensor_to_local
+                    value = dtensor_to_local(value)
                 
                 # Check for shape mismatch before copy_
                 if self._value.shape != value.shape:
