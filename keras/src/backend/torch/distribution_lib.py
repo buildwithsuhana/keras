@@ -1070,11 +1070,14 @@ def _convert_structure(x, device_mesh=None, to_dtensor=True, gather_sharded=True
             current_dist = distribution()
             is_mp = isinstance(current_dist, ModelParallel) if current_dist else False
             
-            # Check cached MP multi-process state
+            # Check cached MP multi-process state - this is the key fix!
+            # Even if distribution() returns None (scope exited), we should still
+            # check the cached state from TorchTrainer._cache_mp_multi_process_state()
             global _MP_MULTI_PROCESS_STATE
             cached_mp_state = _MP_MULTI_PROCESS_STATE
             
-            # Check if torch distributed is initialized
+            # Also check if torch distributed is initialized with a 1D mesh
+            # (which indicates ModelParallel in multi-process mode)
             is_distributed = torch.distributed.is_initialized()
             
             # Get device mesh from various sources
@@ -1089,7 +1092,8 @@ def _convert_structure(x, device_mesh=None, to_dtensor=True, gather_sharded=True
                 torch_device_mesh = _get_default_device_mesh()
             
             # If we have a mesh and distributed is active, we need to convert
-            if torch_device_mesh is not None and is_distributed:
+            # OR if the cached MP multi-process state is True, we must convert
+            if torch_device_mesh is not None and (is_distributed or cached_mp_state):
                 should_convert = True
             
             if debug_mode and should_convert:
