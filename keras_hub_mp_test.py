@@ -293,21 +293,38 @@ def test_keras_hub_model_parallel(epochs=1, use_preset=True):
     start_time = time.time()
     losses = []
     
-    for epoch in range(epochs):
-        epoch_start = time.time()
+    try:
+        for epoch in range(epochs):
+            epoch_start = time.time()
+            
+            with mp.scope():
+                history = model.fit(x, y, epochs=1, verbose=0)
+                loss = history.history['loss'][0]
+            
+            epoch_time = time.time() - epoch_start
+            losses.append(loss)
+            
+            log(f"  Epoch {epoch+1}/{epochs}: loss={loss:.6f} (time={epoch_time:.3f}s)")
         
-        with mp.scope():
-            history = model.fit(x, y, epochs=1, verbose=0)
-            loss = history.history['loss'][0]
+        total_time = time.time() - start_time
+        log(f"✓ ModelParallel test PASSED in {total_time:.3f}s")
+        return True
         
-        epoch_time = time.time() - epoch_start
-        losses.append(loss)
-        
-        log(f"  Epoch {epoch+1}/{epochs}: loss={loss:.6f} (time={epoch_time:.3f}s)")
-    
-    total_time = time.time() - start_time
-    log(f"✓ ModelParallel test PASSED in {total_time:.3f}s")
-    return True
+    except Exception as e:
+        error_msg = str(e)
+        # Check for the specific DTensor slice error that occurs with PositionEmbedding
+        if "aten.alias.default does not have a sharding strategy registered" in error_msg:
+            log(f"⚠ Keras Hub model test failed: DTensor slice operation not supported")
+            log(f"  This is a known limitation with PyTorch DTensor in multi-process mode")
+            log(f"  The PositionEmbedding layer uses ops.slice() which triggers this error")
+            log("Falling back to simple Sequential test...")
+        elif "Unable to automatically build the model" in error_msg:
+            log(f"⚠ Keras Hub model test failed: {error_msg}")
+            log("Falling back to simple Sequential test...")
+        else:
+            log(f"⚠ Keras Hub model test failed: {error_msg}")
+            log("Falling back to simple Sequential test...")
+        return False
 
 
 def verify_weight_sharding(model, rank):
@@ -522,11 +539,11 @@ def main():
     if gpu_count >= 2:
         # Try Keras Hub model first
         log("Attempting to test with OPT model...")
-        try:
-            test_keras_hub_model_parallel(epochs=1, use_preset=False)
-        except Exception as e:
-            log(f"⚠ Keras Hub model test failed: {e}")
-            log("Falling back to simple Sequential test...")
+        test_passed = test_keras_hub_model_parallel(epochs=1, use_preset=False)
+        
+        if not test_passed:
+            # Fall back to simple Sequential test if Keras Hub test failed
+            log("Keras Hub model test did not pass, falling back to simple Sequential test...")
             test_simple_sequential_mp(epochs=1)
     else:
         log_section("MODEL PARALLEL TEST (SKIPPED)")
