@@ -13,13 +13,14 @@ import numpy as np
 
 def setup_dist():
     if not dist.is_initialized():
-        os.environ["MASTER_ADDR"] = "127.0.0.1"
-        print("Setting up distributed environment...")
-        os.environ["MASTER_PORT"] = "12355"
-        print("Using loopback interface for distributed communication...")
-        os.environ["GLOO_SOCKET_IFNAME"] = "lo0"
         print("Initializing process group...")
-        dist.init_process_group(backend="gloo", rank=0, world_size=1)
+        # Using a direct TCP init_method with 127.0.0.1 is usually the most robust for single-node
+        dist.init_process_group(
+            backend="gloo",
+            init_method="tcp://127.0.0.1:12355",
+            rank=0,
+            world_size=1
+        )
     print(f"World size: {dist.get_world_size()}")
 
 def test_opt_model_parallel():
