@@ -7,8 +7,8 @@ import torch
 import torch.distributed as dist
 import keras
 keras.config.disable_traceback_filtering()
-from keras import ops
-from keras import distribution
+from keras.src import ops
+from keras.src import distribution
 import numpy as np
 
 def setup_dist():
@@ -20,11 +20,11 @@ def setup_dist():
 
 def test_opt_model_parallel():
     setup_dist()
-
+    print("test started: test_opt_model_parallel")
     # Define mesh and layout map
     # 1D mesh for model parallel (sharding weights)
     mesh = distribution.DeviceMesh(shape=(1,), axis_names=("model",))
-    
+    print(f"Created device mesh: {mesh}")
     # Simple layout map for OPT: shard embeddings and some dense layers
     layout_map = distribution.LayoutMap(mesh)
     layout_map["token_embedding/embeddings"] = (None, "model")
@@ -38,9 +38,9 @@ def test_opt_model_parallel():
     # Shard the MLP layers
     layout_map["ffn_inner/kernel"] = (None, "model")
     layout_map["ffn_outer/kernel"] = ("model", None)
-
+    print(f"Defined layout map: {layout_map}")
     model_parallel = distribution.ModelParallel(layout_map=layout_map)
-
+    print("Created ModelParallel distribution")
     print("Creating OPT backbone under distribution scope...")
     with model_parallel.scope():
         from keras_hub.models import OPTBackbone
