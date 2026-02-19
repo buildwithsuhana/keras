@@ -25,18 +25,19 @@ def reproduce():
     set_distribution(dist)
     
     try:
-        # 2. Create a functional model
-        print("Creating functional model...")
-        inputs = keras.Input(shape=(5,))
-        print("DEBUG | Created Input")
-        outputs = keras.layers.Dense(10)(inputs)
-        print("DEBUG | Created Dense output")
+        # 2. Create a functional model with Embedding
+        print("Creating functional model with Embedding layer...")
+        inputs = keras.Input(shape=(5,), dtype="int32")
+        outputs = keras.layers.Embedding(100, 10)(inputs)
         model = keras.Model(inputs, outputs)
-        
         print("✓ Model created successfully!")
         
+        print("Attempting to build the model...")
+        model.build((None, 5))
+        print("✓ Model built successfully!")
+        
         # 3. Try to call it on some data
-        x = np.random.random((2, 5)).astype("float32")
+        x = np.random.randint(0, 100, size=(2, 5)).astype("int32")
         y = model(x)
         print(f"✓ Model called successfully! Output shape: {y.shape}")
         

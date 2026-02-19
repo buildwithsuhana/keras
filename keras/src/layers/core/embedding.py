@@ -1,3 +1,4 @@
+import os
 import warnings
 
 from keras.src import backend
@@ -163,7 +164,7 @@ class Embedding(Layer):
     def call(self, inputs):
         if inputs.dtype != "int32" and inputs.dtype != "int64":
             inputs = ops.cast(inputs, "int32")
-        outputs = ops.take(self.embeddings, inputs, axis=0)
+        outputs = ops.take(self.embeddings.value, inputs, axis=0)
         return ops.cast(outputs, dtype=self.compute_dtype)
 
     def compute_mask(self, inputs, mask=None):

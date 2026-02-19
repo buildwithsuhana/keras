@@ -340,6 +340,8 @@ class Variable(KerasVariable):
                     
                     placements = get_dtensor_placements(value)
                     res_data = dtensor_from_local(res_data, mesh, placements)
+                    if os.environ.get("KERAS_DISTRIBUTION_DEBUG", "0") == "1":
+                        print(f"DEBUG | Variable.value returning symbolic DTensor for {getattr(self, 'path', 'N/A')}. Mesh device_type: {mesh.device_type}")
                 
                 # Wrap in Parameter if the original was a Parameter or if it's float/complex
                 if isinstance(value, torch.nn.Parameter) or (
@@ -442,7 +444,11 @@ def convert_to_tensor(x, dtype=None, sparse=None, ragged=None):
             if dtype is not None:
                 x = x.to(to_torch_dtype(dtype))
 
-    # CRITICAL FIX: Now that x is a torch.Tensor, attempt DTensor promotion
+    # CRITICAL FIX: Now that x is a torch.Tensor, attempt DTensor promotion.
+    # We must ensure x is NOT already a DTensor before calling dtensor_from_local.
+    if is_dtensor(x):
+        return x
+
     device_mesh = _get_default_device_mesh()
     if device_mesh is not None and torch.distributed.is_initialized():
         from torch.distributed._tensor import Replicate

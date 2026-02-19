@@ -1,5 +1,6 @@
 import builtins
 import math
+import os
 
 import numpy as np
 import torch
@@ -2740,6 +2741,13 @@ def take(x, indices, axis=None):
     )
     x = convert_to_tensor(x)
     indices = convert_to_tensor(indices).long()
+    
+    # Debug logging
+    if os.environ.get("KERAS_DISTRIBUTION_DEBUG", "0") == "1":
+        print(f"DEBUG | take entered. x type: {type(x)}, indices type: {type(indices)}")
+        print(f"DEBUG |   - x is_dtensor: {is_dtensor(x)}")
+        print(f"DEBUG |   - indices is_dtensor: {is_dtensor(indices)}")
+
     # Correct the indices using "fill" mode which is the same as in jax
     x_dim = x.shape[axis] if axis is not None else x.shape[0]
     indices = torch.where(
@@ -2765,6 +2773,9 @@ def take(x, indices, axis=None):
         if device_mesh is None:
             device_mesh = _get_default_device_mesh()
         
+        if os.environ.get("KERAS_DISTRIBUTION_DEBUG", "0") == "1":
+            print(f"DEBUG |   - device_mesh: {device_mesh}")
+
         if device_mesh is not None:
             # Get mesh dimension
             mesh_ndim = 1
@@ -2782,48 +2793,44 @@ def take(x, indices, axis=None):
                     x = dtensor_from_local(x, device_mesh, [Replicate()])
                 else:
                     x = dtensor_from_local(x, device_mesh, [Replicate()] * mesh_ndim)
+        else:
+            # device_mesh is None - this can happen during symbolic build
+            # or when in multi-process mode where inputs are not converted to DTensors
+            import torch.distributed as dist
+            if dist.is_available() and dist.is_initialized():
+                from torch.distributed.device_mesh import init_device_mesh
+                world_size = dist.get_world_size()
+                
+                # Determine device type
+                device_type = "cuda" if torch.cuda.is_available() else "cpu"
+                
+                try:
+                    # Create 1D mesh matching the world size
+                    backend_mesh = init_device_mesh(
+                        device_type=device_type,
+                        mesh_shape=(world_size,),
+                        mesh_dim_names=["model"]
+                    )
+                    
+                    if os.environ.get("KERAS_DISTRIBUTION_DEBUG", "0") == "1":
+                        print(f"DEBUG |   - created backend_mesh: {backend_mesh}")
+
+                    # Now convert the regular tensor to DTensor with Replicate placement
+                    if is_dtensor(x) and not is_dtensor(indices):
+                        indices = dtensor_from_local(indices, backend_mesh, [Replicate()])
+                    elif is_dtensor(indices) and not is_dtensor(x):
+                        x = dtensor_from_local(x, backend_mesh, [Replicate()])
+                except Exception as e:
+                    if os.environ.get("KERAS_DISTRIBUTION_DEBUG", "0") == "1":
+                        print(f"DEBUG |   - mesh creation or promotion failed: {e}")
+                    # Fallback: extract local tensors
+                    if is_dtensor(x):
+                        x = x.to_local()
+                    if is_dtensor(indices):
+                        indices = indices.to_local()
     
     if x.ndim == 2 and axis == 0:
         # This case is equivalent to embedding lookup.
-        # Handle DTensor: when x is DTensor, we need to ensure indices is also
-        # DTensor or handle the embedding lookup properly.
-        from keras.src.backend.torch.distribution_lib import (
-            is_dtensor,
-            _get_default_device_mesh,
-            DTensor,
-            Replicate,
-        )
-
-        x_is_dtensor = is_dtensor(x)
-        indices_is_dtensor = is_dtensor(indices)
-        
-        if x_is_dtensor or indices_is_dtensor:
-            # Get device_mesh from DTensor if available
-            if x_is_dtensor:
-                device_mesh = getattr(x, 'device_mesh', None)
-                x_placements = getattr(x, 'placements', None)
-            elif indices_is_dtensor:
-                device_mesh = getattr(indices, 'device_mesh', None)
-                indices_placements = getattr(indices, 'placements', None)
-            else:
-                device_mesh = _get_default_device_mesh()
-            
-            if device_mesh is not None:
-                # Convert regular tensor to DTensor to match the other operand
-                if x_is_dtensor and not indices_is_dtensor:
-                    placements = x_placements or [Replicate()]
-                    indices = dtensor_from_local(indices, device_mesh, placements)
-                elif indices_is_dtensor and not x_is_dtensor:
-                    placements = indices_placements or [Replicate()]
-                    x = dtensor_from_local(x, device_mesh, placements)
-            else:
-                # device_mesh is None - this can happen during symbolic build
-                # Extract local tensor from DTensor to avoid mixed tensor errors
-                if x_is_dtensor:
-                    x = x.to_local()
-                if indices_is_dtensor:
-                    indices = indices.to_local()
-        
         return torch.nn.functional.embedding(indices, x)
     if axis is None:
         x = torch.reshape(x, (-1,))
