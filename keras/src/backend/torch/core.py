@@ -340,8 +340,6 @@ class Variable(KerasVariable):
                     
                     placements = get_dtensor_placements(value)
                     res_data = dtensor_from_local(res_data, mesh, placements)
-                    if os.environ.get("KERAS_DISTRIBUTION_DEBUG", "0") == "1":
-                        print(f"DEBUG | Variable.value returning symbolic DTensor for {getattr(self, 'path', 'N/A')}. Mesh device_type: {mesh.device_type}")
                 
                 # Wrap in Parameter if the original was a Parameter or if it's float/complex
                 if isinstance(value, torch.nn.Parameter) or (
@@ -444,11 +442,7 @@ def convert_to_tensor(x, dtype=None, sparse=None, ragged=None):
             if dtype is not None:
                 x = x.to(to_torch_dtype(dtype))
 
-    # CRITICAL FIX: Now that x is a torch.Tensor, attempt DTensor promotion.
-    # We must ensure x is NOT already a DTensor before calling dtensor_from_local.
-    if is_dtensor(x):
-        return x
-
+    # CRITICAL FIX: Now that x is a torch.Tensor, attempt DTensor promotion
     device_mesh = _get_default_device_mesh()
     if device_mesh is not None and torch.distributed.is_initialized():
         from torch.distributed._tensor import Replicate
@@ -557,9 +551,6 @@ def cast(x, dtype):
 
 # Shape / dtype inference util
 def compute_output_spec(fn, *args, **kwargs):
-    if os.environ.get("KERAS_DISTRIBUTION_DEBUG", "0") == "1":
-        print(f"DEBUG | compute_output_spec entered for {fn}")
-
     def has_none_shape(x):
         """Check for if a `KerasTensor` has dynamic shape."""
         if isinstance(x, KerasTensor):
@@ -594,9 +585,6 @@ def compute_output_spec(fn, *args, **kwargs):
         from keras.src.backend.torch import distribution_lib
         from keras.src.distribution.distribution_lib import distribution, ModelParallel
         
-        if os.environ.get("KERAS_DISTRIBUTION_DEBUG", "0") == "1":
-            print(f"DEBUG | symbolic_call entered. distribution: {distribution()}")
-        
         try:
             # CRITICAL FIX: Skip meta trace for ModelParallel to avoid DTensor mesh conflicts.
             # DTensor does not support cross-mesh operations, and model weights are already
@@ -607,6 +595,8 @@ def compute_output_spec(fn, *args, **kwargs):
                         "DEBUG | Skipping meta trace for ModelParallel to avoid mesh conflicts"
                     )
                 raise RuntimeError("Skipping meta trace for ModelParallel")
+
+
 
             # First try instantiating all tensors on the `"meta"` device,
             # which  should give a \"zero flop\" way to trace shape, but does
