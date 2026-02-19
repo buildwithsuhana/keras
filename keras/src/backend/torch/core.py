@@ -551,6 +551,9 @@ def cast(x, dtype):
 
 # Shape / dtype inference util
 def compute_output_spec(fn, *args, **kwargs):
+    if os.environ.get("KERAS_DISTRIBUTION_DEBUG", "0") == "1":
+        print(f"DEBUG | compute_output_spec entered for {fn}")
+
     def has_none_shape(x):
         """Check for if a `KerasTensor` has dynamic shape."""
         if isinstance(x, KerasTensor):
@@ -584,6 +587,9 @@ def compute_output_spec(fn, *args, **kwargs):
         """Call `fn` to infer output shape and dtype."""
         from keras.src.backend.torch import distribution_lib
         from keras.src.distribution.distribution_lib import distribution, ModelParallel
+        
+        if os.environ.get("KERAS_DISTRIBUTION_DEBUG", "0") == "1":
+            print(f"DEBUG | symbolic_call entered. distribution: {distribution()}")
         
         try:
             # CRITICAL FIX: Skip meta trace for ModelParallel to avoid DTensor mesh conflicts.
