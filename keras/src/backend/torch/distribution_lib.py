@@ -124,7 +124,10 @@ def initialize_rng():
                 seed = np.random.randint(0, 2**31)
             else:
                 seed = 0
-            seed_tensor = torch.tensor([seed], dtype=torch.int64)
+            
+            # Match tensor device to backend
+            device = "cuda" if dist.get_backend() == "nccl" else "cpu"
+            seed_tensor = torch.tensor([seed], dtype=torch.int64, device=device)
             dist.broadcast(seed_tensor, src=0)
             global_seed = int(seed_tensor.item())
             rng_utils.set_random_seed(global_seed)
@@ -150,6 +153,10 @@ def initialize(job_addresses, num_processes, process_id):
         os.environ["RANK"] = str(process_id)
         
     backend = "nccl" if torch.cuda.is_available() else "gloo"
+    if backend == "nccl":
+        local_rank = int(os.environ.get("LOCAL_RANK", 0))
+        torch.cuda.set_device(local_rank)
+
     dist.init_process_group(backend=backend)
     
     initialize_rng()
