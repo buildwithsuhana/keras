@@ -1,6 +1,6 @@
 """Unified high-level distribution APIs across backends.
 
-Currently only the JAX backend is supported. The TensorFlow backend
+Currently JAX and Torch backends are supported. The TensorFlow backend
 will be supported in the future (via tf.dtensor API).
 """
 

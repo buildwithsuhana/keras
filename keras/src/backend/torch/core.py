@@ -102,17 +102,50 @@ def to_torch_dtype(dtype):
 
 
 class Variable(KerasVariable):
+    def __init__(self, *args, layout=None, **kwargs):
+        # Intercept layout parameter so that it is available
+        # during initialization.
+        self._layout = layout
+        super().__init__(*args, **kwargs)
+
+    def _initialize_layout(self):
+        # We can't import the keras/distribution/distribution_lib
+        # due to circular dependency.
+        distribution = global_state.get_global_attribute("distribution")
+        if self._layout is None and distribution is not None:
+            tensor_layout = distribution.get_variable_layout(self)
+            from keras.src.distribution import TensorLayout
+
+            if isinstance(tensor_layout, TensorLayout):
+                self._layout = tensor_layout
+            else:
+                self._layout = tensor_layout
+
     def _initialize(self, value):
+        self._shape = self._validate_shape(value.shape)
+        self._initialize_layout()
         if isinstance(value, torch.nn.Parameter):
             # Reuse same parameter
             self._value = value
         else:
+            value = convert_to_tensor(value, dtype=self._dtype)
+            if self._layout is not None:
+                from keras.src.backend.torch import distribution_lib
+
+                value = distribution_lib.distribute_variable(value, self._layout)
+
+            requires_grad = self.trainable and torch.is_floating_point(value)
             self._value = torch.nn.Parameter(
-                convert_to_tensor(value, dtype=self._dtype),
-                requires_grad=self.trainable,
+                value,
+                requires_grad=requires_grad,
             ).to(get_device())
 
     def _direct_assign(self, value):
+        self._initialize_layout()
+        if self._layout is not None:
+            from keras.src.backend.torch import distribution_lib
+
+            value = distribution_lib.distribute_variable(value, self._layout)
         with torch.no_grad():
             self.value.copy_(value)
 
