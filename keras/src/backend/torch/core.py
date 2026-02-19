@@ -148,8 +148,23 @@ class Variable(KerasVariable):
             from keras.src.backend.torch import distribution_lib
 
             value = distribution_lib.distribute_variable(value, self._layout)
+        
+        # DEBUG
+        # if hasattr(value, "device_mesh") or hasattr(self.value, "device_mesh"):
+        #    print(f"DEBUG: _direct_assign self.value type={type(self.value)} is_dtensor={hasattr(self.value, 'device_mesh')}, value type={type(value)} is_dtensor={hasattr(value, 'device_mesh')}")
+
         with torch.no_grad():
-            self.value.copy_(value)
+            try:
+                self.value.copy_(value)
+            except Exception as e:
+                if "DTensor" in str(e) or isinstance(e, AssertionError):
+                    # Fallback for mixed DTensor/Tensor copy
+                    if hasattr(value, "to_local"):
+                        self.value.copy_(value.to_local())
+                    else:
+                        raise e
+                else:
+                    raise e
 
     def _convert_to_tensor(self, value, dtype=None):
         return convert_to_tensor(value, dtype=dtype)
@@ -164,6 +179,9 @@ class Variable(KerasVariable):
             key: value.value if isinstance(value, Variable) else value
             for key, value in kwargs.items()
         }
+        from keras.src.backend.torch import distribution_lib
+
+        args = distribution_lib._sync_tensors(*args)
         return func(*args, **kwargs)
 
     def __array__(self, dtype=None):
@@ -613,6 +631,9 @@ def scatter_update(inputs, indices, updates):
     inputs = convert_to_tensor(inputs)
     indices = convert_to_tensor(indices, dtype="int64")
     updates = convert_to_tensor(updates, dtype=inputs.dtype)
+    from keras.src.backend.torch import distribution_lib
+
+    inputs, updates = distribution_lib._sync_tensors(inputs, updates)
     indices = torch.transpose(indices, 0, 1)
 
     outputs = torch.clone(inputs)
@@ -639,6 +660,9 @@ def slice_update(inputs, start_indices, updates):
     inputs = convert_to_tensor(inputs)
     start_indices = convert_to_tensor(start_indices).to(shape_dtype)
     updates = convert_to_tensor(updates)
+    from keras.src.backend.torch import distribution_lib
+
+    inputs, updates = distribution_lib._sync_tensors(inputs, updates)
 
     python_slice = __builtins__["slice"]
     slices = [

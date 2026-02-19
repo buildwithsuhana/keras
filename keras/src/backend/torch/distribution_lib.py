@@ -93,11 +93,40 @@ def distribute_tensor(tensor, layout):
         
         # Ensure tensor is on the correct device for the mesh
         if tensor.device.type != torch_mesh.device_type:
-            tensor = tensor.to(torch_mesh.device_type)
+            if tensor.is_meta:
+                tensor = torch.empty_like(tensor, device=torch_mesh.device_type)
+            else:
+                tensor = tensor.to(torch_mesh.device_type)
 
         return distribute_tensor_torch(tensor, torch_mesh, placements)
 
     return tensor
+
+
+def _sync_tensors(*tensors):
+    """Ensure all tensors are DTensors if any of them is a DTensor."""
+    has_dtensor = any(isinstance(t, DTensor) for t in tensors)
+    if not has_dtensor:
+        return tensors
+    
+    ref_dtensor = next(t for t in tensors if isinstance(t, DTensor))
+    mesh = ref_dtensor.device_mesh
+    
+    new_tensors = []
+    for t in tensors:
+        if isinstance(t, DTensor):
+            new_tensors.append(t)
+        elif isinstance(t, torch.Tensor):
+            if t.is_meta:
+                t = torch.empty_like(t, device=mesh.device_type)
+            elif t.device.type != mesh.device_type:
+                t = t.to(mesh.device_type)
+            
+            # Default to replicating regular tensors
+            new_tensors.append(distribute_tensor_torch(t, mesh, [Replicate()] * mesh.ndim))
+        else:
+            new_tensors.append(t)
+    return tuple(new_tensors)
 
 
 def distribute_data_input(per_process_batch, layout, batch_dim_name):
@@ -186,13 +215,21 @@ def process_id():
 
 def _to_backend_mesh(device_mesh):
     """Convert the DeviceMesh to Torch backend specific Mesh."""
+    from keras.src.backend.torch import core
+
     mesh_shape = device_mesh.devices.shape
     mesh_dim_names = device_mesh.axis_names
-    
-    device_type = "cuda" if torch.cuda.is_available() else "cpu"
+
+    device = core.get_device()
+    if ":" in device:
+        device_type = device.split(":")[0]
+    else:
+        device_type = device
     
     # In Torch, init_device_mesh handles process group creation if needed.
-    return init_device_mesh(device_type, mesh_shape, mesh_dim_names=mesh_dim_names)
+    return init_device_mesh(
+        device_type, mesh_shape, mesh_dim_names=mesh_dim_names
+    )
 
 
 def _to_backend_layout(tensor_layout):

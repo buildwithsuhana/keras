@@ -784,6 +784,9 @@ def multi_hot(x, num_classes, axis=-1, dtype=None, sparse=False):
 def categorical_crossentropy(target, output, from_logits=False, axis=-1):
     target = convert_to_tensor(target)
     output = convert_to_tensor(output)
+    from keras.src.backend.torch import distribution_lib
+
+    target, output = distribution_lib._sync_tensors(target, output)
 
     if target.shape != output.shape:
         raise ValueError(
@@ -810,6 +813,9 @@ def categorical_crossentropy(target, output, from_logits=False, axis=-1):
 def sparse_categorical_crossentropy(target, output, from_logits=False, axis=-1):
     target = convert_to_tensor(target, dtype=torch.long)
     output = convert_to_tensor(output)
+    from keras.src.backend.torch import distribution_lib
+
+    target, output = distribution_lib._sync_tensors(target, output)
 
     if len(target.shape) == len(output.shape) and target.shape[-1] == 1:
         target = torch.squeeze(target, dim=-1)
@@ -836,12 +842,16 @@ def sparse_categorical_crossentropy(target, output, from_logits=False, axis=-1):
         output = torch.clip(output, backend.epsilon(), 1.0 - backend.epsilon())
         log_prob = torch.log(output)
     target = one_hot(target, output.shape[axis], axis=axis)
+    target, log_prob = distribution_lib._sync_tensors(target, log_prob)
     return -torch.sum(target * log_prob, dim=axis)
 
 
 def binary_crossentropy(target, output, from_logits=False):
     target = convert_to_tensor(target)
     output = convert_to_tensor(output)
+    from keras.src.backend.torch import distribution_lib
+
+    target, output = distribution_lib._sync_tensors(target, output)
 
     # We only apply the squeeze fix if we are on an MPS device,
     # as this change breaks tests on other platforms that
@@ -1134,6 +1144,10 @@ def dot_product_attention(
     query = convert_to_tensor(query)
     key = convert_to_tensor(key)
     value = convert_to_tensor(value)
+    from keras.src.backend.torch import distribution_lib
+
+    query, key, value = distribution_lib._sync_tensors(query, key, value)
+
     if len(query.shape) != 4 or len(key.shape) != 4 or len(value.shape) != 4:
         raise ValueError(
             "`dot_product_attention` only supports 4D inputs. "

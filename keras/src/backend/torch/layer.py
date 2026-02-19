@@ -54,9 +54,10 @@ class TorchLayer(torch.nn.Module):
 
     def forward(self, *args, **kwargs):
         from keras.src.backend.common import global_state
+        from keras.src.backend.torch.core import get_device
 
         distribution = global_state.get_global_attribute("distribution")
-        if distribution is not None:
+        if distribution is not None and str(get_device()) != "meta":
             from keras.src.backend.torch import distribution_lib
 
             args = distribution_lib._maybe_distribute_input(args, distribution)

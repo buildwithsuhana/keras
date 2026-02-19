@@ -1,87 +1,115 @@
 import os
 
 os.environ["KERAS_BACKEND"] = "torch"
+os.environ["KERAS_TORCH_DEVICE"] = "cpu"
 
 import torch
 import torch.distributed as dist
-import numpy as np
 import keras
 keras.config.disable_traceback_filtering()
-from keras.distribution import DeviceMesh, LayoutMap, ModelParallel
+from keras import ops
+from keras import distribution
+import numpy as np
 
-# Initialize distribution
-if "RANK" not in os.environ:
-    os.environ["MASTER_ADDR"] = "localhost"
-    os.environ["MASTER_PORT"] = "12355"
-    os.environ["RANK"] = "0"
-    os.environ["WORLD_SIZE"] = "1"
+def setup_dist():
+    if not dist.is_initialized():
+        os.environ["MASTER_ADDR"] = "localhost"
+        os.environ["MASTER_PORT"] = "12355"
+        dist.init_process_group(backend="gloo", rank=0, world_size=1)
+    print(f"World size: {dist.get_world_size()}")
 
-keras.distribution.initialize()
+def test_opt_model_parallel():
+    setup_dist()
 
-world_size = int(os.environ.get("WORLD_SIZE", "1"))
-rank = int(os.environ.get("RANK", "0"))
+    # Define mesh and layout map
+    # 1D mesh for model parallel (sharding weights)
+    mesh = distribution.DeviceMesh(shape=(1,), axis_names=("model",))
+    
+    # Simple layout map for OPT: shard embeddings and some dense layers
+    layout_map = distribution.LayoutMap(mesh)
+    layout_map["token_embedding/embeddings"] = (None, "model")
+    # Shard the projection layers in attention
+    # OPT projection
+    #  weights are often (hidden_dim, hidden_dim)
+    layout_map["query/kernel"] = (None, "model")
+    layout_map["key/kernel"] = (None, "model")
+    layout_map["value/kernel"] = (None, "model")
+    layout_map["out_proj/kernel"] = ("model", None)
+    # Shard the MLP layers
+    layout_map["ffn_inner/kernel"] = (None, "model")
+    layout_map["ffn_outer/kernel"] = ("model", None)
 
-# Create a 2D mesh for testing
-mesh = DeviceMesh(shape=(1, world_size), axis_names=("batch", "model"))
+    model_parallel = distribution.ModelParallel(layout_map=layout_map)
 
-layout_map = LayoutMap(mesh)
-layout_map["token_embedding/embeddings"] = (None, "model")
-layout_map["decoder_block_.*_attention/query/kernel"] = (None, "model")
-layout_map["decoder_block_.*_attention/key/kernel"] = (None, "model")
-layout_map["decoder_block_.*_attention/value/kernel"] = (None, "model")
-layout_map["decoder_block_.*_attention/output_dense/kernel"] = ("model", None)
-layout_map["decoder_block_.*_ffn_layers_0/kernel"] = (None, "model")
-layout_map["decoder_block_.*_ffn_layers_1/kernel"] = ("model", None)
-
-distribution = ModelParallel(
-    layout_map=layout_map, batch_dim_name="batch"
-)
-keras.distribution.set_distribution(distribution)
-
-if rank == 0:
-    print(f"World size: {world_size}")
     print("Creating OPT backbone under distribution scope...")
+    with model_parallel.scope():
+        from keras_hub.models import OPTBackbone
+        # Smallest OPT for testing
+        backbone = OPTBackbone(
+            vocabulary_size=50272,
+            num_layers=1,
+            num_heads=12,
+            hidden_dim=768,
+            intermediate_dim=3072,
+            max_sequence_length=2048,
+        )
 
-# Import KerasHub to get OPT
-import keras_hub
-
-with distribution.scope():
-    backbone = keras_hub.models.OPTBackbone.from_preset("opt_125m_en")
-    # Wrap in a functional model to use standard fit
-    model = keras.Model(backbone.inputs, backbone(backbone.inputs))
-
-# Verify sharding
-if rank == 0:
+    # Verify sharding
     print("\nVerifying weight sharding (first few weights):")
-    for variable in model.weights[:5]:
-        val = variable.value
-        from torch.distributed.tensor import DTensor
-        is_dtensor = isinstance(val, DTensor)
-        sharding = val.placements if is_dtensor else "None"
-        print(f"Variable {variable.path}: is_dtensor={is_dtensor}, shape={val.shape}, sharding={sharding}")
+    for v in backbone.weights[:5]:
+        is_dtensor = hasattr(v.value, "device_mesh")
+        sharding = v.value.placements if is_dtensor else "N/A"
+        print(f"Variable {v.path}: is_dtensor={is_dtensor}, shape={v.shape}, sharding={sharding}")
 
-# fit test
-if rank == 0:
-    print("\nRunning fit test...")
+    # Test call
+    print("\nRunning test call...")
+    batch_size = 2
+    seq_len = 32
+    token_ids = np.random.randint(0, 50272, (batch_size, seq_len)).astype("int32")
+    padding_mask = np.ones((batch_size, seq_len), dtype="int32")
+    
+    inputs = {
+        "token_ids": token_ids,
+        "padding_mask": padding_mask,
+    }
+    
+    output = backbone(inputs)
+    print(f"Output shape: {output.shape}")
+    
+    # Test model.fit
+    from keras_hub.models import OPTCausalLM
+    with model_parallel.scope():
+        causal_lm = OPTCausalLM(backbone=backbone)
 
-# Create dummy data
-batch_size = 2 * world_size
-seq_len = 32
-# OPT backbone expects "token_ids" and "padding_mask"
-x = {
-    "token_ids": np.random.randint(0, 50272, (batch_size, seq_len)).astype("int32"),
-    "padding_mask": np.ones((batch_size, seq_len)).astype("int32"),
-}
-y = np.random.randn(batch_size, seq_len, 768).astype("float32")
+    print("\nTesting model.fit...")
+    x = {
+        "token_ids": np.random.randint(0, 50272, (batch_size, seq_len)).astype("int32"),
+        "padding_mask": np.ones((batch_size, seq_len), dtype="int32"),
+    }
+    y = np.random.randint(0, 50272, (batch_size, seq_len)).astype("int32")
+    
+    causal_lm.compile(optimizer="adam", loss="sparse_categorical_crossentropy")
+    causal_lm.fit(x, y, epochs=1, batch_size=batch_size)
+    print("model.fit completed successfully!")
 
-# Compile model
-model.compile(
-    optimizer=keras.optimizers.Adam(learning_rate=1e-5),
-    loss="mse",
-)
+    # Test generation
+    print("\nTesting model.generate...")
+    try:
+        # Generate some text
+        prompt = {
+            "token_ids": np.random.randint(0, 50272, (batch_size, 8)).astype("int32"),
+            "padding_mask": np.ones((batch_size, 8), dtype="int32"),
+        }
+        generated = causal_lm.generate(prompt, max_length=12, stop_token_ids=None)
+        if isinstance(generated, dict):
+            print(f"Generated token_ids shape: {generated['token_ids'].shape}")
+        else:
+            print(f"Generated shape: {generated.shape}")
+        print("model.generate completed successfully!")
+    except Exception as e:
+        print(f"model.generate failed: {e}")
+        import traceback
+        traceback.print_exc()
 
-# Run fit
-model.fit(x, y, epochs=1, batch_size=batch_size)
-
-if rank == 0:
-    print("\nFit test completed successfully!")
+if __name__ == "__main__":
+    test_opt_model_parallel()
