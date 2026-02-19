@@ -30,7 +30,8 @@ def test_opt_model_parallel():
     print("test started: test_opt_model_parallel")
     # Define mesh and layout map
     # 1D mesh for model parallel (sharding weights)
-    mesh = distribution.DeviceMesh(shape=(1,), axis_names=("model",))
+    world_size = dist.get_world_size()
+    mesh = distribution.DeviceMesh(shape=(world_size,), axis_names=("model",))
     print(f"Created device mesh: {mesh}")
     # Simple layout map for OPT: shard embeddings and some dense layers
     layout_map = distribution.LayoutMap(mesh)
