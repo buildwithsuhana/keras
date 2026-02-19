@@ -1438,29 +1438,10 @@ def full(shape, fill_value, dtype=None):
         # `torch.full` only supports scala `fill_value`.
         expand_size = len(shape) - len(fill_value.shape)
         tile_shape = tuple(shape[:expand_size]) + (1,) * len(fill_value.shape)
-        result = torch.tile(fill_value, tile_shape)
-    else:
-        result = torch.full(
-            size=shape, fill_value=fill_value, dtype=dtype, device=get_device()
-        )
-
-    # CRITICAL FIX: Handle DTensor conversion for internal tensors
-    from keras.src.backend.torch.distribution_lib import (
-        _get_default_device_mesh,
+        return torch.tile(fill_value, tile_shape)
+    return torch.full(
+        size=shape, fill_value=fill_value, dtype=dtype, device=get_device()
     )
-
-    device_mesh = _get_default_device_mesh()
-    if device_mesh is not None:
-        mesh_ndim = 1
-        if hasattr(device_mesh, "mesh"):
-            mesh_ndim = device_mesh.mesh.ndim
-        from torch.distributed._tensor import Replicate
-        from keras.src.backend.torch.distribution_lib import dtensor_from_local
-
-        placements = [Replicate()] * mesh_ndim
-        result = dtensor_from_local(result, device_mesh, placements)
-
-    return result
 
 
 def full_like(x, fill_value, dtype=None):
@@ -1929,35 +1910,18 @@ def linspace(
             steps = steps.unsqueeze(-1)
 
         # increments from `start` to `stop` in each dimension
-        result = start[None] + steps * (stop - start)[None]
+        linspace = start[None] + steps * (stop - start)[None]
     else:
-        result = torch.linspace(
+        linspace = torch.linspace(
             start=start,
             end=stop,
             steps=num,
             dtype=dtype,
             device=get_device(),
         )
-
-    # CRITICAL FIX: Handle DTensor conversion for internal tensors
-    from keras.src.backend.torch.distribution_lib import (
-        _get_default_device_mesh,
-    )
-
-    device_mesh = _get_default_device_mesh()
-    if device_mesh is not None:
-        mesh_ndim = 1
-        if hasattr(device_mesh, "mesh"):
-            mesh_ndim = device_mesh.mesh.ndim
-        from torch.distributed._tensor import Replicate
-        from keras.src.backend.torch.distribution_lib import dtensor_from_local
-
-        placements = [Replicate()] * mesh_ndim
-        result = dtensor_from_local(result, device_mesh, placements)
-
     if retstep is True:
-        return (result, step)
-    return result
+        return (linspace, step)
+    return linspace
 
 
 def log(x):
@@ -2047,14 +2011,14 @@ def logspace(start, stop, num=50, endpoint=True, base=10, dtype=None, axis=0):
             steps = steps.unsqueeze(-1)
 
         # increments from `start` to `stop` in each dimension
-        linspace_res = start[None] + steps * (stop - start)[None]
-        result = base**linspace_res
+        linspace = start[None] + steps * (stop - start)[None]
+        logspace = base**linspace
     else:
         compute_dtype = dtype
         # TODO: torch.logspace doesn't support float16 with cpu
         if get_device() == "cpu" and dtype == torch.float16:
             compute_dtype = torch.float32
-        result = cast(
+        logspace = cast(
             torch.logspace(
                 start=start,
                 end=stop,
@@ -2065,24 +2029,7 @@ def logspace(start, stop, num=50, endpoint=True, base=10, dtype=None, axis=0):
             ),
             dtype,
         )
-
-    # CRITICAL FIX: Handle DTensor conversion for internal tensors
-    from keras.src.backend.torch.distribution_lib import (
-        _get_default_device_mesh,
-    )
-
-    device_mesh = _get_default_device_mesh()
-    if device_mesh is not None:
-        mesh_ndim = 1
-        if hasattr(device_mesh, "mesh"):
-            mesh_ndim = device_mesh.mesh.ndim
-        from torch.distributed._tensor import Replicate
-        from keras.src.backend.torch.distribution_lib import dtensor_from_local
-
-        placements = [Replicate()] * mesh_ndim
-        result = dtensor_from_local(result, device_mesh, placements)
-
-    return result
+    return logspace
 
 
 def maximum(x1, x2):
