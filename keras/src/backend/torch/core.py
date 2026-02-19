@@ -585,15 +585,17 @@ def compute_output_spec(fn, *args, **kwargs):
         from keras.src.backend.torch import distribution_lib
         from keras.src.distribution.distribution_lib import distribution, ModelParallel
         
-        # CRITICAL FIX: Skip meta trace for ModelParallel to avoid DTensor mesh conflicts.
-        # DTensor does not support cross-mesh operations, and model weights are already
-        # on the real device mesh. Tracing on 'meta' device mesh causes conflicts.
-        if isinstance(distribution(), ModelParallel):
-            if os.environ.get("KERAS_DISTRIBUTION_DEBUG", "0") == "1":
-                print("DEBUG | Skipping meta trace for ModelParallel to avoid mesh conflicts")
-            raise RuntimeError("Skipping meta trace for ModelParallel")
-            
         try:
+            # CRITICAL FIX: Skip meta trace for ModelParallel to avoid DTensor mesh conflicts.
+            # DTensor does not support cross-mesh operations, and model weights are already
+            # on the real device mesh. Tracing on 'meta' device mesh causes conflicts.
+            if isinstance(distribution(), ModelParallel):
+                if os.environ.get("KERAS_DISTRIBUTION_DEBUG", "0") == "1":
+                    print(
+                        "DEBUG | Skipping meta trace for ModelParallel to avoid mesh conflicts"
+                    )
+                raise RuntimeError("Skipping meta trace for ModelParallel")
+
             # First try instantiating all tensors on the `"meta"` device,
             # which  should give a \"zero flop\" way to trace shape, but does
             # not have universal support with torch operations.
