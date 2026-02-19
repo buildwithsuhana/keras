@@ -13,15 +13,17 @@ import numpy as np
 
 def setup_dist():
     if not dist.is_initialized():
-        print("Initializing process group...")
-        # Using a direct TCP init_method with 127.0.0.1 is usually the most robust for single-node
-        dist.init_process_group(
-            backend="gloo",
-            init_method="tcp://127.0.0.1:12355",
-            rank=0,
-            world_size=1
-        )
-    print(f"World size: {dist.get_world_size()}")
+        if "RANK" not in os.environ:
+            os.environ["MASTER_ADDR"] = "127.0.0.1"
+            os.environ["MASTER_PORT"] = "12355"
+            os.environ["RANK"] = "0"
+            os.environ["WORLD_SIZE"] = "1"
+            # On macOS, lo0 is the loopback interface
+            os.environ["GLOO_SOCKET_IFNAME"] = "lo0"
+        
+        print(f"Initializing process group (RANK={os.environ.get('RANK')}, WORLD_SIZE={os.environ.get('WORLD_SIZE')})...")
+        keras.distribution.initialize()
+    print(f"World size: {dist.get_world_size()}, Rank: {dist.get_rank()}")
 
 def test_opt_model_parallel():
     setup_dist()
