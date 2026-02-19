@@ -9,6 +9,8 @@ from keras.src import callbacks as callbacks_module
 from keras.src import optimizers as optimizers_module
 from keras.src import tree
 from keras.src.backend import config
+from keras.src.backend.torch import distribution_lib as torch_distribution_lib
+from keras.src.distribution import distribution_lib
 from keras.src.trainers import trainer as base_trainer
 from keras.src.trainers.data_adapters import array_slicing
 from keras.src.trainers.data_adapters import data_adapter_utils
@@ -267,6 +269,7 @@ class TorchTrainer(base_trainer.Trainer):
                 callbacks.on_train_batch_begin(begin_step)
 
                 logs = self.train_function(data)
+                logs = tree.map_structure(backend.convert_to_numpy, logs)
 
                 # Callbacks
                 callbacks.on_train_batch_end(end_step, logs)
@@ -383,6 +386,7 @@ class TorchTrainer(base_trainer.Trainer):
         for begin_step, end_step, data in epoch_iterator:
             callbacks.on_test_batch_begin(begin_step)
             logs = self.test_function(data)
+            logs = tree.map_structure(backend.convert_to_numpy, logs)
             callbacks.on_test_batch_end(end_step, logs)
             if self.stop_evaluating:
                 break
@@ -442,6 +446,9 @@ class TorchTrainer(base_trainer.Trainer):
         for begin_step, end_step, data in epoch_iterator:
             callbacks.on_predict_batch_begin(begin_step)
             batch_outputs = self.predict_function(data)
+            batch_outputs = tree.map_structure(
+                backend.convert_to_numpy, batch_outputs
+            )
             outputs = append_to_outputs(batch_outputs, outputs)
             callbacks.on_predict_batch_end(end_step, {"outputs": batch_outputs})
             if self.stop_predicting:
@@ -513,6 +520,40 @@ class TorchTrainer(base_trainer.Trainer):
         return batch_outputs
 
 
+def _distribute_data(data, layouts=None):
+    distribution = distribution_lib.distribution()
+    if distribution is not None:
+        if layouts is None:
+            layouts = tree.map_structure(
+                lambda d: distribution.get_data_layout(d.shape),
+                data,
+            )
+        return tree.map_structure(
+            lambda d, l: torch_distribution_lib.distribute_data_input(
+                d, l, distribution.batch_dim_name
+            ),
+            data,
+            layouts,
+        )
+    return tree.map_structure(
+        lambda x: torch.as_tensor(x, device=torch_distribution_lib.get_device()),
+        data,
+    )
+
+
 class TorchEpochIterator(EpochIterator):
     def _get_iterator(self):
+        distribution = distribution_lib.distribution()
+        if distribution is not None:
+            return self._get_distributed_iterator(distribution)
         return self.data_adapter.get_torch_dataloader()
+
+    def _get_distributed_iterator(self, distribution):
+        layouts = None
+        for data in self.data_adapter.get_torch_dataloader():
+            if layouts is None:
+                layouts = tree.map_structure(
+                    lambda d: distribution.get_data_layout(d.shape),
+                    data,
+                )
+            yield _distribute_data(data, layouts)

@@ -6,8 +6,7 @@ import torch
 import torch.distributed as dist
 import numpy as np
 import keras
-keras.config.disable_traceback_filtering()
-from keras.distribution import DeviceMesh, LayoutMap, ModelParallel
+from keras.src.distribution import DeviceMesh, LayoutMap, ModelParallel
 
 # Initialize distribution
 if "RANK" not in os.environ:
@@ -25,8 +24,13 @@ rank = int(os.environ.get("RANK", "0"))
 mesh = DeviceMesh(shape=(1, world_size), axis_names=("batch", "model"))
 
 layout_map = LayoutMap(mesh)
-layout_map["dense_1/kernel"] = (None, "model")
-layout_map["dense_2/kernel"] = ("model", None)
+layout_map["token_embedding/embeddings"] = (None, "model")
+layout_map["decoder_block_.*_attention/query/kernel"] = (None, "model")
+layout_map["decoder_block_.*_attention/key/kernel"] = (None, "model")
+layout_map["decoder_block_.*_attention/value/kernel"] = (None, "model")
+layout_map["decoder_block_.*_attention/output_dense/kernel"] = ("model", None)
+layout_map["decoder_block_.*_ffn_layers_0/kernel"] = (None, "model")
+layout_map["decoder_block_.*_ffn_layers_1/kernel"] = ("model", None)
 
 distribution = ModelParallel(
     layout_map=layout_map, batch_dim_name="batch"
@@ -35,41 +39,30 @@ keras.distribution.set_distribution(distribution)
 
 if rank == 0:
     print(f"World size: {world_size}")
-    print("Creating model under distribution scope...")
+    print("Creating OPT model under distribution scope...")
+
+# Import KerasHub to get OPT
+import keras_hub
 
 with distribution.scope():
-    model = keras.Sequential([
-        keras.layers.Dense(64, activation="relu", name="dense_1", input_shape=(32,)),
-        keras.layers.Dense(32, name="dense_2")
-    ])
+    model = keras_hub.models.OPTCausalLM.from_preset("opt_125m_en")
 
 # Verify sharding
 if rank == 0:
-    print("\nVerifying weight sharding:")
-    for variable in model.weights:
+    print("\nVerifying weight sharding (first few weights):")
+    for variable in model.weights[:5]:
         val = variable.value
         from torch.distributed.tensor import DTensor
         is_dtensor = isinstance(val, DTensor)
         sharding = val.placements if is_dtensor else "None"
         print(f"Variable {variable.path}: is_dtensor={is_dtensor}, shape={val.shape}, sharding={sharding}")
 
-# fit test
+# Generate test
 if rank == 0:
-    print("\nRunning fit test...")
+    print("\nRunning generation test...")
 
-# Create dummy data
-batch_size = 4
-x = np.random.randn(batch_size, 32).astype("float32")
-y = np.random.randn(batch_size, 32).astype("float32")
-
-# Compile model
-model.compile(
-    optimizer=keras.optimizers.Adam(learning_rate=1e-3),
-    loss="mse",
-)
-
-# Run fit
-model.fit(x, y, epochs=2, batch_size=batch_size)
+prompt = "Keras is"
+output = model.generate(prompt, max_length=20)
 
 if rank == 0:
-    print("\nFit test completed successfully!")
+    print(f"\nGenerated output: {output}")

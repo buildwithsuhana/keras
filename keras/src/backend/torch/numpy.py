@@ -160,13 +160,15 @@ def multiply(x1, x2):
 
 
 def mean(x, axis=None, keepdims=False):
+    # print(f"DEBUG mean: x={type(x)}, axis={axis}, keepdims={keepdims}")
     if isinstance(x, (list, tuple)):
         x = stack(x)
     x = convert_to_tensor(x)
     if axis == () or axis == []:
         # Torch handles the empty axis case differently from numpy.
         return x
-    axis = to_tuple_or_list(axis)  # see [NB] below
+    if axis is not None:
+        axis = to_tuple_or_list(axis)
 
     ori_dtype = standardize_dtype(x.dtype)
     # torch.mean only supports floating point inputs
@@ -176,22 +178,19 @@ def mean(x, axis=None, keepdims=False):
     else:
         result_dtype = ori_dtype
 
-    # [NB] the python torch op torch.mean() is generated into
-    # `torch._C._VariableFunctions.pyi`, and the method
-    # signature is overloaded.
-    # Dynamo won't actually find the correct signature of
-    # `torch.mean()` if arguments are passed via kwargs
-    # So we have to pass the arguments via positional args
-    # EXCEPT for those that are forced as kwargs via the `*`
-    # delimiter in the overloaded method signatures.
-    # Additionally, we have to create a singleton-tuple
-    # when `axis` is an int to match the existing fn signature
-    result = torch.mean(
-        x,
-        axis,
-        keepdims,
-        dtype=to_torch_dtype(compute_dtype),
-    )
+    if axis is None:
+        result = torch.mean(
+            x,
+            keepdim=keepdims,
+            dtype=to_torch_dtype(compute_dtype),
+        )
+    else:
+        result = torch.mean(
+            x,
+            dim=axis,
+            keepdim=keepdims,
+            dtype=to_torch_dtype(compute_dtype),
+        )
     return cast(result, result_dtype)
 
 
@@ -434,7 +433,9 @@ def average(x, axis=None, weights=None):
         return torch.sum(torch.mul(x, weights), dim=axis) / torch.sum(
             weights, dim=-1
         )
-    return torch.mean(x, axis)
+    if axis is None:
+        return torch.mean(x)
+    return torch.mean(x, dim=axis)
 
 
 def bartlett(x):
@@ -1948,7 +1949,7 @@ def sum(x, axis=None, keepdims=False):
     if dtype in ("bool", "uint8", "int8", "int16"):
         dtype = "int32"
     if axis is not None:
-        return cast(torch.sum(x, axis=axis, keepdim=keepdims), dtype)
+        return cast(torch.sum(x, dim=axis, keepdim=keepdims), dtype)
     return cast(torch.sum(x), dtype)
 
 

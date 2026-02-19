@@ -139,6 +139,8 @@ class Variable(KerasVariable):
                 value,
                 requires_grad=requires_grad,
             ).to(get_device())
+            if self._layout is not None and requires_grad:
+                self._value.retain_grad()
 
     def _direct_assign(self, value):
         self._initialize_layout()
@@ -275,6 +277,8 @@ def convert_to_tensor(x, dtype=None, sparse=None, ragged=None):
 def convert_to_numpy(x):
     def transform(x):
         if is_tensor(x):
+            if hasattr(x, "to_local"):
+                x = x.to_local()
             if x.requires_grad:
                 x = x.detach()
             # Tensor has to be moved to CPU before converting to numpy.

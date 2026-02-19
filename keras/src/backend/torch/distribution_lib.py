@@ -64,6 +64,11 @@ def get_device_count(device_type=None):
     return len(list_devices(device_type))
 
 
+def distribute_value(value, layout):
+    """Distribute the value based on the layout."""
+    return distribute_tensor(value, layout)
+
+
 def distribute_variable(value, layout):
     """Create a distributed variable for Torch."""
     return distribute_tensor(value, layout)
@@ -109,7 +114,10 @@ def distribute_data_input(per_process_batch, layout, batch_dim_name):
         if per_process_batch.device.type != torch_mesh.device_type:
             per_process_batch = per_process_batch.to(torch_mesh.device_type)
 
-        return DTensor.from_local(per_process_batch, torch_mesh, placements)
+        if isinstance(per_process_batch, DTensor):
+            return per_process_batch.redistribute(torch_mesh, placements)
+        
+        return distribute_tensor_torch(per_process_batch, torch_mesh, placements)
     
     return per_process_batch
 
@@ -194,10 +202,32 @@ def _to_backend_layout(tensor_layout):
 
 def _maybe_distribute_input(x, distribution):
     """Distribute the input data if it's not already a DTensor."""
+    from keras.src import tree
+
     if isinstance(x, torch.Tensor) and not isinstance(x, DTensor):
-        layout = distribution.get_data_layout(x.shape)
+        layout = _get_data_layout(x.shape, distribution)
         return distribute_tensor(x, layout)
-    return x
+
+    def _distribute_if_tensor(t):
+        if isinstance(t, torch.Tensor) and not isinstance(t, DTensor):
+            layout = _get_data_layout(t.shape, distribution)
+            return distribute_tensor(t, layout)
+        return t
+
+    return tree.map_structure(_distribute_if_tensor, x)
+
+
+def _get_data_layout(shape, distribution):
+    """Default data layout if not provided."""
+    try:
+        return distribution.get_data_layout(shape)
+    except NotImplementedError:
+        from keras.src.distribution import TensorLayout
+        # Default to sharding on the first dimension if batch_dim_name is set.
+        spec = [None] * len(shape)
+        if distribution.batch_dim_name:
+            spec[0] = distribution.batch_dim_name
+        return TensorLayout(spec, distribution.device_mesh)
 
 
 def _get_placements(layout):
@@ -214,3 +244,21 @@ def _get_placements(layout):
         if not found:
             placements.append(Replicate())
     return placements
+
+
+def distribute_dataset(dataset, distribution):
+    """Create a distributed dataset for Torch."""
+    if not dist.is_initialized():
+        return dataset
+
+    if isinstance(dataset, torch.utils.data.DataLoader):
+        # For DataLoader, we can wrap the sampler.
+        # But Keras often uses its own data adapters.
+        return dataset
+
+    from keras.src.utils.module_utils import tensorflow as tf
+    if tf.available and isinstance(dataset, tf.data.Dataset):
+        # Reuse ModelParallel logic for tf.data.Dataset
+        return distribution.distribute_dataset(dataset)
+
+    return dataset
