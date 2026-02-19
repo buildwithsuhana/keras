@@ -6,7 +6,8 @@ import torch
 import torch.distributed as dist
 import numpy as np
 import keras
-from keras.src.distribution import DeviceMesh, LayoutMap, ModelParallel
+keras.config.disable_traceback_filtering()
+from keras.distribution import DeviceMesh, LayoutMap, ModelParallel
 
 # Initialize distribution
 if "RANK" not in os.environ:
@@ -39,13 +40,15 @@ keras.distribution.set_distribution(distribution)
 
 if rank == 0:
     print(f"World size: {world_size}")
-    print("Creating OPT model under distribution scope...")
+    print("Creating OPT backbone under distribution scope...")
 
 # Import KerasHub to get OPT
 import keras_hub
 
 with distribution.scope():
-    model = keras_hub.models.OPTCausalLM.from_preset("opt_125m_en")
+    backbone = keras_hub.models.OPTBackbone.from_preset("opt_125m_en")
+    # Wrap in a functional model to use standard fit
+    model = keras.Model(backbone.inputs, backbone(backbone.inputs))
 
 # Verify sharding
 if rank == 0:
@@ -57,12 +60,28 @@ if rank == 0:
         sharding = val.placements if is_dtensor else "None"
         print(f"Variable {variable.path}: is_dtensor={is_dtensor}, shape={val.shape}, sharding={sharding}")
 
-# Generate test
+# fit test
 if rank == 0:
-    print("\nRunning generation test...")
+    print("\nRunning fit test...")
 
-prompt = "Keras is"
-output = model.generate(prompt, max_length=20)
+# Create dummy data
+batch_size = 2 * world_size
+seq_len = 32
+# OPT backbone expects "token_ids" and "padding_mask"
+x = {
+    "token_ids": np.random.randint(0, 50272, (batch_size, seq_len)).astype("int32"),
+    "padding_mask": np.ones((batch_size, seq_len)).astype("int32"),
+}
+y = np.random.randn(batch_size, seq_len, 768).astype("float32")
+
+# Compile model
+model.compile(
+    optimizer=keras.optimizers.Adam(learning_rate=1e-5),
+    loss="mse",
+)
+
+# Run fit
+model.fit(x, y, epochs=1, batch_size=batch_size)
 
 if rank == 0:
-    print(f"\nGenerated output: {output}")
+    print("\nFit test completed successfully!")
