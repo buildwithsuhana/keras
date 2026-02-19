@@ -40,19 +40,29 @@ def test_opt_model_parallel():
     world_size = dist.get_world_size()
     mesh = distribution.DeviceMesh(shape=(world_size,), axis_names=("model",))
     print(f"Created device mesh: {mesh}")
-    # Simple layout map for OPT: shard embeddings and some dense layers
+    # Simple layout map for OPT:
     layout_map = distribution.LayoutMap(mesh)
-    layout_map["token_embedding/embeddings"] = (None, "model")
-    # Shard the projection layers in attention
-    # OPT projection
-    #  weights are often (hidden_dim, hidden_dim)
-    layout_map["query/kernel"] = (None, "model")
-    layout_map["key/kernel"] = (None, "model")
-    layout_map["value/kernel"] = (None, "model")
-    layout_map["out_proj/kernel"] = ("model", None)
-    # Shard the MLP layers
+    
+    # Shard vocab (dim 0) - very safe
+    layout_map["token_embedding/embeddings"] = ("model", None)
+    
+    # For Attention: Sharding the hidden_dim (dim 0) of QKV kernels
+    # This acts as a "Row Parallel" projection if the input is replicated,
+    # or combined with "Column Parallel" if the previous layer was sharded.
+    # It avoids sharding the 'heads' dimension which causes the Flatten error in einsum.
+    layout_map["query/kernel"] = ("model", None, None)
+    layout_map["key/kernel"] = ("model", None, None)
+    layout_map["value/kernel"] = ("model", None, None)
+    
+    # Column parallel for out_proj (shard output dimension)
+    layout_map["out_proj/kernel"] = (None, "model")
+    
+    # Standard Megatron-style MLP sharding:
+    # ffn_inner: Column Parallel (shard output dim 1)
+    # ffn_outer: Row Parallel (shard input dim 0)
     layout_map["ffn_inner/kernel"] = (None, "model")
     layout_map["ffn_outer/kernel"] = ("model", None)
+    
     print(f"Defined layout map: {layout_map}")
     model_parallel = distribution.ModelParallel(layout_map=layout_map)
     print("Created ModelParallel distribution")

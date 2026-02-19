@@ -109,7 +109,11 @@ def einsum(subscripts, *operands, **kwargs):
     try:
         return torch.einsum(subscripts, *operands)
     except RuntimeError as e:
-        if "redistribution" in str(e) or "sharding" in str(e).lower():
+        if (
+            "redistribution" in str(e)
+            or "sharding" in str(e).lower()
+            or "flatten sharded dimension" in str(e).lower()
+        ):
             from torch.distributed.tensor import Replicate
 
             operands = [
