@@ -341,7 +341,12 @@ class Variable(KerasVariable):
                     placements = get_dtensor_placements(value)
                     res_data = dtensor_from_local(res_data, mesh, placements)
                 
-                return torch.nn.Parameter(res_data, requires_grad=self.trainable)
+                # Wrap in Parameter if the original was a Parameter or if it's float/complex
+                if isinstance(value, torch.nn.Parameter) or (
+                    hasattr(res_data, 'dtype') and (res_data.dtype.is_floating_point or res_data.dtype.is_complex)
+                ):
+                    return torch.nn.Parameter(res_data, requires_grad=self.trainable)
+                return res_data
             return value
 
         if in_stateless_scope():
@@ -578,9 +583,19 @@ def compute_output_spec(fn, *args, **kwargs):
     def symbolic_call(fn, args, kwargs, fill_value):
         """Call `fn` to infer output shape and dtype."""
         from keras.src.backend.torch import distribution_lib
+        from keras.src.distribution.distribution_lib import distribution, ModelParallel
+        
+        # CRITICAL FIX: Skip meta trace for ModelParallel to avoid DTensor mesh conflicts.
+        # DTensor does not support cross-mesh operations, and model weights are already
+        # on the real device mesh. Tracing on 'meta' device mesh causes conflicts.
+        if isinstance(distribution(), ModelParallel):
+            if os.environ.get("KERAS_DISTRIBUTION_DEBUG", "0") == "1":
+                print("DEBUG | Skipping meta trace for ModelParallel to avoid mesh conflicts")
+            raise RuntimeError("Skipping meta trace for ModelParallel")
+            
         try:
             # First try instantiating all tensors on the `"meta"` device,
-            # which  should give a "zero flop" way to trace shape, but does
+            # which  should give a \"zero flop\" way to trace shape, but does
             # not have universal support with torch operations.
             with device_scope("meta"):
                 meta_args, meta_kwargs = tree.map_structure(
