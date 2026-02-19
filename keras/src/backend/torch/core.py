@@ -328,10 +328,16 @@ class Variable(KerasVariable):
                 )
                 
                 if is_dtensor(value):
-                    mesh = get_dtensor_mesh(value)
-                    # Use a meta version of the mesh
-                    if mesh is not None and mesh.device_type != "meta":
-                        mesh = DeviceMesh("meta", mesh.mesh, mesh_dim_names=mesh.mesh_dim_names)
+                    # CRITICAL: Use the cached meta mesh from distribution_lib to avoid 
+                    # cross-mesh errors when multiple variables are used together.
+                    from keras.src.backend.torch.distribution_lib import _get_default_device_mesh
+                    mesh = _get_default_device_mesh()
+                    if mesh is None or mesh.device_type != "meta":
+                        # Fallback if no default meta mesh
+                        mesh = get_dtensor_mesh(value)
+                        if mesh is not None and mesh.device_type != "meta":
+                            mesh = DeviceMesh("meta", mesh.mesh, mesh_dim_names=mesh.mesh_dim_names)
+                    
                     placements = get_dtensor_placements(value)
                     res_data = dtensor_from_local(res_data, mesh, placements)
                 

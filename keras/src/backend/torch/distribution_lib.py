@@ -603,10 +603,11 @@ def _to_backend_mesh(device_mesh):
             # Check for meta-cached version
             meta_cached = global_state.get_global_attribute(cache_key + "_meta", None)
             if meta_cached is not None:
-                res_mesh = meta_cached
+                return meta_cached
             else:
                 res_mesh = DeviceMesh("meta", res_mesh.mesh, mesh_dim_names=res_mesh.mesh_dim_names)
                 global_state.set_global_attribute(cache_key + "_meta", res_mesh)
+                return res_mesh
             
         global_state.set_global_attribute("torch_device_mesh", res_mesh)
         return res_mesh
