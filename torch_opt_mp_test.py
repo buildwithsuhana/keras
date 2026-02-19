@@ -1,7 +1,8 @@
 import os
 
 os.environ["KERAS_BACKEND"] = "torch"
-os.environ["KERAS_TORCH_DEVICE"] = "cpu"
+# Remove fixed CPU forcing to allow GPU usage
+# os.environ["KERAS_TORCH_DEVICE"] = "cpu" 
 
 import torch
 import torch.distributed as dist
@@ -18,12 +19,18 @@ def setup_dist():
             os.environ["MASTER_PORT"] = "12355"
             os.environ["RANK"] = "0"
             os.environ["WORLD_SIZE"] = "1"
-            # On macOS, lo0 is the loopback interface
-            os.environ["GLOO_SOCKET_IFNAME"] = "lo0"
         
-        print(f"Initializing process group (RANK={os.environ.get('RANK')}, WORLD_SIZE={os.environ.get('WORLD_SIZE')})...")
-        keras.distribution.initialize()
-    print(f"World size: {dist.get_world_size()}, Rank: {dist.get_rank()}")
+        # Determine backend based on availability
+        backend = "nccl" if torch.cuda.is_available() else "gloo"
+        
+        if backend == "nccl":
+            local_rank = int(os.environ.get("LOCAL_RANK", 0))
+            torch.cuda.set_device(local_rank)
+        
+        print(f"Initializing process group (RANK={os.environ.get('RANK')}, WORLD_SIZE={os.environ.get('WORLD_SIZE')}, BACKEND={backend})...")
+        dist.init_process_group(backend=backend)
+        
+    print(f"World size: {dist.get_world_size()}, Rank: {dist.get_rank()}, Device: {torch.cuda.current_device() if torch.cuda.is_available() else 'cpu'}")
 
 def test_opt_model_parallel():
     setup_dist()
@@ -82,7 +89,8 @@ def test_opt_model_parallel():
     }
     
     output = backbone(inputs)
-    print(f"Output shape: {output.shape}")
+    if dist.get_rank() == 0:
+        print(f"Output shape: {output.shape}")
     
     # Test model.fit
     from keras_hub.models import OPTCausalLM
@@ -98,7 +106,8 @@ def test_opt_model_parallel():
     
     causal_lm.compile(optimizer="adam", loss="sparse_categorical_crossentropy")
     causal_lm.fit(x, y, epochs=1, batch_size=batch_size)
-    print("model.fit completed successfully!")
+    if dist.get_rank() == 0:
+        print("model.fit completed successfully!")
 
     # Test generation
     print("\nTesting model.generate...")
@@ -109,11 +118,12 @@ def test_opt_model_parallel():
             "padding_mask": np.ones((batch_size, 8), dtype="int32"),
         }
         generated = causal_lm.generate(prompt, max_length=12, stop_token_ids=None)
-        if isinstance(generated, dict):
-            print(f"Generated token_ids shape: {generated['token_ids'].shape}")
-        else:
-            print(f"Generated shape: {generated.shape}")
-        print("model.generate completed successfully!")
+        if dist.get_rank() == 0:
+            if isinstance(generated, dict):
+                print(f"Generated token_ids shape: {generated['token_ids'].shape}")
+            else:
+                print(f"Generated shape: {generated.shape}")
+            print("model.generate completed successfully!")
     except Exception as e:
         print(f"model.generate failed: {e}")
         import traceback
