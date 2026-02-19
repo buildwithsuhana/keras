@@ -224,6 +224,7 @@ class Variable(KerasVariable):
                 dtensor_from_local,
                 get_dtensor_mesh,
                 get_dtensor_placements,
+                dtensor_to_local,
             )
             
             # CRITICAL FIX: Robust handling of DTensor assignment.
@@ -260,7 +261,6 @@ class Variable(KerasVariable):
                         self._value.copy_(value_dtensor)
                     else:
                         # value might be a local shard already.
-                        from keras.src.backend.torch.distribution_lib import dtensor_to_local
                         self_local = dtensor_to_local(self._value)
                         if value.shape == self_local.shape:
                             self_local.copy_(value)
@@ -271,7 +271,6 @@ class Variable(KerasVariable):
                 # self._value is a regular torch.Tensor
                 if is_dtensor(value):
                     # Extract local tensor from DTensor
-                    from keras.src.backend.torch.distribution_lib import dtensor_to_local
                     value = dtensor_to_local(value)
                 
                 # Check for shape mismatch before copy_
@@ -312,14 +311,28 @@ class Variable(KerasVariable):
         def maybe_use_symbolic_tensor(value):
             # Create and use a symbolic tensor stub in symbolic calls.
             if str(get_device()) == "meta" and str(value.device) != "meta":
-                return torch.nn.Parameter(
-                    torch.empty(
-                        size=self._shape,
-                        dtype=to_torch_dtype(self._dtype),
-                        device="meta",
-                    ),
-                    requires_grad=self.trainable,
+                # CRITICAL: Preserve DTensor status for symbolic tensors
+                from keras.src.backend.torch.distribution_lib import (
+                    is_dtensor, get_dtensor_mesh, get_dtensor_placements, 
+                    dtensor_from_local
                 )
+                from torch.distributed._tensor import DeviceMesh
+                
+                res_data = torch.empty(
+                    size=self._shape,
+                    dtype=to_torch_dtype(self._dtype),
+                    device="meta",
+                )
+                
+                if is_dtensor(value):
+                    mesh = get_dtensor_mesh(value)
+                    # Use a meta version of the mesh
+                    if mesh is not None and mesh.device_type != "meta":
+                        mesh = DeviceMesh("meta", mesh.mesh, mesh_dim_names=mesh.mesh_dim_names)
+                    placements = get_dtensor_placements(value)
+                    res_data = dtensor_from_local(res_data, mesh, placements)
+                
+                return torch.nn.Parameter(res_data, requires_grad=self.trainable)
             return value
 
         if in_stateless_scope():
@@ -371,9 +384,12 @@ def convert_to_tensor(x, dtype=None, sparse=None, ragged=None):
             dtype = to_torch_dtype(dtype)
             if x.dtype != dtype:
                 # Convert the local tensor and recreate DTensor
-                local_x = x.to_local()
+                local_x = x.to_local() if hasattr(x, 'to_local') else x.data.to_local()
                 local_x = local_x.to(dtype)
-                return dtensor_from_local(local_x, x.device_mesh, x.placements)
+                
+                # Get mesh and placements robustly
+                from keras.src.backend.torch.distribution_lib import get_dtensor_mesh, get_dtensor_placements
+                return dtensor_from_local(local_x, get_dtensor_mesh(x), get_dtensor_placements(x))
         return x
     
     # CRITICAL FIX: Check if we're in ModelParallel multi-process mode
@@ -442,7 +458,7 @@ def convert_to_tensor(x, dtype=None, sparse=None, ragged=None):
             # a different GPU visible as cuda:0 due to CUDA_VISIBLE_DEVICES isolation.
             # We need to create the tensor on the correct local device, not CPU.
             # Get the current local device from torch.cuda.current_device()
-            if torch.cuda.is_available() and torch.distributed.is_initialized():
+            if torch.cuda.is_available() and torch.distributed.is_initialized() and get_device() != "meta":
                 # Use the current device (which is set correctly in initialize())
                 local_device = f"cuda:{torch.cuda.current_device()}"
             else:
@@ -461,12 +477,13 @@ def convert_to_tensor(x, dtype=None, sparse=None, ragged=None):
                 print(f"DEBUG | [Rank {rank}] convert_to_tensor: promoting torch.Tensor to DTensor with Replicate placement")
             
             # CRITICAL FIX: Ensure tensor is on the correct local device before creating DTensor
-            if torch.cuda.is_available() and torch.distributed.is_initialized():
-                local_device = f"cuda:{torch.cuda.current_device()}"
-                if x.device.type != "cuda" or x.device.index != torch.cuda.current_device():
-                    x = x.to(local_device)
-            elif x.device.type != "cpu":
-                x = x.to("cpu")
+            if x.device.type != "meta":
+                if torch.cuda.is_available() and torch.distributed.is_initialized():
+                    local_device = f"cuda:{torch.cuda.current_device()}"
+                    if x.device.type != "cuda" or x.device.index != torch.cuda.current_device():
+                        x = x.to(local_device)
+                elif x.device.type != "cpu":
+                    x = x.to("cpu")
             
             return dtensor_from_local(x, device_mesh, [Replicate()])
     
@@ -579,13 +596,13 @@ def cast(x, dtype):
     if isinstance(x, Variable):
         x = x.value
     # Handle DTensor - cast the local tensor
-    from keras.src.backend.torch.distribution_lib import DTensor, dtensor_from_local
-    is_dtensor, local_x = _get_dtensor_info(x)
-    if is_dtensor:
+    from keras.src.backend.torch.distribution_lib import DTensor, dtensor_from_local, get_dtensor_mesh, get_dtensor_placements, dtensor_to_local
+    if is_dtensor(x):
         if x.dtype == dtype:
             return x
+        local_x = dtensor_to_local(x)
         local_x = local_x.to(dtype)
-        return dtensor_from_local(local_x, x.device_mesh, x.placements)
+        return dtensor_from_local(local_x, get_dtensor_mesh(x), get_dtensor_placements(x))
     if is_tensor(x):
         if x.dtype != dtype:
             x = x.to(dtype)
@@ -902,14 +919,16 @@ def slice(inputs, start_indices, shape):
         # For DTensor, we need to extract local tensor, slice it, and convert back
         # This avoids the view/alias operation that DTensor doesn't support
         from keras.src.backend.torch.distribution_lib import (
-            get_dtensor_local,
+            dtensor_to_local,
             dtensor_from_local,
+            get_dtensor_mesh,
+            get_dtensor_placements,
         )
         
         # Get the local tensor and its device mesh/placements
-        local_inputs = inputs.to_local()
-        device_mesh = inputs.device_mesh
-        placements = inputs.placements
+        local_inputs = dtensor_to_local(inputs)
+        device_mesh = get_dtensor_mesh(inputs)
+        placements = get_dtensor_placements(inputs)
         
         # Perform slice on local tensor
         python_slice = __builtins__["slice"]

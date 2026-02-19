@@ -454,6 +454,17 @@ def _get_default_device_mesh():
     if is_distributed:
         cached_mesh = global_state.get_global_attribute("torch_device_mesh", None)
         if cached_mesh is not None and hasattr(cached_mesh, 'mesh'):
+            # Check if we are in meta scope
+            if get_device() == "meta" and cached_mesh.device_type != "meta":
+                # Create a meta version of the mesh for symbolic building
+                # This ensures consistent device types between mesh and tensors
+                meta_cached = global_state.get_global_attribute("torch_device_mesh_meta", None)
+                if meta_cached is not None:
+                    return meta_cached
+                meta_mesh = DeviceMesh("meta", cached_mesh.mesh, mesh_dim_names=cached_mesh.mesh_dim_names)
+                global_state.set_global_attribute("torch_device_mesh_meta", meta_mesh)
+                return meta_mesh
+                
             # If we're in multi-process MP mode (cached flag), we need a 1D mesh.
             if is_mp_multi_process and cached_mesh.mesh.ndim == 1:
                 return cached_mesh
@@ -471,17 +482,35 @@ def _get_default_device_mesh():
         cache_key = f"torch_mesh_{device_mesh.shape}_{device_mesh.axis_names}_{dist_type}"
         cached = global_state.get_global_attribute(cache_key)
         if cached is not None:
+            if get_device() == "meta" and cached.device_type != "meta":
+                meta_cached = global_state.get_global_attribute(cache_key + "_meta", None)
+                if meta_cached is not None:
+                    return meta_cached
+                meta_mesh = DeviceMesh("meta", cached.mesh, mesh_dim_names=cached.mesh_dim_names)
+                global_state.set_global_attribute(cache_key + "_meta", meta_mesh)
+                return meta_mesh
             return cached
 
         # CRITICAL FIX: If mesh is not yet created for this distribution, create it.
         # This ensures that convert_to_tensor() can always promote to DTensor
         # when a distribution is active.
-        return _to_backend_mesh(device_mesh)
+        res_mesh = _to_backend_mesh(device_mesh)
+        if get_device() == "meta" and res_mesh.device_type != "meta":
+            meta_mesh = DeviceMesh("meta", res_mesh.mesh, mesh_dim_names=res_mesh.mesh_dim_names)
+            return meta_mesh
+        return res_mesh
 
     # Fallback to generic cached mesh if distributed is initialized
     if is_distributed:
         generic_cached = global_state.get_global_attribute("torch_device_mesh", None)
         if generic_cached is not None and hasattr(generic_cached, 'mesh'):
+            if get_device() == "meta" and generic_cached.device_type != "meta":
+                meta_cached = global_state.get_global_attribute("torch_device_mesh_meta", None)
+                if meta_cached is not None:
+                    return meta_cached
+                meta_mesh = DeviceMesh("meta", generic_cached.mesh, mesh_dim_names=generic_cached.mesh_dim_names)
+                global_state.set_global_attribute("torch_device_mesh_meta", meta_mesh)
+                return meta_mesh
             return generic_cached
             
     return None
@@ -568,8 +597,19 @@ def _to_backend_mesh(device_mesh):
     if cached is not None:
         if debug_mode:
             print(f"DEBUG | [Rank {rank}] _to_backend_mesh: using cached mesh: {cached}")
-        global_state.set_global_attribute("torch_device_mesh", cached)
-        return cached
+        
+        res_mesh = cached
+        if get_device() == "meta" and res_mesh.device_type != "meta":
+            # Check for meta-cached version
+            meta_cached = global_state.get_global_attribute(cache_key + "_meta", None)
+            if meta_cached is not None:
+                res_mesh = meta_cached
+            else:
+                res_mesh = DeviceMesh("meta", res_mesh.mesh, mesh_dim_names=res_mesh.mesh_dim_names)
+                global_state.set_global_attribute(cache_key + "_meta", res_mesh)
+            
+        global_state.set_global_attribute("torch_device_mesh", res_mesh)
+        return res_mesh
 
     # Get local rank for proper CUDA device mapping
     local_rank = 0
@@ -627,8 +667,13 @@ def _to_backend_mesh(device_mesh):
                         print(f"DEBUG | [Rank {rank}] _to_backend_mesh: created 1D mesh for MP: {backend_mesh}")
                     
                     global_state.set_global_attribute(cache_key, backend_mesh)
-                    global_state.set_global_attribute("torch_device_mesh", backend_mesh)
-                    return backend_mesh
+                    
+                    res_mesh = backend_mesh
+                    if get_device() == "meta" and res_mesh.device_type != "meta":
+                        res_mesh = DeviceMesh("meta", res_mesh.mesh, mesh_dim_names=res_mesh.mesh_dim_names)
+                        global_state.set_global_attribute(cache_key + "_meta", res_mesh)
+                    global_state.set_global_attribute("torch_device_mesh", res_mesh)
+                    return res_mesh
             else:
                 # DataParallel or single-dimensional mesh
                 # Use 1D mesh where each process has one device
@@ -649,8 +694,13 @@ def _to_backend_mesh(device_mesh):
                         mesh_dim_names=mesh_dim_names
                     )
                     global_state.set_global_attribute(cache_key, backend_mesh)
-                    global_state.set_global_attribute("torch_device_mesh", backend_mesh)
-                    return backend_mesh
+                    
+                    res_mesh = backend_mesh
+                    if get_device() == "meta" and res_mesh.device_type != "meta":
+                        res_mesh = DeviceMesh("meta", res_mesh.mesh, mesh_dim_names=res_mesh.mesh_dim_names)
+                        global_state.set_global_attribute(cache_key + "_meta", res_mesh)
+                    global_state.set_global_attribute("torch_device_mesh", res_mesh)
+                    return res_mesh
     
     # For single-process, create DeviceMesh with all GPUs
     device_type = "cuda" if torch.cuda.is_available() else "cpu"
@@ -667,8 +717,13 @@ def _to_backend_mesh(device_mesh):
         print(f"DEBUG | [Rank {rank}] _to_backend_mesh: created single-process mesh: {backend_mesh}")
 
     global_state.set_global_attribute(cache_key, backend_mesh)
-    global_state.set_global_attribute("torch_device_mesh", backend_mesh)
-    return backend_mesh
+    
+    res_mesh = backend_mesh
+    if get_device() == "meta" and res_mesh.device_type != "meta":
+        res_mesh = DeviceMesh("meta", res_mesh.mesh, mesh_dim_names=res_mesh.mesh_dim_names)
+        global_state.set_global_attribute(cache_key + "_meta", res_mesh)
+    global_state.set_global_attribute("torch_device_mesh", res_mesh)
+    return res_mesh
 
 
 def _to_backend_layout(tensor_layout):
@@ -1441,6 +1496,8 @@ def prepare_output_for_loss(x):
     # If not MP mode, just convert DTensor to local tensor if needed
     if not is_mp:
         if is_dtensor(x):
+            if isinstance(x, torch.nn.Parameter):
+                return x.data.to_local()
             return x.to_local()
         return x
     
@@ -1451,7 +1508,7 @@ def prepare_output_for_loss(x):
     # CRITICAL FIX: Check for DTensor using duck typing in case of module mismatch
     # Sometimes DTensor can be imported from different modules
     # Use different variable name to avoid shadowing the module-level is_dtensor function
-    x_is_dtensor = hasattr(x, 'placements') and hasattr(x, 'to_local') and hasattr(x, 'shape')
+    x_is_dtensor = is_dtensor(x)
     
     if debug_mode:
         rank = 0
@@ -1465,6 +1522,9 @@ def prepare_output_for_loss(x):
     
     # Check if x is a DTensor - this is the model output that needs all-gather
     if x_is_dtensor:
+        # Unwrap data if it's a Parameter
+        x_data = x.data if isinstance(x, torch.nn.Parameter) else x
+        
         # Debug: print the placements and local shape
         if debug_mode:
             rank = 0
@@ -1474,22 +1534,22 @@ def prepare_output_for_loss(x):
                     rank = dist.get_rank()
             except:
                 pass
-            local_shape = x.to_local().shape
-            print(f"DEBUG | [Rank {rank}] prepare_output_for_loss: DTensor placements = {x.placements}, local_shape = {local_shape}, global_shape = {x.shape}")
+            local_shape = x_data.to_local().shape
+            print(f"DEBUG | [Rank {rank}] prepare_output_for_loss: DTensor placements = {x_data.placements}, local_shape = {local_shape}, global_shape = {x_data.shape}")
         
         # Get local tensor shape to determine if sharding is applied
-        local_tensor = x.to_local()
+        local_tensor = x_data.to_local()
         local_shape = local_tensor.shape
         
         # Check if this is a sharded DTensor by comparing local vs global shape
         # OR if it has Partial(sum) placement which requires all-reduce
-        global_shape = x.shape
+        global_shape = x_data.shape
         
         # Check for Partial placement - this indicates the output needs all-reduce
         # (e.g., from ColwiseParallel/RowwiseParallel in tensor parallelism)
         # Use the public API from torch.distributed._tensor.placement_types
         from torch.distributed._tensor.placement_types import Partial
-        has_partial = any(isinstance(p, Partial) for p in x.placements)
+        has_partial = any(isinstance(p, Partial) for p in x_data.placements)
         
         is_sharded = (len(local_shape) > 0 and len(global_shape) > 0 and 
                       local_shape[-1] != global_shape[-1])
@@ -1520,7 +1580,7 @@ def prepare_output_for_loss(x):
             try:
                 # Determine shard dimension from placements or infer from shape difference
                 shard_dim = None
-                for i, p in enumerate(x.placements):
+                for i, p in enumerate(x_data.placements):
                     if isinstance(p, Shard):
                         shard_dim = p.dim
                         break
