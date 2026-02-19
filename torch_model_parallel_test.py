@@ -11,8 +11,9 @@ from keras.distribution import DeviceMesh, LayoutMap, ModelParallel
 
 # Initialize distribution
 if "RANK" not in os.environ:
-    os.environ["MASTER_ADDR"] = "localhost"
+    os.environ["MASTER_ADDR"] = "127.0.0.1"
     os.environ["MASTER_PORT"] = "12355"
+    os.environ["GLOO_SOCKET_IFNAME"] = "lo0"
     os.environ["RANK"] = "0"
     os.environ["WORLD_SIZE"] = "1"
 
