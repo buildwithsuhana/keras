@@ -517,7 +517,14 @@ def cast(x, dtype):
     if isinstance(x, Variable):
         x = x.value
     # Handle DTensor - cast the local tensor
-    from keras.src.backend.torch.distribution_lib import DTensor, dtensor_from_local, get_dtensor_mesh, get_dtensor_placements, dtensor_to_local
+    from keras.src.backend.torch.distribution_lib import (
+        DTensor,
+        dtensor_from_local,
+        get_dtensor_mesh,
+        get_dtensor_placements,
+        dtensor_to_local,
+        is_dtensor,
+    )
     if is_dtensor(x):
         if x.dtype == dtype:
             return x
