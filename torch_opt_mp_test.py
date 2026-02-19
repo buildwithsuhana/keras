@@ -114,14 +114,27 @@ def test_opt_model_parallel():
         causal_lm = OPTCausalLM(backbone=backbone)
 
     print("\nTesting model.fit...")
-    x = {
-        "token_ids": np.random.randint(0, 50272, (batch_size, seq_len)).astype("int32"),
-        "padding_mask": np.ones((batch_size, seq_len), dtype="int32"),
+    # Provide data subset based on rank to avoid identical data issues if any
+    rank = dist.get_rank()
+    world_size = dist.get_world_size()
+    
+    # Use a larger batch size total and slice it
+    total_batch = batch_size * world_size
+    x_full = {
+        "token_ids": np.random.randint(0, 50272, (total_batch, seq_len)).astype("int32"),
+        "padding_mask": np.ones((total_batch, seq_len), dtype="int32"),
     }
-    y = np.random.randint(0, 50272, (batch_size, seq_len)).astype("int32")
+    y_full = np.random.randint(0, 50272, (total_batch, seq_len)).astype("int32")
+    
+    x = {
+        "token_ids": x_full["token_ids"][rank*batch_size:(rank+1)*batch_size],
+        "padding_mask": x_full["padding_mask"][rank*batch_size:(rank+1)*batch_size],
+    }
+    y = y_full[rank*batch_size:(rank+1)*batch_size]
     
     try:
         causal_lm.compile(optimizer="adam", loss="sparse_categorical_crossentropy")
+        # For Torch distributed fit, we might need to ensure all ranks call fit simultaneously
         causal_lm.fit(x, y, epochs=1, batch_size=batch_size)
         if dist.get_rank() == 0:
             print("model.fit completed successfully!")

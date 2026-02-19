@@ -157,15 +157,21 @@ def initialize_rng():
     global_seed = rng_utils.get_random_seed()
     if global_seed is None:
         if dist.is_initialized():
-            if dist.get_rank() == 0:
+            rank = dist.get_rank()
+            if rank == 0:
                 seed = np.random.randint(0, 2**31)
             else:
                 seed = 0
             
             # Match tensor device to backend
             device = "cuda" if dist.get_backend() == "nccl" else "cpu"
+            if device == "cuda":
+                torch.cuda.set_device(rank % torch.cuda.device_count())
+            
             seed_tensor = torch.tensor([seed], dtype=torch.int64, device=device)
+            # print(f"DEBUG: Rank {rank} entering RNG broadcast")
             dist.broadcast(seed_tensor, src=0)
+            # print(f"DEBUG: Rank {rank} exited RNG broadcast")
             global_seed = int(seed_tensor.item())
             rng_utils.set_random_seed(global_seed)
 
