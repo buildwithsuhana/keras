@@ -571,6 +571,7 @@ def compute_output_spec(fn, *args, **kwargs):
 
     def symbolic_call(fn, args, kwargs, fill_value):
         """Call `fn` to infer output shape and dtype."""
+        from keras.src.backend.torch import distribution_lib
         try:
             # First try instantiating all tensors on the `"meta"` device,
             # which  should give a "zero flop" way to trace shape, but does
@@ -579,6 +580,10 @@ def compute_output_spec(fn, *args, **kwargs):
                 meta_args, meta_kwargs = tree.map_structure(
                     lambda x: convert_keras_tensor_to_torch(x, fill_value),
                     (args, kwargs),
+                )
+                meta_args, meta_kwargs = tree.map_structure(
+                    distribution_lib.prepare_input_for_distribution,
+                    (meta_args, meta_kwargs),
                 )
                 return fn(*meta_args, **meta_kwargs)
         except:
@@ -589,6 +594,10 @@ def compute_output_spec(fn, *args, **kwargs):
                 eager_args, eager_kwargs = tree.map_structure(
                     lambda x: convert_keras_tensor_to_torch(x, fill_value),
                     (args, kwargs),
+                )
+                eager_args, eager_kwargs = tree.map_structure(
+                    distribution_lib.prepare_input_for_distribution,
+                    (eager_args, eager_kwargs),
                 )
                 return fn(*eager_args, **eager_kwargs)
 
