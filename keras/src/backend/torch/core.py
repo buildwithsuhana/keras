@@ -182,7 +182,29 @@ class Variable(KerasVariable):
         from keras.src.backend.torch import distribution_lib
 
         args = distribution_lib._sync_tensors(*args)
-        return func(*args, **kwargs)
+        try:
+            return func(*args, **kwargs)
+        except RuntimeError as e:
+            if (
+                "redistribution" in str(e)
+                or "sharding" in str(e).lower()
+                or "flatten sharded dimension" in str(e).lower()
+            ):
+                from torch.distributed.tensor import DTensor, Replicate
+
+                def _replicate(x):
+                    if isinstance(x, DTensor):
+                        return x.redistribute(
+                            x.device_mesh, [Replicate()] * x.device_mesh.ndim
+                        )
+                    return x
+
+                from keras.src import tree
+
+                args = tree.map_structure(_replicate, args)
+                kwargs = tree.map_structure(_replicate, kwargs)
+                return func(*args, **kwargs)
+            raise e
 
     def __array__(self, dtype=None):
         value = convert_to_numpy(self.value)

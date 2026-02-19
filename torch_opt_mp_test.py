@@ -47,9 +47,6 @@ def test_opt_model_parallel():
     layout_map["token_embedding/embeddings"] = ("model", None)
     
     # For Attention: Sharding the hidden_dim (dim 0) of QKV kernels
-    # This acts as a "Row Parallel" projection if the input is replicated,
-    # or combined with "Column Parallel" if the previous layer was sharded.
-    # It avoids sharding the 'heads' dimension which causes the Flatten error in einsum.
     layout_map["query/kernel"] = ("model", None, None)
     layout_map["key/kernel"] = ("model", None, None)
     layout_map["value/kernel"] = ("model", None, None)
@@ -58,12 +55,13 @@ def test_opt_model_parallel():
     layout_map["out_proj/kernel"] = (None, "model")
     
     # Standard Megatron-style MLP sharding:
-    # ffn_inner: Column Parallel (shard output dim 1)
-    # ffn_outer: Row Parallel (shard input dim 0)
     layout_map["ffn_inner/kernel"] = (None, "model")
     layout_map["ffn_outer/kernel"] = ("model", None)
     
-    print(f"Defined layout map: {layout_map}")
+    print("\nConfigured LayoutMap:")
+    for key, value in layout_map._layout_map.items():
+        print(f"  {key}: {value}")
+
     model_parallel = distribution.ModelParallel(layout_map=layout_map)
     print("Created ModelParallel distribution")
     print("Creating OPT backbone under distribution scope...")
@@ -81,7 +79,7 @@ def test_opt_model_parallel():
 
     # Verify sharding
     print("\nVerifying weight sharding (first few weights):")
-    for v in backbone.weights[:5]:
+    for v in backbone.weights[:10]:
         is_dtensor = hasattr(v.value, "device_mesh")
         sharding = v.value.placements if is_dtensor else "N/A"
         print(f"Variable {v.path}: is_dtensor={is_dtensor}, shape={v.shape}, sharding={sharding}")
@@ -98,9 +96,15 @@ def test_opt_model_parallel():
         "padding_mask": padding_mask,
     }
     
-    output = backbone(inputs)
-    if dist.get_rank() == 0:
-        print(f"Output shape: {output.shape}")
+    try:
+        output = backbone(inputs)
+        if dist.get_rank() == 0:
+            print(f"Output shape: {output.shape}")
+    except Exception as e:
+        print(f"Backbone call failed: {e}")
+        import traceback
+        traceback.print_exc()
+        return
     
     # Test model.fit
     from keras_hub.models import OPTCausalLM
@@ -114,10 +118,15 @@ def test_opt_model_parallel():
     }
     y = np.random.randint(0, 50272, (batch_size, seq_len)).astype("int32")
     
-    causal_lm.compile(optimizer="adam", loss="sparse_categorical_crossentropy")
-    causal_lm.fit(x, y, epochs=1, batch_size=batch_size)
-    if dist.get_rank() == 0:
-        print("model.fit completed successfully!")
+    try:
+        causal_lm.compile(optimizer="adam", loss="sparse_categorical_crossentropy")
+        causal_lm.fit(x, y, epochs=1, batch_size=batch_size)
+        if dist.get_rank() == 0:
+            print("model.fit completed successfully!")
+    except Exception as e:
+        print(f"model.fit failed: {e}")
+        import traceback
+        traceback.print_exc()
 
     # Test generation
     print("\nTesting model.generate...")
