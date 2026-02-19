@@ -43,16 +43,18 @@ def test_opt_model_parallel():
     # Simple layout map for OPT:
     layout_map = distribution.LayoutMap(mesh)
     
-    # Shard vocab (dim 0) - very safe
-    layout_map["token_embedding/embeddings"] = ("model", None)
+    # Shard hidden_dim (dim 1) - safer for embedding lookup
+    layout_map["token_embedding/embeddings"] = (None, "model")
+    layout_map["position_embedding/embeddings"] = (None, "model")
     
     # For Attention: Sharding the hidden_dim (dim 0) of QKV kernels
     layout_map["query/kernel"] = ("model", None, None)
     layout_map["key/kernel"] = ("model", None, None)
     layout_map["value/kernel"] = ("model", None, None)
     
-    # Column parallel for out_proj (shard output dimension)
-    layout_map["out_proj/kernel"] = (None, "model")
+    # Row parallel for out_proj (shard input dimension)
+    # Since previous Attention output is sharded on hidden_dim
+    layout_map["attention_output/kernel"] = ("model", None, None)
     
     # Standard Megatron-style MLP sharding:
     layout_map["ffn_inner/kernel"] = (None, "model")

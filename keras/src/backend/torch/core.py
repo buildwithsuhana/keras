@@ -157,7 +157,11 @@ class Variable(KerasVariable):
             try:
                 self.value.copy_(value)
             except Exception as e:
-                if "DTensor" in str(e) or isinstance(e, AssertionError):
+                if (
+                    "DTensor" in str(e)
+                    or "maskbuffer" in str(e).lower()
+                    or isinstance(e, AssertionError)
+                ):
                     # Fallback for mixed DTensor/Tensor copy
                     if hasattr(value, "to_local"):
                         self.value.copy_(value.to_local())
