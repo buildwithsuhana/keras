@@ -436,6 +436,12 @@ def convert_to_tensor(x, dtype=None, sparse=None, ragged=None):
     if device_mesh is not None and torch.distributed.is_initialized():
         from torch.distributed._tensor import Replicate
         
+        # Avoid promoting small 1D integer/bool tensors (likely shapes or metadata)
+        # to DTensor, as iterating over them (e.g. tuple(x)) will fail with
+        # "aten.unbind.int does not have a sharding strategy registered".
+        if x.ndim <= 1 and x.dtype in (torch.int32, torch.int64, torch.bool) and x.numel() <= 64:
+            return x
+
         # Ensure tensor is on the correct local device before creating DTensor.
         # It must match the device_mesh's device_type.
         if x.device.type != device_mesh.device_type:
@@ -806,7 +812,12 @@ def scatter(indices, values, shape):
 
     for i in range(indices.shape[0]):
         index = indices[i]
-        zeros[tuple(index)] += values[i]
+        # Use tolist() to avoid unbind issues with DTensor
+        if hasattr(index, "tolist"):
+            idx_tuple = tuple(index.tolist())
+        else:
+            idx_tuple = tuple(index)
+        zeros[idx_tuple] += values[i]
     return zeros
 
 
@@ -817,7 +828,12 @@ def scatter_update(inputs, indices, updates):
     indices = torch.transpose(indices, 0, 1)
 
     outputs = torch.clone(inputs)
-    outputs[tuple(indices)] = updates
+    # Use tolist() to avoid unbind issues with DTensor
+    if hasattr(indices, "tolist"):
+        idx_tuple = tuple(indices.tolist())
+    else:
+        idx_tuple = tuple(indices)
+    outputs[idx_tuple] = updates
     return outputs
 
 

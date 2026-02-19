@@ -589,6 +589,8 @@ def standardize_dtype(dtype):
 
 
 def standardize_shape(shape):
+    if hasattr(shape, "to_local"):
+        shape = shape.to_local()
     if not isinstance(shape, tuple):
         if shape is None:
             raise ValueError("Undefined shapes are not supported.")
