@@ -1115,22 +1115,25 @@ def _convert_structure(x, device_mesh=None, to_dtensor=True, gather_sharded=True
     rank = torch.distributed.get_rank() if torch.distributed.is_initialized() else 0
 
     if debug_mode:
-        print(f"DEBUG | [Rank {rank}] _convert_structure called: type(x)={type(x).__name__}, to_dtensor={to_dtensor}, x_is_dtensor={isinstance(x, DTensor)}")
+        print(f"DEBUG | [Rank {rank}] _convert_structure called: type(x)={type(x).__name__}, to_dtensor={to_dtensor}, x_is_dtensor={is_dtensor(x)}")
 
-    if isinstance(x, DTensor):
+    if is_dtensor(x):
         if not to_dtensor:
-            if gather_sharded and not all(isinstance(p, Replicate) for p in x.placements):
+            # Unwrap Parameter if needed
+            x_data = x.data if isinstance(x, torch.nn.Parameter) else x
+            
+            if gather_sharded and not all(isinstance(p, Replicate) for p in x_data.placements):
                 if torch.distributed.is_initialized():
-                    shard_dim = next((i for i, p in enumerate(x.placements) if isinstance(p, Shard)), None)
+                    shard_dim = next((i for i, p in enumerate(x_data.placements) if isinstance(p, Shard)), None)
                     if shard_dim is not None:
-                        local_tensor = x.to_local()
+                        local_tensor = x_data.to_local()
                         if local_tensor.requires_grad:
                             return _all_gather_with_grad(local_tensor, shard_dim)
                         else:
                             output = [torch.empty_like(local_tensor) for _ in range(torch.distributed.get_world_size())]
                             torch.distributed.all_gather(output, local_tensor.contiguous())
                             return torch.cat(output, dim=shard_dim)
-            return x.to_local()
+            return x_data.to_local()
         return x
 
     if isinstance(x, (torch.Tensor, np.ndarray)):
@@ -1201,22 +1204,20 @@ def _convert_structure(x, device_mesh=None, to_dtensor=True, gather_sharded=True
                 if debug_mode:
                     print(f"DEBUG | [Rank {rank}] _convert_structure: Promoting {type(x)} to DTensor")
                 
-                # Ensure we have a torch.Tensor on the correct local GPU
-                local_device = f"cuda:{torch.cuda.current_device()}"
+                # Convert numpy arrays or other types to torch tensor first
                 if isinstance(x, np.ndarray):
                     if x.dtype == np.uint32: x = x.astype(np.int64)
                     dtype = standardize_dtype(x.dtype)
                     if dtype == "bfloat16": 
                         x = x.astype(np.float32)
                         dtype = "bfloat16"
-                    local_tensor = torch.as_tensor(x, dtype=to_torch_dtype(dtype), device=local_device)
+                    local_tensor = torch.as_tensor(x, dtype=to_torch_dtype(dtype), device=get_device())
                 else:
-                    # Move standard tensor to local GPU if needed
-                    local_tensor = x.to(local_device) if x.device.type != "cuda" or x.device.index != torch.cuda.current_device() else x
+                    local_tensor = x
                 
                 # Inputs for ModelParallel must be Replicated across the mesh
                 placements = [Replicate()] * torch_device_mesh.mesh.ndim
-                return torch_distribute_tensor(local_tensor, torch_device_mesh, placements)
+                return dtensor_from_local(local_tensor, torch_device_mesh, placements)
 
         # Fallback for non-distributed (CPU / Single-process)
         if isinstance(x, np.ndarray):
@@ -1322,7 +1323,7 @@ def prepare_input_for_distribution(x):
         
         # Fallback to cached mesh if needed
         if torch_device_mesh is None:
-            torch_device_mesh = global_state.get_global_attribute("torch_device_mesh", None)
+            torch_device_mesh = _get_default_device_mesh()
         
         if torch_device_mesh is not None:
             # CRITICAL FIX: Convert input to DTensor with REPLICATE placement

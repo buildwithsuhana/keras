@@ -231,6 +231,9 @@ class Variable(KerasVariable):
             # If self._value is a DTensor (sharded or replicated), we must ensure
             # 'value' is compatible for copy_.
             if is_dtensor(self._value):
+                # Unwrap self._value to its data if it is a Parameter
+                self_data = self._value.data if isinstance(self._value, torch.nn.Parameter) else self._value
+                
                 # If value is also a DTensor, redistribute it to match self._value
                 if is_dtensor(value):
                     target_mesh = get_dtensor_mesh(self._value)
@@ -241,7 +244,7 @@ class Variable(KerasVariable):
                         # Redistribution might need data unwrap if it's a Parameter
                         v = value.data if isinstance(value, torch.nn.Parameter) else value
                         value = v.redistribute(target_mesh, target_placements)
-                    self._value.copy_(value)
+                    self_data.copy_(value)
                 else:
                     # value is a regular tensor.
                     # If it has the same shape as the GLOBAL DTensor, we should distribute/shard it.
@@ -258,7 +261,7 @@ class Variable(KerasVariable):
                         # Convert full regular tensor to DTensor matching self._value
                         from keras.src.backend.torch.distribution_lib import torch_distribute_tensor
                         value_dtensor = torch_distribute_tensor(value, target_mesh, target_placements)
-                        self._value.copy_(value_dtensor)
+                        self_data.copy_(value_dtensor)
                     else:
                         # value might be a local shard already.
                         self_local = dtensor_to_local(self._value)
@@ -392,151 +395,63 @@ def convert_to_tensor(x, dtype=None, sparse=None, ragged=None):
                 return dtensor_from_local(local_x, get_dtensor_mesh(x), get_dtensor_placements(x))
         return x
     
-    # CRITICAL FIX: Check if we're in ModelParallel multi-process mode
-    # In this mode, we SHOULD convert inputs to DTensors because:
-    # 1. Model weights are DTensors (sharded or replicated)
-    # 2. Inputs must also be DTensors to work with DTensor weights
-    # 3. Skipping conversion causes "aten.ge.Tensor: got mixed torch.Tensor and DTensor" errors
-    from keras.src.backend.torch import distribution_lib as torch_dist_lib
-    is_mp_multi_process = torch_dist_lib._MP_MULTI_PROCESS_STATE
-    
-    # Also check if distributed is initialized and if there's a cached MP mesh
-    is_mp_cached = False
-    if torch.distributed.is_initialized():
-        from keras.src.backend.common import global_state
-        cached_mesh = global_state.get_global_attribute("torch_device_mesh", None)
-        if cached_mesh is not None and hasattr(cached_mesh, 'mesh'):
-            # Check if it's a 1D mesh (which is what MP uses in multi-process)
-            if cached_mesh.mesh.ndim == 1:
-                is_mp_cached = True
-    
-    # DEBUG: Add debug logging for DTensor conversion
-    debug_mode = os.environ.get("KERAS_DISTRIBUTION_DEBUG", "0") == "1"
-    if debug_mode:
-        rank = 0
-        try:
-            import torch.distributed as dist
-            if dist.is_available() and dist.is_initialized():
-                rank = dist.get_rank()
-        except:
-            pass
-        print(f"DEBUG | [Rank {rank}] convert_to_tensor called: type(x)={type(x).__name__}, is_mp_multi_process={is_mp_multi_process}, is_mp_cached={is_mp_cached}, dist_init={torch.distributed.is_initialized()}")
-    
-    # FIXED: In ModelParallel multi-process mode, we SHOULD convert inputs to DTensors
-    # because model weights are DTensors and inputs must also be DTensors to avoid
-    # "got mixed torch.Tensor and DTensor" errors
-    
-    # Check if we have an active device mesh and should convert to DTensor
-    # This is critical for data parallel training where inputs must be DTensors
-    device_mesh = _get_default_device_mesh()
-    is_mp_distribution = False
-    try:
-        from keras.src.distribution.distribution_lib import distribution, ModelParallel
-        dist = distribution()
-        is_mp_distribution = isinstance(dist, ModelParallel)
-    except:
-        pass
-    
-    # DEBUG: Add debug logging for device mesh detection
-    if debug_mode:
-        print(f"DEBUG | [Rank {rank}] convert_to_tensor: device_mesh={device_mesh is not None}, is_mp_distribution={is_mp_distribution}")
-    
-    # CRITICAL FIX: Always promote tensors to DTensors when there's an active device mesh
-    # and distributed is initialized. This ensures internal tensors (like attention masks)
-    # created inside layer operations are DTensors, avoiding mixed tensor errors.
-    if device_mesh is not None and torch.distributed.is_initialized():
-        # Convert numpy arrays or other types to torch tensor first
+    # CRITICAL FIX: Ensure inputs are converted to torch.Tensor BEFORE promotion attempts.
+    # This handles scalars, lists, and numpy arrays uniformly.
+    if not isinstance(x, torch.Tensor):
+        if isinstance(x, Variable):
+            x = x.value
+        elif isinstance(x, (list, tuple)):
+            if len(x) > 0 and any(isinstance(xi, torch.Tensor) for xi in x):
+                x = torch.stack([convert_to_tensor(xi) for xi in x])
+            else:
+                x = np.array(x)
+        
         if isinstance(x, np.ndarray):
-            if x.dtype == np.uint32:
-                x = x.astype(np.int64)
+            if x.dtype == np.uint32: x = x.astype(np.int64)
             if standardize_dtype(x.dtype) == "bfloat16":
                 x = x.astype(np.float32)
-                dtype = "bfloat16"
+                dtype = dtype or "bfloat16"
             dtype = dtype or x.dtype
             
-            # CRITICAL FIX: In multi-process distributed training, each process has
-            # a different GPU visible as cuda:0 due to CUDA_VISIBLE_DEVICES isolation.
-            # We need to create the tensor on the correct local device, not CPU.
-            # Get the current local device from torch.cuda.current_device()
+            # Map device for tensor creation
             if torch.cuda.is_available() and torch.distributed.is_initialized() and get_device() != "meta":
-                # Use the current device (which is set correctly in initialize())
                 local_device = f"cuda:{torch.cuda.current_device()}"
             else:
                 local_device = get_device()
-            
-            if debug_mode:
-                print(f"DEBUG | [Rank {rank}] convert_to_tensor: converting np.ndarray to DTensor on device {local_device}")
-            
             x = torch.as_tensor(x, dtype=to_torch_dtype(dtype), device=local_device)
+        elif isinstance(x, (int, float, bool)):
+            if dtype is None:
+                dtype = torch.int32 if isinstance(x, int) else (torch.bool if isinstance(x, bool) else to_torch_dtype(floatx()))
+            else:
+                dtype = to_torch_dtype(dtype)
+            x = torch.as_tensor(x, dtype=dtype, device=get_device())
+        else:
+            # Fallback for other types
+            x = torch.as_tensor(x, device=get_device())
+            if dtype is not None:
+                x = x.to(to_torch_dtype(dtype))
+
+    # CRITICAL FIX: Now that x is a torch.Tensor, attempt DTensor promotion
+    device_mesh = _get_default_device_mesh()
+    if device_mesh is not None and torch.distributed.is_initialized():
+        from torch.distributed._tensor import Replicate
         
-        # Now convert to DTensor - this is the key fix for the mixed tensor error
-        if isinstance(x, torch.Tensor):
-            from torch.distributed._tensor import Replicate
-            
-            if debug_mode:
-                print(f"DEBUG | [Rank {rank}] convert_to_tensor: promoting torch.Tensor to DTensor with Replicate placement")
-            
-            # CRITICAL FIX: Ensure tensor is on the correct local device before creating DTensor
-            if x.device.type != "meta":
-                if torch.cuda.is_available() and torch.distributed.is_initialized():
+        # Ensure tensor is on the correct local device before creating DTensor.
+        # It must match the device_mesh's device_type.
+        if x.device.type != device_mesh.device_type:
+            if device_mesh.device_type == "meta":
+                x = x.to("meta")
+            elif device_mesh.device_type == "cuda":
+                if torch.cuda.is_available():
                     local_device = f"cuda:{torch.cuda.current_device()}"
                     if x.device.type != "cuda" or x.device.index != torch.cuda.current_device():
                         x = x.to(local_device)
-                elif x.device.type != "cpu":
-                    x = x.to("cpu")
-            
-            return dtensor_from_local(x, device_mesh, [Replicate()])
+            elif device_mesh.device_type == "cpu":
+                x = x.to("cpu")
+        
+        return dtensor_from_local(x, device_mesh, [Replicate()])
     
-    # If x is already a torch.Tensor but not converted above (not in MP mode),
-    # just return it as-is
-    if isinstance(x, torch.Tensor):
-        return x
-    
-    if isinstance(x, Variable):
-        x = x.value
-    
-    if is_tensor(x):
-        device = get_device()
-        if x.device != device:
-            if x.is_meta:
-                x = torch.empty_like(x, device=device)
-            else:
-                x = x.to(device)
-        if dtype is not None:
-            x = x.to(to_torch_dtype(dtype))
-        return x
-    
-    if dtype is None:
-        if isinstance(x, bool):
-            return torch.as_tensor(x, dtype=torch.bool, device=get_device())
-        elif isinstance(x, int):
-            return torch.as_tensor(x, dtype=torch.int32, device=get_device())
-        elif isinstance(x, float):
-            return torch.as_tensor(
-                x, dtype=to_torch_dtype(floatx()), device=get_device()
-            )
-
-    # Convert to np in case of any array-like that is not list or tuple.
-    if not isinstance(x, (list, tuple)):
-        x = np.array(x)
-    elif len(x) > 0 and any(isinstance(x1, torch.Tensor) for x1 in x):
-        # Handle list or tuple of torch tensors
-        return torch.stack([convert_to_tensor(x1) for x1 in x])
-    if isinstance(x, np.ndarray):
-        if x.dtype == np.uint32:
-            # Torch backend does not support uint32.
-            x = x.astype(np.int64)
-        if standardize_dtype(x.dtype) == "bfloat16":
-            # Torch backend does not support converting bfloat16 ndarray.
-            x = x.astype(np.float32)
-            dtype = "bfloat16"
-        dtype = dtype or x.dtype
-    if dtype is None:
-        dtype = result_type(
-            *[getattr(item, "dtype", type(item)) for item in tree.flatten(x)]
-        )
-    dtype = to_torch_dtype(dtype)
-    return torch.as_tensor(x, dtype=dtype, device=get_device())
+    return x
 
 
 def convert_to_numpy(x):
