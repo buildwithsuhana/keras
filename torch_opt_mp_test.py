@@ -80,11 +80,20 @@ def test_opt_model_parallel():
         )
 
     # Verify sharding
-    print("\nVerifying weight sharding (first few weights):")
-    for v in backbone.weights[:10]:
-        is_dtensor = hasattr(v.value, "device_mesh")
-        sharding = v.value.placements if is_dtensor else "N/A"
-        print(f"Variable {v.path}: is_dtensor={is_dtensor}, shape={v.shape}, sharding={sharding}")
+    print("\nVerifying weight sharding (Global vs Local):")
+    for v in backbone.weights:
+        if "transformer_layer_0/self_attention/query/kernel" in v.path or "token_embedding/embeddings" in v.path:
+            val = v.value
+            is_dtensor = hasattr(val, "device_mesh")
+            if is_dtensor:
+                # to_local() shows the actual data stored on this specific device
+                local_shape = val.to_local().shape
+                print(f"Variable {v.path}:")
+                print(f"  - Global shape: {tuple(val.shape)}")
+                print(f"  - Local shape:  {tuple(local_shape)}")
+                print(f"  - Placements:   {val.placements}")
+            else:
+                print(f"Variable {v.path}: is_dtensor=False, shape={tuple(val.shape)}")
 
     # Test call
     print("\nRunning test call...")
@@ -135,7 +144,7 @@ def test_opt_model_parallel():
     try:
         causal_lm.compile(optimizer="adam", loss="sparse_categorical_crossentropy")
         # For Torch distributed fit, we might need to ensure all ranks call fit simultaneously
-        causal_lm.fit(x, y, epochs=1, batch_size=batch_size)
+        causal_lm.fit(x, y, epochs=10, batch_size=batch_size)
         if dist.get_rank() == 0:
             print("model.fit completed successfully!")
     except Exception as e:

@@ -87,47 +87,36 @@ def einsum(subscripts, *operands, **kwargs):
             compute_dtype = config.floatx()
         # prevent overflow
         operands = [cast(operand, compute_dtype) for operand in operands]
-        try:
-            return cast(torch.einsum(subscripts, *operands), "int32")
-        except RuntimeError as e:
-            if "redistribution" in str(e) or "sharding" in str(e).lower():
-                from torch.distributed.tensor import Replicate
-
-                operands = [
-                    (
-                        op.redistribute(
-                            op.device_mesh, [Replicate()] * op.device_mesh.ndim
-                        )
-                        if isinstance(op, distribution_lib.DTensor)
-                        else op
-                    )
-                    for op in operands
-                ]
-                return cast(torch.einsum(subscripts, *operands), "int32")
-            raise e
-
-    try:
-        return torch.einsum(subscripts, *operands)
-    except RuntimeError as e:
-        if (
-            "redistribution" in str(e)
-            or "sharding" in str(e).lower()
-            or "flatten sharded dimension" in str(e).lower()
-        ):
-            from torch.distributed.tensor import Replicate
-
-            operands = [
-                (
-                    op.redistribute(
-                        op.device_mesh, [Replicate()] * op.device_mesh.ndim
-                    )
-                    if isinstance(op, distribution_lib.DTensor)
-                    else op
+        
+        # Proactively redistribute to Replicate to avoid sharding propagation
+        # failures in forward or backward pass.
+        from torch.distributed.tensor import Replicate
+        operands = [
+            (
+                op.redistribute(
+                    op.device_mesh, [Replicate()] * op.device_mesh.ndim
                 )
-                for op in operands
-            ]
-            return torch.einsum(subscripts, *operands)
-        raise e
+                if isinstance(op, distribution_lib.DTensor)
+                else op
+            )
+            for op in operands
+        ]
+        return cast(torch.einsum(subscripts, *operands), "int32")
+
+    # Proactively redistribute to Replicate to avoid sharding propagation
+    # failures in forward or backward pass.
+    from torch.distributed.tensor import Replicate
+    operands = [
+        (
+            op.redistribute(
+                op.device_mesh, [Replicate()] * op.device_mesh.ndim
+            )
+            if isinstance(op, distribution_lib.DTensor)
+            else op
+        )
+        for op in operands
+    ]
+    return torch.einsum(subscripts, *operands)
 
 
 def subtract(x1, x2):
@@ -198,7 +187,20 @@ def matmul(x1, x2):
 
     x1 = cast(x1, compute_dtype)
     x2 = cast(x2, compute_dtype)
-    return cast(torch.matmul(x1, x2), result_dtype)
+    try:
+        return cast(torch.matmul(x1, x2), result_dtype)
+    except RuntimeError:
+        from torch.distributed.tensor import Replicate
+
+        if isinstance(x1, distribution_lib.DTensor):
+            x1 = x1.redistribute(
+                x1.device_mesh, [Replicate()] * x1.device_mesh.ndim
+            )
+        if isinstance(x2, distribution_lib.DTensor):
+            x2 = x2.redistribute(
+                x2.device_mesh, [Replicate()] * x2.device_mesh.ndim
+            )
+        return cast(torch.matmul(x1, x2), result_dtype)
 
 
 def multiply(x1, x2):
@@ -1619,17 +1621,11 @@ def reshape(x, newshape):
     from keras.src.backend.torch import distribution_lib
 
     if isinstance(x, distribution_lib.DTensor):
-        try:
-            return torch.reshape(x, newshape)
-        except RuntimeError as e:
-            if "redistribution" in str(e) or "sharding" in str(e).lower():
-                from torch.distributed.tensor import Replicate
+        from torch.distributed.tensor import Replicate
 
-                x = x.redistribute(
-                    x.device_mesh, [Replicate()] * x.device_mesh.ndim
-                )
-                return torch.reshape(x, newshape)
-            raise e
+        # Proactively redistribute to Replicate to avoid sharding propagation
+        # failures in forward or backward pass (especially during flattening).
+        x = x.redistribute(x.device_mesh, [Replicate()] * x.device_mesh.ndim)
     return torch.reshape(x, newshape)
 
 

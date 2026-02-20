@@ -151,7 +151,7 @@ class Variable(KerasVariable):
         
         # DEBUG
         # if hasattr(value, "device_mesh") or hasattr(self.value, "device_mesh"):
-        #    print(f"DEBUG: _direct_assign self.value type={type(self.value)} is_dtensor={hasattr(self.value, 'device_mesh')}, value type={type(value)} is_dtensor={hasattr(value, 'device_mesh')}")
+        #    print(f"DEBUG: _direct_assign self.value type={type(self.value)} is_dtensor={hasattr(self.value, 'device_mesh')}, value type={type(value)} is_dtensor={hasattr(self.value, 'device_mesh')}")
 
         with torch.no_grad():
             try:
@@ -176,18 +176,41 @@ class Variable(KerasVariable):
     # Overload native accessor.
     @classmethod
     def __torch_function__(cls, func, types, args=(), kwargs=None):
-        args = [arg.value if isinstance(arg, Variable) else arg for arg in args]
         if kwargs is None:
             kwargs = {}
-        kwargs = {
-            key: value.value if isinstance(value, Variable) else value
-            for key, value in kwargs.items()
-        }
+
+        def _unwrap(x):
+            if isinstance(x, Variable):
+                return x.value
+            return x
+
+        unwrapped_args = tree.map_structure(_unwrap, args)
+        unwrapped_kwargs = tree.map_structure(_unwrap, kwargs)
+
         from keras.src.backend.torch import distribution_lib
 
-        args = distribution_lib._sync_tensors(*args)
+        # Proactive redistribution for view-related ops to avoid sharding
+        # propagation failures in backward pass (aten._unsafe_view).
+        is_view_op = False
+        if hasattr(func, "__name__"):
+            if func.__name__ in ("reshape", "view", "flatten"):
+                is_view_op = True
+        
+        if is_view_op:
+            from torch.distributed.tensor import DTensor, Replicate, Shard, Partial
+            def _replicate_if_needed(x):
+                if isinstance(x, DTensor):
+                    if any(isinstance(p, (Shard, Partial)) for p in x.placements):
+                        return x.redistribute(
+                            x.device_mesh, [Replicate()] * x.device_mesh.ndim
+                        )
+                return x
+            unwrapped_args = tree.map_structure(_replicate_if_needed, unwrapped_args)
+            unwrapped_kwargs = tree.map_structure(_replicate_if_needed, unwrapped_kwargs)
+
+        unwrapped_args = distribution_lib._sync_tensors(*unwrapped_args)
         try:
-            return func(*args, **kwargs)
+            return func(*unwrapped_args, **unwrapped_kwargs)
         except RuntimeError as e:
             if (
                 "redistribution" in str(e)
@@ -203,11 +226,9 @@ class Variable(KerasVariable):
                         )
                     return x
 
-                from keras.src import tree
-
-                args = tree.map_structure(_replicate, args)
-                kwargs = tree.map_structure(_replicate, kwargs)
-                return func(*args, **kwargs)
+                unwrapped_args = tree.map_structure(_replicate, unwrapped_args)
+                unwrapped_kwargs = tree.map_structure(_replicate, unwrapped_kwargs)
+                return func(*unwrapped_args, **unwrapped_kwargs)
             raise e
 
     def __array__(self, dtype=None):
@@ -680,12 +701,12 @@ def slice(inputs, start_indices, shape):
         shape = shape.tolist()
 
     python_slice = builtins.slice
-    slices = [
+    slices = tuple(
         python_slice(int(start), int(start) + int(length))
         if not is_tensor(start) and not is_tensor(length)
         else python_slice(start, start + length)
         for start, length in zip(start_indices, shape)
-    ]
+    )
     return inputs[slices]
 
 
@@ -702,12 +723,12 @@ def slice_update(inputs, start_indices, updates):
         start_indices = start_indices.tolist()
 
     python_slice = builtins.slice
-    slices = [
+    slices = tuple(
         python_slice(int(start), int(start) + int(length))
-        if not is_tensor(start)
+        if not is_tensor(start) and not is_tensor(length)
         else python_slice(start, start + length)
         for start, length in zip(start_indices, updates.shape)
-    ]
+    )
     outputs = torch.clone(inputs)
     outputs[slices] = updates
     return outputs

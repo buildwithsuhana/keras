@@ -1148,6 +1148,25 @@ def dot_product_attention(
 
     query, key, value = distribution_lib._sync_tensors(query, key, value)
 
+    if isinstance(query, distribution_lib.DTensor):
+        from torch.distributed.tensor import Replicate
+
+        query = query.redistribute(
+            query.device_mesh, [Replicate()] * query.device_mesh.ndim
+        )
+    if isinstance(key, distribution_lib.DTensor):
+        from torch.distributed.tensor import Replicate
+
+        key = key.redistribute(
+            key.device_mesh, [Replicate()] * key.device_mesh.ndim
+        )
+    if isinstance(value, distribution_lib.DTensor):
+        from torch.distributed.tensor import Replicate
+
+        value = value.redistribute(
+            value.device_mesh, [Replicate()] * value.device_mesh.ndim
+        )
+
     if len(query.shape) != 4 or len(key.shape) != 4 or len(value.shape) != 4:
         raise ValueError(
             "`dot_product_attention` only supports 4D inputs. "

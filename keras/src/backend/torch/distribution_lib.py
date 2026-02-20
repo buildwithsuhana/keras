@@ -108,19 +108,29 @@ def distribute_tensor(tensor, layout):
 
 def _sync_tensors(*tensors):
     """Ensure all tensors are DTensors if any of them is a DTensor."""
-    if get_device() == "meta":
-        return tensors
+    # Handle Variables by extracting their value. 
+    # We must do this before any other operation to avoid recursion
+    # in Variable.__torch_function__.
+    from keras.src.backend.torch.core import Variable
+    tensors = [t.value if isinstance(t, Variable) else t for t in tensors]
 
     has_dtensor = any(isinstance(t, DTensor) for t in tensors)
     if not has_dtensor:
         return tensors
     
+    # If we are in meta scope, avoid sync.
+    if any(isinstance(t, torch.Tensor) and t.is_meta for t in tensors):
+        return tensors
+
     ref_dtensor = next(t for t in tensors if isinstance(t, DTensor))
     mesh = ref_dtensor.device_mesh
     
+    from torch.distributed.tensor import Partial
     new_tensors = []
     for t in tensors:
         if isinstance(t, DTensor):
+            if any(isinstance(p, Partial) for p in t.placements):
+                t = t.redistribute(mesh, [Replicate()] * mesh.ndim)
             new_tensors.append(t)
         elif isinstance(t, torch.Tensor):
             if t.is_meta:
