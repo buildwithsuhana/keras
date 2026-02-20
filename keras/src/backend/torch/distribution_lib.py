@@ -91,6 +91,9 @@ def distribute_tensor(tensor, layout):
         if not isinstance(tensor, torch.Tensor):
             tensor = torch.as_tensor(tensor, device=get_device())
         
+        if get_device() == "meta":
+            return tensor
+
         # Ensure tensor is on the correct device for the mesh
         if tensor.device.type != torch_mesh.device_type:
             if tensor.is_meta:
@@ -105,6 +108,9 @@ def distribute_tensor(tensor, layout):
 
 def _sync_tensors(*tensors):
     """Ensure all tensors are DTensors if any of them is a DTensor."""
+    if get_device() == "meta":
+        return tensors
+
     has_dtensor = any(isinstance(t, DTensor) for t in tensors)
     if not has_dtensor:
         return tensors

@@ -668,32 +668,45 @@ def scatter_update(inputs, indices, updates):
 
 
 def slice(inputs, start_indices, shape):
-    shape_dtype = to_torch_dtype("int64")
     inputs = convert_to_tensor(inputs)
-    start_indices = convert_to_tensor(start_indices).to(shape_dtype)
-    shape = convert_to_tensor(shape).to(shape_dtype)
+    if not is_tensor(start_indices):
+        start_indices = [int(x) for x in start_indices]
+    elif not start_indices.is_meta:
+        start_indices = start_indices.tolist()
 
-    python_slice = __builtins__["slice"]
+    if not is_tensor(shape):
+        shape = [int(x) for x in shape]
+    elif not shape.is_meta:
+        shape = shape.tolist()
+
+    python_slice = builtins.slice
     slices = [
-        python_slice(start_index, start_index + length)
-        for start_index, length in zip(start_indices, shape)
+        python_slice(int(start), int(start) + int(length))
+        if not is_tensor(start) and not is_tensor(length)
+        else python_slice(start, start + length)
+        for start, length in zip(start_indices, shape)
     ]
     return inputs[slices]
 
 
 def slice_update(inputs, start_indices, updates):
-    shape_dtype = to_torch_dtype("int64")
     inputs = convert_to_tensor(inputs)
-    start_indices = convert_to_tensor(start_indices).to(shape_dtype)
     updates = convert_to_tensor(updates)
     from keras.src.backend.torch import distribution_lib
 
     inputs, updates = distribution_lib._sync_tensors(inputs, updates)
 
-    python_slice = __builtins__["slice"]
+    if not is_tensor(start_indices):
+        start_indices = [int(x) for x in start_indices]
+    elif not start_indices.is_meta:
+        start_indices = start_indices.tolist()
+
+    python_slice = builtins.slice
     slices = [
-        python_slice(start_index, start_index + update_length)
-        for start_index, update_length in zip(start_indices, updates.shape)
+        python_slice(int(start), int(start) + int(length))
+        if not is_tensor(start)
+        else python_slice(start, start + length)
+        for start, length in zip(start_indices, updates.shape)
     ]
     outputs = torch.clone(inputs)
     outputs[slices] = updates
