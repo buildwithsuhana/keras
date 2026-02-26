@@ -750,13 +750,25 @@ def one_hot(x, num_classes, axis=-1, dtype=None, sparse=False):
     # If axis is not last, change output to axis and shift remaining elements.
     x = convert_to_tensor(x, dtype=torch.long)
     zero = convert_to_tensor(0, dtype=torch.long)
+    from keras.src.backend.torch import distribution_lib
+
+    x, zero = distribution_lib._sync_tensors(x, zero)
 
     # Torch one_hot does not natively handle negative values, so we add some
     # manual handling for negatives in the input to one_hot by using max(x, 0).
     # The output will have some invalid results, so we set them back to 0 using
     # `where` afterwards.
-    output = tnn.one_hot(torch.clamp(x, min=0), num_classes)
-    output = where(expand_dims(x, axis=-1) >= 0, output, zero)
+    if isinstance(x, distribution_lib.DTensor):
+        from torch.distributed.tensor import DTensor
+
+        local_output = tnn.one_hot(torch.clamp(x.to_local(), min=0), num_classes)
+        output = DTensor.from_local(
+            local_output, x.device_mesh, x.placements, run_check=False
+        )
+    else:
+        output = tnn.one_hot(torch.clamp(x, min=0), num_classes)
+
+    output = where(expand_dims(x, axis=-1) >= zero, output, zero)
     output = convert_to_tensor(output, dtype=dtype)
     dims = output.dim()
     if axis != -1 and axis != dims:
@@ -1146,7 +1158,9 @@ def dot_product_attention(
     value = convert_to_tensor(value)
     from keras.src.backend.torch import distribution_lib
 
-    query, key, value = distribution_lib._sync_tensors(query, key, value)
+    query, key, value, mask, bias, scale = distribution_lib._sync_tensors(
+        query, key, value, mask, bias, scale
+    )
 
     if isinstance(query, distribution_lib.DTensor):
         from torch.distributed.tensor import Replicate
@@ -1206,6 +1220,18 @@ def dot_product_attention(
         _can_use_flash_attention(
             query, key, value, mask, is_causal, raise_error=True
         )
+    is_dtensor = isinstance(query, distribution_lib.DTensor)
+    if is_dtensor:
+        device_mesh = query.device_mesh
+        placements = query.placements
+        query = query.to_local()
+        key = key.to_local()
+        value = value.to_local()
+        if mask is not None:
+            mask = mask.to_local()
+        if isinstance(scale, distribution_lib.DTensor):
+            scale = scale.to_local()
+
     if flash_attention:
         with torch.nn.attention.sdpa_kernel(
             backends=[torch.nn.attention.SDPBackend.FLASH_ATTENTION],
@@ -1229,6 +1255,12 @@ def dot_product_attention(
             is_causal=is_causal,
             scale=scale,
         )
+
+    if is_dtensor:
+        attention_output = distribution_lib.DTensor.from_local(
+            attention_output, device_mesh, placements, run_check=False
+        )
+
     return torch.transpose(attention_output, axis1, axis0)
 
 

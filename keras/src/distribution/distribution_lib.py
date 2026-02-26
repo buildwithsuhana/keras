@@ -814,6 +814,7 @@ class LayoutMap(collections.abc.MutableMapping):
         Returns:
             Corresponding layout based on the query.
         """
+        key = key.replace(".", "/")
         if key in self._layout_map:
             return self._layout_map[key]
 

@@ -9,21 +9,30 @@ import keras
 keras.config.disable_traceback_filtering()
 from keras.distribution import DeviceMesh, LayoutMap, ModelParallel
 
-# Initialize distribution
-if "RANK" not in os.environ:
-    os.environ["MASTER_ADDR"] = "127.0.0.1"
-    os.environ["MASTER_PORT"] = "12355"
-    os.environ["GLOO_SOCKET_IFNAME"] = "lo0"
-    os.environ["RANK"] = "0"
-    os.environ["WORLD_SIZE"] = "1"
+def setup_dist():
+    if not dist.is_initialized():
+        if "RANK" not in os.environ:
+            os.environ["MASTER_ADDR"] = "127.0.0.1"
+            os.environ["MASTER_PORT"] = "12355"
+            os.environ["RANK"] = "0"
+            os.environ["WORLD_SIZE"] = "1"
+        
+        backend = "nccl" if torch.cuda.is_available() else "gloo"
+        if backend == "nccl":
+            local_rank = int(os.environ.get("LOCAL_RANK", 0))
+            torch.cuda.set_device(local_rank)
+        
+        dist.init_process_group(backend=backend)
 
-keras.distribution.initialize()
+setup_dist()
 
-world_size = int(os.environ.get("WORLD_SIZE", "1"))
-rank = int(os.environ.get("RANK", "0"))
+world_size = dist.get_world_size()
+rank = dist.get_rank()
 
-# Create a 2D mesh for testing
-mesh = DeviceMesh(shape=(1, world_size), axis_names=("batch", "model"))
+# Create a 2D mesh for testing. 
+# Use "cuda" if available, else "cpu"
+device_type = "cuda" if torch.cuda.is_available() else "cpu"
+mesh = DeviceMesh(shape=(1, world_size), axis_names=("batch", "model"), device_type=device_type)
 
 layout_map = LayoutMap(mesh)
 layout_map["dense_1/kernel"] = (None, "model")
@@ -35,7 +44,7 @@ distribution = ModelParallel(
 keras.distribution.set_distribution(distribution)
 
 if rank == 0:
-    print(f"World size: {world_size}")
+    print(f"World size: {world_size}, Device: {device_type}")
     print("Creating model under distribution scope...")
 
 with distribution.scope():
@@ -74,3 +83,5 @@ model.fit(x, y, epochs=2, batch_size=batch_size)
 
 if rank == 0:
     print("\nFit test completed successfully!")
+
+dist.destroy_process_group()

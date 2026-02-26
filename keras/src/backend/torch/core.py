@@ -84,6 +84,8 @@ def _parse_device_input(device_name):
         device_name = device_name.lower()
         if "gpu" in device_name:
             device_name = device_name.replace("gpu", "cuda")
+        if "tpu" in device_name:
+            device_name = device_name.replace("tpu", "xla")
     else:
         raise ValueError(
             "Invalid value for argument `device_name`. "
@@ -120,6 +122,10 @@ class Variable(KerasVariable):
                 self._layout = tensor_layout
             else:
                 self._layout = tensor_layout
+        
+        # DEBUG
+        # if self._layout is not None:
+        #    print(f"DEBUG: Variable {self.path} assigned layout {self._layout.axes}")
 
     def _initialize(self, value):
         self._shape = self._validate_shape(value.shape)
@@ -138,7 +144,20 @@ class Variable(KerasVariable):
             self._value = torch.nn.Parameter(
                 value,
                 requires_grad=requires_grad,
-            ).to(get_device())
+            )
+            # Avoid redundant .to() for DTensors which might trigger sync or strip sharding.
+            # We check both the object and its .data for sharding attributes.
+            is_sharded = (
+                getattr(value, "device_mesh", None) is not None or 
+                getattr(value, "placements", None) is not None or
+                (hasattr(value, "data") and (
+                    getattr(value.data, "device_mesh", None) is not None or 
+                    getattr(value.data, "placements", None) is not None
+                ))
+            )
+            if not is_sharded and self._value.device.type != torch.device(get_device()).type:
+                self._value = self._value.to(get_device())
+            
             if self._layout is not None and requires_grad:
                 self._value.retain_grad()
 
@@ -148,10 +167,6 @@ class Variable(KerasVariable):
             from keras.src.backend.torch import distribution_lib
 
             value = distribution_lib.distribute_variable(value, self._layout)
-        
-        # DEBUG
-        # if hasattr(value, "device_mesh") or hasattr(self.value, "device_mesh"):
-        #    print(f"DEBUG: _direct_assign self.value type={type(self.value)} is_dtensor={hasattr(self.value, 'device_mesh')}, value type={type(value)} is_dtensor={hasattr(self.value, 'device_mesh')}")
 
         with torch.no_grad():
             try:
@@ -689,46 +704,33 @@ def scatter_update(inputs, indices, updates):
 
 
 def slice(inputs, start_indices, shape):
+    shape_dtype = to_torch_dtype("int64")
     inputs = convert_to_tensor(inputs)
-    if not is_tensor(start_indices):
-        start_indices = [int(x) for x in start_indices]
-    elif not start_indices.is_meta:
-        start_indices = start_indices.tolist()
+    start_indices = convert_to_tensor(start_indices).to(shape_dtype)
+    shape = convert_to_tensor(shape).to(shape_dtype)
 
-    if not is_tensor(shape):
-        shape = [int(x) for x in shape]
-    elif not shape.is_meta:
-        shape = shape.tolist()
-
-    python_slice = builtins.slice
-    slices = tuple(
-        python_slice(int(start), int(start) + int(length))
-        if not is_tensor(start) and not is_tensor(length)
-        else python_slice(start, start + length)
-        for start, length in zip(start_indices, shape)
-    )
+    python_slice = __builtins__["slice"]
+    slices = [
+        python_slice(start_index, start_index + length)
+        for start_index, length in zip(start_indices, shape)
+    ]
     return inputs[slices]
 
 
 def slice_update(inputs, start_indices, updates):
+    shape_dtype = to_torch_dtype("int64")
     inputs = convert_to_tensor(inputs)
+    start_indices = convert_to_tensor(start_indices).to(shape_dtype)
     updates = convert_to_tensor(updates)
     from keras.src.backend.torch import distribution_lib
 
     inputs, updates = distribution_lib._sync_tensors(inputs, updates)
 
-    if not is_tensor(start_indices):
-        start_indices = [int(x) for x in start_indices]
-    elif not start_indices.is_meta:
-        start_indices = start_indices.tolist()
-
-    python_slice = builtins.slice
-    slices = tuple(
-        python_slice(int(start), int(start) + int(length))
-        if not is_tensor(start) and not is_tensor(length)
-        else python_slice(start, start + length)
-        for start, length in zip(start_indices, updates.shape)
-    )
+    python_slice = __builtins__["slice"]
+    slices = [
+        python_slice(start_index, start_index + update_length)
+        for start_index, update_length in zip(start_indices, updates.shape)
+    ]
     outputs = torch.clone(inputs)
     outputs[slices] = updates
     return outputs

@@ -27,6 +27,8 @@ def list_devices(device_type=None):
     if device_type is None:
         if torch.cuda.is_available():
             device_type = "cuda"
+        elif "xla" in get_device():
+            device_type = "xla"
         elif torch.backends.mps.is_available():
             device_type = "mps"
         else:
@@ -35,9 +37,17 @@ def list_devices(device_type=None):
     device_type = device_type.lower()
     if "gpu" in device_type:
         device_type = "cuda"
+    if "tpu" in device_type:
+        device_type = "xla"
 
     if device_type == "cuda":
         count = torch.cuda.device_count()
+    elif device_type == "xla":
+        try:
+            import torch_xla.core.xla_model as xm
+            count = len(xm.get_xla_supported_devices())
+        except ImportError:
+            count = 0
     elif device_type == "mps":
         count = 1 if torch.backends.mps.is_available() else 0
     else:
@@ -94,6 +104,29 @@ def distribute_tensor(tensor, layout):
         if get_device() == "meta":
             return tensor
 
+        # Optimization: use from_local to avoid unnecessary communication
+        # if the tensor is already on the correct device.
+        # This is safe for initializers and pre-sharded data.
+        if not isinstance(tensor, DTensor) and tensor.device.type == torch_mesh.device_type:
+            # For Shard, we need to slice the tensor locally
+            local_tensor = tensor
+            should_shard_locally = True
+            for i, placement in enumerate(placements):
+                if isinstance(placement, Shard):
+                    shard_dim = placement.dim
+                    num_chunks = torch_mesh.shape[i]
+                    if local_tensor.shape[shard_dim] % num_chunks != 0:
+                        should_shard_locally = False
+                        break
+                    
+                    # get_local_rank returns the rank of the current process 
+                    # within the specific mesh dimension.
+                    chunk_idx = torch_mesh.get_local_rank(mesh_dim=i)
+                    local_tensor = torch.chunk(local_tensor, num_chunks, dim=shard_dim)[chunk_idx]
+            
+            if should_shard_locally:
+                return DTensor.from_local(local_tensor, torch_mesh, placements)
+
         # Ensure tensor is on the correct device for the mesh
         if tensor.device.type != torch_mesh.device_type:
             if tensor.is_meta:
@@ -116,11 +149,11 @@ def _sync_tensors(*tensors):
 
     has_dtensor = any(isinstance(t, DTensor) for t in tensors)
     if not has_dtensor:
-        return tensors
-    
+        return tuple(tensors)
+
     # If we are in meta scope, avoid sync.
     if any(isinstance(t, torch.Tensor) and t.is_meta for t in tensors):
-        return tensors
+        return tuple(tensors)
 
     ref_dtensor = next(t for t in tensors if isinstance(t, DTensor))
     mesh = ref_dtensor.device_mesh
@@ -180,9 +213,19 @@ def initialize_rng():
                 seed = 0
             
             # Match tensor device to backend
-            device = "cuda" if dist.get_backend() == "nccl" else "cpu"
+            backend_name = dist.get_backend()
+            if backend_name == "nccl":
+                device = "cuda"
+            elif backend_name == "xla":
+                device = "xla"
+            else:
+                device = "cpu"
+            
             if device == "cuda":
                 torch.cuda.set_device(rank % torch.cuda.device_count())
+            elif device == "xla":
+                import torch_xla.core.xla_model as xm
+                device = xm.xla_device()
             
             seed_tensor = torch.tensor([seed], dtype=torch.int64, device=device)
             # print(f"DEBUG: Rank {rank} entering RNG broadcast")
@@ -211,10 +254,22 @@ def initialize(job_addresses, num_processes, process_id):
     if process_id is not None:
         os.environ["RANK"] = str(process_id)
         
-    backend = "nccl" if torch.cuda.is_available() else "gloo"
+    if torch.cuda.is_available():
+        backend = "nccl"
+    else:
+        try:
+            import torch_xla.core.xla_model as xm
+            backend = "xla"
+        except ImportError:
+            backend = "gloo"
+
     if backend == "nccl":
         local_rank = int(os.environ.get("LOCAL_RANK", 0))
         torch.cuda.set_device(local_rank)
+    elif backend == "xla":
+        import torch_xla.core.xla_model as xm
+        # This call implicitly sets the device
+        xm.xla_device()
 
     dist.init_process_group(backend=backend)
     
@@ -247,6 +302,9 @@ def _to_backend_mesh(device_mesh):
         device_type = device.split(":")[0]
     else:
         device_type = device
+    
+    if device_type == "mps":
+        device_type = "cpu"
     
     # In Torch, init_device_mesh handles process group creation if needed.
     return init_device_mesh(

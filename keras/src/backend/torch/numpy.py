@@ -427,26 +427,64 @@ def arctanh(x):
 
 def argmax(x, axis=None, keepdims=False):
     x = convert_to_tensor(x)
+    from keras.src.backend.torch import distribution_lib
+
+    is_dtensor = isinstance(x, distribution_lib.DTensor)
+    if is_dtensor:
+        from torch.distributed.tensor import DTensor, Replicate
+
+        mesh = x.device_mesh
+        x = x.redistribute(mesh, [Replicate()] * mesh.ndim).to_local()
 
     # TODO: torch.argmax doesn't support bool
     if standardize_dtype(x.dtype) == "bool":
         x = cast(x, "uint8")
 
-    return cast(torch.argmax(x, dim=axis, keepdim=keepdims), dtype="int32")
+    res = torch.argmax(x, dim=axis, keepdim=keepdims)
+
+    if is_dtensor:
+        return cast(
+            DTensor.from_local(res, mesh, [Replicate()] * mesh.ndim),
+            dtype="int32",
+        )
+    return cast(res, dtype="int32")
 
 
 def argmin(x, axis=None, keepdims=False):
     x = convert_to_tensor(x)
+    from keras.src.backend.torch import distribution_lib
+
+    is_dtensor = isinstance(x, distribution_lib.DTensor)
+    if is_dtensor:
+        from torch.distributed.tensor import DTensor, Replicate
+
+        mesh = x.device_mesh
+        x = x.redistribute(mesh, [Replicate()] * mesh.ndim).to_local()
 
     # TODO: torch.argmin doesn't support bool
     if standardize_dtype(x.dtype) == "bool":
         x = cast(x, "uint8")
 
-    return cast(torch.argmin(x, dim=axis, keepdim=keepdims), dtype="int32")
+    res = torch.argmin(x, dim=axis, keepdim=keepdims)
+
+    if is_dtensor:
+        return cast(
+            DTensor.from_local(res, mesh, [Replicate()] * mesh.ndim),
+            dtype="int32",
+        )
+    return cast(res, dtype="int32")
 
 
 def argsort(x, axis=-1):
     x = convert_to_tensor(x)
+    from keras.src.backend.torch import distribution_lib
+
+    is_dtensor = isinstance(x, distribution_lib.DTensor)
+    if is_dtensor:
+        from torch.distributed.tensor import DTensor, Replicate
+
+        mesh = x.device_mesh
+        x = x.redistribute(mesh, [Replicate()] * mesh.ndim).to_local()
 
     # TODO: torch.argsort doesn't support bool
     if standardize_dtype(x.dtype) == "bool":
@@ -455,7 +493,14 @@ def argsort(x, axis=-1):
     if axis is None:
         axis = -1
         x = x.reshape(-1)
-    return cast(torch.argsort(x, dim=axis, stable=True), dtype="int32")
+    res = torch.argsort(x, dim=axis, stable=True)
+
+    if is_dtensor:
+        return cast(
+            DTensor.from_local(res, mesh, [Replicate()] * mesh.ndim),
+            dtype="int32",
+        )
+    return cast(res, dtype="int32")
 
 
 def array(x, dtype=None):

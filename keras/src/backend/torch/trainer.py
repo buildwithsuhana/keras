@@ -485,7 +485,7 @@ class TorchTrainer(base_trainer.Trainer):
         self.make_train_function()
 
         logs = self.train_function([data])
-        logs = tree.map_structure(lambda x: np.array(x), logs)
+        logs = tree.map_structure(backend.convert_to_numpy, logs)
         if return_dict:
             return logs
         return self._flatten_metrics_in_order(logs)
@@ -506,7 +506,7 @@ class TorchTrainer(base_trainer.Trainer):
         self.make_test_function()
 
         logs = self.test_function([data])
-        logs = tree.map_structure(lambda x: np.array(x), logs)
+        logs = tree.map_structure(backend.convert_to_numpy, logs)
         if return_dict:
             return logs
         return self._flatten_metrics_in_order(logs)
