@@ -4,10 +4,6 @@ import numpy as np
 import keras
 import keras_hub
 
-# Force CPU for absolute parity on Mac
-os.environ["KERAS_DEVICE"] = "cpu"
-os.environ["KERAS_TORCH_DEVICE"] = "cpu"
-
 backend = os.environ.get("KERAS_BACKEND", "jax")
 keras.utils.set_random_seed(42)
 keras.config.disable_traceback_filtering()
@@ -17,9 +13,14 @@ from keras.src import ops
 
 def setup_dist():
     if backend == "torch":
+        import torch
         import torch.distributed as dist
         if not dist.is_initialized():
-            dist.init_process_group(backend="gloo")
+            dist_backend = "nccl" if torch.cuda.is_available() else "gloo"
+            if dist_backend == "nccl":
+                local_rank = int(os.environ.get("LOCAL_RANK", 0))
+                torch.cuda.set_device(local_rank)
+            dist.init_process_group(backend=dist_backend)
         return dist.get_rank(), dist.get_world_size()
     else:
         import jax

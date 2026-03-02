@@ -28,11 +28,10 @@ setup_dist()
 
 world_size = dist.get_world_size()
 rank = dist.get_rank()
+device_type = "cuda" if torch.cuda.is_available() else "cpu"
 
 # Create a 2D mesh for testing. 
-# Use "cuda" if available, else "cpu"
-device_type = "cuda" if torch.cuda.is_available() else "cpu"
-mesh = DeviceMesh(shape=(1, world_size), axis_names=("batch", "model"), device_type=device_type)
+mesh = DeviceMesh(shape=(1, world_size), axis_names=("batch", "model"))
 
 layout_map = LayoutMap(mesh)
 layout_map["dense_1/kernel"] = (None, "model")

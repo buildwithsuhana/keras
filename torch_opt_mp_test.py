@@ -1,13 +1,15 @@
 import os
+
+# Force Keras to use Torch backend
+os.environ["KERAS_BACKEND"] = "torch"
+
+# Prevent TensorFlow from grabbing all GPU memory if it gets imported
+os.environ["TF_FORCE_GPU_ALLOW_GROWTH"] = "true"
+
 import torch
 import torch.distributed as dist
 import keras
 import numpy as np
-
-# Force Keras to use Torch backend
-os.environ["KERAS_BACKEND"] = "torch"
-# Prevent TensorFlow from grabbing all GPU memory if it gets imported
-os.environ["TF_FORCE_GPU_ALLOW_GROWTH"] = "true"
 
 import tensorflow as tf
 tf.config.set_visible_devices([], 'GPU')
@@ -43,10 +45,8 @@ def test_opt_model_parallel():
     rank = dist.get_rank()
     
     # Define mesh and layout map
-    # Use "cuda" if available
-    device_type = "cuda" if torch.cuda.is_available() else "cpu"
-    mesh = distribution.DeviceMesh(shape=(world_size,), axis_names=("model",), device_type=device_type)
-    print(f"Created device mesh on {device_type}: {mesh}")
+    mesh = distribution.DeviceMesh(shape=(world_size,), axis_names=("model",))
+    print(f"Created device mesh: {mesh}")
     
     layout_map = distribution.LayoutMap(mesh)
     

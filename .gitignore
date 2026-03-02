@@ -20,4 +20,4 @@ examples/**/*.jpg
 .python-version
 .coverage
 *coverage.xml
-.ruff_cache
+.ruff_cache*.npy

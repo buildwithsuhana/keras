@@ -1158,9 +1158,7 @@ def dot_product_attention(
     value = convert_to_tensor(value)
     from keras.src.backend.torch import distribution_lib
 
-    query, key, value, mask, bias, scale = distribution_lib._sync_tensors(
-        query, key, value, mask, bias, scale
-    )
+    query, key, value = distribution_lib._sync_tensors(query, key, value)
 
     if isinstance(query, distribution_lib.DTensor):
         from torch.distributed.tensor import Replicate
@@ -1200,9 +1198,23 @@ def dot_product_attention(
     if mask is not None:
         # Explicit set `is_causal` to `False` when `mask` is not `None`.
         is_causal = False
+        if hasattr(query, "device_mesh") and not hasattr(mask, "device_mesh"):
+            from torch.distributed._tensor import Replicate
+            from torch.distributed._tensor import distribute_tensor
+
+            mask = distribute_tensor(
+                mask, query.device_mesh, [Replicate()] * query.device_mesh.ndim
+            )
         mask = torch.where(mask, 0.0, _get_large_negative(query.dtype))
     if bias is not None:
         bias = convert_to_tensor(bias, dtype=compute_dtype)
+        if hasattr(query, "device_mesh") and not hasattr(bias, "device_mesh"):
+            from torch.distributed._tensor import Replicate
+            from torch.distributed._tensor import distribute_tensor
+
+            bias = distribute_tensor(
+                bias, query.device_mesh, [Replicate()] * query.device_mesh.ndim
+            )
         mask = bias  # Use `bias` as `mask` for scaled_dot_product_attention.
 
     axis0, axis1 = 1, 2
@@ -1214,28 +1226,19 @@ def dot_product_attention(
         flash_attention = _can_use_flash_attention(
             query, key, value, mask, is_causal
         )
+
+
+        if flash_attention and hasattr(query, "device_mesh") and query.device.type == "cpu":
+             flash_attention = False
     elif flash_attention is True:
         # Use `raise_error=True` to provide more details if the inputs failed to
-        # use flash attention
+        # use flash attention 
         _can_use_flash_attention(
             query, key, value, mask, is_causal, raise_error=True
         )
-    is_dtensor = isinstance(query, distribution_lib.DTensor)
-    if is_dtensor:
-        device_mesh = query.device_mesh
-        placements = query.placements
-        query = query.to_local()
-        key = key.to_local()
-        value = value.to_local()
-        if mask is not None:
-            mask = mask.to_local()
-        if isinstance(scale, distribution_lib.DTensor):
-            scale = scale.to_local()
-
     if flash_attention:
-        with torch.nn.attention.sdpa_kernel(
-            backends=[torch.nn.attention.SDPBackend.FLASH_ATTENTION],
-        ):
+        backends = [torch.nn.attention.SDPBackend.FLASH_ATTENTION]
+        with torch.nn.attention.sdpa_kernel(backends=backends):
             attention_output = torch.nn.functional.scaled_dot_product_attention(
                 query,
                 key,
@@ -1247,20 +1250,20 @@ def dot_product_attention(
     else:
         if mask is not None:
             mask = mask.contiguous()
-        attention_output = torch.nn.functional.scaled_dot_product_attention(
-            query.contiguous(),
-            key.contiguous(),
-            value.contiguous(),
-            attn_mask=mask,
-            is_causal=is_causal,
-            scale=scale,
-        )
-
-    if is_dtensor:
-        attention_output = distribution_lib.DTensor.from_local(
-            attention_output, device_mesh, placements, run_check=False
-        )
-
+        
+        backends = [
+            torch.nn.attention.SDPBackend.MATH,
+            torch.nn.attention.SDPBackend.EFFICIENT_ATTENTION,
+        ]
+        with torch.nn.attention.sdpa_kernel(backends=backends):
+            attention_output = torch.nn.functional.scaled_dot_product_attention(
+                query.contiguous(),
+                key.contiguous(),
+                value.contiguous(),
+                attn_mask=mask,
+                is_causal=is_causal,
+                scale=scale,
+            )
     return torch.transpose(attention_output, axis1, axis0)
 
 
