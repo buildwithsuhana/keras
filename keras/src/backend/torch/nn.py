@@ -1253,8 +1253,12 @@ def dot_product_attention(
         
         backends = [
             torch.nn.attention.SDPBackend.MATH,
-            torch.nn.attention.SDPBackend.EFFICIENT_ATTENTION,
         ]
+        # Only use MATH backend for DTensor to avoid sharding propagation
+        # issues in EFFICIENT_ATTENTION (assert len(input_specs) == len(input_args_strategy)).
+        if not hasattr(query, "device_mesh"):
+            backends.append(torch.nn.attention.SDPBackend.EFFICIENT_ATTENTION)
+
         with torch.nn.attention.sdpa_kernel(backends=backends):
             attention_output = torch.nn.functional.scaled_dot_product_attention(
                 query.contiguous(),

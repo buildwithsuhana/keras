@@ -710,10 +710,12 @@ def slice(inputs, start_indices, shape):
     shape = convert_to_tensor(shape).to(shape_dtype)
 
     python_slice = __builtins__["slice"]
-    slices = [
-        python_slice(start_index, start_index + length)
-        for start_index, length in zip(start_indices, shape)
-    ]
+    slices = []
+    for start, length in zip(start_indices, shape):
+        if not inputs.is_meta:
+            slices.append(python_slice(int(start), int(start + length)))
+        else:
+            slices.append(python_slice(start, start + length))
     return inputs[slices]
 
 
