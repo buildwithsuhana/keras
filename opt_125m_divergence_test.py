@@ -16,12 +16,12 @@ def main():
     np.save("opt_padding_mask.npy", np.ones((batch_size, seq_len), dtype="int32"))
     np.save("opt_targets.npy", np.random.randn(batch_size, seq_len, hidden_dim).astype("float32"))
 
-    # 2. Run JAX (2 Simulated CPU Devices or GPUs)
-    print("\n--- Running JAX (2 devices) ---")
+    # 2. Run JAX (Simulated CPU Devices or GPUs)
+    num_devices = torch.cuda.device_count() if torch.cuda.is_available() else 2
+    print(f"\n--- Running JAX ({num_devices} devices) ---")
     env_jax = os.environ.copy()
     env_jax["KERAS_BACKEND"] = "jax"
-    # Force CPU for absolute parity on Mac
-    import torch
+    # Force CPU for absolute parity on Mac if no GPU
     if not torch.cuda.is_available():
         env_jax["KERAS_TORCH_DEVICE"] = "cpu"
         env_jax["KERAS_DEVICE"] = "cpu"
@@ -35,18 +35,18 @@ def main():
         subprocess.run(["python3", "opt_worker.py"], env=env_jax)
     else:
         # Fallback to simulated CPU devices
-        env_jax["XLA_FLAGS"] = "--xla_force_host_platform_device_count=2"
+        env_jax["XLA_FLAGS"] = f"--xla_force_host_platform_device_count={num_devices}"
         subprocess.run(["python3", "opt_worker.py"], env=env_jax)
 
-    # 3. Run Torch (2 Simulated Ranks)
-    print("\n--- Running Torch (2 ranks) ---")
+    # 3. Run Torch (Simulated Ranks)
+    print(f"\n--- Running Torch ({num_devices} ranks) ---")
     env_torch = os.environ.copy()
     env_torch["KERAS_BACKEND"] = "torch"
     if not torch.cuda.is_available():
         env_torch["KERAS_TORCH_DEVICE"] = "cpu"
         env_torch["KERAS_DEVICE"] = "cpu"
-    # Use torchrun to launch 2 ranks
-    subprocess.run(["torchrun", "--nproc_per_node=2", "opt_worker.py"], env=env_torch)
+    # Use torchrun to launch ranks
+    subprocess.run(["torchrun", f"--nproc_per_node={num_devices}", "opt_worker.py"], env=env_torch)
 
     # 4. Compare
     print("\n" + "="*40)
@@ -74,8 +74,8 @@ def main():
                 loss_diff = np.abs(jl - tl)
                 print(f"Loss: JAX={jl:.6f}, Torch={tl:.6f}, Diff={loss_diff:.2e}")
             
-            # Compare shards for both devices/ranks
-            for r in [0, 1]:
+            # Compare shards for all devices/ranks
+            for r in range(num_devices):
                 j_file = f"jax_opt_s{step}_rank{r}.npy"
                 t_file = f"torch_opt_s{step}_rank{r}.npy"
                 
