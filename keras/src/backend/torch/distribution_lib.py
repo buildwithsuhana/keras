@@ -139,45 +139,6 @@ def distribute_tensor(tensor, layout):
     return tensor
 
 
-def _sync_tensors(*tensors):
-    """Ensure all tensors are DTensors if any of them is a DTensor."""
-    # Handle Variables by extracting their value. 
-    # We must do this before any other operation to avoid recursion
-    # in Variable.__torch_function__.
-    from keras.src.backend.torch.core import Variable
-    tensors = [t.value if isinstance(t, Variable) else t for t in tensors]
-
-    has_dtensor = any(isinstance(t, DTensor) for t in tensors)
-    if not has_dtensor:
-        return tuple(tensors)
-
-    # If we are in meta scope, avoid sync.
-    if any(isinstance(t, torch.Tensor) and t.is_meta for t in tensors):
-        return tuple(tensors)
-
-    ref_dtensor = next(t for t in tensors if isinstance(t, DTensor))
-    mesh = ref_dtensor.device_mesh
-    
-    from torch.distributed.tensor import Partial
-    new_tensors = []
-    for t in tensors:
-        if isinstance(t, DTensor):
-            if any(isinstance(p, Partial) for p in t.placements):
-                t = t.redistribute(mesh, [Replicate()] * mesh.ndim)
-            new_tensors.append(t)
-        elif isinstance(t, torch.Tensor):
-            if t.is_meta:
-                t = torch.empty_like(t, device=mesh.device_type)
-            elif t.device.type != mesh.device_type:
-                t = t.to(mesh.device_type)
-            
-            # Default to replicating regular tensors
-            new_tensors.append(distribute_tensor_torch(t, mesh, [Replicate()] * mesh.ndim))
-        else:
-            new_tensors.append(t)
-    return tuple(new_tensors)
-
-
 def distribute_data_input(per_process_batch, layout, batch_dim_name):
     """Distribute the input data with the corresponding layout."""
     from keras.src.distribution import TensorLayout

@@ -752,8 +752,6 @@ def one_hot(x, num_classes, axis=-1, dtype=None, sparse=False):
     zero = convert_to_tensor(0, dtype=torch.long)
     from keras.src.backend.torch import distribution_lib
 
-    x, zero = distribution_lib._sync_tensors(x, zero)
-
     # Torch one_hot does not natively handle negative values, so we add some
     # manual handling for negatives in the input to one_hot by using max(x, 0).
     # The output will have some invalid results, so we set them back to 0 using
@@ -796,9 +794,6 @@ def multi_hot(x, num_classes, axis=-1, dtype=None, sparse=False):
 def categorical_crossentropy(target, output, from_logits=False, axis=-1):
     target = convert_to_tensor(target)
     output = convert_to_tensor(output)
-    from keras.src.backend.torch import distribution_lib
-
-    target, output = distribution_lib._sync_tensors(target, output)
 
     if target.shape != output.shape:
         raise ValueError(
@@ -825,9 +820,6 @@ def categorical_crossentropy(target, output, from_logits=False, axis=-1):
 def sparse_categorical_crossentropy(target, output, from_logits=False, axis=-1):
     target = convert_to_tensor(target, dtype=torch.long)
     output = convert_to_tensor(output)
-    from keras.src.backend.torch import distribution_lib
-
-    target, output = distribution_lib._sync_tensors(target, output)
 
     if len(target.shape) == len(output.shape) and target.shape[-1] == 1:
         target = torch.squeeze(target, dim=-1)
@@ -854,16 +846,12 @@ def sparse_categorical_crossentropy(target, output, from_logits=False, axis=-1):
         output = torch.clip(output, backend.epsilon(), 1.0 - backend.epsilon())
         log_prob = torch.log(output)
     target = one_hot(target, output.shape[axis], axis=axis)
-    target, log_prob = distribution_lib._sync_tensors(target, log_prob)
     return -torch.sum(target * log_prob, dim=axis)
 
 
 def binary_crossentropy(target, output, from_logits=False):
     target = convert_to_tensor(target)
     output = convert_to_tensor(output)
-    from keras.src.backend.torch import distribution_lib
-
-    target, output = distribution_lib._sync_tensors(target, output)
 
     # We only apply the squeeze fix if we are on an MPS device,
     # as this change breaks tests on other platforms that
@@ -1157,8 +1145,6 @@ def dot_product_attention(
     key = convert_to_tensor(key)
     value = convert_to_tensor(value)
     from keras.src.backend.torch import distribution_lib
-
-    query, key, value = distribution_lib._sync_tensors(query, key, value)
 
     if isinstance(query, distribution_lib.DTensor):
         from torch.distributed.tensor import Replicate

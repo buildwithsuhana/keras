@@ -215,7 +215,6 @@ class Variable(KerasVariable):
             unwrapped_args = tree.map_structure(redistribute_to_replicate, unwrapped_args)
             unwrapped_kwargs = tree.map_structure(redistribute_to_replicate, unwrapped_kwargs)
 
-        unwrapped_args = distribution_lib._sync_tensors(*unwrapped_args)
         try:
             return func(*unwrapped_args, **unwrapped_kwargs)
         except RuntimeError as e:
@@ -723,9 +722,7 @@ def scatter_update(inputs, indices, updates):
     inputs = convert_to_tensor(inputs)
     indices = convert_to_tensor(indices, dtype="int64")
     updates = convert_to_tensor(updates, dtype=inputs.dtype)
-    from keras.src.backend.torch import distribution_lib
 
-    inputs, updates = distribution_lib._sync_tensors(inputs, updates)
     indices = torch.transpose(indices, 0, 1)
 
     outputs = torch.clone(inputs)
@@ -754,9 +751,6 @@ def slice_update(inputs, start_indices, updates):
     inputs = convert_to_tensor(inputs)
     start_indices = convert_to_tensor(start_indices).to(shape_dtype)
     updates = convert_to_tensor(updates)
-    from keras.src.backend.torch import distribution_lib
-
-    inputs, updates = distribution_lib._sync_tensors(inputs, updates)
 
     python_slice = __builtins__["slice"]
     slices = [
