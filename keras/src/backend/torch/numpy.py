@@ -67,16 +67,13 @@ def rot90(array, k=1, axes=(0, 1)):
 def add(x1, x2):
     x1 = convert_to_tensor(x1)
     x2 = convert_to_tensor(x2)
-    from keras.src.backend.torch import distribution_lib
-    x1, x2 = distribution_lib._sync_tensors(x1, x2)
     return torch.add(x1, x2)
 
 
 def einsum(subscripts, *operands, **kwargs):
+    from keras.src.backend.torch.core import redistribute_to_replicate
     operands = [convert_to_tensor(operand) for operand in operands]
-    from keras.src.backend.torch import distribution_lib
-
-    operands = list(distribution_lib._sync_tensors(*operands))
+    operands = [redistribute_to_replicate(operand) for operand in operands]
     # When all operands are of int8, we cast the result to int32 to align with
     # the behavior of jax.
     dtypes_to_resolve = list(set(standardize_dtype(x.dtype) for x in operands))
@@ -87,43 +84,13 @@ def einsum(subscripts, *operands, **kwargs):
             compute_dtype = config.floatx()
         # prevent overflow
         operands = [cast(operand, compute_dtype) for operand in operands]
-        
-        # Proactively redistribute to Replicate to avoid sharding propagation
-        # failures in forward or backward pass.
-        from torch.distributed.tensor import Replicate
-        operands = [
-            (
-                op.redistribute(
-                    op.device_mesh, [Replicate()] * op.device_mesh.ndim
-                )
-                if isinstance(op, distribution_lib.DTensor)
-                else op
-            )
-            for op in operands
-        ]
         return cast(torch.einsum(subscripts, *operands), "int32")
-
-    # Proactively redistribute to Replicate to avoid sharding propagation
-    # failures in forward or backward pass.
-    from torch.distributed.tensor import Replicate
-    operands = [
-        (
-            op.redistribute(
-                op.device_mesh, [Replicate()] * op.device_mesh.ndim
-            )
-            if isinstance(op, distribution_lib.DTensor)
-            else op
-        )
-        for op in operands
-    ]
     return torch.einsum(subscripts, *operands)
 
 
 def subtract(x1, x2):
     x1 = convert_to_tensor(x1)
     x2 = convert_to_tensor(x2)
-    from keras.src.backend.torch import distribution_lib
-    x1, x2 = distribution_lib._sync_tensors(x1, x2)
     # TODO: torch.subtract doesn't support bool
     if standardize_dtype(x1.dtype) == "bool":
         x1 = cast(x1, x2.dtype)
@@ -135,8 +102,6 @@ def subtract(x1, x2):
 def matmul(x1, x2):
     x1 = convert_to_tensor(x1)
     x2 = convert_to_tensor(x2)
-    from keras.src.backend.torch import distribution_lib
-    x1, x2 = distribution_lib._sync_tensors(x1, x2)
 
     def can_use_int_matmul(x1, x2):
         # torch._int_mm only accepts the following conditions:
@@ -187,40 +152,23 @@ def matmul(x1, x2):
 
     x1 = cast(x1, compute_dtype)
     x2 = cast(x2, compute_dtype)
-    try:
-        return cast(torch.matmul(x1, x2), result_dtype)
-    except RuntimeError:
-        from torch.distributed.tensor import Replicate
-
-        if isinstance(x1, distribution_lib.DTensor):
-            x1 = x1.redistribute(
-                x1.device_mesh, [Replicate()] * x1.device_mesh.ndim
-            )
-        if isinstance(x2, distribution_lib.DTensor):
-            x2 = x2.redistribute(
-                x2.device_mesh, [Replicate()] * x2.device_mesh.ndim
-            )
-        return cast(torch.matmul(x1, x2), result_dtype)
+    return cast(torch.matmul(x1, x2), result_dtype)
 
 
 def multiply(x1, x2):
     x1 = convert_to_tensor(x1)
     x2 = convert_to_tensor(x2)
-    from keras.src.backend.torch import distribution_lib
-    x1, x2 = distribution_lib._sync_tensors(x1, x2)
     return torch.multiply(x1, x2)
 
 
 def mean(x, axis=None, keepdims=False):
-    # print(f"DEBUG mean: x={type(x)}, axis={axis}, keepdims={keepdims}")
     if isinstance(x, (list, tuple)):
         x = stack(x)
     x = convert_to_tensor(x)
     if axis == () or axis == []:
         # Torch handles the empty axis case differently from numpy.
         return x
-    if axis is not None:
-        axis = to_tuple_or_list(axis)
+    axis = to_tuple_or_list(axis)  # see [NB] below
 
     ori_dtype = standardize_dtype(x.dtype)
     # torch.mean only supports floating point inputs
@@ -230,19 +178,21 @@ def mean(x, axis=None, keepdims=False):
     else:
         result_dtype = ori_dtype
 
-    if axis is None:
-        result = torch.mean(
-            x,
-            keepdim=keepdims,
-            dtype=to_torch_dtype(compute_dtype),
-        )
-    else:
-        result = torch.mean(
-            x,
-            dim=axis,
-            keepdim=keepdims,
-            dtype=to_torch_dtype(compute_dtype),
-        )
+    # [NB] the python torch op torch.mean() is generated into
+    # `torch._C._VariableFunctions.pyi`, and the method
+    # signature is overloaded.
+    # Dynamo won't actually find the correct signature of
+    # `torch.mean()` if arguments are passed via kwargs
+    # So we have to pass the arguments via positional args
+    # EXCEPT for those that are forced as kwargs via the `*`
+    # delimiter in the overloaded method signatures.
+    # Additionally, we have to create a singleton-tuple
+    # when `axis` is an int to match the existing fn signature
+
+    # Cast input to compute dtype before mean to avoid dtype kwarg
+    # which causes issues with ONNX export (dtype kwarg not supported)
+    x = cast(x, compute_dtype)
+    result = torch.mean(x, axis, keepdims)
     return cast(result, result_dtype)
 
 
@@ -377,9 +327,10 @@ def arange(start, stop=None, step=None, dtype=None):
         start, stop = 0, start
     if step is None:
         step = 1
-    return torch.arange(
+    res = torch.arange(
         start, stop, step=step, dtype=dtype, device=get_device()
     )
+    return convert_to_tensor(res)
 
 
 def arccos(x):
@@ -427,64 +378,26 @@ def arctanh(x):
 
 def argmax(x, axis=None, keepdims=False):
     x = convert_to_tensor(x)
-    from keras.src.backend.torch import distribution_lib
-
-    is_dtensor = isinstance(x, distribution_lib.DTensor)
-    if is_dtensor:
-        from torch.distributed.tensor import DTensor, Replicate
-
-        mesh = x.device_mesh
-        x = x.redistribute(mesh, [Replicate()] * mesh.ndim).to_local()
 
     # TODO: torch.argmax doesn't support bool
     if standardize_dtype(x.dtype) == "bool":
         x = cast(x, "uint8")
 
-    res = torch.argmax(x, dim=axis, keepdim=keepdims)
-
-    if is_dtensor:
-        return cast(
-            DTensor.from_local(res, mesh, [Replicate()] * mesh.ndim),
-            dtype="int32",
-        )
-    return cast(res, dtype="int32")
+    return cast(torch.argmax(x, dim=axis, keepdim=keepdims), dtype="int32")
 
 
 def argmin(x, axis=None, keepdims=False):
     x = convert_to_tensor(x)
-    from keras.src.backend.torch import distribution_lib
-
-    is_dtensor = isinstance(x, distribution_lib.DTensor)
-    if is_dtensor:
-        from torch.distributed.tensor import DTensor, Replicate
-
-        mesh = x.device_mesh
-        x = x.redistribute(mesh, [Replicate()] * mesh.ndim).to_local()
 
     # TODO: torch.argmin doesn't support bool
     if standardize_dtype(x.dtype) == "bool":
         x = cast(x, "uint8")
 
-    res = torch.argmin(x, dim=axis, keepdim=keepdims)
-
-    if is_dtensor:
-        return cast(
-            DTensor.from_local(res, mesh, [Replicate()] * mesh.ndim),
-            dtype="int32",
-        )
-    return cast(res, dtype="int32")
+    return cast(torch.argmin(x, dim=axis, keepdim=keepdims), dtype="int32")
 
 
 def argsort(x, axis=-1):
     x = convert_to_tensor(x)
-    from keras.src.backend.torch import distribution_lib
-
-    is_dtensor = isinstance(x, distribution_lib.DTensor)
-    if is_dtensor:
-        from torch.distributed.tensor import DTensor, Replicate
-
-        mesh = x.device_mesh
-        x = x.redistribute(mesh, [Replicate()] * mesh.ndim).to_local()
 
     # TODO: torch.argsort doesn't support bool
     if standardize_dtype(x.dtype) == "bool":
@@ -493,14 +406,7 @@ def argsort(x, axis=-1):
     if axis is None:
         axis = -1
         x = x.reshape(-1)
-    res = torch.argsort(x, dim=axis, stable=True)
-
-    if is_dtensor:
-        return cast(
-            DTensor.from_local(res, mesh, [Replicate()] * mesh.ndim),
-            dtype="int32",
-        )
-    return cast(res, dtype="int32")
+    return cast(torch.argsort(x, dim=axis, stable=True), dtype="int32")
 
 
 def array(x, dtype=None):
@@ -863,6 +769,11 @@ def dot(x1, x2):
     return cast(torch.matmul(x1, x2), result_dtype)
 
 
+def dstack(xs):
+    xs = [convert_to_tensor(x) for x in xs]
+    return torch.dstack(xs)
+
+
 def empty(shape, dtype=None):
     dtype = to_torch_dtype(dtype or config.floatx())
     return torch.empty(size=shape, dtype=dtype, device=get_device())
@@ -876,8 +787,6 @@ def empty_like(x, dtype=None):
 
 def equal(x1, x2):
     x1, x2 = convert_to_tensor(x1), convert_to_tensor(x2)
-    from keras.src.backend.torch import distribution_lib
-    x1, x2 = distribution_lib._sync_tensors(x1, x2)
     return torch.eq(x1, x2)
 
 
@@ -905,6 +814,13 @@ def expand_dims(x, axis):
     for a in axis:
         x = torch.unsqueeze(x, dim=a)
     return x
+
+
+def flatten(x):
+    from keras.src.backend.torch.core import redistribute_to_replicate
+    x = convert_to_tensor(x)
+    x = redistribute_to_replicate(x)
+    return torch.flatten(x)
 
 
 def expm1(x):
@@ -960,23 +876,24 @@ def gcd(x1, x2):
 
 def greater(x1, x2):
     x1, x2 = convert_to_tensor(x1), convert_to_tensor(x2)
-    from keras.src.backend.torch import distribution_lib
-
-    x1, x2 = distribution_lib._sync_tensors(x1, x2)
     return torch.greater(x1, x2)
 
 
 def greater_equal(x1, x2):
     x1, x2 = convert_to_tensor(x1), convert_to_tensor(x2)
-    from keras.src.backend.torch import distribution_lib
-
-    x1, x2 = distribution_lib._sync_tensors(x1, x2)
     return torch.greater_equal(x1, x2)
 
 
 def hstack(xs):
     xs = [convert_to_tensor(x) for x in xs]
     return torch.hstack(xs)
+
+
+def hsplit(x, indices_or_sections):
+    x = convert_to_tensor(x)
+    if not isinstance(indices_or_sections, int):
+        indices_or_sections = convert_to_tensor(indices_or_sections).tolist()
+    return list(torch.hsplit(x, indices_or_sections))
 
 
 def hypot(x1, x2):
@@ -1019,7 +936,22 @@ def isclose(x1, x2, rtol=1e-5, atol=1e-8, equal_nan=False):
     result_dtype = dtypes.result_type(x1.dtype, x2.dtype)
     x1 = cast(x1, result_dtype)
     x2 = cast(x2, result_dtype)
-    return torch.isclose(x1, x2, rtol, atol, equal_nan)
+    if "float" in standardize_dtype(result_dtype):
+        return torch.isclose(x1, x2, rtol=rtol, atol=atol, equal_nan=equal_nan)
+    return torch.eq(x1, x2)
+
+
+def allclose(x1, x2, rtol=1e-5, atol=1e-8, equal_nan=False):
+    x1 = convert_to_tensor(x1)
+    x2 = convert_to_tensor(x2)
+    result_dtype = dtypes.result_type(x1.dtype, x2.dtype)
+    x1 = cast(x1, result_dtype)
+    x2 = cast(x2, result_dtype)
+    if "float" in standardize_dtype(result_dtype):
+        return torch.all(
+            torch.isclose(x1, x2, rtol=rtol, atol=atol, equal_nan=equal_nan)
+        )
+    return torch.all(torch.eq(x1, x2))
 
 
 def isfinite(x):
@@ -1097,17 +1029,11 @@ def ldexp(x1, x2):
 
 def less(x1, x2):
     x1, x2 = convert_to_tensor(x1), convert_to_tensor(x2)
-    from keras.src.backend.torch import distribution_lib
-
-    x1, x2 = distribution_lib._sync_tensors(x1, x2)
     return torch.less(x1, x2)
 
 
 def less_equal(x1, x2):
     x1, x2 = convert_to_tensor(x1), convert_to_tensor(x2)
-    from keras.src.backend.torch import distribution_lib
-
-    x1, x2 = distribution_lib._sync_tensors(x1, x2)
     return torch.less_equal(x1, x2)
 
 
@@ -1280,8 +1206,6 @@ def maximum(x1, x2):
     )
     x1 = convert_to_tensor(x1, dtype)
     x2 = convert_to_tensor(x2, dtype)
-    from keras.src.backend.torch import distribution_lib
-    x1, x2 = distribution_lib._sync_tensors(x1, x2)
     return torch.maximum(x1, x2)
 
 
@@ -1368,9 +1292,6 @@ def minimum(x1, x2):
     )
     x1 = convert_to_tensor(x1, dtype)
     x2 = convert_to_tensor(x2, dtype)
-    from keras.src.backend.torch import distribution_lib
-
-    x1, x2 = distribution_lib._sync_tensors(x1, x2)
     return torch.minimum(x1, x2)
 
 
@@ -1435,6 +1356,25 @@ def nanmin(x, axis=None, keepdims=False):
     )
 
 
+def nanprod(x, axis=None, keepdims=False):
+    x = convert_to_tensor(x)
+
+    if axis == () or axis == []:
+        return torch.nan_to_num(x, nan=1)
+
+    if isinstance(axis, (list, tuple)):
+        axis = sorted(axis, reverse=True)
+
+    if not torch.is_floating_point(x):
+        return prod(x, axis=axis, keepdims=keepdims)
+
+    return prod(
+        torch.where(torch.isnan(x), torch.ones((), dtype=x.dtype), x),
+        axis=axis,
+        keepdims=keepdims,
+    )
+
+
 def nansum(x, axis=None, keepdims=False):
     if isinstance(x, (list, tuple)):
         x = stack(x)
@@ -1447,6 +1387,30 @@ def nansum(x, axis=None, keepdims=False):
     if axis == () or axis == []:
         return cast(torch.nan_to_num(x, nan=0), dtype)
     return cast(torch.nansum(x, dim=axis, keepdim=keepdims), dtype)
+
+
+def nanvar(x, axis=None, keepdims=False):
+    x = convert_to_tensor(x)
+
+    result_dtype = dtypes.result_type(x.dtype, float)
+    x = cast(x, result_dtype)
+
+    if axis == () or axis == []:
+        return torch.where(torch.isnan(x), x, torch.zeros(()))
+
+    mean = nanmean(x, axis=axis, keepdims=True)
+
+    valid = ~torch.isnan(x)
+    centered = torch.where(valid, x - mean, torch.zeros_like(x))
+
+    if torch.is_complex(centered):
+        centered = centered.real * centered.real + centered.imag * centered.imag
+    else:
+        centered = centered.square()
+
+    count = valid.sum(dim=axis, keepdim=keepdims)
+    var = centered.sum(dim=axis, keepdim=keepdims) / count
+    return var
 
 
 def nan_to_num(x, nan=0.0, posinf=None, neginf=None):
@@ -1466,9 +1430,6 @@ def nonzero(x):
 
 def not_equal(x1, x2):
     x1, x2 = convert_to_tensor(x1), convert_to_tensor(x2)
-    from keras.src.backend.torch import distribution_lib
-
-    x1, x2 = distribution_lib._sync_tensors(x1, x2)
     return torch.not_equal(x1, x2)
 
 
@@ -1663,14 +1624,6 @@ def reshape(x, newshape):
     if not isinstance(newshape, (list, tuple)):
         newshape = (newshape,)
     x = convert_to_tensor(x)
-    from keras.src.backend.torch import distribution_lib
-
-    if isinstance(x, distribution_lib.DTensor):
-        from torch.distributed.tensor import Replicate
-
-        # Proactively redistribute to Replicate to avoid sharding propagation
-        # failures in forward or backward pass (especially during flattening).
-        x = x.redistribute(x.device_mesh, [Replicate()] * x.device_mesh.ndim)
     return torch.reshape(x, newshape)
 
 
@@ -1787,9 +1740,6 @@ def swapaxes(x, axis1, axis2):
 def take(x, indices, axis=None):
     x = convert_to_tensor(x)
     indices = convert_to_tensor(indices).long()
-    from keras.src.backend.torch import distribution_lib
-
-    x, indices = distribution_lib._sync_tensors(x, indices)
     # Correct the indices using "fill" mode which is the same as in jax
     x_dim = x.shape[axis] if axis is not None else x.shape[0]
     indices = torch.where(
@@ -1817,9 +1767,6 @@ def take(x, indices, axis=None):
 def take_along_axis(x, indices, axis=None):
     x = convert_to_tensor(x)
     indices = convert_to_tensor(indices).long()
-    from keras.src.backend.torch import distribution_lib
-
-    x, indices = distribution_lib._sync_tensors(x, indices)
     # Correct the indices using "fill" mode which is the same as in jax
     x_dim = x.shape[axis] if axis is not None else x.shape[0]
     indices = torch.where(
@@ -1843,9 +1790,6 @@ def tanh(x):
 def tensordot(x1, x2, axes=2):
     x1 = convert_to_tensor(x1)
     x2 = convert_to_tensor(x2)
-    from keras.src.backend.torch import distribution_lib
-
-    x1, x2 = distribution_lib._sync_tensors(x1, x2)
     result_dtype = dtypes.result_type(x1.dtype, x2.dtype)
     # TODO: torch.tensordot only supports float types
     compute_dtype = dtypes.result_type(result_dtype, float)
@@ -1956,6 +1900,13 @@ def vstack(xs):
     return torch.vstack(xs)
 
 
+def vsplit(x, indices_or_sections):
+    x = convert_to_tensor(x)
+    if not isinstance(indices_or_sections, int):
+        indices_or_sections = convert_to_tensor(indices_or_sections).tolist()
+    return list(torch.vsplit(x, indices_or_sections))
+
+
 def vectorize(pyfunc, *, excluded=None, signature=None):
     return vectorize_impl(
         pyfunc, torch.vmap, excluded=excluded, signature=signature
@@ -1967,16 +1918,8 @@ def where(condition, x1=None, x2=None):
     if x1 is not None and x2 is not None:
         x1 = convert_to_tensor(x1)
         x2 = convert_to_tensor(x2)
-        from keras.src.backend.torch import distribution_lib
-
-        condition, x1, x2 = distribution_lib._sync_tensors(condition, x1, x2)
         return torch.where(condition, x1, x2)
     else:
-        if hasattr(condition, "device_mesh"):
-            # If condition is DTensor, we need to ensure torch.where(condition) works
-            # or convert back to regular tensor if it's 1D indices?
-            # Actually torch.where(condition) returns a tuple of index tensors.
-            pass
         return torch.where(condition)
 
 
@@ -1985,9 +1928,6 @@ def divide(x1, x2):
         x1 = convert_to_tensor(x1)
     if not isinstance(x2, (int, float)):
         x2 = convert_to_tensor(x2)
-    from keras.src.backend.torch import distribution_lib
-
-    x1, x2 = distribution_lib._sync_tensors(x1, x2)
     return torch.divide(x1, x2)
 
 
@@ -1996,9 +1936,6 @@ def divide_no_nan(x1, x2):
         x1 = convert_to_tensor(x1)
     if not isinstance(x2, (int, float)):
         x2 = convert_to_tensor(x2)
-    from keras.src.backend.torch import distribution_lib
-
-    x1, x2 = distribution_lib._sync_tensors(x1, x2)
     return torch.where(x2 == 0, 0, torch.divide(x1, x2))
 
 
@@ -2008,9 +1945,6 @@ def true_divide(x1, x2):
 
 def power(x1, x2):
     x1, x2 = convert_to_tensor(x1), convert_to_tensor(x2)
-    from keras.src.backend.torch import distribution_lib
-
-    x1, x2 = distribution_lib._sync_tensors(x1, x2)
     return torch.pow(x1, x2)
 
 
@@ -2139,9 +2073,6 @@ def floor_divide(x1, x2):
 
 def logical_xor(x1, x2):
     x1, x2 = convert_to_tensor(x1), convert_to_tensor(x2)
-    from keras.src.backend.torch import distribution_lib
-
-    x1, x2 = distribution_lib._sync_tensors(x1, x2)
     return torch.logical_xor(x1, x2)
 
 
@@ -2206,13 +2137,8 @@ def correlate(x1, x2, mode="valid"):
 def select(condlist, choicelist, default=0):
     condlist = [convert_to_tensor(c) for c in condlist]
     choicelist = [convert_to_tensor(c) for c in choicelist]
-    from keras.src.backend.torch import distribution_lib
-
-    condlist = list(distribution_lib._sync_tensors(*condlist))
-    choicelist = list(distribution_lib._sync_tensors(*choicelist))
     out = convert_to_tensor(default)
     for c, v in reversed(list(zip(condlist, choicelist))):
-        c, v, out = distribution_lib._sync_tensors(c, v, out)
         out = torch.where(c, v, out)
     return out
 

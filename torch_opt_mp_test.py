@@ -2,6 +2,7 @@ import os
 
 # Force Keras to use Torch backend
 os.environ["KERAS_BACKEND"] = "torch"
+os.environ["KERAS_TORCH_DEVICE"] = "cpu"
 
 # Prevent TensorFlow from grabbing all GPU memory if it gets imported
 os.environ["TF_FORCE_GPU_ALLOW_GROWTH"] = "true"
@@ -10,9 +11,6 @@ import torch
 import torch.distributed as dist
 import keras
 import numpy as np
-
-import tensorflow as tf
-tf.config.set_visible_devices([], 'GPU')
 
 keras.config.disable_traceback_filtering()
 from keras.src import distribution
@@ -60,21 +58,21 @@ def test_opt_model_parallel():
     layout_map[".*ffn_inner/kernel"] = (None, "model")
     layout_map[".*ffn_outer/kernel"] = ("model", None)
     
-    model_parallel = distribution.ModelParallel(layout_map=layout_map)
+    model_parallel = distribution.ModelParallel(layout_map=layout_map, auto_shard_dataset=False)
     print("Created ModelParallel distribution")
+    distribution.set_distribution(model_parallel)
     
     print("Creating OPT backbone under distribution scope...")
-    with model_parallel.scope():
-        from keras_hub.models import OPTBackbone
-        # Smallest OPT for testing
-        backbone = OPTBackbone(
-            vocabulary_size=50272,
-            num_layers=1,
-            num_heads=12,
-            hidden_dim=768,
-            intermediate_dim=3072,
-            max_sequence_length=2048,
-        )
+    from keras_hub.models import OPTBackbone
+    # Smallest OPT for testing
+    backbone = OPTBackbone(
+        vocabulary_size=50272,
+        num_layers=1,
+        num_heads=12,
+        hidden_dim=768,
+        intermediate_dim=3072,
+        max_sequence_length=2048,
+    )
 
     # Verify sharding
     print(f"\n[Rank {rank}] Verifying weight sharding:")
@@ -97,16 +95,25 @@ def test_opt_model_parallel():
     token_ids = np.random.randint(0, 50272, (batch_size, seq_len)).astype("int32")
     padding_mask = np.ones((batch_size, seq_len), dtype="int32")
     
+    # Pre-distribute inputs to test DTensor input handling
+    from keras.src.backend.torch.distribution_lib import distribute_tensor
+    # Shard batch on 'model' axis
+    data_layout = distribution.TensorLayout(("model", None), mesh)
+    
+    token_ids_dt = distribute_tensor(torch.as_tensor(token_ids), data_layout)
+    padding_mask_dt = distribute_tensor(torch.as_tensor(padding_mask), data_layout)
+    
     inputs = {
-        "token_ids": token_ids,
-        "padding_mask": padding_mask,
+        "token_ids": token_ids_dt,
+        "padding_mask": padding_mask_dt,
     }
     
-    print("\nRunning test call...")
+    print("\nRunning test call with DTensor inputs...")
     try:
         output = backbone(inputs)
         if rank == 0:
             print(f"Output shape: {output.shape}")
+            print(f"Output type: {type(output)}")
     except Exception as e:
         print(f"Backbone call failed: {e}")
         import traceback
@@ -115,27 +122,31 @@ def test_opt_model_parallel():
     
     # Test model.fit
     from keras_hub.models import OPTCausalLM
-    with model_parallel.scope():
-        causal_lm = OPTCausalLM(backbone=backbone)
+    causal_lm = OPTCausalLM(backbone=backbone)
 
-    print("\nTesting model.fit...")
+    print("\nTesting model.fit with DTensor inputs...")
     total_batch = batch_size * world_size
-    x_full = {
-        "token_ids": np.random.randint(0, 50272, (total_batch, seq_len)).astype("int32"),
-        "padding_mask": np.ones((total_batch, seq_len), dtype="int32"),
-    }
-    y_full = np.random.randint(0, 50272, (total_batch, seq_len)).astype("int32")
     
-    x = {
-        "token_ids": x_full["token_ids"][rank*batch_size:(rank+1)*batch_size],
-        "padding_mask": x_full["padding_mask"][rank*batch_size:(rank+1)*batch_size],
+    # For model.fit, we can also pass DTensors directly
+    x_dt = {
+        "token_ids": distribute_tensor(
+            torch.as_tensor(np.random.randint(0, 50272, (total_batch, seq_len)).astype("int32")),
+            data_layout
+        ),
+        "padding_mask": distribute_tensor(
+            torch.as_tensor(np.ones((total_batch, seq_len), dtype="int32")),
+            data_layout
+        ),
     }
-    y = y_full[rank*batch_size:(rank+1)*batch_size]
+    y_dt = distribute_tensor(
+        torch.as_tensor(np.random.randint(0, 50272, (total_batch, seq_len)).astype("int32")),
+        data_layout
+    )
     
     try:
         causal_lm.compile(optimizer="adam", loss="sparse_categorical_crossentropy")
         verbose = 1 if rank == 0 else 0
-        causal_lm.fit(x, y, epochs=2, batch_size=batch_size, verbose=verbose)
+        causal_lm.fit(x_dt, y_dt, epochs=2, batch_size=total_batch, verbose=verbose)
         if rank == 0:
             print("model.fit completed successfully!")
     except Exception as e:
@@ -143,6 +154,7 @@ def test_opt_model_parallel():
         import traceback
         traceback.print_exc()
 
+    distribution.set_distribution(None)
     dist.destroy_process_group()
 
 if __name__ == "__main__":

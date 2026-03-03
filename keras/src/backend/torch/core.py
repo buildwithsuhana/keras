@@ -208,20 +208,12 @@ class Variable(KerasVariable):
         # propagation failures in backward pass (aten._unsafe_view).
         is_view_op = False
         if hasattr(func, "__name__"):
-            if func.__name__ in ("reshape", "view", "flatten"):
+            if func.__name__ in ("reshape", "view", "flatten", "transpose", "permute"):
                 is_view_op = True
         
         if is_view_op:
-            from torch.distributed.tensor import DTensor, Replicate, Shard, Partial
-            def _replicate_if_needed(x):
-                if isinstance(x, DTensor):
-                    if any(isinstance(p, (Shard, Partial)) for p in x.placements):
-                        return x.redistribute(
-                            x.device_mesh, [Replicate()] * x.device_mesh.ndim
-                        )
-                return x
-            unwrapped_args = tree.map_structure(_replicate_if_needed, unwrapped_args)
-            unwrapped_kwargs = tree.map_structure(_replicate_if_needed, unwrapped_kwargs)
+            unwrapped_args = tree.map_structure(redistribute_to_replicate, unwrapped_args)
+            unwrapped_kwargs = tree.map_structure(redistribute_to_replicate, unwrapped_kwargs)
 
         unwrapped_args = distribution_lib._sync_tensors(*unwrapped_args)
         try:
@@ -232,17 +224,8 @@ class Variable(KerasVariable):
                 or "sharding" in str(e).lower()
                 or "flatten sharded dimension" in str(e).lower()
             ):
-                from torch.distributed.tensor import DTensor, Replicate
-
-                def _replicate(x):
-                    if isinstance(x, DTensor):
-                        return x.redistribute(
-                            x.device_mesh, [Replicate()] * x.device_mesh.ndim
-                        )
-                    return x
-
-                unwrapped_args = tree.map_structure(_replicate, unwrapped_args)
-                unwrapped_kwargs = tree.map_structure(_replicate, unwrapped_kwargs)
+                unwrapped_args = tree.map_structure(redistribute_to_replicate, unwrapped_args)
+                unwrapped_kwargs = tree.map_structure(redistribute_to_replicate, unwrapped_kwargs)
                 return func(*unwrapped_args, **unwrapped_kwargs)
             raise e
 
@@ -304,11 +287,57 @@ class Variable(KerasVariable):
             return False
 
 
+def _maybe_distribute(res):
+    from keras.src.backend.torch.distribution_lib import DTensor
+    if not isinstance(res, DTensor):
+        from keras.src.distribution import distribution_lib
+        dist = distribution_lib.distribution()
+        if dist is not None:
+            from keras.src.backend.torch.distribution_lib import distribute_tensor
+            from keras.src.distribution import TensorLayout
+            # Default to replication for new constants/inputs
+            layout = TensorLayout([None] * len(res.shape), dist.device_mesh)
+            return distribute_tensor(res, layout)
+    return res
+
+
+def redistribute_to_replicate(x):
+    import torch
+    from keras.src.backend.torch.distribution_lib import DTensor, Replicate
+    if isinstance(x, Variable):
+        x = x.value
+    if isinstance(x, DTensor):
+        # Always redistribute if not all placements are Replicate
+        all_replicate = True
+        for p in x.placements:
+            if not isinstance(p, Replicate):
+                all_replicate = False
+                break
+        if not all_replicate:
+            # print(f"DEBUG: Redistributing tensor of shape {tuple(x.shape)} from {x.placements} to Replicate", flush=True)
+            return x.redistribute(x.device_mesh, [Replicate()] * x.device_mesh.ndim)
+    elif hasattr(x, "device_mesh") and hasattr(x, "placements"):
+        # Handle cases where it might be a DTensor-like but not isinstance(DTensor)
+        # (e.g. if multiple DTensor types exist due to imports)
+        from torch.distributed.tensor import Replicate as TorchReplicate
+        all_replicate = True
+        for p in x.placements:
+            if not isinstance(p, (Replicate, TorchReplicate)):
+                all_replicate = False
+                break
+        if not all_replicate:
+            # print(f"DEBUG: Redistributing DTensor-like of shape {tuple(x.shape)} from {x.placements} to Replicate", flush=True)
+            from torch.distributed.tensor import Replicate as TorchReplicate
+            return x.redistribute(x.device_mesh, [TorchReplicate()] * x.device_mesh.ndim)
+    return x
+
+
 def convert_to_tensor(x, dtype=None, sparse=None, ragged=None):
     if sparse:
         raise ValueError("`sparse=True` is not supported with torch backend")
     if ragged:
         raise ValueError("`ragged=True` is not supported with torch backend")
+
     if isinstance(x, Variable) or is_tensor(x):
         if isinstance(x, Variable):
             x = x.value
@@ -320,23 +349,23 @@ def convert_to_tensor(x, dtype=None, sparse=None, ragged=None):
                 x = x.to(device)
         if dtype is not None:
             x = x.to(to_torch_dtype(dtype))
-        return x
+        return _maybe_distribute(x)
     if dtype is None:
         if isinstance(x, bool):
-            return torch.as_tensor(x, dtype=torch.bool, device=get_device())
+            return _maybe_distribute(torch.as_tensor(x, dtype=torch.bool, device=get_device()))
         elif isinstance(x, int):
-            return torch.as_tensor(x, dtype=torch.int32, device=get_device())
+            return _maybe_distribute(torch.as_tensor(x, dtype=torch.int32, device=get_device()))
         elif isinstance(x, float):
-            return torch.as_tensor(
+            return _maybe_distribute(torch.as_tensor(
                 x, dtype=to_torch_dtype(floatx()), device=get_device()
-            )
+            ))
 
     # Convert to np in case of any array-like that is not list or tuple.
     if not isinstance(x, (list, tuple)):
         x = np.array(x)
     elif len(x) > 0 and any(isinstance(x1, torch.Tensor) for x1 in x):
         # Handle list or tuple of torch tensors
-        return torch.stack([convert_to_tensor(x1) for x1 in x])
+        return _maybe_distribute(torch.stack([convert_to_tensor(x1) for x1 in x]))
     if isinstance(x, np.ndarray):
         if x.dtype == np.uint32:
             # Torch backend does not support uint32.
@@ -351,7 +380,7 @@ def convert_to_tensor(x, dtype=None, sparse=None, ragged=None):
             *[getattr(item, "dtype", type(item)) for item in tree.flatten(x)]
         )
     dtype = to_torch_dtype(dtype)
-    return torch.as_tensor(x, dtype=dtype, device=get_device())
+    return _maybe_distribute(torch.as_tensor(x, dtype=dtype, device=get_device()))
 
 
 def convert_to_numpy(x):
@@ -422,11 +451,12 @@ def compute_output_spec(fn, *args, **kwargs):
                 for i, e in enumerate(shape):
                     if e is None:
                         shape[i] = fill_value
-            return torch.ones(
+            res = torch.ones(
                 size=shape,
                 dtype=TORCH_DTYPES[x.dtype],
                 device=get_device(),
             )
+            return _maybe_distribute(res)
         return x
 
     def convert_torch_to_keras_tensor(x):
@@ -716,7 +746,7 @@ def slice(inputs, start_indices, shape):
             slices.append(python_slice(int(start), int(start + length)))
         else:
             slices.append(python_slice(start, start + length))
-    return inputs[slices]
+    return inputs[tuple(slices)]
 
 
 def slice_update(inputs, start_indices, updates):
