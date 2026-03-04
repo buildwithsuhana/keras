@@ -101,9 +101,6 @@ def distribute_tensor(tensor, layout):
         if not isinstance(tensor, torch.Tensor):
             tensor = torch.as_tensor(tensor, device=get_device())
         
-        if get_device() == "meta":
-            return tensor
-
         # Optimization: use from_local to avoid unnecessary communication
         # if the tensor is already on the correct device.
         # This is safe for initializers and pre-sharded data.

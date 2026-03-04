@@ -26,17 +26,6 @@ def setup_dist():
         import jax
         return jax.process_index(), jax.device_count()
 
-def get_weight_slice(model, rank):
-    for v in model.weights:
-        if "query/kernel" in v.path:
-            val = v.value
-            if hasattr(val, "to_local"): # Torch DTensor
-                return val.to_local().detach().cpu().numpy()
-            elif hasattr(val, "addressable_data"): # JAX sharded array
-                return np.array(val.addressable_data(rank))
-            return np.array(val)
-    return None
-
 def run_test():
     rank, world_size = setup_dist()
     
@@ -63,7 +52,7 @@ def run_test():
         model = backbone
         
         model.compile(
-            optimizer=keras.optimizers.Adam(learning_rate=1e-4),
+            optimizer=keras.optimizers.Adam(learning_rate=1e-5, epsilon=1e-7),
             loss="mse" 
         )
 
@@ -91,76 +80,65 @@ def run_test():
             model.compute_loss(None, dummy_targets, y_pred)
 
     # 2. Weight Sync
-    synced_count = 0
     if backend == "jax":
         if rank == 0:
             for v in model.weights:
                 val = np.array(v.value)
-                np.save(f"opt_initial_{v.path.replace('/', '_')}.npy", val)
-                synced_count += 1
-            print(f"JAX synced {synced_count} weights")
+                np.save(f"opt_epoch_initial_{v.path.replace('/', '_')}.npy", val)
     else:
         for v in model.weights:
-            path = f"opt_initial_{v.path.replace('/', '_')}.npy"
+            path = f"opt_epoch_initial_{v.path.replace('/', '_')}.npy"
             if os.path.exists(path):
                 v.assign(np.load(path))
-                synced_count += 1
-            else:
-                print(f"Sync warning: {v.path} not found")
-        if rank == 0:
-            print(f"Torch synced {synced_count} weights")
 
     # 3. Load fixed data
-    token_ids = np.load("opt_token_ids.npy")
-    padding_mask = np.load("opt_padding_mask.npy")
-    targets = np.load("opt_targets.npy")
+    token_ids = np.load("opt_token_ids_large.npy")
+    padding_mask = np.load("opt_padding_mask_large.npy")
+    targets = np.load("opt_targets_large.npy")
 
-    # Use full batch on all ranks to ensure identical replicated inputs
-    x_local = {
-        "token_ids": token_ids,
-        "padding_mask": padding_mask
-    }
-    y_local = targets
+    num_samples = token_ids.shape[0]
+    batch_size = 4
+    num_steps = num_samples // batch_size
+    num_epochs = 10
 
-    # 4. Train 10 steps
-    for step in range(1, 11):
-        if backend == "torch":
-            with model_parallel.scope():
-                from keras.src.backend.torch import distribution_lib
-                x_torch = {
-                    "token_ids": distribution_lib.distribute_tensor(
-                        x_local["token_ids"], model_parallel.get_data_layout(x_local["token_ids"].shape)
-                    ),
-                    "padding_mask": distribution_lib.distribute_tensor(
-                        x_local["padding_mask"], model_parallel.get_data_layout(x_local["padding_mask"].shape)
+    # 4. Train 10 epochs
+    for epoch in range(1, num_epochs + 1):
+        epoch_losses = []
+        for step in range(num_steps):
+            start = step * batch_size
+            end = (step + 1) * batch_size
+            
+            x_batch = {
+                "token_ids": token_ids[start:end],
+                "padding_mask": padding_mask[start:end]
+            }
+            y_batch = targets[start:end]
+
+            if backend == "torch":
+                with model_parallel.scope():
+                    from keras.src.backend.torch import distribution_lib
+                    x_torch = {
+                        "token_ids": distribution_lib.distribute_tensor(
+                            x_batch["token_ids"], model_parallel.get_data_layout(x_batch["token_ids"].shape)
+                        ),
+                        "padding_mask": distribution_lib.distribute_tensor(
+                            x_batch["padding_mask"], model_parallel.get_data_layout(x_batch["padding_mask"].shape)
+                        )
+                    }
+                    y_torch = distribution_lib.distribute_tensor(
+                        y_batch, model_parallel.get_data_layout(y_batch.shape)
                     )
-                }
-                y_torch = distribution_lib.distribute_tensor(
-                    y_local, model_parallel.get_data_layout(y_local.shape)
-                )
-                
-                logs = model.train_on_batch(x_torch, y_torch)
-        else:
-            # JAX: don't use scope during train_on_batch if it causes issues with None sample_weight
-            logs = model.train_on_batch(x_local, y_local)
+                    logs = model.train_on_batch(x_torch, y_torch)
+            else:
+                logs = model.train_on_batch(x_batch, y_batch)
 
-        loss = logs
-        if isinstance(logs, dict):
-            loss = logs["loss"]
+            loss = logs["loss"] if isinstance(logs, dict) else logs
+            epoch_losses.append(float(np.array(loss)))
         
-        # 5. Save shards and losses
-        if backend == "jax":
-            import jax
-            if rank == 0:
-                np.save(f"jax_opt_s{step}_loss.npy", np.array(loss))
-            for i in range(jax.local_device_count()):
-                w_shard = get_weight_slice(model, i)
-                np.save(f"jax_opt_s{step}_rank{i}.npy", w_shard)
-        else:
-            if rank == 0:
-                np.save(f"torch_opt_s{step}_loss.npy", np.array(loss))
-            w = get_weight_slice(model, rank)
-            np.save(f"torch_opt_s{step}_rank{rank}.npy", w)
+        avg_epoch_loss = np.mean(epoch_losses)
+        if rank == 0:
+            np.save(f"{backend}_opt_epoch_{epoch}_loss.npy", np.array(avg_epoch_loss))
+            print(f"Epoch {epoch} {backend} Loss: {avg_epoch_loss:.6f}")
 
     if backend == "torch":
         import torch.distributed as dist
