@@ -70,6 +70,10 @@ def categorical(logits, num_samples, dtype="int32", seed=None):
 def uniform(shape, minval=0.0, maxval=1.0, dtype=None, seed=None):
     dtype = dtype or floatx()
     dtype = to_torch_dtype(dtype)
+    if hasattr(shape, "to_local"):
+        shape = shape.to_local()
+    if isinstance(shape, torch.Tensor):
+        shape = tuple(shape.tolist())
     requested_shape = shape
     if len(requested_shape) == 0:
         shape = (1,)
@@ -91,6 +95,10 @@ def uniform(shape, minval=0.0, maxval=1.0, dtype=None, seed=None):
 
 def randint(shape, minval, maxval, dtype="int32", seed=None):
     dtype = to_torch_dtype(dtype)
+    if hasattr(shape, "to_local"):
+        shape = shape.to_local()
+    if isinstance(shape, torch.Tensor):
+        shape = tuple(shape.tolist())
     # Do not use generator during symbolic execution.
     if get_device() == "meta":
         return torch.randint(
@@ -113,11 +121,22 @@ def randint(shape, minval, maxval, dtype="int32", seed=None):
 
 def truncated_normal(shape, mean=0.0, stddev=1.0, dtype=None, seed=None):
     dtype = to_torch_dtype(dtype)
+    if hasattr(shape, "to_local"):
+        shape = shape.to_local()
+    if isinstance(shape, torch.Tensor):
+        shape = tuple(shape.tolist())
     # Take a larger standard normal dist, discard values outside 2 * stddev
     # Offset by mean and stddev
     x = normal(tuple(shape) + (4,), mean=0, stddev=1, dtype=dtype, seed=seed)
     valid = (x > -2) & (x < 2)
     indexes = valid.max(-1, keepdim=True)[1]
+    
+    if hasattr(x, "to_local"):
+        # For DTensors, gather and squeeze directly.
+        # This relies on PyTorch DTensor support for gather.
+        res = x.gather(-1, indexes).squeeze(-1)
+        return res
+    
     trunc_x = torch.empty(shape, dtype=dtype, device=get_device())
     trunc_x.data.copy_(x.gather(-1, indexes).squeeze(-1))
     trunc_x.data.mul_(stddev).add_(mean)
@@ -138,8 +157,8 @@ def _get_concrete_noise_shape(inputs, noise_shape):
 
 
 def _ensure_not_partial(inputs):
-    from torch.distributed.tensor import DTensor, Partial, Replicate
-    if isinstance(inputs, DTensor):
+    if hasattr(inputs, "to_local"):
+        from torch.distributed.tensor import Partial, Replicate
         has_partial = any(isinstance(p, Partial) for p in inputs.placements)
         if has_partial:
             # Redistribute Partial to Replicated

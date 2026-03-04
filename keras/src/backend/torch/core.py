@@ -736,6 +736,12 @@ def slice(inputs, start_indices, shape):
     start_indices = convert_to_tensor(start_indices).to(shape_dtype)
     shape = convert_to_tensor(shape).to(shape_dtype)
 
+    # Ensure indices are local before iteration to avoid DTensor unbind issues
+    if hasattr(start_indices, "to_local"):
+        start_indices = start_indices.to_local()
+    if hasattr(shape, "to_local"):
+        shape = shape.to_local()
+
     python_slice = __builtins__["slice"]
     slices = []
     for start, length in zip(start_indices, shape):
@@ -751,6 +757,10 @@ def slice_update(inputs, start_indices, updates):
     inputs = convert_to_tensor(inputs)
     start_indices = convert_to_tensor(start_indices).to(shape_dtype)
     updates = convert_to_tensor(updates)
+
+    # Ensure indices are local before iteration to avoid DTensor unbind issues
+    if hasattr(start_indices, "to_local"):
+        start_indices = start_indices.to_local()
 
     python_slice = __builtins__["slice"]
     slices = [
@@ -806,6 +816,11 @@ def stop_gradient(variable):
 
 
 def unstack(x, num=None, axis=0):
+    if hasattr(x, "to_local"):
+        from torch.distributed.tensor import Replicate
+        x = x.redistribute(x.device_mesh, [Replicate()] * x.device_mesh.ndim)
+        res = x.to_local().unbind(axis)
+        return [_maybe_distribute(t) for t in res]
     return x.unbind(axis)
 
 
