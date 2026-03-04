@@ -380,6 +380,8 @@ def argmax(x, axis=None, keepdims=False):
     x = convert_to_tensor(x)
     from keras.src.backend.torch.core import redistribute_to_replicate
     x = redistribute_to_replicate(x)
+    if hasattr(x, "to_local"):
+        x = x.to_local()
 
     # TODO: torch.argmax doesn't support bool
     if standardize_dtype(x.dtype) == "bool":
@@ -392,6 +394,8 @@ def argmin(x, axis=None, keepdims=False):
     x = convert_to_tensor(x)
     from keras.src.backend.torch.core import redistribute_to_replicate
     x = redistribute_to_replicate(x)
+    if hasattr(x, "to_local"):
+        x = x.to_local()
 
     # TODO: torch.argmin doesn't support bool
     if standardize_dtype(x.dtype) == "bool":
@@ -404,6 +408,8 @@ def argsort(x, axis=-1):
     x = convert_to_tensor(x)
     from keras.src.backend.torch.core import redistribute_to_replicate
     x = redistribute_to_replicate(x)
+    if hasattr(x, "to_local"):
+        x = x.to_local()
 
     # TODO: torch.argsort doesn't support bool
     if standardize_dtype(x.dtype) == "bool":
