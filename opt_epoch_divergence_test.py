@@ -16,15 +16,13 @@ def main():
     np.save("opt_padding_mask_large.npy", np.ones((num_samples, seq_len), dtype="int32"))
     np.save("opt_targets_large.npy", np.random.randn(num_samples, seq_len, hidden_dim).astype("float32"))
 
-    num_devices = 2
+    num_devices = torch.cuda.device_count() if torch.cuda.is_available() else 2
     
     # 2. Run JAX
     print("\n--- Running JAX (10 epochs) ---")
     env_jax = os.environ.copy()
     env_jax["KERAS_BACKEND"] = "jax"
     if not torch.cuda.is_available():
-        env_jax["KERAS_TORCH_DEVICE"] = "cpu"
-        env_jax["KERAS_DEVICE"] = "cpu"
         env_jax["XLA_FLAGS"] = f"--xla_force_host_platform_device_count={num_devices}"
     
     subprocess.run(["python3", "opt_epoch_worker.py"], env=env_jax)
@@ -33,9 +31,6 @@ def main():
     print("\n--- Running Torch (10 epochs) ---")
     env_torch = os.environ.copy()
     env_torch["KERAS_BACKEND"] = "torch"
-    if not torch.cuda.is_available():
-        env_torch["KERAS_TORCH_DEVICE"] = "cpu"
-        env_torch["KERAS_DEVICE"] = "cpu"
     
     subprocess.run(["torchrun", f"--nproc_per_node={num_devices}", "opt_epoch_worker.py"], env=env_torch)
 

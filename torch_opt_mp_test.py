@@ -2,7 +2,6 @@ import os
 
 # Force Keras to use Torch backend
 os.environ["KERAS_BACKEND"] = "torch"
-os.environ["KERAS_TORCH_DEVICE"] = "cpu"
 
 # Prevent TensorFlow from grabbing all GPU memory if it gets imported
 os.environ["TF_FORCE_GPU_ALLOW_GROWTH"] = "true"
@@ -29,6 +28,9 @@ def setup_dist():
         if backend == "nccl":
             local_rank = int(os.environ.get("LOCAL_RANK", 0))
             torch.cuda.set_device(local_rank)
+            os.environ["KERAS_TORCH_DEVICE"] = f"cuda:{local_rank}"
+        else:
+            os.environ["KERAS_TORCH_DEVICE"] = "cpu"
         
         print(f"Initializing process group (RANK={os.environ.get('RANK')}, WORLD_SIZE={os.environ.get('WORLD_SIZE')}, BACKEND={backend})...")
         dist.init_process_group(backend=backend)

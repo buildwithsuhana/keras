@@ -20,10 +20,6 @@ def main():
     print(f"\n--- Running JAX ({num_devices} devices) ---")
     env_jax = os.environ.copy()
     env_jax["KERAS_BACKEND"] = "jax"
-    # Force CPU for absolute parity on Mac if no GPU
-    if not torch.cuda.is_available():
-        env_jax["KERAS_TORCH_DEVICE"] = "cpu"
-        env_jax["KERAS_DEVICE"] = "cpu"
 
     # Prevent JAX from pre-allocating all GPU memory
     env_jax["XLA_PYTHON_CLIENT_MEM_FRACTION"] = "0.4"
@@ -41,9 +37,6 @@ def main():
     print(f"\n--- Running Torch ({num_devices} ranks) ---")
     env_torch = os.environ.copy()
     env_torch["KERAS_BACKEND"] = "torch"
-    if not torch.cuda.is_available():
-        env_torch["KERAS_TORCH_DEVICE"] = "cpu"
-        env_torch["KERAS_DEVICE"] = "cpu"
     # Use torchrun to launch ranks
     subprocess.run(["torchrun", f"--nproc_per_node={num_devices}", "opt_worker.py"], env=env_torch)
 

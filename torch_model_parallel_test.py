@@ -21,6 +21,9 @@ def setup_dist():
         if backend == "nccl":
             local_rank = int(os.environ.get("LOCAL_RANK", 0))
             torch.cuda.set_device(local_rank)
+            os.environ["KERAS_TORCH_DEVICE"] = f"cuda:{local_rank}"
+        else:
+            os.environ["KERAS_TORCH_DEVICE"] = "cpu"
         
         dist.init_process_group(backend=backend)
 
