@@ -102,7 +102,10 @@ def distribute_tensor(tensor, layout):
             tensor = torch.as_tensor(tensor, device=get_device())
         
         if get_device() == "meta":
-            return tensor
+            # Return a DTensor on meta device to preserve sharding info during symbolic build
+            if not isinstance(tensor, DTensor):
+                return distribute_tensor_torch(tensor, torch_mesh, placements)
+            return tensor.redistribute(torch_mesh, placements)
 
         # Optimization: use from_local to avoid unnecessary communication
         # if the tensor is already on the correct device.
