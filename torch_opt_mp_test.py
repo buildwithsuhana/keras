@@ -1,10 +1,15 @@
 import os
 
+# Isolate GPUs for each rank and hide them from TF to avoid hangs/conflicts
+if "LOCAL_RANK" in os.environ:
+    os.environ["CUDA_VISIBLE_DEVICES"] = os.environ["LOCAL_RANK"]
+
 # Force Keras to use Torch backend
 os.environ["KERAS_BACKEND"] = "torch"
 
-# Prevent TensorFlow from grabbing all GPU memory if it gets imported
+# Prevent TensorFlow from grabbing all GPU memory
 os.environ["TF_FORCE_GPU_ALLOW_GROWTH"] = "true"
+os.environ["TF_CPP_MIN_LOG_LEVEL"] = "3"
 
 import torch
 import torch.distributed as dist
@@ -26,7 +31,7 @@ def setup_dist():
         backend = "nccl" if torch.cuda.is_available() else "gloo"
         
         if backend == "nccl":
-            local_rank = int(os.environ.get("LOCAL_RANK", 0))
+            local_rank = 0 # Already isolated by CUDA_VISIBLE_DEVICES
             torch.cuda.set_device(local_rank)
             os.environ["KERAS_TORCH_DEVICE"] = f"cuda:{local_rank}"
         else:

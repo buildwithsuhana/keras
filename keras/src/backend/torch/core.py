@@ -733,14 +733,8 @@ def scatter_update(inputs, indices, updates):
 def slice(inputs, start_indices, shape):
     shape_dtype = to_torch_dtype("int64")
     inputs = convert_to_tensor(inputs)
-    start_indices = convert_to_tensor(start_indices).to(shape_dtype)
-    shape = convert_to_tensor(shape).to(shape_dtype)
-
-    # Ensure indices are local before iteration to avoid DTensor unbind issues
-    if hasattr(start_indices, "to_local"):
-        start_indices = start_indices.to_local()
-    if hasattr(shape, "to_local"):
-        shape = shape.to_local()
+    start_indices = convert_to_numpy(start_indices).flatten().tolist()
+    shape = convert_to_numpy(shape).flatten().tolist()
 
     python_slice = __builtins__["slice"]
     slices = []
@@ -755,12 +749,8 @@ def slice(inputs, start_indices, shape):
 def slice_update(inputs, start_indices, updates):
     shape_dtype = to_torch_dtype("int64")
     inputs = convert_to_tensor(inputs)
-    start_indices = convert_to_tensor(start_indices).to(shape_dtype)
+    start_indices = convert_to_numpy(start_indices).flatten().tolist()
     updates = convert_to_tensor(updates)
-
-    # Ensure indices are local before iteration to avoid DTensor unbind issues
-    if hasattr(start_indices, "to_local"):
-        start_indices = start_indices.to_local()
 
     python_slice = __builtins__["slice"]
     slices = [
