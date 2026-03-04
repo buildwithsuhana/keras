@@ -736,6 +736,11 @@ def slice(inputs, start_indices, shape):
     start_indices = convert_to_tensor(start_indices).to(shape_dtype)
     shape = convert_to_tensor(shape).to(shape_dtype)
 
+    if hasattr(start_indices, "to_local"):
+        start_indices = start_indices.to_local()
+    if hasattr(shape, "to_local"):
+        shape = shape.to_local()
+
     python_slice = __builtins__["slice"]
     slices = []
     for start, length in zip(start_indices, shape):
@@ -751,6 +756,9 @@ def slice_update(inputs, start_indices, updates):
     inputs = convert_to_tensor(inputs)
     start_indices = convert_to_tensor(start_indices).to(shape_dtype)
     updates = convert_to_tensor(updates)
+
+    if hasattr(start_indices, "to_local"):
+        start_indices = start_indices.to_local()
 
     python_slice = __builtins__["slice"]
     slices = [
