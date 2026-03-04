@@ -15,7 +15,10 @@ from keras.src.random.seed_generator import make_default_seed
 # see: https://github.com/pytorch/pytorch/issues/88576
 @dynamo.disable()
 def torch_seed_generator(seed):
-    first_seed, second_seed = draw_seed(seed)
+    seed = draw_seed(seed)
+    if hasattr(seed, "to_local"):
+        seed = seed.to_local()
+    first_seed, second_seed = seed
     device = get_device()
     if device == "meta":
         # Generator is not supported by the meta device.
@@ -213,8 +216,11 @@ def gamma(shape, alpha, dtype=None, seed=None):
     prev_rng_state = torch.random.get_rng_state()
     # Do not draw seed during symbolic execution
     if not get_device() == "meta":
-        first_seed, second_seed = draw_seed(seed)
-        torch.manual_seed(first_seed + second_seed)
+        seed = draw_seed(seed)
+        if hasattr(seed, "to_local"):
+            seed = seed.to_local()
+        first_seed, second_seed = seed
+        torch.manual_seed(int(first_seed + second_seed))
     gamma_distribution = torch.distributions.gamma.Gamma(alpha, beta)
     sample = gamma_distribution.sample().type(dtype)
     torch.random.set_rng_state(prev_rng_state)
@@ -229,8 +235,11 @@ def binomial(shape, counts, probabilities, dtype=None, seed=None):
     prev_rng_state = torch.random.get_rng_state()
     # Do not draw seed during symbolic execution
     if not get_device() == "meta":
-        first_seed, second_seed = draw_seed(seed)
-        torch.manual_seed(first_seed + second_seed)
+        seed = draw_seed(seed)
+        if hasattr(seed, "to_local"):
+            seed = seed.to_local()
+        first_seed, second_seed = seed
+        torch.manual_seed(int(first_seed + second_seed))
     binomial_distribution = torch.distributions.binomial.Binomial(
         total_count=counts, probs=probabilities
     )
@@ -247,8 +256,11 @@ def beta(shape, alpha, beta, dtype=None, seed=None):
     prev_rng_state = torch.random.get_rng_state()
     # Do not draw seed during symbolic execution
     if not get_device() == "meta":
-        first_seed, second_seed = draw_seed(seed)
-        torch.manual_seed(first_seed + second_seed)
+        seed = draw_seed(seed)
+        if hasattr(seed, "to_local"):
+            seed = seed.to_local()
+        first_seed, second_seed = seed
+        torch.manual_seed(int(first_seed + second_seed))
     beta_distribution = torch.distributions.beta.Beta(
         concentration1=alpha, concentration0=beta
     )

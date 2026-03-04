@@ -40,6 +40,9 @@ def run_test():
     model_parallel = distribution.ModelParallel(layout_map=layout_map)
     
     with model_parallel.scope():
+        # Re-set seed inside scope to ensure SeedGenerator state is replicated
+        keras.utils.set_random_seed(42)
+        
         backbone = keras_hub.models.OPTBackbone(
             vocabulary_size=50272,
             num_layers=12, 
@@ -52,7 +55,7 @@ def run_test():
         model = backbone
         
         model.compile(
-            optimizer=keras.optimizers.Adam(learning_rate=1e-5, epsilon=1e-7),
+            optimizer=keras.optimizers.Adam(learning_rate=1e-4),
             loss="mse" 
         )
 

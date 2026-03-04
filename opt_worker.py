@@ -51,6 +51,9 @@ def run_test():
     model_parallel = distribution.ModelParallel(layout_map=layout_map)
     
     with model_parallel.scope():
+        # Re-set seed inside scope to ensure SeedGenerator state is replicated
+        keras.utils.set_random_seed(42)
+        
         backbone = keras_hub.models.OPTBackbone(
             vocabulary_size=50272,
             num_layers=12, 
