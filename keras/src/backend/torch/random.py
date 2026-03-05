@@ -15,10 +15,7 @@ from keras.src.random.seed_generator import make_default_seed
 # see: https://github.com/pytorch/pytorch/issues/88576
 @dynamo.disable()
 def torch_seed_generator(seed):
-    seeds = draw_seed(seed)
-    if hasattr(seeds, "to_local"):
-        seeds = seeds.to_local()
-    first_seed, second_seed = seeds
+    first_seed, second_seed = draw_seed(seed)
     device = get_device()
     if device == "meta":
         # Generator is not supported by the meta device.
@@ -31,18 +28,16 @@ def torch_seed_generator(seed):
 def normal(shape, mean=0.0, stddev=1.0, dtype=None, seed=None):
     dtype = dtype or floatx()
     dtype = to_torch_dtype(dtype)
-    if hasattr(shape, "to_local"):
-        shape = shape.to_local()
     # Do not use generator during symbolic execution.
     if get_device() == "meta":
         return torch.normal(
-            mean, stddev, size=tuple(shape), dtype=dtype, device=get_device()
+            mean, stddev, size=shape, dtype=dtype, device=get_device()
         )
     generator = torch_seed_generator(seed)
     return torch.normal(
         mean,
         stddev,
-        size=tuple(shape),
+        size=shape,
         generator=generator,
         dtype=dtype,
         device=get_device(),
@@ -72,23 +67,16 @@ def categorical(logits, num_samples, dtype="int32", seed=None):
 def uniform(shape, minval=0.0, maxval=1.0, dtype=None, seed=None):
     dtype = dtype or floatx()
     dtype = to_torch_dtype(dtype)
-    if hasattr(shape, "to_local"):
-        shape = shape.to_local()
     requested_shape = shape
     if len(requested_shape) == 0:
         shape = (1,)
     # Do not use generator during symbolic execution.
     if get_device() == "meta":
-        rand_tensor = torch.rand(
-            size=tuple(shape), dtype=dtype, device=get_device()
-        )
+        rand_tensor = torch.rand(size=shape, dtype=dtype, device=get_device())
     else:
         generator = torch_seed_generator(seed)
         rand_tensor = torch.rand(
-            size=tuple(shape),
-            generator=generator,
-            dtype=dtype,
-            device=get_device(),
+            size=shape, generator=generator, dtype=dtype, device=get_device()
         )
 
     output = (maxval - minval) * rand_tensor + minval
@@ -100,14 +88,12 @@ def uniform(shape, minval=0.0, maxval=1.0, dtype=None, seed=None):
 
 def randint(shape, minval, maxval, dtype="int32", seed=None):
     dtype = to_torch_dtype(dtype)
-    if hasattr(shape, "to_local"):
-        shape = shape.to_local()
     # Do not use generator during symbolic execution.
     if get_device() == "meta":
         return torch.randint(
             low=minval,
             high=maxval,
-            size=tuple(shape),
+            size=shape,
             dtype=dtype,
             device=get_device(),
         )
@@ -115,7 +101,7 @@ def randint(shape, minval, maxval, dtype="int32", seed=None):
     return torch.randint(
         low=minval,
         high=maxval,
-        size=tuple(shape),
+        size=shape,
         generator=generator,
         dtype=dtype,
         device=get_device(),
@@ -124,16 +110,12 @@ def randint(shape, minval, maxval, dtype="int32", seed=None):
 
 def truncated_normal(shape, mean=0.0, stddev=1.0, dtype=None, seed=None):
     dtype = to_torch_dtype(dtype)
-    if hasattr(shape, "to_local"):
-        shape = shape.to_local()
     # Take a larger standard normal dist, discard values outside 2 * stddev
     # Offset by mean and stddev
-    x = normal(
-        tuple(shape) + (4,), mean=0, stddev=1, dtype=dtype, seed=seed
-    )
+    x = normal(tuple(shape) + (4,), mean=0, stddev=1, dtype=dtype, seed=seed)
     valid = (x > -2) & (x < 2)
     indexes = valid.max(-1, keepdim=True)[1]
-    trunc_x = torch.empty(tuple(shape), dtype=dtype, device=get_device())
+    trunc_x = torch.empty(shape, dtype=dtype, device=get_device())
     trunc_x.data.copy_(x.gather(-1, indexes).squeeze(-1))
     trunc_x.data.mul_(stddev).add_(mean)
     return trunc_x
@@ -152,20 +134,7 @@ def _get_concrete_noise_shape(inputs, noise_shape):
     return concrete_noise_shape
 
 
-def _ensure_not_partial(inputs):
-    from torch.distributed.tensor import DTensor, Partial, Replicate
-    if isinstance(inputs, DTensor):
-        has_partial = any(isinstance(p, Partial) for p in inputs.placements)
-        if has_partial:
-            # Redistribute Partial to Replicated
-            return inputs.redistribute(
-                inputs.device_mesh, [Replicate()] * inputs.device_mesh.ndim
-            )
-    return inputs
-
-
 def dropout(inputs, rate, noise_shape=None, seed=None):
-    inputs = _ensure_not_partial(inputs)
     if (
         seed is not None
         and not (isinstance(seed, SeedGenerator) and seed._initial_seed is None)
@@ -226,18 +195,13 @@ def shuffle(x, axis=0, seed=None):
 def gamma(shape, alpha, dtype=None, seed=None):
     dtype = dtype or floatx()
     dtype = to_torch_dtype(dtype)
-    if hasattr(shape, "to_local"):
-        shape = shape.to_local()
-    alpha = torch.broadcast_to(convert_to_tensor(alpha), tuple(shape))
-    beta = torch.ones(tuple(shape), device=get_device())
+    alpha = torch.broadcast_to(convert_to_tensor(alpha), shape)
+    beta = torch.ones(shape, device=get_device())
     prev_rng_state = torch.random.get_rng_state()
     # Do not draw seed during symbolic execution
     if not get_device() == "meta":
-        seeds = draw_seed(seed)
-        if hasattr(seeds, "to_local"):
-            seeds = seeds.to_local()
-        first_seed, second_seed = seeds
-        torch.manual_seed(int(first_seed + second_seed))
+        first_seed, second_seed = draw_seed(seed)
+        torch.manual_seed(first_seed + second_seed)
     gamma_distribution = torch.distributions.gamma.Gamma(alpha, beta)
     sample = gamma_distribution.sample().type(dtype)
     torch.random.set_rng_state(prev_rng_state)
@@ -247,20 +211,13 @@ def gamma(shape, alpha, dtype=None, seed=None):
 def binomial(shape, counts, probabilities, dtype=None, seed=None):
     dtype = dtype or floatx()
     dtype = to_torch_dtype(dtype)
-    if hasattr(shape, "to_local"):
-        shape = shape.to_local()
-    counts = torch.broadcast_to(convert_to_tensor(counts), tuple(shape))
-    probabilities = torch.broadcast_to(
-        convert_to_tensor(probabilities), tuple(shape)
-    )
+    counts = torch.broadcast_to(convert_to_tensor(counts), shape)
+    probabilities = torch.broadcast_to(convert_to_tensor(probabilities), shape)
     prev_rng_state = torch.random.get_rng_state()
     # Do not draw seed during symbolic execution
     if not get_device() == "meta":
-        seeds = draw_seed(seed)
-        if hasattr(seeds, "to_local"):
-            seeds = seeds.to_local()
-        first_seed, second_seed = seeds
-        torch.manual_seed(int(first_seed + second_seed))
+        first_seed, second_seed = draw_seed(seed)
+        torch.manual_seed(first_seed + second_seed)
     binomial_distribution = torch.distributions.binomial.Binomial(
         total_count=counts, probs=probabilities
     )
@@ -272,18 +229,13 @@ def binomial(shape, counts, probabilities, dtype=None, seed=None):
 def beta(shape, alpha, beta, dtype=None, seed=None):
     dtype = dtype or floatx()
     dtype = to_torch_dtype(dtype)
-    if hasattr(shape, "to_local"):
-        shape = shape.to_local()
-    alpha = torch.broadcast_to(convert_to_tensor(alpha), tuple(shape))
-    beta = torch.broadcast_to(convert_to_tensor(beta), tuple(shape))
+    alpha = torch.broadcast_to(convert_to_tensor(alpha), shape)
+    beta = torch.broadcast_to(convert_to_tensor(beta), shape)
     prev_rng_state = torch.random.get_rng_state()
     # Do not draw seed during symbolic execution
     if not get_device() == "meta":
-        seeds = draw_seed(seed)
-        if hasattr(seeds, "to_local"):
-            seeds = seeds.to_local()
-        first_seed, second_seed = seeds
-        torch.manual_seed(int(first_seed + second_seed))
+        first_seed, second_seed = draw_seed(seed)
+        torch.manual_seed(first_seed + second_seed)
     beta_distribution = torch.distributions.beta.Beta(
         concentration1=alpha, concentration0=beta
     )
