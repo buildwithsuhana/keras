@@ -5,13 +5,22 @@ backend = os.environ.get("KERAS_BACKEND", "jax")
 
 # Isolate GPUs for each rank and hide them from TF to avoid hangs/conflicts
 if backend == "torch" and "LOCAL_RANK" in os.environ:
-    os.environ["CUDA_VISIBLE_DEVICES"] = os.environ["LOCAL_RANK"]
-    # Force Keras to use the isolated GPU (it will always be index 0 due to isolation)
-    os.environ["KERAS_TORCH_DEVICE"] = "cuda:0"
+    import torch
+    if torch.cuda.is_available():
+        os.environ["CUDA_VISIBLE_DEVICES"] = os.environ["LOCAL_RANK"]
+        # Force Keras to use the isolated GPU (it will always be index 0 due to isolation)
+        os.environ["KERAS_TORCH_DEVICE"] = "cuda:0"
+    elif torch.backends.mps.is_available():
+        # MPS doesn't support CUDA_VISIBLE_DEVICES isolation in the same way,
+        # so we set the device index directly for Keras.
+        os.environ["KERAS_TORCH_DEVICE"] = f"mps:{os.environ['LOCAL_RANK']}"
+    else:
+        os.environ["KERAS_TORCH_DEVICE"] = "cpu"
 
-# Prevent TensorFlow from grabbing all GPU memory
+# Prevent TensorFlow from grabbing all GPU memory and suppress logs
 os.environ["TF_FORCE_GPU_ALLOW_GROWTH"] = "true"
 os.environ["TF_CPP_MIN_LOG_LEVEL"] = "3"
+os.environ["PROTOCOL_BUFFERS_PYTHON_IMPLEMENTATION"] = "python"
 
 import sys
 import numpy as np
