@@ -15,7 +15,10 @@ from keras.src.random.seed_generator import make_default_seed
 # see: https://github.com/pytorch/pytorch/issues/88576
 @dynamo.disable()
 def torch_seed_generator(seed):
-    first_seed, second_seed = draw_seed(seed)
+    seeds = draw_seed(seed)
+    if hasattr(seeds, "to_local"):
+        seeds = seeds.to_local()
+    first_seed, second_seed = seeds
     device = get_device()
     if device == "meta":
         # Generator is not supported by the meta device.
