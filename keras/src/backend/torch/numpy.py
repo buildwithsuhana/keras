@@ -192,7 +192,7 @@ def mean(x, axis=None, keepdims=False):
         keepdims,
         dtype=to_torch_dtype(compute_dtype),
     )
-
+    return cast(result, result_dtype)
 
 def max(x, axis=None, keepdims=False, initial=None):
     x = convert_to_tensor(x)
