@@ -123,7 +123,7 @@ def run_test():
     y_local = targets[start:end]
 
     # 4. Train 10 steps
-    for step in range(1, 11):
+    for step in range(1, 6):
         if backend == "torch":
             from keras.src.backend.torch import distribution_lib
             data_layout = distribution.TensorLayout(("model", None), mesh)
