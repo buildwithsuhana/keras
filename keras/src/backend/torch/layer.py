@@ -18,40 +18,12 @@ class TorchLayer(torch.nn.Module):
             return
         self._track_variables()
 
-        from keras.src.backend.common import global_state
-        distribution = global_state.get_global_attribute("distribution")
-        if distribution is not None:
-            from keras.src.backend.torch import distribution_lib
-            # Call auto_parallelize on the original Keras layer
-            # which is the parent of this TorchLayer wrapper
-            keras_layer = getattr(self, "_keras_layer", None)
-            if keras_layer is None and hasattr(self, "variables"):
-                keras_layer = self
-            
-            if keras_layer is not None:
-                distribution_lib.auto_parallelize(keras_layer, distribution)
-
     def _track_variables(self):
         # set torch_params attribute will have module automatically track
         # parameters.
-        from keras.src.backend.torch.core import get_device
-
-        params = {}
-        device = get_device()
-        for variable in self.variables:
-            value = variable.value
-            if not isinstance(value, torch.nn.Parameter):
-                requires_grad = variable.trainable and torch.is_floating_point(
-                    value
-                )
-                from torch.distributed.tensor import DTensor
-                if isinstance(value, DTensor):
-                    # DTensor should not be moved with .to(device) normally if it's already on mesh
-                    value = torch.nn.Parameter(value, requires_grad=requires_grad)
-                else:
-                    value = torch.nn.Parameter(value, requires_grad=requires_grad).to(device)
-            params[variable.path] = value
-        self._torch_params = torch.nn.ParameterDict(params)
+        self._torch_params = torch.nn.ParameterDict(
+            {variable.path: variable.value for variable in self.variables}
+        )
 
     def named_parameters(
         self,
@@ -66,19 +38,7 @@ class TorchLayer(torch.nn.Module):
         )
 
     def forward(self, *args, **kwargs):
-        from keras.src.backend.common import global_state
-        from keras.src.backend.torch.core import get_device
-        from keras.src.backend.torch.distribution_lib import KerasTorchDispatchMode
-
-        distribution = global_state.get_global_attribute("distribution")
-        if distribution is not None and str(get_device()) != "meta":
-            from keras.src.backend.torch import distribution_lib
-
-            args = distribution_lib._maybe_distribute_input(args, distribution)
-            kwargs = distribution_lib._maybe_distribute_input(kwargs, distribution)
-
-        with KerasTorchDispatchMode():
-            return Operation.__call__(self, *args, **kwargs)
+        return Operation.__call__(self, *args, **kwargs)
 
     def _setattr_hook(self, name, value):
         from keras.src.layers import Layer
