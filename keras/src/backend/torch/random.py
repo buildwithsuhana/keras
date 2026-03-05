@@ -15,10 +15,7 @@ from keras.src.random.seed_generator import make_default_seed
 # see: https://github.com/pytorch/pytorch/issues/88576
 @dynamo.disable()
 def torch_seed_generator(seed):
-    seeds = draw_seed(seed)
-    if hasattr(seeds, "to_local"):
-        seeds = seeds.to_local()
-    first_seed, second_seed = seeds
+    first_seed, second_seed = draw_seed(seed)
     device = get_device()
     if device == "meta":
         # Generator is not supported by the meta device.
@@ -137,10 +134,8 @@ def _get_concrete_noise_shape(inputs, noise_shape):
     return concrete_noise_shape
 
 
-def dropout(inputs, rate, noise_shape=None, seed=None, training=True):
+def dropout(inputs, rate, noise_shape=None, seed=None):
     inputs = convert_to_tensor(inputs)
-    if training is False or rate == 0.0:
-        return inputs
     if (
         seed is not None
         and not (isinstance(seed, SeedGenerator) and seed._initial_seed is None)
