@@ -18,6 +18,19 @@ class TorchLayer(torch.nn.Module):
             return
         self._track_variables()
 
+        from keras.src.backend.common import global_state
+        distribution = global_state.get_global_attribute("distribution")
+        if distribution is not None:
+            from keras.src.backend.torch import distribution_lib
+            # Call auto_parallelize on the original Keras layer
+            # which is the parent of this TorchLayer wrapper
+            keras_layer = getattr(self, "_keras_layer", None)
+            if keras_layer is None and hasattr(self, "variables"):
+                keras_layer = self
+            
+            if keras_layer is not None:
+                distribution_lib.auto_parallelize(keras_layer, distribution)
+
     def _track_variables(self):
         # set torch_params attribute will have module automatically track
         # parameters.
@@ -55,6 +68,7 @@ class TorchLayer(torch.nn.Module):
     def forward(self, *args, **kwargs):
         from keras.src.backend.common import global_state
         from keras.src.backend.torch.core import get_device
+        from keras.src.backend.torch.distribution_lib import KerasTorchDispatchMode
 
         distribution = global_state.get_global_attribute("distribution")
         if distribution is not None and str(get_device()) != "meta":
@@ -63,7 +77,8 @@ class TorchLayer(torch.nn.Module):
             args = distribution_lib._maybe_distribute_input(args, distribution)
             kwargs = distribution_lib._maybe_distribute_input(kwargs, distribution)
 
-        return Operation.__call__(self, *args, **kwargs)
+        with KerasTorchDispatchMode():
+            return Operation.__call__(self, *args, **kwargs)
 
     def _setattr_hook(self, name, value):
         from keras.src.layers import Layer

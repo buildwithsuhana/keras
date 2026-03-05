@@ -137,7 +137,10 @@ def _get_concrete_noise_shape(inputs, noise_shape):
     return concrete_noise_shape
 
 
-def dropout(inputs, rate, noise_shape=None, seed=None):
+def dropout(inputs, rate, noise_shape=None, seed=None, training=True):
+    inputs = convert_to_tensor(inputs)
+    if training is False or rate == 0.0:
+        return inputs
     if (
         seed is not None
         and not (isinstance(seed, SeedGenerator) and seed._initial_seed is None)

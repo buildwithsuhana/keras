@@ -72,9 +72,14 @@ def device_scope(device_name):
 
 def get_device():
     device = global_state.get_global_attribute("torch_device", None)
-    if device is None:
-        return DEFAULT_DEVICE
-    return device
+    if device is not None:
+        return device
+    
+    distribution = global_state.get_global_attribute("distribution")
+    if distribution is not None:
+        return distribution.device_mesh.backend_mesh.device_type
+
+    return DEFAULT_DEVICE
 
 
 def _parse_device_input(device_name):
@@ -202,30 +207,58 @@ class Variable(KerasVariable):
         unwrapped_args = tree.map_structure(_unwrap, args)
         unwrapped_kwargs = tree.map_structure(_unwrap, kwargs)
 
-        from keras.src.backend.torch import distribution_lib
-
-        # Proactive redistribution for view-related ops to avoid sharding
-        # propagation failures in backward pass (aten._unsafe_view).
-        is_view_op = False
-        if hasattr(func, "__name__"):
-            if func.__name__ in ("reshape", "view", "flatten", "transpose", "permute"):
-                is_view_op = True
-        
-        if is_view_op:
-            unwrapped_args = tree.map_structure(redistribute_to_replicate, unwrapped_args)
-            unwrapped_kwargs = tree.map_structure(redistribute_to_replicate, unwrapped_kwargs)
-
         try:
             return func(*unwrapped_args, **unwrapped_kwargs)
-        except RuntimeError as e:
-            if (
-                "redistribution" in str(e)
-                or "sharding" in str(e).lower()
-                or "flatten sharded dimension" in str(e).lower()
+        except (RuntimeError, Exception) as e:
+            msg = str(e).lower()
+            if any(
+                keyword in msg
+                for keyword in (
+                    "sharding",
+                    "shard",
+                    "redistribute",
+                    "redistribution",
+                    "partial",
+                    "dtensor",
+                    "flatten",
+                    "view",
+                    "reshape",
+                    "boolean value",
+                )
             ):
-                unwrapped_args = tree.map_structure(redistribute_to_replicate, unwrapped_args)
-                unwrapped_kwargs = tree.map_structure(redistribute_to_replicate, unwrapped_kwargs)
+                from keras.src.backend.torch.distribution_lib import _maybe_replicate
+                unwrapped_args = tree.map_structure(_maybe_replicate, unwrapped_args)
+                unwrapped_kwargs = tree.map_structure(_maybe_replicate, unwrapped_kwargs)
                 return func(*unwrapped_args, **unwrapped_kwargs)
+            raise e
+
+    def __torch_dispatch__(self, func, types, args=(), kwargs=None):
+        if kwargs is None:
+            kwargs = {}
+        
+        try:
+            return func(*args, **kwargs)
+        except (RuntimeError, Exception) as e:
+            msg = str(e).lower()
+            if any(
+                keyword in msg
+                for keyword in (
+                    "sharding",
+                    "shard",
+                    "redistribute",
+                    "redistribution",
+                    "partial",
+                    "dtensor",
+                    "flatten",
+                    "view",
+                    "reshape",
+                    "boolean value",
+                )
+            ):
+                from keras.src.backend.torch.distribution_lib import _maybe_replicate
+                args = tree.map_structure(_maybe_replicate, args)
+                kwargs = tree.map_structure(_maybe_replicate, kwargs)
+                return func(*args, **kwargs)
             raise e
 
     def __array__(self, dtype=None):
@@ -298,37 +331,6 @@ def _maybe_distribute(res):
             layout = TensorLayout([None] * len(res.shape), dist.device_mesh)
             return distribute_tensor(res, layout)
     return res
-
-
-def redistribute_to_replicate(x):
-    import torch
-    from keras.src.backend.torch.distribution_lib import DTensor, Replicate
-    if isinstance(x, Variable):
-        x = x.value
-    if isinstance(x, DTensor):
-        # Always redistribute if not all placements are Replicate
-        all_replicate = True
-        for p in x.placements:
-            if not isinstance(p, Replicate):
-                all_replicate = False
-                break
-        if not all_replicate:
-            # print(f"DEBUG: Redistributing tensor of shape {tuple(x.shape)} from {x.placements} to Replicate", flush=True)
-            return x.redistribute(x.device_mesh, [Replicate()] * x.device_mesh.ndim)
-    elif hasattr(x, "device_mesh") and hasattr(x, "placements"):
-        # Handle cases where it might be a DTensor-like but not isinstance(DTensor)
-        # (e.g. if multiple DTensor types exist due to imports)
-        from torch.distributed.tensor import Replicate as TorchReplicate
-        all_replicate = True
-        for p in x.placements:
-            if not isinstance(p, (Replicate, TorchReplicate)):
-                all_replicate = False
-                break
-        if not all_replicate:
-            # print(f"DEBUG: Redistributing DTensor-like of shape {tuple(x.shape)} from {x.placements} to Replicate", flush=True)
-            from torch.distributed.tensor import Replicate as TorchReplicate
-            return x.redistribute(x.device_mesh, [TorchReplicate()] * x.device_mesh.ndim)
-    return x
 
 
 def convert_to_tensor(x, dtype=None, sparse=None, ragged=None):
@@ -477,7 +479,7 @@ def compute_output_spec(fn, *args, **kwargs):
                 )
                 return fn(*meta_args, **meta_kwargs)
         except:
-            with device_scope(DEFAULT_DEVICE):
+            with device_scope(get_device()):
                 # If the `"meta"` device placement fails, fall back to tracing
                 # eagerly with tensors on the default device. This will be
                 # more robust, but more expensive.

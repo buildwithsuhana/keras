@@ -71,9 +71,7 @@ def add(x1, x2):
 
 
 def einsum(subscripts, *operands, **kwargs):
-    from keras.src.backend.torch.core import redistribute_to_replicate
     operands = [convert_to_tensor(operand) for operand in operands]
-    operands = [redistribute_to_replicate(operand) for operand in operands]
     # When all operands are of int8, we cast the result to int32 to align with
     # the behavior of jax.
     dtypes_to_resolve = list(set(standardize_dtype(x.dtype) for x in operands))
@@ -378,9 +376,6 @@ def arctanh(x):
 
 def argmax(x, axis=None, keepdims=False):
     x = convert_to_tensor(x)
-    if hasattr(x, "to_local"):
-        from keras.src.backend.torch.core import redistribute_to_replicate
-        x = redistribute_to_replicate(x).to_local()
 
     # TODO: torch.argmax doesn't support bool
     if standardize_dtype(x.dtype) == "bool":
@@ -391,9 +386,6 @@ def argmax(x, axis=None, keepdims=False):
 
 def argmin(x, axis=None, keepdims=False):
     x = convert_to_tensor(x)
-    if hasattr(x, "to_local"):
-        from keras.src.backend.torch.core import redistribute_to_replicate
-        x = redistribute_to_replicate(x).to_local()
 
     # TODO: torch.argmin doesn't support bool
     if standardize_dtype(x.dtype) == "bool":
@@ -404,9 +396,6 @@ def argmin(x, axis=None, keepdims=False):
 
 def argsort(x, axis=-1):
     x = convert_to_tensor(x)
-    if hasattr(x, "to_local"):
-        from keras.src.backend.torch.core import redistribute_to_replicate
-        x = redistribute_to_replicate(x).to_local()
 
     # TODO: torch.argsort doesn't support bool
     if standardize_dtype(x.dtype) == "bool":
@@ -826,9 +815,7 @@ def expand_dims(x, axis):
 
 
 def flatten(x):
-    from keras.src.backend.torch.core import redistribute_to_replicate
     x = convert_to_tensor(x)
-    x = redistribute_to_replicate(x)
     return torch.flatten(x)
 
 
