@@ -325,10 +325,9 @@ def arange(start, stop=None, step=None, dtype=None):
         start, stop = 0, start
     if step is None:
         step = 1
-    res = torch.arange(
+    return torch.arange(
         start, stop, step=step, dtype=dtype, device=get_device()
     )
-    return convert_to_tensor(res)
 
 
 def arccos(x):
@@ -434,9 +433,7 @@ def average(x, axis=None, weights=None):
         return torch.sum(torch.mul(x, weights), dim=axis) / torch.sum(
             weights, dim=-1
         )
-    if axis is None:
-        return torch.mean(x)
-    return torch.mean(x, dim=axis)
+    return torch.mean(x, axis)
 
 
 def bartlett(x):
@@ -812,11 +809,6 @@ def expand_dims(x, axis):
     for a in axis:
         x = torch.unsqueeze(x, dim=a)
     return x
-
-
-def flatten(x):
-    x = convert_to_tensor(x)
-    return torch.flatten(x)
 
 
 def expm1(x):
@@ -2032,7 +2024,7 @@ def sum(x, axis=None, keepdims=False):
     if dtype in ("bool", "uint8", "int8", "int16"):
         dtype = "int32"
     if axis is not None:
-        return cast(torch.sum(x, dim=axis, keepdim=keepdims), dtype)
+        return cast(torch.sum(x, axis=axis, keepdim=keepdims), dtype)
     return cast(torch.sum(x), dtype)
 
 
