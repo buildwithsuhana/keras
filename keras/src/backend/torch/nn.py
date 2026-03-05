@@ -756,8 +756,7 @@ def one_hot(x, num_classes, axis=-1, dtype=None, sparse=False):
     # The output will have some invalid results, so we set them back to 0 using
     # `where` afterwards.
     output = tnn.one_hot(torch.clamp(x, min=0), num_classes)
-
-    output = where(expand_dims(x, axis=-1) >= zero, output, zero)
+    output = where(expand_dims(x, axis=-1) >= 0, output, zero)
     output = convert_to_tensor(output, dtype=dtype)
     dims = output.dim()
     if axis != -1 and axis != dims:
@@ -1135,7 +1134,6 @@ def dot_product_attention(
     query = convert_to_tensor(query)
     key = convert_to_tensor(key)
     value = convert_to_tensor(value)
-
     if len(query.shape) != 4 or len(key.shape) != 4 or len(value.shape) != 4:
         raise ValueError(
             "`dot_product_attention` only supports 4D inputs. "
@@ -1184,18 +1182,22 @@ def dot_product_attention(
             query, key, value, mask, is_causal
         )
 
-
-        if flash_attention and hasattr(query, "device_mesh") and query.device.type == "cpu":
-             flash_attention = False
+        if (
+            flash_attention
+            and hasattr(query, "device_mesh")
+            and query.device.type == "cpu"
+        ):
+            flash_attention = False
     elif flash_attention is True:
         # Use `raise_error=True` to provide more details if the inputs failed to
-        # use flash attention 
+        # use flash attention
         _can_use_flash_attention(
             query, key, value, mask, is_causal, raise_error=True
         )
     if flash_attention:
-        backends = [torch.nn.attention.SDPBackend.FLASH_ATTENTION]
-        with torch.nn.attention.sdpa_kernel(backends=backends):
+        with torch.nn.attention.sdpa_kernel(
+            backends=[torch.nn.attention.SDPBackend.FLASH_ATTENTION],
+        ):
             attention_output = torch.nn.functional.scaled_dot_product_attention(
                 query,
                 key,
@@ -1207,7 +1209,7 @@ def dot_product_attention(
     else:
         if mask is not None:
             mask = mask.contiguous()
-        
+
         backends = [
             torch.nn.attention.SDPBackend.MATH,
         ]
