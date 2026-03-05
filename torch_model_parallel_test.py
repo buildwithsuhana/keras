@@ -38,7 +38,7 @@ layout_map["dense_1/kernel"] = (None, "model")
 layout_map["dense_2/kernel"] = ("model", None)
 
 distribution = ModelParallel(
-    layout_map=layout_map, batch_dim_name="batch"
+    layout_map=layout_map, batch_dim_name="batch", auto_shard_dataset=False
 )
 keras.distribution.set_distribution(distribution)
 
