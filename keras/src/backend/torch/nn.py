@@ -829,14 +829,31 @@ def sparse_categorical_crossentropy(target, output, from_logits=False, axis=-1):
             "up until the last dimension: "
             f"target.shape={target.shape}, output.shape={output.shape}"
         )
-    if from_logits:
-        log_prob = tnn.log_softmax(output, dim=axis)
+    # Use PyTorch native cross-entropy ops to avoid allocating a full
+    # one-hot matrix of shape (batch, ..., num_classes).  For large
+    # vocabularies this saves gigabytes of GPU memory per step.
+    # F.cross_entropy / F.nll_loss expect the class dim at position 1,
+    if output.dim() == 1:
+        output = output.unsqueeze(0)
+        target = target.unsqueeze(0)
+        squeeze = True
     else:
-        output = output / torch.sum(output, dim=axis, keepdim=True)
+        squeeze = False
+        class_axis = axis % output.dim()
+        if class_axis != 1:
+            output = output.movedim(class_axis, 1)
+
+    if from_logits:
+        result = tnn.cross_entropy(output, target, reduction="none")
+    else:
+        output = output / torch.sum(output, dim=1, keepdim=True)
         output = torch.clip(output, backend.epsilon(), 1.0 - backend.epsilon())
         log_prob = torch.log(output)
-    target = one_hot(target, output.shape[axis], axis=axis)
-    return -torch.sum(target * log_prob, dim=axis)
+        result = tnn.nll_loss(log_prob, target, reduction="none")
+
+    if squeeze:
+        result = result.squeeze(0)
+    return result
 
 
 def binary_crossentropy(target, output, from_logits=False):
@@ -1153,23 +1170,9 @@ def dot_product_attention(
     if mask is not None:
         # Explicit set `is_causal` to `False` when `mask` is not `None`.
         is_causal = False
-        if hasattr(query, "device_mesh") and not hasattr(mask, "device_mesh"):
-            from torch.distributed._tensor import Replicate
-            from torch.distributed._tensor import distribute_tensor
-
-            mask = distribute_tensor(
-                mask, query.device_mesh, [Replicate()] * query.device_mesh.ndim
-            )
         mask = torch.where(mask, 0.0, _get_large_negative(query.dtype))
     if bias is not None:
         bias = convert_to_tensor(bias, dtype=compute_dtype)
-        if hasattr(query, "device_mesh") and not hasattr(bias, "device_mesh"):
-            from torch.distributed._tensor import Replicate
-            from torch.distributed._tensor import distribute_tensor
-
-            bias = distribute_tensor(
-                bias, query.device_mesh, [Replicate()] * query.device_mesh.ndim
-            )
         mask = bias  # Use `bias` as `mask` for scaled_dot_product_attention.
 
     axis0, axis1 = 1, 2
@@ -1181,13 +1184,6 @@ def dot_product_attention(
         flash_attention = _can_use_flash_attention(
             query, key, value, mask, is_causal
         )
-
-        if (
-            flash_attention
-            and hasattr(query, "device_mesh")
-            and query.device.type == "cpu"
-        ):
-            flash_attention = False
     elif flash_attention is True:
         # Use `raise_error=True` to provide more details if the inputs failed to
         # use flash attention
@@ -1209,24 +1205,14 @@ def dot_product_attention(
     else:
         if mask is not None:
             mask = mask.contiguous()
-
-        backends = [
-            torch.nn.attention.SDPBackend.MATH,
-        ]
-        # Only use MATH backend for DTensor to avoid sharding propagation
-        # issues in EFFICIENT_ATTENTION (assert len(input_specs) == len(input_args_strategy)).
-        if not hasattr(query, "device_mesh"):
-            backends.append(torch.nn.attention.SDPBackend.EFFICIENT_ATTENTION)
-
-        with torch.nn.attention.sdpa_kernel(backends=backends):
-            attention_output = torch.nn.functional.scaled_dot_product_attention(
-                query.contiguous(),
-                key.contiguous(),
-                value.contiguous(),
-                attn_mask=mask,
-                is_causal=is_causal,
-                scale=scale,
-            )
+        attention_output = torch.nn.functional.scaled_dot_product_attention(
+            query.contiguous(),
+            key.contiguous(),
+            value.contiguous(),
+            attn_mask=mask,
+            is_causal=is_causal,
+            scale=scale,
+        )
     return torch.transpose(attention_output, axis1, axis0)
 
 

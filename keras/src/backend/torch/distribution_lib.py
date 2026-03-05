@@ -420,14 +420,115 @@ class KerasTorchDispatchMode(TorchDispatchMode):
     the inputs to a replicated state before retrying.
     """
 
+    def _handle_sdpa(func, args, kwargs):
+        # query, key, value, attn_mask=None, dropout_p=0.0, is_causal=False, scale=None
+        query = args[0]
+        key = args[1]
+        value = args[2]
+        attn_mask = kwargs.get("attn_mask", args[3] if len(args) > 3 else None)
+        dropout_p = kwargs.get("dropout_p", args[4] if len(args) > 4 else 0.0)
+        is_causal = kwargs.get("is_causal", args[5] if len(args) > 5 else False)
+        scale = kwargs.get("scale", args[6] if len(args) > 6 else None)
+
+        if attn_mask is not None:
+            if hasattr(query, "device_mesh") and not hasattr(
+                attn_mask, "device_mesh"
+            ):
+                attn_mask = distribute_tensor_torch(
+                    attn_mask,
+                    query.device_mesh,
+                    [Replicate()] * query.device_mesh.ndim,
+                )
+
+        backends = [torch.nn.attention.SDPBackend.MATH]
+        if not hasattr(query, "device_mesh"):
+            backends.append(torch.nn.attention.SDPBackend.EFFICIENT_ATTENTION)
+
+        with torch.nn.attention.sdpa_kernel(backends=backends):
+            return torch.nn.functional.scaled_dot_product_attention(
+                query,
+                key,
+                value,
+                attn_mask=attn_mask,
+                dropout_p=dropout_p,
+                is_causal=is_causal,
+                scale=scale,
+            )
+
+    def _handle_cross_entropy(func, args, kwargs):
+        # input, target, weight=None, size_average=None, ignore_index=-100,
+        # reduction='mean', label_smoothing=0.0
+        input = args[0]
+        target = args[1]
+        reduction = kwargs.get("reduction", "mean")
+
+        # Use safer manual cross entropy for sharded DTensors to avoid view errors
+        if reduction == "none":
+            log_prob = torch.nn.functional.log_softmax(input, dim=-1)
+            if input.ndim == target.ndim + 1:
+                # sparse cross entropy
+                from keras.src.backend.torch.nn import one_hot
+
+                target = one_hot(target, input.shape[-1], axis=-1)
+            return -torch.sum(target * log_prob, dim=-1)
+
+        return func(*args, **kwargs)
+
+    _OP_HANDLERS = {}
+
+    # Initialize _OP_HANDLERS with safe lookups
+    def _init_handlers(self):
+        handlers = {
+            # SDPA ops
+            "scaled_dot_product_attention": KerasTorchDispatchMode._handle_sdpa,
+            "_scaled_dot_product_attention": KerasTorchDispatchMode._handle_sdpa,
+            "_scaled_dot_product_attention_math": KerasTorchDispatchMode._handle_sdpa,
+            # NLL Loss ops
+            "nll_loss_forward": KerasTorchDispatchMode._handle_cross_entropy,
+            "nll_loss": KerasTorchDispatchMode._handle_cross_entropy,
+        }
+        
+        # Add aten ops
+        for op_name, handler in handlers.items():
+            if hasattr(torch.ops.aten, op_name):
+                op = getattr(torch.ops.aten, op_name)
+                if hasattr(op, "default"):
+                    KerasTorchDispatchMode._OP_HANDLERS[op.default] = handler
+                else:
+                    KerasTorchDispatchMode._OP_HANDLERS[op] = handler
+                    
+        # Add functional ops
+        KerasTorchDispatchMode._OP_HANDLERS[torch.nn.functional.scaled_dot_product_attention] = KerasTorchDispatchMode._handle_sdpa
+        KerasTorchDispatchMode._OP_HANDLERS[torch.nn.functional.cross_entropy] = KerasTorchDispatchMode._handle_cross_entropy
+        KerasTorchDispatchMode._OP_HANDLERS[torch.nn.functional.nll_loss] = KerasTorchDispatchMode._handle_cross_entropy
+
     def __torch_dispatch__(self, func, types, args=(), kwargs=None):
+        if not self._OP_HANDLERS:
+            self._init_handlers()
+            
+        if func in self._OP_HANDLERS:
+            return self._OP_HANDLERS[func](func, args, kwargs or {})
+
         try:
             return func(*args, **(kwargs or {}))
         except (RuntimeError, NotImplementedError) as e:
             msg = str(e).lower()
-            if any(k in msg for k in ("sharding", "shard", "redistribute", "partial", "dtensor", "flatten", "view", "reshape", "boolean value", "meta tensor")):
+            if any(
+                k in msg
+                for k in (
+                    "sharding",
+                    "shard",
+                    "redistribute",
+                    "partial",
+                    "dtensor",
+                    "flatten",
+                    "view",
+                    "reshape",
+                    "boolean value",
+                    "meta tensor",
+                )
+            ):
                 # Fallback Stage 1: replicate all sharded inputs
-                changed = [False]
                 def _replicate_if_sharded(x):
                     if isinstance(x, DTensor):
                         is_replicated = True
@@ -436,26 +537,51 @@ class KerasTorchDispatchMode(TorchDispatchMode):
                                 is_replicated = False
                                 break
                         if not is_replicated:
-                            changed[0] = True
-                            return x.redistribute(x.device_mesh, [Replicate()] * x.device_mesh.ndim)
+                            return x.redistribute(
+                                x.device_mesh,
+                                [Replicate()] * x.device_mesh.ndim,
+                            )
                     return x
-                
+
                 new_args = tree.map_structure(_replicate_if_sharded, args)
-                new_kwargs = tree.map_structure(_replicate_if_sharded, kwargs or {})
-                
+                new_kwargs = tree.map_structure(
+                    _replicate_if_sharded, kwargs or {}
+                )
+
                 try:
                     return func(*new_args, **new_kwargs)
                 except (RuntimeError, NotImplementedError):
-                    # Fallback Stage 2: convert to local tensors (last resort for ops like argmax)
-                    local_args = tree.map_structure(lambda x: x.to_local() if isinstance(x, DTensor) else x, new_args)
-                    local_kwargs = tree.map_structure(lambda x: x.to_local() if isinstance(x, DTensor) else x, new_kwargs)
+                    # Fallback Stage 2: convert to local tensors and ensure contiguity
+                    def _to_local_contiguous(x):
+                        if isinstance(x, DTensor):
+                            return x.to_local().contiguous()
+                        if isinstance(x, torch.Tensor):
+                            return x.contiguous()
+                        return x
+
+                    local_args = tree.map_structure(_to_local_contiguous, new_args)
+                    local_kwargs = tree.map_structure(_to_local_contiguous, new_kwargs)
                     res = func(*local_args, **local_kwargs)
-                    
+
                     # If we had DTensors, try to wrap the result back if possible
-                    has_dt = any(isinstance(x, DTensor) for x in tree.flatten(new_args))
-                    if has_dt and isinstance(res, torch.Tensor) and not isinstance(res, DTensor):
+                    has_dt = any(
+                        isinstance(x, DTensor) for x in tree.flatten(new_args)
+                    )
+                    if (
+                        has_dt
+                        and isinstance(res, torch.Tensor)
+                        and not isinstance(res, DTensor)
+                    ):
                         # Use the first DTensor's mesh and Replicate placements
-                        dt = next(x for x in tree.flatten(new_args) if isinstance(x, DTensor))
-                        return DTensor.from_local(res, dt.device_mesh, [Replicate()] * dt.device_mesh.ndim)
+                        dt = next(
+                            x
+                            for x in tree.flatten(new_args)
+                            if isinstance(x, DTensor)
+                        )
+                        return DTensor.from_local(
+                            res,
+                            dt.device_mesh,
+                            [Replicate()] * dt.device_mesh.ndim,
+                        )
                     return res
             raise e
