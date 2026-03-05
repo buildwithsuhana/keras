@@ -418,100 +418,227 @@ def associative_scan(f, elems, reverse=False, axis=0):
     """Perform an associative scan operation."""
     flat_elems = [convert_to_tensor(e) for e in tree.flatten(elems)]
     if reverse:
-        flat_elems = [torch.flip(e, (axis,)) for e in flat_elems]
+        flat_elems = [torch.flip(elem, (axis,)) for elem in flat_elems]
 
-    def combine(a_flat, b_flat):
+    def _combine(a_flat, b_flat):
+        a_flat = [convert_to_tensor(a) for a in a_flat]
+        b_flat = [convert_to_tensor(b) for b in b_flat]
+
         a = tree.pack_sequence_as(elems, a_flat)
         b = tree.pack_sequence_as(elems, b_flat)
-        return tree.flatten(f(a, b))
+        c = f(a, b)
+        c_flat = tree.flatten(c)
+        return c_flat
 
-    def interleave(a, b, axis):
-        s = list(a.shape)
-        s[axis] = a.shape[axis] * 2 - 1
-        ad, bd = torch.zeros(s), torch.zeros(s)
-        slice_along_axis(ad, 0, None, 2, axis).copy_(a)
-        slice_along_axis(bd, 0, None, 2, axis).copy_(b)
-        ap, bp = [[0, 0] for _ in range(a.dim())], [[0, 0] for _ in range(b.dim())]
-        ap[axis][-1] = 1 if a.shape[axis] == b.shape[axis] else 0
-        bp[axis] = [1, 0] if a.shape[axis] == b.shape[axis] else [1, 1]
+    num_elems = int(flat_elems[0].shape[axis])
+    if not all(int(elem.shape[axis]) == num_elems for elem in flat_elems[1:]):
+        raise ValueError(
+            "Array inputs to associative_scan must have the same "
+            "first dimension. (saw: {})".format(
+                [elem.shape for elem in flat_elems]
+            )
+        )
+
+    def _interleave(a, b, axis):
+        """Given two Tensors of static shape, interleave them along axis."""
+        assert (
+            a.shape[axis] == b.shape[axis] or a.shape[axis] == b.shape[axis] + 1
+        )
+
+        # we want to get a: [a1, a2], b: [b1, b2]
+        # to a: [a1, 0, a2, 0], b: [0, b1, 0, b2]
+        a_shape = list(a.shape)
+        a_shape[axis] = a.shape[axis] * 2 - 1
+
+        b_shape = list(b.shape)
+        b_shape[axis] = b.shape[axis] * 2 - 1
+
+        a_dil = torch.zeros(a_shape)
+        slice_along_axis(a_dil, 0, None, 2, axis).copy_(a)
+
+        b_dil = torch.zeros(b_shape)
+        slice_along_axis(b_dil, 0, None, 2, axis).copy_(b)
+
+        a_pad = [[0, 0] for _ in range(a.dim())]
+        a_pad[axis][-1] = 1 if a.shape[axis] == b.shape[axis] else 0
+        a_pad = a_pad[::-1]
+        a_pad = tree.flatten(a_pad)
+
+        b_pad = [[0, 0] for _ in range(b.dim())]
+        b_pad[axis] = [1, 0] if a.shape[axis] == b.shape[axis] else [1, 1]
+        b_pad = b_pad[::-1]
+        b_pad = tree.flatten(b_pad)
+
         op = torch.bitwise_or if a.dtype == torch.bool else torch.add
-        return op(torch.nn.functional.pad(ad, tree.flatten(ap[::-1])), torch.nn.functional.pad(bd, tree.flatten(bp[::-1])))
+        return op(
+            torch.nn.functional.pad(a_dil, a_pad),
+            torch.nn.functional.pad(b_dil, b_pad),
+        )
 
-    def _scan(e):
-        n = e[0].shape[axis]
-        if n < 2: return e
-        odd = _scan(combine([slice_along_axis(x, 0, -1, 2, axis) for x in e], [slice_along_axis(x, 1, None, 2, axis) for x in e]))
-        if n % 2 == 0:
-            even = combine([slice_along_axis(x, 0, -1, axis=axis) for x in odd], [slice_along_axis(x, 2, None, 2, axis) for x in e])
+    def _scan(elems):
+        num_elems = elems[0].shape[axis]
+        if num_elems < 2:
+            return elems
+
+        reduced_elems = _combine(
+            [
+                slice_along_axis(elem, 0, -1, step=2, axis=axis)
+                for elem in elems
+            ],
+            [
+                slice_along_axis(elem, 1, None, step=2, axis=axis)
+                for elem in elems
+            ],
+        )
+
+        odd_elems = _scan(reduced_elems)
+        if num_elems % 2 == 0:
+            even_elems = _combine(
+                [slice_along_axis(e, 0, -1, axis=axis) for e in odd_elems],
+                [
+                    slice_along_axis(e, 2, None, step=2, axis=axis)
+                    for e in elems
+                ],
+            )
         else:
-            even = combine(odd, [slice_along_axis(x, 2, None, 2, axis) for x in e])
-        even = [torch.cat([slice_along_axis(x, 0, 1, axis), r], axis) for x, r in zip(e, even)]
-        return [interleave(x, y, axis) for x, y in zip(even, odd)]
+            even_elems = _combine(
+                odd_elems,
+                [
+                    slice_along_axis(e, 2, None, step=2, axis=axis)
+                    for e in elems
+                ],
+            )
 
-    results = _scan(flat_elems)
+        even_elems = [
+            torch.cat(
+                [slice_along_axis(elem, 0, 1, axis=axis), result],
+                dim=axis,
+            )
+            for (elem, result) in zip(elems, even_elems)
+        ]
+        return list(
+            builtins.map(
+                functools.partial(_interleave, axis=axis), even_elems, odd_elems
+            )
+        )
+
+    scans = _scan(elems_flat)
     if reverse:
-        results = [torch.flip(e, (axis,)) for e in results]
-    return tree.pack_sequence_as(elems, results)
+        scans = [torch.flip(scanned, (axis,)) for scanned in scans]
+
+    return tree.pack_sequence_as(elems, scans)
 
 
 def scatter(indices, values, shape):
-    """Perform a scatter operation."""
-    indices, values = convert_to_tensor(indices), convert_to_tensor(values)
+    indices = convert_to_tensor(indices)
+    values = convert_to_tensor(values)
     zeros = torch.zeros(shape, dtype=values.dtype, device=get_device())
-    l = indices.shape[-1]
-    flat_indices = torch.reshape(indices, [-1, l])
-    flat_values = torch.reshape(values, [-1] + list(shape[l:]))
-    for i in range(flat_indices.shape[0]):
-        zeros[tuple(flat_indices[i])] += flat_values[i]
+
+    index_length = indices.shape[-1]
+    value_shape = shape[index_length:]
+    indices = torch.reshape(indices, [-1, index_length])
+    values = torch.reshape(values, [-1] + list(value_shape))
+
+    for i in range(indices.shape[0]):
+        index = indices[i]
+        zeros[tuple(index)] += values[i]
     return zeros
 
 
-def scatter_update(inputs, indices, updates):
-    """Update inputs using a scatter operation."""
-    res = torch.clone(convert_to_tensor(inputs))
-    idx = torch.transpose(convert_to_tensor(indices, dtype="int64"), 0, 1)
-    res[tuple(idx)] = convert_to_tensor(updates, dtype=res.dtype)
-    return res
+def scatter_update(inputs, indices, updates, reduction=None):
+    inputs = convert_to_tensor(inputs)
+    indices = convert_to_tensor(indices, dtype="int64")
+    updates = convert_to_tensor(updates, dtype=inputs.dtype)
+    indices = torch.transpose(indices, 0, 1)
+    idx = tuple(indices)
+
+    outputs = torch.clone(inputs)
+    if reduction is None:
+        outputs[idx] = updates
+    elif reduction == "add":
+        # Use index_put_ with accumulate=True for proper accumulation
+        outputs.index_put_(idx, updates, accumulate=True)
+    elif reduction == "max":
+        # Loop-based approach handles both scalar and slice updates.
+        # Associative, so sequential application handles duplicates.
+        indices_t = indices.T
+        for i in range(indices_t.shape[0]):
+            idx = tuple(indices_t[i])
+            outputs[idx] = torch.maximum(outputs[idx], updates[i])
+    elif reduction == "min":
+        indices_t = indices.T
+        for i in range(indices_t.shape[0]):
+            idx = tuple(indices_t[i])
+            outputs[idx] = torch.minimum(outputs[idx], updates[i])
+    elif reduction == "mul":
+        indices_t = indices.T
+        for i in range(indices_t.shape[0]):
+            idx = tuple(indices_t[i])
+            outputs[idx] = outputs[idx] * updates[i]
+    else:
+        raise ValueError(f"Unsupported reduction: {reduction}")
+    return outputs
 
 
 def slice(inputs, start_indices, shape):
-    """Slice a tensor."""
-    inputs, st, sz = convert_to_tensor(inputs), convert_to_tensor(start_indices, "int64"), convert_to_tensor(shape, "int64")
-    if hasattr(st, "to_local"): st = st.to_local()
-    if hasattr(sz, "to_local"): sz = sz.to_local()
-    indices = [builtins.slice(int(st[i]), int(st[i]+sz[i])) if not inputs.is_meta else builtins.slice(st[i], st[i]+sz[i]) for i in range(len(st))]
-    return inputs[tuple(indices)]
+    shape_dtype = to_torch_dtype("int64")
+    inputs = convert_to_tensor(inputs)
+    start_indices = convert_to_tensor(start_indices).to(shape_dtype)
+    shape = convert_to_tensor(shape).to(shape_dtype)
+
+    python_slice = builtins.slice
+    slices = [
+        python_slice(int(start_index), int(start_index + length))
+        for start_index, length in zip(start_indices, shape)
+    ]
+    return inputs[slices]
 
 
 def slice_update(inputs, start_indices, updates):
-    """Update a slice of a tensor."""
-    inputs, st, updates = convert_to_tensor(inputs), convert_to_tensor(start_indices, "int64"), convert_to_tensor(updates)
-    if hasattr(st, "to_local"): st = st.to_local()
-    res = torch.clone(inputs)
-    indices = [builtins.slice(st[i], st[i] + updates.shape[i]) for i in range(len(st))]
-    res[tuple(indices)] = updates
-    return res
+    shape_dtype = to_torch_dtype("int64")
+    inputs = convert_to_tensor(inputs)
+    start_indices = convert_to_tensor(start_indices).to(shape_dtype)
+    updates = convert_to_tensor(updates)
+
+    python_slice = builtins.slice
+    slices = [
+        python_slice(int(start_index), int(start_index + update_length))
+        for start_index, update_length in zip(start_indices, updates.shape)
+    ]
+    outputs = torch.clone(inputs)
+    outputs[slices] = updates
+    return outputs
 
 
 def switch(index, branches, *operands):
-    """Select and execute a branch based on index."""
-    idx = torch.clamp(convert_to_tensor(index, "int32"), 0, len(branches) - 1)
-    return branches[idx](*operands)
+    index = convert_to_tensor(index, "int32")
+    index = torch.clamp(index, 0, len(branches) - 1)
+    return branches[index](*operands)
 
 
-def while_loop(cond, body, loop_vars, maximum_iterations=None):
-    """Perform a while loop operation."""
-    it, is_tuple = 0, isinstance(loop_vars, (tuple, list))
-    v = tree.map_structure(convert_to_tensor, tuple(loop_vars) if is_tuple else (loop_vars,))
-    while cond(*v) and (maximum_iterations is None or it < maximum_iterations):
-        v = body(*v)
-        if not isinstance(v, (list, tuple)): v = (v,)
-        v, it = tuple(v), it + 1
-    return v if is_tuple else v[0]
+def while_loop(
+    cond,
+    body,
+    loop_vars,
+    maximum_iterations=None,
+):
+    current_iter = 0
+    iteration_check = (
+        lambda iter: maximum_iterations is None or iter < maximum_iterations
+    )
+    is_tuple = isinstance(loop_vars, (tuple, list))
+    loop_vars = tuple(loop_vars) if is_tuple else (loop_vars,)
+    loop_vars = tree.map_structure(convert_to_tensor, loop_vars)
+    while cond(*loop_vars) and iteration_check(current_iter):
+        loop_vars = body(*loop_vars)
+        if not isinstance(loop_vars, (list, tuple)):
+            loop_vars = (loop_vars,)
+        loop_vars = tuple(loop_vars)
+        current_iter += 1
+    return loop_vars if is_tuple else loop_vars[0]
 
 
 def fori_loop(lower, upper, body_fun, init_val):
-    """Perform a for loop operation."""
     val = init_val
     for i in range(lower, upper):
         val = body_fun(i, val)
@@ -519,28 +646,47 @@ def fori_loop(lower, upper, body_fun, init_val):
 
 
 def stop_gradient(variable):
-    """Stop gradient propagation."""
-    v = variable.value if isinstance(variable, Variable) else variable
-    return v.detach()
+    if isinstance(variable, Variable):
+        variable = variable.value
+    # We can't use `.requires_grad_(False)` here since it only
+    # works when the tensor is a leaf node in the graph.
+    return variable.detach()
 
 
 def unstack(x, num=None, axis=0):
-    """Unstack a tensor along an axis."""
     return x.unbind(axis)
 
 
 def random_seed_dtype():
-    """Return the dtype for random seeds."""
+    # uint32 doesn't exist in torch, use int32 instead.
     return "int32"
 
 
 def remat(f):
-    """Rematerialization decorator."""
-    return lambda *args, **kwargs: torch.utils.checkpoint.checkpoint(f, *args, use_reentrant=False, **kwargs)
+    """Implementation of rematerialization.
+
+    Args:
+        f: The function or operation to rematerialize.
+    Returns:
+        A function wrapping f that defines a custom gradient, which
+        recomputes f on the backwards pass of a gradient call.
+    """
+
+    def wrapped(*args, **kwargs):
+        return torch.utils.checkpoint.checkpoint(
+            f, *args, use_reentrant=False, **kwargs
+        )
+
+    return wrapped
 
 
 class custom_gradient:
-    """Decorator for custom gradients."""
+    """Decorator for custom gradients.
+
+    Args:
+        forward_fn: Forward pass function.
+    """
+
     def __init__(self, forward_fn):
         self.forward_fn = forward_fn
 
@@ -549,18 +695,40 @@ class custom_gradient:
 
 
 class CustomGradientFunction(torch.autograd.Function):
-    """Autograd function for custom gradients."""
+    """Enables custom forward & backward passes for gradient computation."""
+
     @staticmethod
     def forward(ctx, forward_fn, *args, **kwargs):
+        """Forward pass computation specification.
+
+        Args:
+            ctx: Context object.
+            forward_fn: Function to compute forward pass.
+            *args: Arguments for the forward pass.
+            **kwargs: Keyword arguments for the forward pass.
+        """
         ctx.forward_fn = forward_fn
         ctx.save_for_backward(*args)
         try:
             output, ctx.grad_fn = forward_fn(*args, **kwargs)
         except:
-            output, ctx.grad_fn = forward_fn(*args, **kwargs), lambda *args, **kwargs: torch.full((), float("nan"))
+            output = forward_fn(*args, **kwargs)
+            ctx.grad_fn = lambda *args, **kwargs: torch.full((), float("nan"))
         return output
 
     @staticmethod
     def backward(ctx, grad_output):
-        grads = ctx.grad_fn(*ctx.saved_tensors, upstream=grad_output)
-        return (None,) + (grads if isinstance(grads, tuple) else (grads,))
+        """Backward pass computation specification.
+
+        Args:
+            ctx: Context object.
+            grad_output: Gradient with respect to the output.
+        """
+        args = ctx.saved_tensors
+        grad_fn = ctx.grad_fn
+        if grad_fn is None:
+            raise ValueError("grad_fn must be provided for custom gradient")
+        grads = grad_fn(*args, upstream=grad_output)
+        if not isinstance(grads, tuple):
+            grads = (grads,)
+        return (None,) + grads
