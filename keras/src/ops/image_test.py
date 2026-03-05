@@ -736,30 +736,33 @@ def gaussian_blur_np(
         kernel_size, sigma, num_channels, input_dtype
     )
     batch_size, height, width, _ = images.shape
+
+    kernel_h, kernel_w = kernel.shape[0], kernel.shape[1]
+    pad_h = (kernel_h - 1) // 2
+    pad_h_after = kernel_h - 1 - pad_h
+    pad_w = (kernel_w - 1) // 2
+    pad_w_after = kernel_w - 1 - pad_w
+
     padded_images = np.pad(
         images,
         (
             (0, 0),
-            (kernel_size[0] // 2, kernel_size[0] // 2),
-            (kernel_size[1] // 2, kernel_size[1] // 2),
+            (pad_h, pad_h_after),
+            (pad_w, pad_w_after),
             (0, 0),
         ),
         mode="constant",
     )
 
     blurred_images = np.zeros_like(images)
-    kernel_reshaped = kernel.reshape(
-        (1, kernel.shape[0], kernel.shape[1], num_channels)
-    )
+    kernel_reshaped = kernel.reshape((1, kernel_h, kernel_w, num_channels))
 
     for b in range(batch_size):
         image_patch = padded_images[b : b + 1, :, :, :]
 
     for i in range(height):
         for j in range(width):
-            patch = image_patch[
-                :, i : i + kernel_size[0], j : j + kernel_size[1], :
-            ]
+            patch = image_patch[:, i : i + kernel_h, j : j + kernel_w, :]
             blurred_images[b, i, j, :] = np.sum(
                 patch * kernel_reshaped, axis=(1, 2)
             )
@@ -1037,13 +1040,13 @@ class ImageOpsCorrectnessTest(testing.TestCase):
         out = kimage.rgb_to_grayscale(x)
         ref_out = tf.image.rgb_to_grayscale(x)
         self.assertEqual(tuple(out.shape), tuple(ref_out.shape))
-        self.assertAllClose(ref_out, out)
+        self.assertAllClose(ref_out.numpy(), out)
 
         x = np.random.random((2, 50, 50, 3)).astype("float32") * 255
         out = kimage.rgb_to_grayscale(x)
         ref_out = tf.image.rgb_to_grayscale(x)
         self.assertEqual(tuple(out.shape), tuple(ref_out.shape))
-        self.assertAllClose(ref_out, out)
+        self.assertAllClose(ref_out.numpy(), out)
 
         # Test channels_first
         backend.set_image_data_format("channels_first")
@@ -1052,18 +1055,18 @@ class ImageOpsCorrectnessTest(testing.TestCase):
         ref_out = tf.image.rgb_to_grayscale(np.transpose(x, [1, 2, 0]))
         ref_out = tf.transpose(ref_out, [2, 0, 1])
         self.assertEqual(tuple(out.shape), tuple(ref_out.shape))
-        self.assertAllClose(ref_out, out)
+        self.assertAllClose(ref_out.numpy(), out)
 
         x = np.random.random((2, 3, 50, 50)).astype("float32") * 255
         out = kimage.rgb_to_grayscale(x)
         ref_out = tf.image.rgb_to_grayscale(np.transpose(x, [0, 2, 3, 1]))
         ref_out = tf.transpose(ref_out, [0, 3, 1, 2])
         self.assertEqual(tuple(out.shape), tuple(ref_out.shape))
-        self.assertAllClose(ref_out, out)
+        self.assertAllClose(ref_out.numpy(), out)
 
         # Test class
         out = kimage.RGBToGrayscale()(x)
-        self.assertAllClose(ref_out, out)
+        self.assertAllClose(ref_out.numpy(), out)
 
     def test_rgb_to_hsv(self):
         # Test channels_last
@@ -1071,13 +1074,13 @@ class ImageOpsCorrectnessTest(testing.TestCase):
         out = kimage.rgb_to_hsv(x)
         ref_out = tf.image.rgb_to_hsv(x)
         self.assertEqual(tuple(out.shape), tuple(ref_out.shape))
-        self.assertAllClose(ref_out, out)
+        self.assertAllClose(ref_out.numpy(), out)
 
         x = np.random.random((2, 50, 50, 3)).astype("float32")
         out = kimage.rgb_to_hsv(x)
         ref_out = tf.image.rgb_to_hsv(x)
         self.assertEqual(tuple(out.shape), tuple(ref_out.shape))
-        self.assertAllClose(ref_out, out)
+        self.assertAllClose(ref_out.numpy(), out)
 
         # Test channels_first
         backend.set_image_data_format("channels_first")
@@ -1086,18 +1089,18 @@ class ImageOpsCorrectnessTest(testing.TestCase):
         ref_out = tf.image.rgb_to_hsv(np.transpose(x, [1, 2, 0]))
         ref_out = tf.transpose(ref_out, [2, 0, 1])
         self.assertEqual(tuple(out.shape), tuple(ref_out.shape))
-        self.assertAllClose(ref_out, out)
+        self.assertAllClose(ref_out.numpy(), out)
 
         x = np.random.random((2, 3, 50, 50)).astype("float32")
         out = kimage.rgb_to_hsv(x)
         ref_out = tf.image.rgb_to_hsv(np.transpose(x, [0, 2, 3, 1]))
         ref_out = tf.transpose(ref_out, [0, 3, 1, 2])
         self.assertEqual(tuple(out.shape), tuple(ref_out.shape))
-        self.assertAllClose(ref_out, out)
+        self.assertAllClose(ref_out.numpy(), out)
 
         # Test class
         out = kimage.RGBToHSV()(x)
-        self.assertAllClose(ref_out, out)
+        self.assertAllClose(ref_out.numpy(), out)
 
     def test_hsv_to_rgb(self):
         # Test channels_last
@@ -1105,13 +1108,13 @@ class ImageOpsCorrectnessTest(testing.TestCase):
         out = kimage.hsv_to_rgb(x)
         ref_out = tf.image.hsv_to_rgb(x)
         self.assertEqual(tuple(out.shape), tuple(ref_out.shape))
-        self.assertAllClose(ref_out, out)
+        self.assertAllClose(ref_out.numpy(), out)
 
         x = np.random.random((2, 50, 50, 3)).astype("float32")
         out = kimage.hsv_to_rgb(x)
         ref_out = tf.image.hsv_to_rgb(x)
         self.assertEqual(tuple(out.shape), tuple(ref_out.shape))
-        self.assertAllClose(ref_out, out)
+        self.assertAllClose(ref_out.numpy(), out)
 
         # Test channels_first
         backend.set_image_data_format("channels_first")
@@ -1120,18 +1123,18 @@ class ImageOpsCorrectnessTest(testing.TestCase):
         ref_out = tf.image.hsv_to_rgb(np.transpose(x, [1, 2, 0]))
         ref_out = tf.transpose(ref_out, [2, 0, 1])
         self.assertEqual(tuple(out.shape), tuple(ref_out.shape))
-        self.assertAllClose(ref_out, out)
+        self.assertAllClose(ref_out.numpy(), out)
 
         x = np.random.random((2, 3, 50, 50)).astype("float32")
         out = kimage.hsv_to_rgb(x)
         ref_out = tf.image.hsv_to_rgb(np.transpose(x, [0, 2, 3, 1]))
         ref_out = tf.transpose(ref_out, [0, 3, 1, 2])
         self.assertEqual(tuple(out.shape), tuple(ref_out.shape))
-        self.assertAllClose(ref_out, out)
+        self.assertAllClose(ref_out.numpy(), out)
 
         # Test class
         out = kimage.HSVToRGB()(x)
-        self.assertAllClose(ref_out, out)
+        self.assertAllClose(ref_out.numpy(), out)
 
     @parameterized.named_parameters(
         named_product(
@@ -1897,6 +1900,63 @@ class ImageOpsCorrectnessTest(testing.TestCase):
             data_format="channels_first",
         )
 
+        self.assertEqual(tuple(out.shape), tuple(ref_out.shape))
+        self.assertAllClose(ref_out, out, atol=1e-2, rtol=1e-2)
+
+    def test_gaussian_blur_even_kernel_size(self):
+        """Test gaussian_blur with even kernel sizes"""
+        # This test is specific to the numpy backend fix
+        if backend.backend() != "numpy":
+            self.skipTest(
+                "Test is specific to numpy backend, current backend: "
+                f"{backend.backend()}"
+            )
+
+        backend.set_image_data_format("channels_last")
+        np.random.seed(42)
+        x = np.random.uniform(size=(32, 32, 3)).astype("float32")
+        kernel_size = np.array([4, 4])  # Even kernel size
+        sigma = np.array([0.8, 1.2]).astype("float32")
+
+        out = kimage.gaussian_blur(
+            x,
+            kernel_size,
+            sigma,
+            data_format="channels_last",
+        )
+
+        ref_out = gaussian_blur_np(
+            x,
+            kernel_size,
+            sigma,
+            data_format="channels_last",
+        )
+
+        self.assertEqual(tuple(out.shape), (32, 32, 3))
+        self.assertEqual(tuple(out.shape), tuple(ref_out.shape))
+        self.assertAllClose(ref_out, out, atol=1e-2, rtol=1e-2)
+
+        # Test channels_first with different even kernel sizes
+        backend.set_image_data_format("channels_first")
+        x = np.random.uniform(size=(3, 32, 32)).astype("float32")
+        kernel_size = np.array([6, 4])  # Different even kernel sizes
+        sigma = np.array([1.0, 1.5]).astype("float32")
+
+        out = kimage.gaussian_blur(
+            x,
+            kernel_size,
+            sigma,
+            data_format="channels_first",
+        )
+
+        ref_out = gaussian_blur_np(
+            x,
+            kernel_size,
+            sigma,
+            data_format="channels_first",
+        )
+
+        self.assertEqual(tuple(out.shape), (3, 32, 32))
         self.assertEqual(tuple(out.shape), tuple(ref_out.shape))
         self.assertAllClose(ref_out, out, atol=1e-2, rtol=1e-2)
 
