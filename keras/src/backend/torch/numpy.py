@@ -194,6 +194,7 @@ def mean(x, axis=None, keepdims=False):
     )
     return cast(result, result_dtype)
 
+
 def max(x, axis=None, keepdims=False, initial=None):
     x = convert_to_tensor(x)
     if 0 in x.shape:
