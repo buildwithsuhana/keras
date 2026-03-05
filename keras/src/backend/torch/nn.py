@@ -832,10 +832,10 @@ def sparse_categorical_crossentropy(target, output, from_logits=False, axis=-1):
     if from_logits:
         log_prob = tnn.log_softmax(output, dim=axis)
     else:
-        ooutput = output / torch.sum(output, dim=axis, keepdim=True)
+        output = output / torch.sum(output, dim=axis, keepdim=True)
         output = torch.clip(output, backend.epsilon(), 1.0 - backend.epsilon())
         log_prob = torch.log(output)
-        target = one_hot(target, output.shape[axis], axis=axis)
+    target = one_hot(target, output.shape[axis], axis=axis)
     return -torch.sum(target * log_prob, dim=axis)
 
 
