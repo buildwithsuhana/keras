@@ -426,7 +426,7 @@ class KerasTorchDispatchMode(TorchDispatchMode):
         except (RuntimeError, NotImplementedError) as e:
             msg = str(e).lower()
             if any(k in msg for k in ("sharding", "shard", "redistribute", "partial", "dtensor", "flatten", "view", "reshape", "boolean value", "meta tensor")):
-                # Fallback: replicate all inputs and retry
+                # Fallback Stage 1: replicate all sharded inputs
                 changed = [False]
                 def _replicate_if_sharded(x):
                     if isinstance(x, DTensor):
@@ -443,6 +443,19 @@ class KerasTorchDispatchMode(TorchDispatchMode):
                 new_args = tree.map_structure(_replicate_if_sharded, args)
                 new_kwargs = tree.map_structure(_replicate_if_sharded, kwargs or {})
                 
-                if changed[0]:
+                try:
                     return func(*new_args, **new_kwargs)
+                except (RuntimeError, NotImplementedError):
+                    # Fallback Stage 2: convert to local tensors (last resort for ops like argmax)
+                    local_args = tree.map_structure(lambda x: x.to_local() if isinstance(x, DTensor) else x, new_args)
+                    local_kwargs = tree.map_structure(lambda x: x.to_local() if isinstance(x, DTensor) else x, new_kwargs)
+                    res = func(*local_args, **local_kwargs)
+                    
+                    # If we had DTensors, try to wrap the result back if possible
+                    has_dt = any(isinstance(x, DTensor) for x in tree.flatten(new_args))
+                    if has_dt and isinstance(res, torch.Tensor) and not isinstance(res, DTensor):
+                        # Use the first DTensor's mesh and Replicate placements
+                        dt = next(x for x in tree.flatten(new_args) if isinstance(x, DTensor))
+                        return DTensor.from_local(res, dt.device_mesh, [Replicate()] * dt.device_mesh.ndim)
+                    return res
             raise e
