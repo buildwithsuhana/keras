@@ -829,31 +829,14 @@ def sparse_categorical_crossentropy(target, output, from_logits=False, axis=-1):
             "up until the last dimension: "
             f"target.shape={target.shape}, output.shape={output.shape}"
         )
-    # Use PyTorch native cross-entropy ops to avoid allocating a full
-    # one-hot matrix of shape (batch, ..., num_classes).  For large
-    # vocabularies this saves gigabytes of GPU memory per step.
-    # F.cross_entropy / F.nll_loss expect the class dim at position 1,
-    if output.dim() == 1:
-        output = output.unsqueeze(0)
-        target = target.unsqueeze(0)
-        squeeze = True
-    else:
-        squeeze = False
-        class_axis = axis % output.dim()
-        if class_axis != 1:
-            output = output.movedim(class_axis, 1)
-
     if from_logits:
-        result = tnn.cross_entropy(output, target, reduction="none")
+        log_prob = tnn.log_softmax(output, dim=axis)
     else:
-        output = output / torch.sum(output, dim=1, keepdim=True)
+        ooutput = output / torch.sum(output, dim=axis, keepdim=True)
         output = torch.clip(output, backend.epsilon(), 1.0 - backend.epsilon())
         log_prob = torch.log(output)
-        result = tnn.nll_loss(log_prob, target, reduction="none")
-
-    if squeeze:
-        result = result.squeeze(0)
-    return result
+        target = one_hot(target, output.shape[axis], axis=axis)
+    return -torch.sum(target * log_prob, dim=axis)
 
 
 def binary_crossentropy(target, output, from_logits=False):
