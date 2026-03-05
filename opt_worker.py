@@ -139,7 +139,27 @@ def run_test():
             
             logs = model.train_on_batch(x_torch, y_torch)
         else:
-            logs = model.train_on_batch(x_local, y_local)
+            from keras.src.backend.jax import distribution_lib as jax_distribution_lib
+            data_layout = distribution.TensorLayout(("model", None), mesh)
+            
+            # Explicitly distribute to avoid JAX backend trainer.py _distribute_data issue with None
+            x_jax = {
+                "token_ids": jax_distribution_lib.distribute_data_input(
+                    x_local["token_ids"], data_layout, "batch"
+                ),
+                "padding_mask": jax_distribution_lib.distribute_data_input(
+                    x_local["padding_mask"], data_layout, "batch"
+                )
+            }
+            y_jax = jax_distribution_lib.distribute_data_input(
+                y_local, data_layout, "batch"
+            )
+            sw_jax = jax_distribution_lib.distribute_data_input(
+                np.ones(y_local.shape[:2], dtype="float32"), 
+                distribution.TensorLayout(("model", None), mesh),
+                "batch"
+            )
+            logs = model.train_on_batch(x_jax, y_jax, sample_weight=sw_jax)
 
         loss = logs["loss"] if isinstance(logs, dict) else logs
         
