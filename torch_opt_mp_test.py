@@ -1,13 +1,15 @@
 import os
+import torch
 
 # Force Keras to use Torch backend
 os.environ["KERAS_BACKEND"] = "torch"
 
 # Isolate GPUs for each rank and hide them from TF to avoid hangs/conflicts
-if "LOCAL_RANK" in os.environ:
+if "LOCAL_RANK" in os.environ and torch.cuda.is_available():
     os.environ["CUDA_VISIBLE_DEVICES"] = os.environ["LOCAL_RANK"]
     # Force Keras to use the isolated GPU (it will always be index 0 due to isolation)
-    os.environ["KERAS_TORCH_DEVICE"] = "cuda:0"
+    if os.environ.get("KERAS_TORCH_DEVICE") != "cpu":
+        os.environ["KERAS_TORCH_DEVICE"] = "cuda:0"
 
 # Prevent TensorFlow from grabbing all GPU memory if it gets imported
 os.environ["TF_FORCE_GPU_ALLOW_GROWTH"] = "true"
