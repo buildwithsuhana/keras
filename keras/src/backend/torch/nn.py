@@ -750,23 +750,13 @@ def one_hot(x, num_classes, axis=-1, dtype=None, sparse=False):
     # If axis is not last, change output to axis and shift remaining elements.
     x = convert_to_tensor(x, dtype=torch.long)
     zero = convert_to_tensor(0, dtype=torch.long)
-    from keras.src.backend.torch import distribution_lib
 
     # Torch one_hot does not natively handle negative values, so we add some
     # manual handling for negatives in the input to one_hot by using max(x, 0).
     # The output will have some invalid results, so we set them back to 0 using
     # `where` afterwards.
-    if isinstance(x, distribution_lib.DTensor):
-        from torch.distributed.tensor import DTensor
-
-        local_output = tnn.one_hot(torch.clamp(x.to_local(), min=0), num_classes)
-        output = DTensor.from_local(
-            local_output, x.device_mesh, x.placements, run_check=False
-        )
-    else:
-        output = tnn.one_hot(torch.clamp(x, min=0), num_classes)
-
-    output = where(expand_dims(x, axis=-1) >= zero, output, zero)
+    output = tnn.one_hot(torch.clamp(x, min=0), num_classes)
+    output = where(expand_dims(x, axis=-1) >= 0, output, zero)
     output = convert_to_tensor(output, dtype=dtype)
     dims = output.dim()
     if axis != -1 and axis != dims:
@@ -839,14 +829,31 @@ def sparse_categorical_crossentropy(target, output, from_logits=False, axis=-1):
             "up until the last dimension: "
             f"target.shape={target.shape}, output.shape={output.shape}"
         )
-    if from_logits:
-        log_prob = tnn.log_softmax(output, dim=axis)
+    # Use PyTorch native cross-entropy ops to avoid allocating a full
+    # one-hot matrix of shape (batch, ..., num_classes).  For large
+    # vocabularies this saves gigabytes of GPU memory per step.
+    # F.cross_entropy / F.nll_loss expect the class dim at position 1,
+    if output.dim() == 1:
+        output = output.unsqueeze(0)
+        target = target.unsqueeze(0)
+        squeeze = True
     else:
-        output = output / torch.sum(output, dim=axis, keepdim=True)
+        squeeze = False
+        class_axis = axis % output.dim()
+        if class_axis != 1:
+            output = output.movedim(class_axis, 1)
+
+    if from_logits:
+        result = tnn.cross_entropy(output, target, reduction="none")
+    else:
+        output = output / torch.sum(output, dim=1, keepdim=True)
         output = torch.clip(output, backend.epsilon(), 1.0 - backend.epsilon())
         log_prob = torch.log(output)
-    target = one_hot(target, output.shape[axis], axis=axis)
-    return -torch.sum(target * log_prob, dim=axis)
+        result = tnn.nll_loss(log_prob, target, reduction="none")
+
+    if squeeze:
+        result = result.squeeze(0)
+    return result
 
 
 def binary_crossentropy(target, output, from_logits=False):
@@ -1144,27 +1151,6 @@ def dot_product_attention(
     query = convert_to_tensor(query)
     key = convert_to_tensor(key)
     value = convert_to_tensor(value)
-    from keras.src.backend.torch import distribution_lib
-
-    if isinstance(query, distribution_lib.DTensor):
-        from torch.distributed.tensor import Replicate
-
-        query = query.redistribute(
-            query.device_mesh, [Replicate()] * query.device_mesh.ndim
-        )
-    if isinstance(key, distribution_lib.DTensor):
-        from torch.distributed.tensor import Replicate
-
-        key = key.redistribute(
-            key.device_mesh, [Replicate()] * key.device_mesh.ndim
-        )
-    if isinstance(value, distribution_lib.DTensor):
-        from torch.distributed.tensor import Replicate
-
-        value = value.redistribute(
-            value.device_mesh, [Replicate()] * value.device_mesh.ndim
-        )
-
     if len(query.shape) != 4 or len(key.shape) != 4 or len(value.shape) != 4:
         raise ValueError(
             "`dot_product_attention` only supports 4D inputs. "
@@ -1184,23 +1170,9 @@ def dot_product_attention(
     if mask is not None:
         # Explicit set `is_causal` to `False` when `mask` is not `None`.
         is_causal = False
-        if hasattr(query, "device_mesh") and not hasattr(mask, "device_mesh"):
-            from torch.distributed._tensor import Replicate
-            from torch.distributed._tensor import distribute_tensor
-
-            mask = distribute_tensor(
-                mask, query.device_mesh, [Replicate()] * query.device_mesh.ndim
-            )
         mask = torch.where(mask, 0.0, _get_large_negative(query.dtype))
     if bias is not None:
         bias = convert_to_tensor(bias, dtype=compute_dtype)
-        if hasattr(query, "device_mesh") and not hasattr(bias, "device_mesh"):
-            from torch.distributed._tensor import Replicate
-            from torch.distributed._tensor import distribute_tensor
-
-            bias = distribute_tensor(
-                bias, query.device_mesh, [Replicate()] * query.device_mesh.ndim
-            )
         mask = bias  # Use `bias` as `mask` for scaled_dot_product_attention.
 
     axis0, axis1 = 1, 2
@@ -1212,19 +1184,16 @@ def dot_product_attention(
         flash_attention = _can_use_flash_attention(
             query, key, value, mask, is_causal
         )
-
-
-        if flash_attention and hasattr(query, "device_mesh") and query.device.type == "cpu":
-             flash_attention = False
     elif flash_attention is True:
         # Use `raise_error=True` to provide more details if the inputs failed to
-        # use flash attention 
+        # use flash attention
         _can_use_flash_attention(
             query, key, value, mask, is_causal, raise_error=True
         )
     if flash_attention:
-        backends = [torch.nn.attention.SDPBackend.FLASH_ATTENTION]
-        with torch.nn.attention.sdpa_kernel(backends=backends):
+        with torch.nn.attention.sdpa_kernel(
+            backends=[torch.nn.attention.SDPBackend.FLASH_ATTENTION],
+        ):
             attention_output = torch.nn.functional.scaled_dot_product_attention(
                 query,
                 key,
@@ -1236,24 +1205,14 @@ def dot_product_attention(
     else:
         if mask is not None:
             mask = mask.contiguous()
-        
-        backends = [
-            torch.nn.attention.SDPBackend.MATH,
-        ]
-        # Only use MATH backend for DTensor to avoid sharding propagation
-        # issues in EFFICIENT_ATTENTION (assert len(input_specs) == len(input_args_strategy)).
-        if not hasattr(query, "device_mesh"):
-            backends.append(torch.nn.attention.SDPBackend.EFFICIENT_ATTENTION)
-
-        with torch.nn.attention.sdpa_kernel(backends=backends):
-            attention_output = torch.nn.functional.scaled_dot_product_attention(
-                query.contiguous(),
-                key.contiguous(),
-                value.contiguous(),
-                attn_mask=mask,
-                is_causal=is_causal,
-                scale=scale,
-            )
+        attention_output = torch.nn.functional.scaled_dot_product_attention(
+            query.contiguous(),
+            key.contiguous(),
+            value.contiguous(),
+            attn_mask=mask,
+            is_causal=is_causal,
+            scale=scale,
+        )
     return torch.transpose(attention_output, axis1, axis0)
 
 
@@ -1278,3 +1237,112 @@ def unfold(input, kernel_size, dilation=1, padding=0, stride=1):
         padding=padding,
         stride=stride,
     )
+
+
+def fold(x, output_size, kernel_size, dilation=1, padding=0, stride=1):
+    """Native PyTorch implementation of Fold.
+    Combine an array of sliding local blocks into a large tensor (col2im).
+
+    Args:
+        x: 3-D tensor, shape (N, C*kH*kW, L)  **required**.
+        output_size: int or (oH, oW)
+        kernel_size: int or (kH, kW)
+        dilation: int or (dH, dW), default 1
+        padding: int or (pH, pW), default 0
+        stride: int or (sH, sW), default 1
+
+    Returns:
+        4-D tensor, shape (N, C, oH, oW)
+    """
+    return tnn.fold(
+        x,
+        output_size=output_size,
+        kernel_size=kernel_size,
+        dilation=dilation,
+        padding=padding,
+        stride=stride,
+    )
+
+
+def depth_to_space(x, block_size, data_format="channels_last"):
+    """PyTorch implementation of depth_to_space.
+
+    Rearranges data from depth into blocks of spatial data.
+    Matches TensorFlow's depth_to_space behavior.
+
+    Args:
+        x: 4-D tensor with shape (N, H, W, C) for channels_last or
+            (N, C, H, W) for channels_first.
+        block_size: An integer specifying the block size.
+        data_format: "channels_last" or "channels_first".
+
+    Returns:
+        A tensor with shape (N, H*block_size, W*block_size, C/block_size**2)
+        for channels_last or (N, C/block_size**2, H*block_size, W*block_size)
+        for channels_first.
+    """
+    x = convert_to_tensor(x)
+    if data_format == "channels_last":
+        # NHWC format
+        n, h, w, c = x.shape
+        new_c = c // (block_size**2)
+        # Reshape: (N, H, W, C) -> (N, H, W, block_size, block_size, new_C)
+        x = x.reshape(n, h, w, block_size, block_size, new_c)
+        # Permute to (N, H, bH, W, bW, new_C) to interleave spatial blocks.
+        x = x.permute(0, 1, 3, 2, 4, 5)
+        # Reshape to the final spatial dimensions.
+        x = x.reshape(n, h * block_size, w * block_size, new_c)
+    else:
+        # NCHW format
+        n, c, h, w = x.shape
+        new_c = c // (block_size**2)
+        # Reshape: (N, C, H, W) -> (N, new_C, block_size, block_size, H, W)
+        x = x.reshape(n, new_c, block_size, block_size, h, w)
+        # Permute: (N, C, bH, bW, H, W) -> (N, C, H, bH, W, bW)
+        x = x.permute(0, 1, 4, 2, 5, 3)
+        # Reshape: (N, C, H, bH, W, bW) -> (N, C, H*bH, W*bW)
+        x = x.reshape(n, new_c, h * block_size, w * block_size)
+    return x
+
+
+def space_to_depth(x, block_size, data_format="channels_last"):
+    """PyTorch implementation of space_to_depth.
+
+    Rearranges blocks of spatial data into depth.
+    Matches TensorFlow's space_to_depth behavior.
+
+    Args:
+        x: 4-D tensor with shape (N, H, W, C) for channels_last or
+            (N, C, H, W) for channels_first.
+        block_size: An integer specifying the block size.
+        data_format: "channels_last" or "channels_first".
+
+    Returns:
+        A tensor with shape (N, H/block_size, W/block_size, C*block_size**2)
+        for channels_last or (N, C*block_size**2, H/block_size, W/block_size)
+        for channels_first.
+    """
+    x = convert_to_tensor(x)
+    if data_format == "channels_last":
+        # NHWC format
+        n, h, w, c = x.shape
+        new_h = h // block_size
+        new_w = w // block_size
+        # Reshape: (N, H, W, C) -> (N, new_H, bH, new_W, bW, C)
+        x = x.reshape(n, new_h, block_size, new_w, block_size, c)
+        # Permute: (N, new_H, bH, new_W, bW, C) -> (N, new_H, new_W, bH, bW, C)
+        x = x.permute(0, 1, 3, 2, 4, 5)
+        # Reshape: (N, new_H, new_W, bH, bW, C) -> (N, new_H, new_W, C*bH*bW)
+        x = x.reshape(n, new_h, new_w, c * block_size**2)
+    else:
+        # NCHW format
+        n, c, h, w = x.shape
+        new_h = h // block_size
+        new_w = w // block_size
+        # Reshape: (N, C, H, W) -> (N, C, new_H, bH, new_W, bW)
+        x = x.reshape(n, c, new_h, block_size, new_w, block_size)
+        # Permute: (N, C, new_H, bH, new_W, bW) -> (N, C, bH, bW, new_H, new_W)
+        x = x.permute(0, 1, 3, 5, 2, 4)
+        # Reshape: (N, C, bH, bW, new_H, new_W) -> (N, C*bH*bW, new_H, new_W)
+        x = x.reshape(n, c * block_size**2, new_h, new_w)
+    return x

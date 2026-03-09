@@ -20,4 +20,7 @@ examples/**/*.jpg
 .python-version
 .coverage
 *coverage.xml
-.ruff_cache*.npy
+.ruff_cache
+
+pytest.ini
+venv/

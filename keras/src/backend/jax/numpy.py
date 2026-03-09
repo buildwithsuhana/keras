@@ -682,6 +682,10 @@ def dot(x1, x2):
     return jnp.dot(x1, x2)
 
 
+def dstack(xs):
+    return jnp.dstack(xs)
+
+
 def empty(shape, dtype=None):
     dtype = dtype or config.floatx()
     return jnp.empty(shape, dtype=dtype)
@@ -770,6 +774,12 @@ def gcd(x1, x2):
     return jnp.gcd(x1, x2)
 
 
+def geomspace(start, stop, num=50, endpoint=True, dtype=None, axis=0):
+    return jnp.geomspace(
+        start, stop, num=num, endpoint=endpoint, dtype=dtype, axis=axis
+    )
+
+
 def greater(x1, x2):
     x1 = convert_to_tensor(x1)
     x2 = convert_to_tensor(x2)
@@ -784,6 +794,11 @@ def greater_equal(x1, x2):
 
 def hstack(xs):
     return jnp.hstack(xs)
+
+
+def hsplit(x, indices_or_sections):
+    x = convert_to_tensor(x)
+    return jnp.hsplit(x, indices_or_sections)
 
 
 def identity(n, dtype=None):
@@ -801,6 +816,12 @@ def isclose(x1, x2, rtol=1e-5, atol=1e-8, equal_nan=False):
     x1 = convert_to_tensor(x1)
     x2 = convert_to_tensor(x2)
     return jnp.isclose(x1, x2, rtol, atol, equal_nan)
+
+
+def allclose(x1, x2, rtol=1e-5, atol=1e-8, equal_nan=False):
+    x1 = convert_to_tensor(x1)
+    x2 = convert_to_tensor(x2)
+    return jnp.allclose(x1, x2, rtol, atol, equal_nan)
 
 
 @sparse.densifying_unary
@@ -1022,6 +1043,16 @@ def moveaxis(x, source, destination):
     return jnp.moveaxis(x, source=source, destination=destination)
 
 
+def nanargmin(x, axis=None, keepdims=False):
+    x = convert_to_tensor(x)
+    return jnp.nanargmin(x, axis=axis, keepdims=keepdims)
+
+
+def nancumsum(x, axis=None, dtype=None):
+    x = convert_to_tensor(x)
+    return jnp.nancumsum(x, axis=axis, dtype=dtype)
+
+
 def nanmax(x, axis=None, keepdims=False):
     x = convert_to_tensor(x)
     return jnp.nanmax(x, axis=axis, keepdims=keepdims)
@@ -1037,9 +1068,24 @@ def nanmin(x, axis=None, keepdims=False):
     return jnp.nanmin(x, axis=axis, keepdims=keepdims)
 
 
+def nanprod(x, axis=None, keepdims=False):
+    x = convert_to_tensor(x)
+    return jnp.nanprod(x, axis=axis, keepdims=keepdims)
+
+
+def nanstd(x, axis=None, keepdims=False):
+    x = convert_to_tensor(x)
+    return jnp.nanstd(x, axis=axis, keepdims=keepdims)
+
+
 def nansum(x, axis=None, keepdims=False):
     x = convert_to_tensor(x)
     return jnp.nansum(x, axis=axis, keepdims=keepdims)
+
+
+def nanvar(x, axis=None, keepdims=False):
+    x = convert_to_tensor(x)
+    return jnp.nanvar(x, axis=axis, keepdims=keepdims)
 
 
 def nan_to_num(x, nan=0.0, posinf=None, neginf=None):
@@ -1343,6 +1389,11 @@ def inner(x1, x2):
 
 def vstack(xs):
     return jnp.vstack(xs)
+
+
+def vsplit(x, indices_or_sections):
+    x = convert_to_tensor(x)
+    return jnp.vsplit(x, indices_or_sections)
 
 
 def vectorize(pyfunc, *, excluded=None, signature=None):

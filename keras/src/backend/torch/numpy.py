@@ -71,9 +71,7 @@ def add(x1, x2):
 
 
 def einsum(subscripts, *operands, **kwargs):
-    from keras.src.backend.torch.core import redistribute_to_replicate
     operands = [convert_to_tensor(operand) for operand in operands]
-    operands = [redistribute_to_replicate(operand) for operand in operands]
     # When all operands are of int8, we cast the result to int32 to align with
     # the behavior of jax.
     dtypes_to_resolve = list(set(standardize_dtype(x.dtype) for x in operands))
@@ -327,10 +325,9 @@ def arange(start, stop=None, step=None, dtype=None):
         start, stop = 0, start
     if step is None:
         step = 1
-    res = torch.arange(
+    return torch.arange(
         start, stop, step=step, dtype=dtype, device=get_device()
     )
-    return convert_to_tensor(res)
 
 
 def arccos(x):
@@ -378,9 +375,6 @@ def arctanh(x):
 
 def argmax(x, axis=None, keepdims=False):
     x = convert_to_tensor(x)
-    if hasattr(x, "to_local"):
-        from keras.src.backend.torch.core import redistribute_to_replicate
-        x = redistribute_to_replicate(x).to_local()
 
     # TODO: torch.argmax doesn't support bool
     if standardize_dtype(x.dtype) == "bool":
@@ -391,9 +385,6 @@ def argmax(x, axis=None, keepdims=False):
 
 def argmin(x, axis=None, keepdims=False):
     x = convert_to_tensor(x)
-    if hasattr(x, "to_local"):
-        from keras.src.backend.torch.core import redistribute_to_replicate
-        x = redistribute_to_replicate(x).to_local()
 
     # TODO: torch.argmin doesn't support bool
     if standardize_dtype(x.dtype) == "bool":
@@ -404,9 +395,6 @@ def argmin(x, axis=None, keepdims=False):
 
 def argsort(x, axis=-1):
     x = convert_to_tensor(x)
-    if hasattr(x, "to_local"):
-        from keras.src.backend.torch.core import redistribute_to_replicate
-        x = redistribute_to_replicate(x).to_local()
 
     # TODO: torch.argsort doesn't support bool
     if standardize_dtype(x.dtype) == "bool":
@@ -445,9 +433,7 @@ def average(x, axis=None, weights=None):
         return torch.sum(torch.mul(x, weights), dim=axis) / torch.sum(
             weights, dim=-1
         )
-    if axis is None:
-        return torch.mean(x)
-    return torch.mean(x, dim=axis)
+    return torch.mean(x, axis)
 
 
 def bartlett(x):
@@ -825,13 +811,6 @@ def expand_dims(x, axis):
     return x
 
 
-def flatten(x):
-    from keras.src.backend.torch.core import redistribute_to_replicate
-    x = convert_to_tensor(x)
-    x = redistribute_to_replicate(x)
-    return torch.flatten(x)
-
-
 def expm1(x):
     x = convert_to_tensor(x)
     ori_dtype = standardize_dtype(x.dtype)
@@ -881,6 +860,33 @@ def gcd(x1, x2):
     x1 = convert_to_tensor(x1)
     x2 = convert_to_tensor(x2)
     return torch.gcd(x1, x2)
+
+
+def geomspace(start, stop, num=50, endpoint=True, dtype=None, axis=0):
+    if axis != 0:
+        raise ValueError(
+            "torch does not support an `axis` argument for geomspace. "
+            f"Received axis={axis}"
+        )
+    if dtype is None:
+        dtypes_to_resolve = [
+            getattr(start, "dtype", type(start)),
+            getattr(stop, "dtype", type(stop)),
+            float,
+        ]
+        dtype = dtypes.result_type(*dtypes_to_resolve)
+    dtype = to_torch_dtype(dtype)
+
+    start = convert_to_tensor(start, dtype=dtype)
+    stop = convert_to_tensor(stop, dtype=dtype)
+
+    log_start = torch.log10(torch.abs(start))
+    log_stop = torch.log10(torch.abs(stop))
+
+    result = logspace(
+        log_start, log_stop, num=num, endpoint=endpoint, base=10, dtype=dtype
+    )
+    return result * torch.sign(start)
 
 
 def greater(x1, x2):
@@ -1319,6 +1325,26 @@ def moveaxis(x, source, destination):
     return torch.moveaxis(x, source=source, destination=destination)
 
 
+def nanargmin(x, axis=None, keepdims=False):
+    x = convert_to_tensor(x)
+
+    if not torch.is_floating_point(x):
+        return argmin(x, axis=axis, keepdims=keepdims)
+
+    x_clean = torch.where(torch.isnan(x), float("inf"), x)
+
+    return torch.where(
+        torch.isnan(x).all(dim=axis, keepdim=keepdims),
+        torch.tensor(-1, dtype=torch.int32, device=get_device()),
+        argmin(x_clean, axis=axis, keepdims=keepdims),
+    )
+
+
+def nancumsum(x, axis=None, dtype=None):
+    x = nan_to_num(x)
+    return cumsum(x, axis=axis, dtype=dtype)
+
+
 def nanmax(x, axis=None, keepdims=False):
     x = convert_to_tensor(x)
     if not torch.is_floating_point(x):
@@ -1382,6 +1408,11 @@ def nanprod(x, axis=None, keepdims=False):
         axis=axis,
         keepdims=keepdims,
     )
+
+
+def nanstd(x, axis=None, keepdims=False):
+    var_val = nanvar(x, axis=axis, keepdims=keepdims)
+    return torch.sqrt(var_val)
 
 
 def nansum(x, axis=None, keepdims=False):
@@ -2045,7 +2076,7 @@ def sum(x, axis=None, keepdims=False):
     if dtype in ("bool", "uint8", "int8", "int16"):
         dtype = "int32"
     if axis is not None:
-        return cast(torch.sum(x, dim=axis, keepdim=keepdims), dtype)
+        return cast(torch.sum(x, axis=axis, keepdim=keepdims), dtype)
     return cast(torch.sum(x), dtype)
 
 

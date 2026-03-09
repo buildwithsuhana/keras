@@ -61,6 +61,11 @@ TORCH_DTYPES = {
 
 @contextlib.contextmanager
 def device_scope(device_name):
+    """Context manager to specify the device for Torch operations.
+
+    Args:
+        device_name: String identifying the device (e.g., "cpu", "gpu:0").
+    """
     previous_device = global_state.get_global_attribute("torch_device", None)
     current_device = _parse_device_input(device_name)
     global_state.set_global_attribute("torch_device", current_device)
@@ -71,32 +76,36 @@ def device_scope(device_name):
 
 
 def get_device():
+    """Return the current default device as a string."""
     device = global_state.get_global_attribute("torch_device", None)
-    if device is None:
-        return DEFAULT_DEVICE
-    return device
+    if device is not None:
+        return device
+    
+    distribution = global_state.get_global_attribute("distribution")
+    if distribution is not None:
+        return distribution.device_mesh.backend_mesh.device_type
+
+    return DEFAULT_DEVICE
 
 
 def _parse_device_input(device_name):
+    """Normalize device input strings."""
     if isinstance(device_name, str):
-        # We support string value like "cpu:0", "gpu:1", and need to convert
-        # "gpu" to "cuda"
         device_name = device_name.lower()
         if "gpu" in device_name:
             device_name = device_name.replace("gpu", "cuda")
         if "tpu" in device_name:
             device_name = device_name.replace("tpu", "xla")
-    else:
-        raise ValueError(
-            "Invalid value for argument `device_name`. "
-            "Expected a string like 'gpu:0' or 'cpu'. "
-            f"Received: device_name='{device_name}'"
-        )
-    # The torch.Device instance can be used directly.
-    return device_name
+        return device_name
+    raise ValueError(
+        "Invalid value for argument `device_name`. "
+        "Expected a string like 'gpu:0' or 'cpu'. "
+        f"Received: device_name='{device_name}'"
+    )
 
 
 def to_torch_dtype(dtype):
+    """Convert Keras dtype to Torch dtype."""
     standardized_dtype = TORCH_DTYPES.get(standardize_dtype(dtype), None)
     if standardized_dtype is None:
         raise ValueError(f"Unsupported dtype for PyTorch: {dtype}")
@@ -104,49 +113,34 @@ def to_torch_dtype(dtype):
 
 
 class Variable(KerasVariable):
+    """Torch-specific implementation of Keras Variable."""
+
     def __init__(self, *args, layout=None, **kwargs):
-        # Intercept layout parameter so that it is available
-        # during initialization.
         self._layout = layout
         super().__init__(*args, **kwargs)
 
     def _initialize_layout(self):
-        # We can't import the keras/distribution/distribution_lib
-        # due to circular dependency.
+        """Initialize the layout for distributed training."""
         distribution = global_state.get_global_attribute("distribution")
         if self._layout is None and distribution is not None:
-            tensor_layout = distribution.get_variable_layout(self)
-            from keras.src.distribution import TensorLayout
-
-            if isinstance(tensor_layout, TensorLayout):
-                self._layout = tensor_layout
-            else:
-                self._layout = tensor_layout
-        
-        # DEBUG
-        # if self._layout is not None:
-        #    print(f"DEBUG: Variable {self.path} assigned layout {self._layout.axes}")
+            self._layout = distribution.get_variable_layout(self)
 
     def _initialize(self, value):
+        """Initialize the variable value and sharding."""
         self._shape = self._validate_shape(value.shape)
         self._initialize_layout()
         if isinstance(value, torch.nn.Parameter):
-            # Reuse same parameter
             self._value = value
         else:
             value = convert_to_tensor(value, dtype=self._dtype)
             if self._layout is not None:
                 from keras.src.backend.torch import distribution_lib
-
                 value = distribution_lib.distribute_variable(value, self._layout)
 
             requires_grad = self.trainable and torch.is_floating_point(value)
-            self._value = torch.nn.Parameter(
-                value,
-                requires_grad=requires_grad,
-            )
-            # Avoid redundant .to() for DTensors which might trigger sync or strip sharding.
-            # We check both the object and its .data for sharding attributes.
+            self._value = torch.nn.Parameter(value, requires_grad=requires_grad)
+            
+            # Sharding detection for avoidance of redundant .to()
             is_sharded = (
                 getattr(value, "device_mesh", None) is not None or 
                 getattr(value, "placements", None) is not None or
@@ -162,109 +156,78 @@ class Variable(KerasVariable):
                 self._value.retain_grad()
 
     def _direct_assign(self, value):
+        """Perform direct assignment to the variable."""
         self._initialize_layout()
         if self._layout is not None:
             from keras.src.backend.torch import distribution_lib
-
             value = distribution_lib.distribute_variable(value, self._layout)
 
         with torch.no_grad():
             try:
                 self.value.copy_(value)
             except Exception as e:
-                if (
-                    "DTensor" in str(e)
-                    or "maskbuffer" in str(e).lower()
-                    or isinstance(e, AssertionError)
-                ):
-                    # Fallback for mixed DTensor/Tensor copy
-                    if hasattr(value, "to_local"):
-                        self.value.copy_(value.to_local())
-                    else:
-                        raise e
+                # Fallback for mixed DTensor/Tensor copy
+                if hasattr(value, "to_local"):
+                    self.value.copy_(value.to_local())
                 else:
                     raise e
 
     def _convert_to_tensor(self, value, dtype=None):
         return convert_to_tensor(value, dtype=dtype)
 
-    # Overload native accessor.
     @classmethod
     def __torch_function__(cls, func, types, args=(), kwargs=None):
-        if kwargs is None:
-            kwargs = {}
-
         def _unwrap(x):
-            if isinstance(x, Variable):
-                return x.value
-            return x
+            return x.value if isinstance(x, Variable) else x
 
         unwrapped_args = tree.map_structure(_unwrap, args)
-        unwrapped_kwargs = tree.map_structure(_unwrap, kwargs)
-
-        from keras.src.backend.torch import distribution_lib
-
-        # Proactive redistribution for view-related ops to avoid sharding
-        # propagation failures in backward pass (aten._unsafe_view).
-        is_view_op = False
-        if hasattr(func, "__name__"):
-            if func.__name__ in ("reshape", "view", "flatten", "transpose", "permute"):
-                is_view_op = True
-        
-        if is_view_op:
-            unwrapped_args = tree.map_structure(redistribute_to_replicate, unwrapped_args)
-            unwrapped_kwargs = tree.map_structure(redistribute_to_replicate, unwrapped_kwargs)
+        unwrapped_kwargs = tree.map_structure(_unwrap, kwargs or {})
 
         try:
             return func(*unwrapped_args, **unwrapped_kwargs)
-        except RuntimeError as e:
-            if (
-                "redistribution" in str(e)
-                or "sharding" in str(e).lower()
-                or "flatten sharded dimension" in str(e).lower()
-            ):
-                unwrapped_args = tree.map_structure(redistribute_to_replicate, unwrapped_args)
-                unwrapped_kwargs = tree.map_structure(redistribute_to_replicate, unwrapped_kwargs)
+        except (RuntimeError, Exception) as e:
+            msg = str(e).lower()
+            if any(k in msg for k in ("sharding", "shard", "redistribute", "partial", "dtensor", "flatten", "view", "reshape", "boolean value", "meta tensor")):
+                from keras.src.backend.torch.distribution_lib import _maybe_replicate
+                unwrapped_args = tree.map_structure(_maybe_replicate, unwrapped_args)
+                unwrapped_kwargs = tree.map_structure(_maybe_replicate, unwrapped_kwargs)
                 return func(*unwrapped_args, **unwrapped_kwargs)
+            raise e
+
+    def __torch_dispatch__(self, func, types, args=(), kwargs=None):
+        try:
+            return func(*args, **(kwargs or {}))
+        except (RuntimeError, Exception) as e:
+            msg = str(e).lower()
+            if any(k in msg for k in ("sharding", "shard", "redistribute", "partial", "dtensor", "flatten", "view", "reshape", "boolean value", "meta tensor")):
+                from keras.src.backend.torch.distribution_lib import _maybe_replicate
+                args = tree.map_structure(_maybe_replicate, args)
+                kwargs = tree.map_structure(_maybe_replicate, kwargs or {})
+                return func(*args, **kwargs)
             raise e
 
     def __array__(self, dtype=None):
         value = convert_to_numpy(self.value)
-        if dtype:
-            return value.astype(dtype)
-        return value
+        return value.astype(dtype) if dtype else value
 
     @property
     def value(self):
-        # We cannot chain super() here because it will fail TorchDynamo. The
-        # reason why is unclear.
+        """Return the current value of the variable, handling symbolic and stateless scopes."""
         def maybe_use_symbolic_tensor(value):
-            # Create and use a symbolic tensor stub in symbolic calls.
             if str(get_device()) == "meta" and str(value.device) != "meta":
                 return torch.nn.Parameter(
-                    torch.empty(
-                        size=self._shape,
-                        dtype=to_torch_dtype(self._dtype),
-                        device="meta",
-                    ),
-                    requires_grad=self.trainable,
+                    torch.empty(size=self._shape, dtype=to_torch_dtype(self._dtype), device="meta"),
+                    requires_grad=self.trainable
                 )
             return value
 
         if in_stateless_scope():
-            scope = get_stateless_scope()
-            value = scope.get_current_value(self)
+            value = get_stateless_scope().get_current_value(self)
             if value is not None:
-                value = self._maybe_autocast(value)
-                return maybe_use_symbolic_tensor(value)
+                return maybe_use_symbolic_tensor(self._maybe_autocast(value))
+        
         if self._value is None:
-            # Uninitialized variable. Return a placeholder.
-            # This is fine because it's only ever used
-            # in during shape inference / graph tracing
-            # (anything else would be a bug, to be fixed.)
-            value = self._maybe_autocast(
-                self._initializer(self._shape, dtype=self._dtype)
-            )
+            value = self._maybe_autocast(self._initializer(self._shape, dtype=self._dtype))
         else:
             value = self._maybe_autocast(self._value)
         return maybe_use_symbolic_tensor(value)
@@ -287,116 +250,71 @@ class Variable(KerasVariable):
 
 
 def _maybe_distribute(res):
+    """Automatically distribute a tensor if a distribution is active."""
     from keras.src.backend.torch.distribution_lib import DTensor
     if not isinstance(res, DTensor):
         from keras.src.distribution import distribution_lib
-        dist = distribution_lib.distribution()
-        if dist is not None:
+        d = distribution_lib.distribution()
+        if d is not None:
             from keras.src.backend.torch.distribution_lib import distribute_tensor
             from keras.src.distribution import TensorLayout
-            # Default to replication for new constants/inputs
-            layout = TensorLayout([None] * len(res.shape), dist.device_mesh)
+            layout = TensorLayout([None] * len(res.shape), d.device_mesh)
             return distribute_tensor(res, layout)
     return res
 
 
-def redistribute_to_replicate(x):
-    import torch
-    from keras.src.backend.torch.distribution_lib import DTensor, Replicate
-    if isinstance(x, Variable):
-        x = x.value
-    if isinstance(x, DTensor):
-        # Always redistribute if not all placements are Replicate
-        all_replicate = True
-        for p in x.placements:
-            if not isinstance(p, Replicate):
-                all_replicate = False
-                break
-        if not all_replicate:
-            # print(f"DEBUG: Redistributing tensor of shape {tuple(x.shape)} from {x.placements} to Replicate", flush=True)
-            return x.redistribute(x.device_mesh, [Replicate()] * x.device_mesh.ndim)
-    elif hasattr(x, "device_mesh") and hasattr(x, "placements"):
-        # Handle cases where it might be a DTensor-like but not isinstance(DTensor)
-        # (e.g. if multiple DTensor types exist due to imports)
-        from torch.distributed.tensor import Replicate as TorchReplicate
-        all_replicate = True
-        for p in x.placements:
-            if not isinstance(p, (Replicate, TorchReplicate)):
-                all_replicate = False
-                break
-        if not all_replicate:
-            # print(f"DEBUG: Redistributing DTensor-like of shape {tuple(x.shape)} from {x.placements} to Replicate", flush=True)
-            from torch.distributed.tensor import Replicate as TorchReplicate
-            return x.redistribute(x.device_mesh, [TorchReplicate()] * x.device_mesh.ndim)
-    return x
-
-
 def convert_to_tensor(x, dtype=None, sparse=None, ragged=None):
-    if sparse:
-        raise ValueError("`sparse=True` is not supported with torch backend")
-    if ragged:
-        raise ValueError("`ragged=True` is not supported with torch backend")
+    """Convert input to a Torch tensor."""
+    if sparse or ragged:
+        raise ValueError(f"{'Sparse' if sparse else 'Ragged'} tensors are not supported in Torch backend.")
 
     if isinstance(x, Variable) or is_tensor(x):
         if isinstance(x, Variable):
             x = x.value
         device = get_device()
         if x.device != device:
-            if x.is_meta:
-                x = torch.empty_like(x, device=device)
-            else:
-                x = x.to(device)
+            x = torch.empty_like(x, device=device) if x.is_meta else x.to(device)
         if dtype is not None:
             x = x.to(to_torch_dtype(dtype))
         return _maybe_distribute(x)
+    
     if dtype is None:
         if isinstance(x, bool):
             return _maybe_distribute(torch.as_tensor(x, dtype=torch.bool, device=get_device()))
-        elif isinstance(x, int):
+        if isinstance(x, int):
             return _maybe_distribute(torch.as_tensor(x, dtype=torch.int32, device=get_device()))
-        elif isinstance(x, float):
-            return _maybe_distribute(torch.as_tensor(
-                x, dtype=to_torch_dtype(floatx()), device=get_device()
-            ))
+        if isinstance(x, float):
+            return _maybe_distribute(torch.as_tensor(x, dtype=to_torch_dtype(floatx()), device=get_device()))
 
-    # Convert to np in case of any array-like that is not list or tuple.
     if not isinstance(x, (list, tuple)):
         x = np.array(x)
     elif len(x) > 0 and any(isinstance(x1, torch.Tensor) for x1 in x):
-        # Handle list or tuple of torch tensors
         return _maybe_distribute(torch.stack([convert_to_tensor(x1) for x1 in x]))
+    
     if isinstance(x, np.ndarray):
         if x.dtype == np.uint32:
-            # Torch backend does not support uint32.
             x = x.astype(np.int64)
         if standardize_dtype(x.dtype) == "bfloat16":
-            # Torch backend does not support converting bfloat16 ndarray.
-            x = x.astype(np.float32)
-            dtype = "bfloat16"
+            x, dtype = x.astype(np.float32), "bfloat16"
         dtype = dtype or x.dtype
+    
     if dtype is None:
-        dtype = result_type(
-            *[getattr(item, "dtype", type(item)) for item in tree.flatten(x)]
-        )
-    dtype = to_torch_dtype(dtype)
-    return _maybe_distribute(torch.as_tensor(x, dtype=dtype, device=get_device()))
+        dtype = result_type(*[getattr(item, "dtype", type(item)) for item in tree.flatten(x)])
+    
+    return _maybe_distribute(torch.as_tensor(x, dtype=to_torch_dtype(dtype), device=get_device()))
 
 
 def convert_to_numpy(x):
+    """Convert a Torch tensor to a NumPy array."""
     def transform(x):
         if is_tensor(x):
             if hasattr(x, "to_local"):
                 x = x.to_local()
             if x.requires_grad:
                 x = x.detach()
-            # Tensor has to be moved to CPU before converting to numpy.
             if x.device != torch.device("cpu"):
                 x = x.cpu()
             if x.dtype == torch.bfloat16:
-                # Attempting to call .numpy() on a bfloat16 torch tensor leads
-                # to an immediate error. Instead we upcast to float32 and then
-                # convert to the numpy friendly bfloat16 type.
-                # https://github.com/pytorch/pytorch/issues/90574
                 return np.array(x.to(torch.float32)).astype(ml_dtypes.bfloat16)
         return np.array(x)
 
@@ -406,192 +324,101 @@ def convert_to_numpy(x):
 
 
 def is_tensor(x):
-    # Using the built-in `isinstance` is recommended by pytorch
-    # over using torch.is_tensor
-    # see: https://pytorch.org/docs/stable/generated/torch.is_tensor.html
-    #
-    # Also, `torch.is_tensor()` causes issues with dynamo caching when
-    # a torch.Tensor and numpy.ndarray of the same size, shape, and dtype
-    # is passed, if called on a Tensor first the second call with ndarray
-    # will return `True` and vice-versa.
+    """Return True if x is a Torch tensor."""
     return isinstance(x, torch.Tensor)
 
 
 def shape(x):
-    # Convert from `torch.Size` to plain tuple.
+    """Return the shape of a tensor as a tuple."""
     return tuple(x.shape)
 
 
 def cast(x, dtype):
-    dtype = to_torch_dtype(dtype)
+    """Cast a tensor to a specific dtype."""
+    target_dtype = to_torch_dtype(dtype)
     if isinstance(x, Variable):
         x = x.value
     if is_tensor(x):
-        if x.dtype == dtype:
-            return x
-        else:
-            return x.to(dtype)
+        return x if x.dtype == target_dtype else x.to(target_dtype)
     return convert_to_tensor(x, dtype)
 
 
-# Shape / dtype inference util
 def compute_output_spec(fn, *args, **kwargs):
-    def has_none_shape(x):
-        """Check for if a `KerasTensor` has dynamic shape."""
-        if isinstance(x, KerasTensor):
-            return None in x.shape
-        return False
-
+    """Compute the output specification (shape and dtype) of a function."""
     def convert_keras_tensor_to_torch(x, fill_value=None):
-        """Convert `KerasTensor`s to `torch.Tensor`s."""
         if isinstance(x, KerasTensor):
-            shape = list(x.shape)
-            if fill_value:
-                for i, e in enumerate(shape):
-                    if e is None:
-                        shape[i] = fill_value
-            res = torch.ones(
-                size=shape,
-                dtype=TORCH_DTYPES[x.dtype],
-                device=get_device(),
-            )
-            return _maybe_distribute(res)
-        return x
-
-    def convert_torch_to_keras_tensor(x):
-        """Convert `torch.Tensor`s to `KerasTensor`s."""
-        if is_tensor(x):
-            return KerasTensor(x.shape, standardize_dtype(x.dtype))
+            s = [fill_value if e is None else e for e in x.shape]
+            return _maybe_distribute(torch.ones(size=s, dtype=TORCH_DTYPES[x.dtype], device=get_device()))
         return x
 
     def symbolic_call(fn, args, kwargs, fill_value):
-        """Call `fn` to infer output shape and dtype."""
         try:
-            # First try instantiating all tensors on the `"meta"` device,
-            # which  should give a "zero flop" way to trace shape, but does
-            # not have universal support with torch operations.
             with device_scope("meta"):
-                meta_args, meta_kwargs = tree.map_structure(
-                    lambda x: convert_keras_tensor_to_torch(x, fill_value),
-                    (args, kwargs),
-                )
+                meta_args, meta_kwargs = tree.map_structure(lambda x: convert_keras_tensor_to_torch(x, fill_value), (args, kwargs))
                 return fn(*meta_args, **meta_kwargs)
         except:
-            with device_scope(DEFAULT_DEVICE):
-                # If the `"meta"` device placement fails, fall back to tracing
-                # eagerly with tensors on the default device. This will be
-                # more robust, but more expensive.
-                eager_args, eager_kwargs = tree.map_structure(
-                    lambda x: convert_keras_tensor_to_torch(x, fill_value),
-                    (args, kwargs),
-                )
+            with device_scope(get_device()):
+                eager_args, eager_kwargs = tree.map_structure(lambda x: convert_keras_tensor_to_torch(x, fill_value), (args, kwargs))
                 return fn(*eager_args, **eager_kwargs)
 
     with StatelessScope(), SymbolicScope(), torch.no_grad():
         outputs = symbolic_call(fn, args, kwargs, fill_value=83)
-
-        none_in_shape = any(
-            builtins.map(has_none_shape, tree.flatten((args, kwargs)))
-        )
-        if none_in_shape:
-            outputs_1 = outputs
+        if any(None in x.shape for x in tree.flatten((args, kwargs)) if isinstance(x, KerasTensor)):
             outputs_2 = symbolic_call(fn, args, kwargs, fill_value=89)
-
-            flat_out_1 = tree.flatten(outputs_1)
-            flat_out_2 = tree.flatten(outputs_2)
-
+            flat_out_1, flat_out_2 = tree.flatten(outputs), tree.flatten(outputs_2)
             flat_out = []
             for x1, x2 in zip(flat_out_1, flat_out_2):
-                shape = list(x1.shape)
-                for i, e in enumerate(x2.shape):
-                    if e != shape[i]:
-                        shape[i] = None
-                flat_out.append(KerasTensor(shape, standardize_dtype(x1.dtype)))
-            outputs = tree.pack_sequence_as(outputs_1, flat_out)
-
-        output_spec = tree.map_structure(convert_torch_to_keras_tensor, outputs)
-    return output_spec
+                s = [None if x1.shape[i] != x2.shape[i] else x1.shape[i] for i in range(len(x1.shape))]
+                flat_out.append(KerasTensor(s, standardize_dtype(x1.dtype)))
+            outputs = tree.pack_sequence_as(outputs, flat_out)
+        
+        return tree.map_structure(lambda x: KerasTensor(x.shape, standardize_dtype(x.dtype)) if is_tensor(x) else x, outputs)
 
 
 def cond(pred, true_fn, false_fn):
-    # When symbolic execution, take pred as true.
+    """Conditional execution."""
     if get_device() == "meta":
         return true_fn()
-
-    if pred:
-        return true_fn()
-    return false_fn()
+    return true_fn() if pred else false_fn()
 
 
 def vectorized_map(function, elements):
+    """Apply function to elements using vectorized execution."""
     return torch.vmap(function)(elements)
 
 
 def map(f, xs):
-    def g(_, x):
-        return (), f(x)
-
-    _, ys = scan(g, (), xs)
-    return ys
+    """Apply function to elements sequentially."""
+    return scan(lambda _, x: ((), f(x)), (), xs)[1]
 
 
 def scan(f, init, xs=None, length=None, reverse=False, unroll=1):
-    # Ref: jax.lax.scan
-    if not callable(f):
-        raise TypeError(f"`f` should be a callable. Received: f={f}")
-    if not isinstance(unroll, bool):
-        if not isinstance(unroll, int) or unroll < 1:
-            raise ValueError(
-                "`unroll` must be an positive integer or boolean. "
-                f"Received: unroll={unroll}"
-            )
-    if xs is None and length is None:
-        raise ValueError("Got no `xs` to scan over and `length` not provided.")
-
-    input_is_sequence = tree.is_nested(xs)
-    output_is_sequence = tree.is_nested(init)
-
-    def pack_input(x):
-        return tree.pack_sequence_as(xs, x) if input_is_sequence else x[0]
-
-    def pack_output(x):
-        return tree.pack_sequence_as(init, x) if output_is_sequence else x[0]
-
+    """Iteratively apply a function and accumulate results."""
     if xs is None:
-        xs_flat = []
-        n = int(length)
+        num_elements, flat_xs = int(length), []
     else:
-        xs_flat = tree.flatten(xs)
-        xs_flat = [convert_to_tensor(elem) for elem in xs_flat]
-        n = int(length) if length is not None else shape(xs_flat[0])[0]
+        flat_xs = [convert_to_tensor(e) for e in tree.flatten(xs)]
+        num_elements = int(length) if length is not None else shape(flat_xs[0])[0]
 
-    init_flat = tree.flatten(init)
-    init_flat = [convert_to_tensor(init) for init in init_flat]
-    init = pack_output(init_flat)
-    dummy_y = [torch.zeros_like(init) for init in init_flat]
-
-    carry = init
+    init_flat = [convert_to_tensor(i) for i in tree.flatten(init)]
+    carry = tree.pack_sequence_as(init, init_flat)
     ys = []
-    maybe_reversed = reversed if reverse else lambda x: x
-    for i in maybe_reversed(range(n)):
-        xs_slice = [x[i] for x in xs_flat]
-        packed_xs = pack_input(xs_slice) if len(xs_slice) > 0 else None
-        carry, y = f(carry, packed_xs)
-        ys.append(y if y is not None else dummy_y)
-    stacked_y = tree.map_structure(
-        lambda *ys: torch.stack(ys), *maybe_reversed(ys)
-    )
+    indices = reversed(range(num_elements)) if reverse else range(num_elements)
+    
+    for i in indices:
+        xs_slice = tree.pack_sequence_as(xs, [x[i] for x in flat_xs]) if flat_xs else None
+        carry, y = f(carry, xs_slice)
+        ys.append(y if y is not None else [torch.zeros_like(i) for i in init_flat])
+    
+    stacked_y = tree.map_structure(lambda *ys: torch.stack(ys), *(reversed(ys) if reverse else ys))
     return carry, stacked_y
 
 
 def associative_scan(f, elems, reverse=False, axis=0):
-    # Ref: jax.lax.associative_scan
-    if not callable(f):
-        raise TypeError(f"`f` should be a callable. Received: f={f}")
-    elems_flat = tree.flatten(elems)
-    elems_flat = [convert_to_tensor(elem) for elem in elems_flat]
+    """Perform an associative scan operation."""
+    flat_elems = [convert_to_tensor(e) for e in tree.flatten(elems)]
     if reverse:
-        elems_flat = [torch.flip(elem, (axis,)) for elem in elems_flat]
+        flat_elems = [torch.flip(elem, (axis,)) for elem in flat_elems]
 
     def _combine(a_flat, b_flat):
         a_flat = [convert_to_tensor(a) for a in a_flat]
@@ -603,12 +430,12 @@ def associative_scan(f, elems, reverse=False, axis=0):
         c_flat = tree.flatten(c)
         return c_flat
 
-    num_elems = int(elems_flat[0].shape[axis])
-    if not all(int(elem.shape[axis]) == num_elems for elem in elems_flat[1:]):
+    num_elems = int(flat_elems[0].shape[axis])
+    if not all(int(elem.shape[axis]) == num_elems for elem in flat_elems[1:]):
         raise ValueError(
             "Array inputs to associative_scan must have the same "
             "first dimension. (saw: {})".format(
-                [elem.shape for elem in elems_flat]
+                [elem.shape for elem in flat_elems]
             )
         )
 
@@ -718,15 +545,38 @@ def scatter(indices, values, shape):
     return zeros
 
 
-def scatter_update(inputs, indices, updates):
+def scatter_update(inputs, indices, updates, reduction=None):
     inputs = convert_to_tensor(inputs)
     indices = convert_to_tensor(indices, dtype="int64")
     updates = convert_to_tensor(updates, dtype=inputs.dtype)
-
     indices = torch.transpose(indices, 0, 1)
+    idx = tuple(indices)
 
     outputs = torch.clone(inputs)
-    outputs[tuple(indices)] = updates
+    if reduction is None:
+        outputs[idx] = updates
+    elif reduction == "add":
+        # Use index_put_ with accumulate=True for proper accumulation
+        outputs.index_put_(idx, updates, accumulate=True)
+    elif reduction == "max":
+        # Loop-based approach handles both scalar and slice updates.
+        # Associative, so sequential application handles duplicates.
+        indices_t = indices.T
+        for i in range(indices_t.shape[0]):
+            idx = tuple(indices_t[i])
+            outputs[idx] = torch.maximum(outputs[idx], updates[i])
+    elif reduction == "min":
+        indices_t = indices.T
+        for i in range(indices_t.shape[0]):
+            idx = tuple(indices_t[i])
+            outputs[idx] = torch.minimum(outputs[idx], updates[i])
+    elif reduction == "mul":
+        indices_t = indices.T
+        for i in range(indices_t.shape[0]):
+            idx = tuple(indices_t[i])
+            outputs[idx] = outputs[idx] * updates[i]
+    else:
+        raise ValueError(f"Unsupported reduction: {reduction}")
     return outputs
 
 
@@ -736,19 +586,12 @@ def slice(inputs, start_indices, shape):
     start_indices = convert_to_tensor(start_indices).to(shape_dtype)
     shape = convert_to_tensor(shape).to(shape_dtype)
 
-    if hasattr(start_indices, "to_local"):
-        start_indices = start_indices.to_local()
-    if hasattr(shape, "to_local"):
-        shape = shape.to_local()
-
-    python_slice = __builtins__["slice"]
-    slices = []
-    for start, length in zip(start_indices, shape):
-        if not inputs.is_meta:
-            slices.append(python_slice(int(start), int(start + length)))
-        else:
-            slices.append(python_slice(start, start + length))
-    return inputs[tuple(slices)]
+    python_slice = builtins.slice
+    slices = [
+        python_slice(int(start_index), int(start_index + length))
+        for start_index, length in zip(start_indices, shape)
+    ]
+    return inputs[slices]
 
 
 def slice_update(inputs, start_indices, updates):
@@ -757,12 +600,9 @@ def slice_update(inputs, start_indices, updates):
     start_indices = convert_to_tensor(start_indices).to(shape_dtype)
     updates = convert_to_tensor(updates)
 
-    if hasattr(start_indices, "to_local"):
-        start_indices = start_indices.to_local()
-
-    python_slice = __builtins__["slice"]
+    python_slice = builtins.slice
     slices = [
-        python_slice(start_index, start_index + update_length)
+        python_slice(int(start_index), int(start_index + update_length))
         for start_index, update_length in zip(start_indices, updates.shape)
     ]
     outputs = torch.clone(inputs)
