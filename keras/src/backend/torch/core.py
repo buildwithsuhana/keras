@@ -111,10 +111,12 @@ def _is_sharded(tensor):
 
 _original_reshape = torch.Tensor.reshape
 _original_view = torch.Tensor.view
+_original_expand = torch.Tensor.expand
 _original_unbind = torch.Tensor.unbind
 _original_detach = torch.Tensor.detach
 _original_einsum = torch.einsum
 _original_unbind_fn = torch.unbind
+_original_broadcast_to = torch.broadcast_to
 
 
 def _sharding_aware_reshape(self, *args, **kwargs):
@@ -135,6 +137,18 @@ def _sharding_aware_view(self, *args, **kwargs):
             self.device_mesh, [Replicate()] * self.device_mesh.ndim
         )
     return _original_view(self, *args, **kwargs)
+
+
+def _sharding_aware_expand(self, *args, **kwargs):
+    if hasattr(self, "device_mesh"):
+        from torch.distributed.tensor import Replicate
+
+        if _is_sharded(self):
+            self = self.redistribute(
+                self.device_mesh, [Replicate()] * self.device_mesh.ndim
+            )
+        return _original_expand(self.to_local(), *args, **kwargs)
+    return _original_expand(self, *args, **kwargs)
 
 
 def _sharding_aware_unbind(self, *args, **kwargs):
@@ -173,6 +187,18 @@ def _sharding_aware_detach(self, *args, **kwargs):
     return _original_detach(self, *args, **kwargs)
 
 
+def _sharding_aware_broadcast_to(input, *args, **kwargs):
+    if hasattr(input, "device_mesh"):
+        from torch.distributed.tensor import Replicate
+
+        if _is_sharded(input):
+            input = input.redistribute(
+                input.device_mesh, [Replicate()] * input.device_mesh.ndim
+            )
+        return _original_broadcast_to(input.to_local(), *args, **kwargs)
+    return _original_broadcast_to(input, *args, **kwargs)
+
+
 def _sharding_aware_einsum(subscripts, *operands, **kwargs):
     if get_device() == "cpu":
         new_operands = []
@@ -193,9 +219,11 @@ def _sharding_aware_einsum(subscripts, *operands, **kwargs):
 
 torch.Tensor.reshape = _sharding_aware_reshape
 torch.Tensor.view = _sharding_aware_view
+torch.Tensor.expand = _sharding_aware_expand
 torch.Tensor.unbind = _sharding_aware_unbind
 torch.Tensor.detach = _sharding_aware_detach
 torch.unbind = _sharding_aware_unbind_fn
+torch.broadcast_to = _sharding_aware_broadcast_to
 torch.einsum = _sharding_aware_einsum
 
 
