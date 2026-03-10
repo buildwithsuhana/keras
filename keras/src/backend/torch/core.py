@@ -227,7 +227,11 @@ def _sharding_aware_getitem(self, *args, **kwargs):
         self = self.redistribute(
             self.device_mesh, [Replicate()] * self.device_mesh.ndim
         )
-        res = _original_getitem(self.to_local(), *args, **kwargs)
+        # Use tuple for indexing to avoid deprecation warning
+        index = args[0]
+        if isinstance(index, (list, np.ndarray)):
+            index = tuple(index)
+        res = _original_getitem(self.to_local(), index, **kwargs)
         return maybe_distribute_tensor(res)
     return _original_getitem(self, *args, **kwargs)
 
@@ -311,13 +315,18 @@ class Variable(KerasVariable):
     def _initialize_layout(self):
         distribution = global_state.get_global_attribute("distribution")
         if self._layout is None and distribution is not None:
-            tensor_layout = distribution.get_variable_layout(self)
+            self._layout = distribution.get_variable_layout(self)
             from keras.src.distribution import TensorLayout
 
-            if isinstance(tensor_layout, TensorLayout):
-                self._layout = tensor_layout.backend_layout
+            if self._layout is None:
+                self._layout = TensorLayout(
+                    [None] * len(self._shape), distribution.device_mesh
+                )
+
+            if isinstance(self._layout, TensorLayout):
+                self._layout = self._layout.backend_layout
             else:
-                self._layout = tensor_layout
+                self._layout = self._layout
 
     def _initialize(self, value):
         # Note that variable.shape is needed by distribution_lib
@@ -915,7 +924,8 @@ def slice(inputs, start_indices, shape):
         python_slice(start_index, start_index + length)
         for start_index, length in zip(start_indices, shape)
     ]
-    return inputs[slices]
+    res = inputs[tuple(slices)]
+    return maybe_distribute_tensor(res)
 
 
 def slice_update(inputs, start_indices, updates):
@@ -930,7 +940,7 @@ def slice_update(inputs, start_indices, updates):
         for start_index, update_length in zip(start_indices, updates.shape)
     ]
     outputs = torch.clone(inputs)
-    outputs[slices] = updates
+    outputs[tuple(slices)] = updates
     return outputs
 
 

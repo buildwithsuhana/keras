@@ -10,7 +10,7 @@ os.environ["KERAS_DISTRIBUTION_DEBUG"] = "1"
 # Set NCCL environment variables to avoid conflicts
 os.environ["NCCL_DEBUG"] = "WARN"
 os.environ["NCCL_P2P_LEVEL"] = "NVL"
-os.environ["TORCH_NCCL_BLOCKING_WAIT"] = "1"  # Updated to use the recommended variable
+os.environ["TORCH_NCCL_BLOCKING_WAIT"] = "1"
 
 # Add OMP_NUM_THREADS to avoid system overload
 os.environ["OMP_NUM_THREADS"] = "1"
@@ -19,9 +19,6 @@ import numpy as np
 import keras
 import keras_hub
 from keras.distribution import DeviceMesh, LayoutMap, ModelParallel, TensorLayout
-
-# Ensure each rank is assigned a unique GPU
-rank = torch.distributed.get_rank() if torch.distributed.is_initialized() else 0
 
 # Ensure proper cleanup of distributed process group at the end of the script
 import atexit
@@ -40,27 +37,23 @@ def train_opt_model_parallel():
 
     keras.distribution.initialize()
 
-    # Setup DeviceMesh
-    if torch.distributed.is_initialized():
-        world_size = torch.distributed.get_world_size()
-    else:
-        world_size = int(os.environ.get("WORLD_SIZE", "1"))
-
-    if torch.cuda.is_available():
-        num_gpus = torch.cuda.device_count()
-        # Use all available GPUs for the global mesh
-        devices = [f"cuda:{i}" for i in range(world_size)]
-        mesh_shape = (world_size,)
-    else:
-        devices = [f"cpu:{i}" for i in range(world_size)]
-        mesh_shape = (world_size,)
-
-    mesh = DeviceMesh(shape=mesh_shape, axis_names=("model",), devices=devices)
+    # Get ranks and world size
+    rank = dist.get_rank()
+    local_rank = int(os.environ.get("LOCAL_RANK", "0"))
+    world_size = dist.get_world_size()
 
     # Assign a unique GPU to each rank
     if torch.cuda.is_available():
-        torch.cuda.set_device(rank % torch.cuda.device_count())
+        torch.cuda.set_device(local_rank % torch.cuda.device_count())
 
+    # Setup DeviceMesh
+    if torch.cuda.is_available():
+        devices = [f"cuda:{i}" for i in range(world_size)]
+    else:
+        devices = [f"cpu:{i}" for i in range(world_size)]
+    
+    mesh_shape = (world_size,)
+    mesh = DeviceMesh(shape=mesh_shape, axis_names=("model",), devices=devices)
 
     tmp_model = keras_hub.models.OPTBackbone(
         vocabulary_size=1000, num_layers=2, num_heads=2, hidden_dim=64, intermediate_dim=128, max_sequence_length=32, dropout=0.0,
@@ -84,12 +77,11 @@ def train_opt_model_parallel():
         elif "feedforward_output_dense/kernel" in path:
             axes[0] = "model"
             
-        # 3. LayerNorm: Shard hidden dim (Fixed in ops/nn.py)
+        # 3. LayerNorm: Shard hidden dim
         elif "layer_norm" in path and ("gamma" in path or "beta" in path):
             axes[0] = "model"
             
-        # 4. Attention: Shard heads (Fixed in ops/nn.py)
-        # Note: We can shard heads now because ops/nn.py uses decomposed SDPA
+        # 4. Attention: Shard heads
         elif "self_attention" in path and "/kernel" in path and len(var.shape) == 3:
             axes[1] = "model"
         elif "self_attention/attention_output/kernel" in path:
@@ -104,7 +96,7 @@ def train_opt_model_parallel():
     distribution = ModelParallel(layout_map=layout_map, auto_shard_dataset=False)
 
     # Build model INSIDE distribution scope
-    print(f"Creating and building model within distribution scope on RANK {os.environ.get('RANK', '0')}...")
+    print(f"Creating and building model within distribution scope on RANK {rank}...")
     with distribution.scope():
         model = keras_hub.models.OPTBackbone(
             vocabulary_size=1000, num_layers=2, num_heads=2, hidden_dim=64, intermediate_dim=128, max_sequence_length=32, dropout=0.0,
@@ -118,19 +110,19 @@ def train_opt_model_parallel():
         y = np.random.randn(16, 32, 64).astype("float32")
         x = {"token_ids": token_ids, "padding_mask": padding_mask}
         
-        print(f"\nRunning model.fit() on RANK {os.environ.get('RANK', '0')}...")
+        print(f"\nRunning model.fit() on RANK {rank}...")
         try:
             history = model.fit(x, y, epochs=1, batch_size=4, verbose=1)
-            print(f"\n✓ model.fit() completed successfully on RANK {os.environ.get('RANK', '0')}!")
+            print(f"\n✓ model.fit() completed successfully on RANK {rank}!")
             final_loss = float(history.history['loss'][-1])
-            print(f"  Final loss on RANK {os.environ.get('RANK', '0')}: {final_loss:.4f}")
+            print(f"  Final loss on RANK {rank}: {final_loss:.4f}")
         except Exception as e:
-            print(f"\n✗ model.fit() failed on RANK {os.environ.get('RANK', '0')}: {e}")
+            print(f"\n✗ model.fit() failed on RANK {rank}: {e}")
             import traceback
             traceback.print_exc()
             
         # Validation
-        print(f"Validating sharding on RANK {os.environ.get('RANK', '0')}...")
+        print(f"Validating sharding on RANK {rank}...")
         shard_count = 0
         replicate_count = 0
         import torch.distributed.tensor as dt
@@ -139,12 +131,12 @@ def train_opt_model_parallel():
                 has_shard = any(isinstance(p, dt.Shard) for p in v.value.placements)
                 if has_shard:
                     shard_count += 1
-                    if os.environ.get('RANK', '0') == '0' and ("/kernel" in v.path or "layer_norm" in v.path or "token_embedding" in v.path):
+                    if rank == 0 and ("/kernel" in v.path or "layer_norm" in v.path or "token_embedding" in v.path):
                         print(f"  [SHARDED] {v.path}: {v.value.placements}")
                 else: replicate_count += 1
             else: replicate_count += 1
         
-        print(f"\nSharding Summary on RANK {os.environ.get('RANK', '0')}:")
+        print(f"\nSharding Summary on RANK {rank}:")
         print(f"  Sharded variables: {shard_count}")
         print(f"  Replicated variables: {replicate_count}")
 
