@@ -1,34 +1,21 @@
 import os
 import argparse
 import numpy as np
-import keras
-import keras_hub
-import jax
 import json
 
-# Set float32 as default (change to float64 if needed for higher precision)
-keras.config.set_floatx("float32")
+# Prevent JAX from pre-allocating all GPU memory when it's not the active backend
+os.environ["XLA_PYTHON_CLIENT_PREALLOCATE"] = "false"
+os.environ["KERAS_DISTRIBUTION_DEBUG"] = "1"
+
+# Torch/NCCL optimizations for Kaggle
+os.environ["NCCL_DEBUG"] = "WARN"
+os.environ["OMP_NUM_THREADS"] = "1"
+
+import keras
+import keras_hub
 
 # Set global random seed
 keras.utils.set_random_seed(42)
-
-# Set JAX to use GPU if available
-if os.environ.get("KERAS_BACKEND") == "jax":
-    # JAX handles multi-GPU automatically if visible
-    pass
-
-# Set Torch settings
-if os.environ.get("KERAS_BACKEND") == "torch":
-    import torch
-    # Try to avoid MPS issues on Mac
-    try:
-        if hasattr(torch, "mps"):
-            if not hasattr(torch.mps, "is_initialized"):
-                torch.mps.is_initialized = lambda: False
-            if not hasattr(torch.mps, "set_device"):
-                torch.mps.set_device = lambda x: None
-    except:
-        pass
 
 parser = argparse.ArgumentParser()
 parser.add_argument("--strategy", choices=["mp", "dp"], required=True)
@@ -75,7 +62,11 @@ def run_training():
     local_rank = int(os.environ.get("LOCAL_RANK", "0"))
     world_size = int(os.environ.get("WORLD_SIZE", "1"))
     
+    if rank == 0:
+        print(f"Running strategy={args.strategy} on backend={backend}")
+
     if backend == "torch":
+        import torch
         import torch.distributed as dist
         if not dist.is_initialized():
             dist.init_process_group(backend="nccl" if torch.cuda.is_available() else "gloo")
@@ -84,29 +75,39 @@ def run_training():
         if torch.cuda.is_available():
             torch.cuda.set_device(local_rank)
         keras.distribution.initialize()
-    
+    elif backend == "jax":
+        import jax
+        # JAX uses all visible devices by default
+        pass
+
     from keras.distribution import DeviceMesh, ModelParallel, DataParallel
     
-    # Detect devices
-    if backend == "jax":
-        # JAX simulation or actual GPUs
-        devices = jax.local_devices()
-        device_names = [str(d) for d in devices]
-        world_size = len(devices)
-    else: # torch
-        if torch.cuda.is_available():
-            device_names = [f"cuda:{i}" for i in range(world_size)]
-        else:
-            device_names = [f"cpu:{i}" for i in range(world_size)]
+    # Use generic 'gpu' strings. Keras backends map these to 'cuda' or 'gpu'
+    num_gpus = 0
+    if backend == "torch":
+        import torch
+        num_gpus = torch.cuda.device_count() if torch.cuda.is_available() else 0
+    elif backend == "jax":
+        import jax
+        try:
+            num_gpus = jax.device_count("gpu")
+        except:
+            num_gpus = 0
+            
+    if num_gpus > 0:
+        device_names = [f"gpu:{i}" for i in range(world_size)]
+    else:
+        device_names = [f"cpu:{i}" for i in range(world_size)]
     
     mesh_shape = (world_size,)
     if args.strategy == "mp":
         mesh = DeviceMesh(shape=mesh_shape, axis_names=("model",), devices=device_names)
+        # MP requires a built model to generate layout map
         tmp_model = get_model()
         tmp_model({"token_ids": np.zeros((1, 32), dtype="int32"), "padding_mask": np.ones((1, 32), dtype="int32")})
         layout_map = get_layout_map(mesh, tmp_model)
         distribution = ModelParallel(layout_map=layout_map, auto_shard_dataset=False)
-    else:
+    else: # dp
         mesh = DeviceMesh(shape=mesh_shape, axis_names=("batch",), devices=device_names)
         distribution = DataParallel(device_mesh=mesh, auto_shard_dataset=False)
 
@@ -122,7 +123,7 @@ def run_training():
         y = data["y"]
         
         global_batch_size = 4
-        # Multi-process backend (Torch) manual sharding
+        # Manual sharding for multi-process backends
         if backend == "torch" and world_size > 1:
             num_samples = token_ids.shape[0]
             indices = np.arange(num_samples)
