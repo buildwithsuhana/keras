@@ -267,7 +267,8 @@ def convert_to_tensor(x, dtype=None, sparse=None, ragged=None):
             *[getattr(item, "dtype", type(item)) for item in tree.flatten(x)]
         )
     dtype = to_torch_dtype(dtype)
-    return torch.as_tensor(x, dtype=dtype, device=get_device())
+    res = torch.as_tensor(x, dtype=dtype, device=get_device())
+    return maybe_distribute_tensor(res)
 
 
 def convert_to_numpy(x):
