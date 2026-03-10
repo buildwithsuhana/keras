@@ -17,7 +17,7 @@ import keras
 import keras_hub
 from keras.distribution import DeviceMesh, LayoutMap, ModelParallel, TensorLayout
 
-# Ensure `rank` is defined before usage
+# Ensure each rank is assigned a unique GPU
 rank = torch.distributed.get_rank() if torch.distributed.is_initialized() else 0
 
 def train_opt_model_parallel():
@@ -32,6 +32,12 @@ def train_opt_model_parallel():
         world_size = torch.distributed.get_world_size()
     else:
         world_size = 1
+
+    # Set CUDA_VISIBLE_DEVICES for proper GPU isolation
+    if torch.cuda.is_available():
+        num_gpus = torch.cuda.device_count()
+        os.environ["CUDA_VISIBLE_DEVICES"] = str(rank % num_gpus)
+
     devices = [f"cuda:{i}" for i in range(torch.cuda.device_count())] if torch.cuda.is_available() else [f"cpu:{i}" for i in range(world_size)]
     mesh = DeviceMesh(shape=(world_size,), axis_names=("model",), devices=devices)
 
