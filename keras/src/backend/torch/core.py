@@ -123,22 +123,28 @@ _original_broadcast_to = torch.broadcast_to
 
 
 def _sharding_aware_reshape(self, *args, **kwargs):
-    if hasattr(self, "device_mesh") and _is_sharded(self):
+    if hasattr(self, "device_mesh"):
         from torch.distributed.tensor import Replicate
 
-        self = self.redistribute(
-            self.device_mesh, [Replicate()] * self.device_mesh.ndim
-        )
+        if _is_sharded(self):
+            self = self.redistribute(
+                self.device_mesh, [Replicate()] * self.device_mesh.ndim
+            )
+        res = _original_reshape(self.to_local(), *args, **kwargs)
+        return maybe_distribute_tensor(res)
     return _original_reshape(self, *args, **kwargs)
 
 
 def _sharding_aware_view(self, *args, **kwargs):
-    if hasattr(self, "device_mesh") and _is_sharded(self):
+    if hasattr(self, "device_mesh"):
         from torch.distributed.tensor import Replicate
 
-        self = self.redistribute(
-            self.device_mesh, [Replicate()] * self.device_mesh.ndim
-        )
+        if _is_sharded(self):
+            self = self.redistribute(
+                self.device_mesh, [Replicate()] * self.device_mesh.ndim
+            )
+        res = _original_view(self.to_local(), *args, **kwargs)
+        return maybe_distribute_tensor(res)
     return _original_view(self, *args, **kwargs)
 
 
@@ -221,12 +227,13 @@ def _sharding_aware_unsqueeze(self, *args, **kwargs):
 
 
 def _sharding_aware_getitem(self, *args, **kwargs):
-    if hasattr(self, "device_mesh") and _is_sharded(self):
+    if hasattr(self, "device_mesh"):
         from torch.distributed.tensor import Replicate
 
-        self = self.redistribute(
-            self.device_mesh, [Replicate()] * self.device_mesh.ndim
-        )
+        if _is_sharded(self):
+            self = self.redistribute(
+                self.device_mesh, [Replicate()] * self.device_mesh.ndim
+            )
         # Use tuple for indexing to avoid deprecation warning
         index = args[0]
         if isinstance(index, (list, np.ndarray)):
@@ -909,12 +916,13 @@ def scatter_update(inputs, indices, updates, reduction=None):
 def slice(inputs, start_indices, shape):
     shape_dtype = to_torch_dtype("int64")
     inputs = convert_to_tensor(inputs)
-    if hasattr(inputs, "device_mesh") and _is_sharded(inputs):
+    if hasattr(inputs, "device_mesh"):
         from torch.distributed.tensor import Replicate
 
-        inputs = inputs.redistribute(
-            inputs.device_mesh, [Replicate()] * inputs.device_mesh.ndim
-        )
+        if _is_sharded(inputs):
+            inputs = inputs.redistribute(
+                inputs.device_mesh, [Replicate()] * inputs.device_mesh.ndim
+            )
         inputs = inputs.to_local()
     start_indices = convert_to_tensor(start_indices).to(shape_dtype)
     shape = convert_to_tensor(shape).to(shape_dtype)
@@ -934,6 +942,24 @@ def slice_update(inputs, start_indices, updates):
     start_indices = convert_to_tensor(start_indices).to(shape_dtype)
     updates = convert_to_tensor(updates)
 
+    if hasattr(inputs, "device_mesh"):
+        from torch.distributed.tensor import Replicate
+
+        if _is_sharded(inputs):
+            inputs = inputs.redistribute(
+                inputs.device_mesh, [Replicate()] * inputs.device_mesh.ndim
+            )
+        inputs = inputs.to_local()
+
+    if hasattr(updates, "device_mesh"):
+        from torch.distributed.tensor import Replicate
+
+        if _is_sharded(updates):
+            updates = updates.redistribute(
+                updates.device_mesh, [Replicate()] * updates.device_mesh.ndim
+            )
+        updates = updates.to_local()
+
     python_slice = __builtins__["slice"]
     slices = [
         python_slice(start_index, start_index + update_length)
@@ -941,7 +967,7 @@ def slice_update(inputs, start_indices, updates):
     ]
     outputs = torch.clone(inputs)
     outputs[tuple(slices)] = updates
-    return outputs
+    return maybe_distribute_tensor(outputs)
 
 
 def switch(index, branches, *operands):

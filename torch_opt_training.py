@@ -115,12 +115,10 @@ def train_opt_model_parallel():
                        "padding_mask": np.ones((1, 32), dtype="int32")}
         model(dummy_input)
 
-        # Disable sharding for unsupported operations during model.fit()
-        with torch.no_grad():
-            history = model.fit(x, y, epochs=1, batch_size=4, verbose=1)
-            print(f"\n✓ model.fit() completed successfully on RANK {rank}!")
-            final_loss = float(history.history['loss'][-1])
-            print(f"  Final loss on RANK {rank}: {final_loss:.4f}")
+        history = model.fit(x, y, epochs=1, batch_size=4, verbose=1)
+        print(f"\n✓ model.fit() completed successfully on RANK {rank}!")
+        final_loss = float(history.history['loss'][-1])
+        print(f"  Final loss on RANK {rank}: {final_loss:.4f}")
             
         # Validation
         print(f"Validating sharding on RANK {rank}...")

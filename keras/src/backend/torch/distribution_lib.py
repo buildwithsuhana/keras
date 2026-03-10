@@ -7,7 +7,7 @@ import torch.nn as nn
 import numpy as np
 from torch.distributed.device_mesh import init_device_mesh
 from torch.distributed.tensor import distribute_tensor as torch_distribute_tensor
-from torch.distributed.tensor import Shard, Replicate
+from torch.distributed.tensor import Shard, Replicate, DTensor
 from torch.distributed.tensor.parallel import (
     parallelize_module,
     ColwiseParallel,
@@ -182,12 +182,12 @@ def distribute_tensor(tensor, layout):
                 print(f"[DEBUG] Unsupported operation during redistribution: {e}. Falling back to replication.")
             return tensor  # Return the tensor as-is without redistribution
 
-    with torch.no_grad():
-        if str(tensor.device).split(":")[0] != mesh_device_type:
-            tensor = tensor.to(mesh_device_type)
+    if str(tensor.device).split(":")[0] != mesh_device_type:
+        tensor = tensor.to(mesh_device_type)
 
-        if not tensor.is_leaf:
-            tensor = tensor.detach()
+    if not tensor.is_leaf:
+        # Use from_local for intermediate tensors to preserve gradients
+        return DTensor.from_local(tensor, mesh, placements, run_check=False)
 
     try:
         return torch_distribute_tensor(tensor, mesh, placements)
