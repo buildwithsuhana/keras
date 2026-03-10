@@ -114,6 +114,9 @@ _original_view = torch.Tensor.view
 _original_expand = torch.Tensor.expand
 _original_unbind = torch.Tensor.unbind
 _original_detach = torch.Tensor.detach
+_original_squeeze = torch.Tensor.squeeze
+_original_unsqueeze = torch.Tensor.unsqueeze
+_original_getitem = torch.Tensor.__getitem__
 _original_einsum = torch.einsum
 _original_unbind_fn = torch.unbind
 _original_broadcast_to = torch.broadcast_to
@@ -147,7 +150,8 @@ def _sharding_aware_expand(self, *args, **kwargs):
             self = self.redistribute(
                 self.device_mesh, [Replicate()] * self.device_mesh.ndim
             )
-        return _original_expand(self.to_local(), *args, **kwargs)
+        res = _original_expand(self.to_local(), *args, **kwargs)
+        return maybe_distribute_tensor(res)
     return _original_expand(self, *args, **kwargs)
 
 
@@ -158,7 +162,8 @@ def _sharding_aware_unbind(self, *args, **kwargs):
         self = self.redistribute(
             self.device_mesh, [Replicate()] * self.device_mesh.ndim
         )
-        return _original_unbind(self.to_local(), *args, **kwargs)
+        res = _original_unbind(self.to_local(), *args, **kwargs)
+        return tree.map_structure(maybe_distribute_tensor, res)
     return _original_unbind(self, *args, **kwargs)
 
 
@@ -169,7 +174,8 @@ def _sharding_aware_unbind_fn(input, *args, **kwargs):
         input = input.redistribute(
             input.device_mesh, [Replicate()] * input.device_mesh.ndim
         )
-        return _original_unbind_fn(input.to_local(), *args, **kwargs)
+        res = _original_unbind_fn(input.to_local(), *args, **kwargs)
+        return tree.map_structure(maybe_distribute_tensor, res)
     return _original_unbind_fn(input, *args, **kwargs)
 
 
@@ -183,8 +189,47 @@ def _sharding_aware_detach(self, *args, **kwargs):
             self = self.redistribute(
                 self.device_mesh, [Replicate()] * self.device_mesh.ndim
             )
-            return _original_detach(self.to_local(), *args, **kwargs)
+            res = _original_detach(self.to_local(), *args, **kwargs)
+            return maybe_distribute_tensor(res)
     return _original_detach(self, *args, **kwargs)
+
+
+def _sharding_aware_squeeze(self, *args, **kwargs):
+    if hasattr(self, "device_mesh"):
+        from torch.distributed.tensor import Replicate
+
+        if _is_sharded(self):
+            self = self.redistribute(
+                self.device_mesh, [Replicate()] * self.device_mesh.ndim
+            )
+        res = _original_squeeze(self.to_local(), *args, **kwargs)
+        return maybe_distribute_tensor(res)
+    return _original_squeeze(self, *args, **kwargs)
+
+
+def _sharding_aware_unsqueeze(self, *args, **kwargs):
+    if hasattr(self, "device_mesh"):
+        from torch.distributed.tensor import Replicate
+
+        if _is_sharded(self):
+            self = self.redistribute(
+                self.device_mesh, [Replicate()] * self.device_mesh.ndim
+            )
+        res = _original_unsqueeze(self.to_local(), *args, **kwargs)
+        return maybe_distribute_tensor(res)
+    return _original_unsqueeze(self, *args, **kwargs)
+
+
+def _sharding_aware_getitem(self, *args, **kwargs):
+    if hasattr(self, "device_mesh") and _is_sharded(self):
+        from torch.distributed.tensor import Replicate
+
+        self = self.redistribute(
+            self.device_mesh, [Replicate()] * self.device_mesh.ndim
+        )
+        res = _original_getitem(self.to_local(), *args, **kwargs)
+        return maybe_distribute_tensor(res)
+    return _original_getitem(self, *args, **kwargs)
 
 
 def _sharding_aware_broadcast_to(input, *args, **kwargs):
@@ -195,7 +240,8 @@ def _sharding_aware_broadcast_to(input, *args, **kwargs):
             input = input.redistribute(
                 input.device_mesh, [Replicate()] * input.device_mesh.ndim
             )
-        return _original_broadcast_to(input.to_local(), *args, **kwargs)
+        res = _original_broadcast_to(input.to_local(), *args, **kwargs)
+        return maybe_distribute_tensor(res)
     return _original_broadcast_to(input, *args, **kwargs)
 
 
@@ -222,6 +268,9 @@ torch.Tensor.view = _sharding_aware_view
 torch.Tensor.expand = _sharding_aware_expand
 torch.Tensor.unbind = _sharding_aware_unbind
 torch.Tensor.detach = _sharding_aware_detach
+torch.Tensor.squeeze = _sharding_aware_squeeze
+torch.Tensor.unsqueeze = _sharding_aware_unsqueeze
+torch.Tensor.__getitem__ = _sharding_aware_getitem
 torch.unbind = _sharding_aware_unbind_fn
 torch.broadcast_to = _sharding_aware_broadcast_to
 torch.einsum = _sharding_aware_einsum
@@ -459,7 +508,13 @@ def maybe_distribute_tensor(res):
                 res = res.to(mesh.device_type)
 
             # Use a replicated layout for intermediate tensors by default
+            # BUT if it's too small to be sharded, we MUST use Replicate
+            # to avoid empty tensors on some ranks which cause unpacking errors.
             layout = TensorLayout([None] * res.ndim, distribution.device_mesh)
+            
+            # Check if any dimension is smaller than the mesh dimension it would be sharded on
+            # For now, intermediate tensors are always Replicated by default in Keras Torch backend
+            # so this is mostly a safeguard.
             return distribution_lib.distribute_tensor(res, layout)
         finally:
             _DISTRIBUTION_AWARE_ACTIVE.active = False
