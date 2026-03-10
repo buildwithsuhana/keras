@@ -18,6 +18,24 @@ from keras.src.backend.common import global_state
 
 DEBUG = os.environ.get("KERAS_DISTRIBUTION_DEBUG", "0") == "1"
 
+from torch.distributed.tensor._sharding_prop import ShardingPropagator
+
+def register_fallback_sharding_strategy():
+    """Register a fallback sharding strategy for unsupported operators."""
+    def fallback_sharding_strategy(op_info):
+        if DEBUG:
+            print(f"[DEBUG] Operator {op_info.schema} does not have a registered sharding strategy. Falling back to replication.")
+        return None  # Returning None disables sharding for this operator
+
+    if hasattr(ShardingPropagator, "register_fallback"):
+        ShardingPropagator.register_fallback(fallback_sharding_strategy)
+    else:
+        if DEBUG:
+            print("[DEBUG] ShardingPropagator does not support fallback registration. Skipping fallback setup.")
+
+# Call the fallback registration during initialization
+register_fallback_sharding_strategy()
+
 
 def list_devices(device_type=None):
     """Return all the available devices based on the device type."""
