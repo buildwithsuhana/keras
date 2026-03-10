@@ -20,6 +20,7 @@ from keras.src.backend.common.stateless_scope import get_stateless_scope
 from keras.src.backend.common.stateless_scope import in_stateless_scope
 from keras.src.backend.common.symbolic_scope import SymbolicScope
 from keras.src.backend.config import floatx
+from keras.src.utils.module_utils import torch_xla
 
 SUPPORTS_SPARSE_TENSORS = False
 SUPPORTS_RAGGED_TENSORS = False
@@ -36,6 +37,8 @@ elif torch.cuda.is_available():
     DEFAULT_DEVICE = "cuda"
 elif hasattr(torch, "xpu") and torch.xpu.is_available():
     DEFAULT_DEVICE = "xpu"
+elif torch_xla.available:
+    DEFAULT_DEVICE = "xla"
 else:
     DEFAULT_DEVICE = "cpu"
 

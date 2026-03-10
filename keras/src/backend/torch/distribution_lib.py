@@ -13,37 +13,14 @@ from torch.distributed.tensor.parallel import (
     ColwiseParallel,
     RowwiseParallel,
 )
-
 from keras.src.backend.common import global_state
-
-DEBUG = os.environ.get("KERAS_DISTRIBUTION_DEBUG", "0") == "1"
-
-from torch.distributed.tensor._sharding_prop import ShardingPropagator
-
-def register_fallback_sharding_strategy():
-    """Register a fallback sharding strategy for unsupported operators."""
-    def fallback_sharding_strategy(op_info):
-        if DEBUG:
-            print(f"[DEBUG] Operator {op_info.schema} does not have a registered sharding strategy. Falling back to replication.")
-        return None  # Returning None disables sharding for this operator
-
-    if hasattr(ShardingPropagator, "register_fallback"):
-        ShardingPropagator.register_fallback(fallback_sharding_strategy)
-    else:
-        if DEBUG:
-            print("[DEBUG] ShardingPropagator does not support fallback registration. Skipping fallback setup.")
-
-# Call the fallback registration during initialization
-register_fallback_sharding_strategy()
 
 
 def list_devices(device_type=None):
     """Return all the available devices based on the device type."""
     if device_type is None:
-        if torch.cuda.is_available():
-            device_type = "cuda"
-        else:
-            device_type = "cpu"
+        from keras.src.backend.torch.core import get_device
+        device_type = str(get_device()).split(":")[0]
     else:
         device_type = device_type.lower()
         if device_type == "gpu":
@@ -51,6 +28,13 @@ def list_devices(device_type=None):
 
     if device_type == "cuda":
         num_devices = torch.cuda.device_count()
+    elif device_type == "xla":
+        from keras.src.utils.module_utils import torch_xla
+        if torch_xla.available:
+            import torch_xla.core.xla_model as xm
+            num_devices = len(xm.get_xla_supported_devices())
+        else:
+            num_devices = 0
     elif device_type == "cpu":
         num_devices = 1
     else:
@@ -89,10 +73,15 @@ def initialize(job_addresses=None, num_processes=None, process_id=None):
         if "RANK" not in os.environ:
             os.environ["RANK"] = "0"
 
-        backend = "nccl" if torch.cuda.is_available() else "gloo"
-        if DEBUG:
-            print(f"[DEBUG] Initializing torch distributed with {backend} backend")
-            
+        from keras.src.backend.torch.core import get_device
+        device_type = str(get_device()).split(":")[0]
+
+        if device_type == "xla":
+            backend = "xla"
+        elif device_type == "cuda":
+            backend = "nccl"
+        else:
+            backend = "gloo"
         torch.distributed.init_process_group(backend=backend)
 
 
@@ -112,10 +101,9 @@ def process_id():
 
 def _to_backend_mesh(device_mesh):
     """Convert the DeviceMesh to Torch backend specific Mesh."""
-    device_type = "cuda" if torch.cuda.is_available() else "cpu"
+    from keras.src.backend.torch.core import get_device
+    device_type = str(get_device()).split(":")[0]
     mesh_shape = device_mesh.shape
-    if DEBUG:
-        print(f"[DEBUG] Creating device mesh: type={device_type}, shape={mesh_shape}, axis_names={device_mesh.axis_names}")
     return init_device_mesh(
         device_type, mesh_shape, mesh_dim_names=device_mesh.axis_names
     )
@@ -175,12 +163,7 @@ def distribute_tensor(tensor, layout):
     mesh_device_type = mesh.device_type
 
     if hasattr(tensor, "device_mesh"):
-        try:
-            return tensor.redistribute(mesh, placements)
-        except NotImplementedError as e:
-            if DEBUG:
-                print(f"[DEBUG] Unsupported operation during redistribution: {e}. Falling back to replication.")
-            return tensor  # Return the tensor as-is without redistribution
+        return tensor.redistribute(mesh, placements)
 
     if str(tensor.device).split(":")[0] != mesh_device_type:
         tensor = tensor.to(mesh_device_type)
@@ -188,13 +171,7 @@ def distribute_tensor(tensor, layout):
     if not tensor.is_leaf:
         # Use from_local for intermediate tensors to preserve gradients
         return DTensor.from_local(tensor, mesh, placements, run_check=False)
-
-    try:
-        return torch_distribute_tensor(tensor, mesh, placements)
-    except NotImplementedError as e:
-        if DEBUG:
-            print(f"[DEBUG] Unsupported operation during distribution: {e}. Falling back to replication.")
-        return tensor  # Return the tensor as-is without distribution
+    return torch_distribute_tensor(tensor, mesh, placements)
 
 
 def distribute_data_input(per_process_batch, layout, batch_dim_name):
@@ -246,8 +223,6 @@ def parallelize_layer(layer, distribution):
     for module, sub_plan in module_plans.items():
         if isinstance(module, torch.nn.ParameterDict):
             continue
-        if DEBUG:
-            print(f"[DEBUG] Parallelizing module {module} with plan {list(sub_plan.keys())}")
         parallelize_module(module, mesh, sub_plan)
         
     for var_path, (var, module, attr_name, style) in variable_to_attr.items():
