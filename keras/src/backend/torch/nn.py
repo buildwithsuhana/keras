@@ -1137,17 +1137,6 @@ def _can_use_flash_attention(
     return can_use_flash_attention(spda_params, False)
 
 
-def _maybe_replicate(x):
-    if hasattr(x, "device_mesh") and hasattr(x, "placements"):
-        from torch.distributed.tensor import Replicate
-
-        if any(not isinstance(p, Replicate) for p in x.placements):
-            return x.redistribute(
-                x.device_mesh, [Replicate()] * x.device_mesh.ndim
-            )
-    return x
-
-
 def dot_product_attention(
     query,
     key,
@@ -1162,16 +1151,6 @@ def dot_product_attention(
     query = convert_to_tensor(query)
     key = convert_to_tensor(key)
     value = convert_to_tensor(value)
-
-    # Handle Distributed Tensor
-    query = _maybe_replicate(query)
-    key = _maybe_replicate(key)
-    value = _maybe_replicate(value)
-    if bias is not None:
-        bias = _maybe_replicate(bias)
-    if mask is not None:
-        mask = _maybe_replicate(mask)
-
     if len(query.shape) != 4 or len(key.shape) != 4 or len(value.shape) != 4:
         raise ValueError(
             "`dot_product_attention` only supports 4D inputs. "
