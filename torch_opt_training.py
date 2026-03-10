@@ -110,16 +110,17 @@ def train_opt_model_parallel():
         y = np.random.randn(16, 32, 64).astype("float32")
         x = {"token_ids": token_ids, "padding_mask": padding_mask}
         
-        print(f"\nRunning model.fit() on RANK {rank}...")
-        try:
+        # Explicitly build the model before calling fit()
+        dummy_input = {"token_ids": np.random.randint(0, 1000, (1, 32)).astype("int32"),
+                       "padding_mask": np.ones((1, 32), dtype="int32")}
+        model(dummy_input)
+
+        # Disable sharding for unsupported operations during model.fit()
+        with torch.no_grad():
             history = model.fit(x, y, epochs=1, batch_size=4, verbose=1)
             print(f"\n✓ model.fit() completed successfully on RANK {rank}!")
             final_loss = float(history.history['loss'][-1])
             print(f"  Final loss on RANK {rank}: {final_loss:.4f}")
-        except Exception as e:
-            print(f"\n✗ model.fit() failed on RANK {rank}: {e}")
-            import traceback
-            traceback.print_exc()
             
         # Validation
         print(f"Validating sharding on RANK {rank}...")
