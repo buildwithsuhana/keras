@@ -37,9 +37,13 @@ def train_opt_model_parallel():
     if torch.cuda.is_available():
         num_gpus = torch.cuda.device_count()
         os.environ["CUDA_VISIBLE_DEVICES"] = str(rank % num_gpus)
+        devices = [f"cuda:{i}" for i in range(1)]  # Each rank gets one device
+        mesh_shape = (1,)  # Shape matches the number of devices per rank
+    else:
+        devices = [f"cpu:{i}" for i in range(world_size)]
+        mesh_shape = (world_size,)
 
-    devices = [f"cuda:{i}" for i in range(torch.cuda.device_count())] if torch.cuda.is_available() else [f"cpu:{i}" for i in range(world_size)]
-    mesh = DeviceMesh(shape=(world_size,), axis_names=("model",), devices=devices)
+    mesh = DeviceMesh(shape=mesh_shape, axis_names=("model",), devices=devices)
 
     # Assign a unique GPU to each rank
     if torch.cuda.is_available():
