@@ -148,7 +148,7 @@ class Variable(KerasVariable):
 
     def _convert_to_tensor(self, value, dtype=None):
         return convert_to_tensor(value, dtype=dtype)
-    
+
     # Overload native accessor.
     @classmethod
     def __torch_function__(cls, func, types, args=(), kwargs=None):
@@ -158,8 +158,6 @@ class Variable(KerasVariable):
             return x
         if kwargs is None:
             kwargs = {}
-        if not all(issubclass(t, (torch.Tensor, Variable)) for t in types):
-            return NotImplemented
         args = tree.map_structure(unwrap, args)
         kwargs = tree.map_structure(unwrap, kwargs)
         return func(*args, **kwargs)
