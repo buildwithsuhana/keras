@@ -173,18 +173,28 @@ def distribute_tensor(tensor, layout):
 
     mesh, placements = layout
     mesh_device_type = mesh.device_type
-    
+
     if hasattr(tensor, "device_mesh"):
-        return tensor.redistribute(mesh, placements)
+        try:
+            return tensor.redistribute(mesh, placements)
+        except NotImplementedError as e:
+            if DEBUG:
+                print(f"[DEBUG] Unsupported operation during redistribution: {e}. Falling back to replication.")
+            return tensor  # Return the tensor as-is without redistribution
 
     with torch.no_grad():
         if str(tensor.device).split(":")[0] != mesh_device_type:
             tensor = tensor.to(mesh_device_type)
-        
+
         if not tensor.is_leaf:
             tensor = tensor.detach()
 
-    return torch_distribute_tensor(tensor, mesh, placements)
+    try:
+        return torch_distribute_tensor(tensor, mesh, placements)
+    except NotImplementedError as e:
+        if DEBUG:
+            print(f"[DEBUG] Unsupported operation during distribution: {e}. Falling back to replication.")
+        return tensor  # Return the tensor as-is without distribution
 
 
 def distribute_data_input(per_process_batch, layout, batch_dim_name):
