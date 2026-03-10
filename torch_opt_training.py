@@ -44,14 +44,13 @@ def train_opt_model_parallel():
     if torch.distributed.is_initialized():
         world_size = torch.distributed.get_world_size()
     else:
-        world_size = 1
+        world_size = int(os.environ.get("WORLD_SIZE", "1"))
 
-    # Set CUDA_VISIBLE_DEVICES for proper GPU isolation
     if torch.cuda.is_available():
         num_gpus = torch.cuda.device_count()
-        os.environ["CUDA_VISIBLE_DEVICES"] = str(rank % num_gpus)
-        devices = [f"cuda:{i}" for i in range(1)]  # Each rank gets one device
-        mesh_shape = (1,)  # Shape matches the number of devices per rank
+        # Use all available GPUs for the global mesh
+        devices = [f"cuda:{i}" for i in range(world_size)]
+        mesh_shape = (world_size,)
     else:
         devices = [f"cpu:{i}" for i in range(world_size)]
         mesh_shape = (world_size,)
@@ -61,6 +60,7 @@ def train_opt_model_parallel():
     # Assign a unique GPU to each rank
     if torch.cuda.is_available():
         torch.cuda.set_device(rank % torch.cuda.device_count())
+
 
     tmp_model = keras_hub.models.OPTBackbone(
         vocabulary_size=1000, num_layers=2, num_heads=2, hidden_dim=64, intermediate_dim=128, max_sequence_length=32, dropout=0.0,
