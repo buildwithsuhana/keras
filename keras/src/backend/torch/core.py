@@ -123,6 +123,7 @@ class Variable(KerasVariable):
         self._shape = self._validate_shape(value.shape)
         self._initialize_layout()
         if isinstance(value, torch.nn.Parameter):
+            # Reuse same parameter
             self._value = value
         else:
             requires_grad = self.trainable and torch.is_floating_point(
@@ -147,7 +148,8 @@ class Variable(KerasVariable):
 
     def _convert_to_tensor(self, value, dtype=None):
         return convert_to_tensor(value, dtype=dtype)
-
+    
+    # Overload native accessor.
     @classmethod
     def __torch_function__(cls, func, types, args=(), kwargs=None):
         def unwrap(x):
@@ -170,7 +172,10 @@ class Variable(KerasVariable):
 
     @property
     def value(self):
+        # We cannot chain super() here because it will fail TorchDynamo. The
+        # reason why is unclear.
         def maybe_use_symbolic_tensor(value):
+            # Create and use a symbolic tensor stub in symbolic calls.
             if str(get_device()) == "meta" and str(value.device) != "meta":
                 return torch.nn.Parameter(
                     torch.empty(
@@ -189,6 +194,10 @@ class Variable(KerasVariable):
                 value = self._maybe_autocast(value)
                 return maybe_use_symbolic_tensor(value)
         if self._value is None:
+            # Uninitialized variable. Return a placeholder.
+            # This is fine because it's only ever used
+            # in during shape inference / graph tracing
+            # (anything else would be a bug, to be fixed.)
             value = self._maybe_autocast(
                 self._initializer(self._shape, dtype=self._dtype)
             )
@@ -275,7 +284,6 @@ def convert_to_numpy(x):
         if is_tensor(x):
             if x.requires_grad:
                 x = x.detach()
-            # Handle Distributed Tensor
             x = _ensure_replicated_local(x)
             # Tensor has to be moved to CPU before converting to numpy.
             if x.device != torch.device("cpu"):
@@ -477,7 +485,7 @@ def associative_scan(f, elems, reverse=False, axis=0):
     if not callable(f):
         raise TypeError(f"`f` should be a callable. Received: f={f}")
     elems_flat = tree.flatten(elems)
-    elems_flat = [convert_to_tensor(elem) for elem in tree.flatten(elems_flat)]
+    elems_flat = [convert_to_tensor(elem) for elem in elems_flat]
     if reverse:
         elems_flat = [torch.flip(elem, (axis,)) for elem in elems_flat]
 
@@ -492,7 +500,7 @@ def associative_scan(f, elems, reverse=False, axis=0):
         return c_flat
 
     num_elems = int(elems_flat[0].shape[axis])
-    if not all(int(elem.shape[axis]) == num_elems for i, elem in enumerate(elems_flat)):
+    if not all(int(elem.shape[axis]) == num_elems for elem in elems_flat[1:]):
         raise ValueError(
             "Array inputs to associative_scan must have the same "
             "first dimension. (saw: {})".format(
@@ -654,7 +662,7 @@ def slice(inputs, start_indices, shape):
         python_slice(start_index, start_index + length)
         for start_index, length in zip(start_indices, shape)
     ]
-    res = inputs[tuple(slices)]
+    res = inputs[slices]
     return maybe_distribute_tensor(res)
 
 
@@ -676,7 +684,7 @@ def slice_update(inputs, start_indices, updates):
         for start_index, update_length in zip(start_indices, updates.shape)
     ]
     outputs = torch.clone(inputs)
-    outputs[tuple(slices)] = updates
+    outputs[slices] = updates
     return maybe_distribute_tensor(outputs)
 
 
@@ -803,8 +811,6 @@ class CustomGradientFunction(torch.autograd.Function):
             grads = (grads,)
         return (None,) + grads
 
-
-# --- Sharding awareness logic ---
 
 def _is_sharded(tensor):
     if hasattr(tensor, "placements"):
