@@ -109,14 +109,11 @@ def _is_sharded(tensor):
         return any(isinstance(p, Shard) for p in tensor.placements)
     return False
 
-
-# Monkeypatch torch.Tensor.reshape, torch.Tensor.view, and torch.einsum
-# to handle DTensors on CPU. PyTorch DTensor on CPU doesn't support
-# flattening sharded dimensions, and native torch.einsum often performs
-# such operations internally.
 _original_reshape = torch.Tensor.reshape
 _original_view = torch.Tensor.view
+_original_unbind = torch.Tensor.unbind
 _original_einsum = torch.einsum
+_original_unbind_fn = torch.unbind
 
 
 def _sharding_aware_reshape(self, *args, **kwargs):
@@ -139,6 +136,30 @@ def _sharding_aware_view(self, *args, **kwargs):
     return _original_view(self, *args, **kwargs)
 
 
+def _sharding_aware_unbind(self, *args, **kwargs):
+    if hasattr(self, "device_mesh"):
+        from torch.distributed.tensor import Replicate
+
+        if _is_sharded(self):
+            self = self.redistribute(
+                self.device_mesh, [Replicate()] * self.device_mesh.ndim
+            )
+        return _original_unbind(self.to_local(), *args, **kwargs)
+    return _original_unbind(self, *args, **kwargs)
+
+
+def _sharding_aware_unbind_fn(input, *args, **kwargs):
+    if hasattr(input, "device_mesh"):
+        from torch.distributed.tensor import Replicate
+
+        if _is_sharded(input):
+            input = input.redistribute(
+                input.device_mesh, [Replicate()] * input.device_mesh.ndim
+            )
+        return _original_unbind_fn(input.to_local(), *args, **kwargs)
+    return _original_unbind_fn(input, *args, **kwargs)
+
+
 def _sharding_aware_einsum(subscripts, *operands, **kwargs):
     if get_device() == "cpu":
         new_operands = []
@@ -159,6 +180,8 @@ def _sharding_aware_einsum(subscripts, *operands, **kwargs):
 
 torch.Tensor.reshape = _sharding_aware_reshape
 torch.Tensor.view = _sharding_aware_view
+torch.Tensor.unbind = _sharding_aware_unbind
+torch.unbind = _sharding_aware_unbind_fn
 torch.einsum = _sharding_aware_einsum
 
 
