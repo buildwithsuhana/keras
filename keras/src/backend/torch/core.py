@@ -112,6 +112,8 @@ def _is_sharded(tensor):
 _original_reshape = torch.Tensor.reshape
 _original_view = torch.Tensor.view
 _original_unbind = torch.Tensor.unbind
+_original_alias = torch.Tensor.alias
+_original_detach = torch.Tensor.detach
 _original_einsum = torch.einsum
 _original_unbind_fn = torch.unbind
 
@@ -140,10 +142,9 @@ def _sharding_aware_unbind(self, *args, **kwargs):
     if hasattr(self, "device_mesh"):
         from torch.distributed.tensor import Replicate
 
-        if _is_sharded(self):
-            self = self.redistribute(
-                self.device_mesh, [Replicate()] * self.device_mesh.ndim
-            )
+        self = self.redistribute(
+            self.device_mesh, [Replicate()] * self.device_mesh.ndim
+        )
         return _original_unbind(self.to_local(), *args, **kwargs)
     return _original_unbind(self, *args, **kwargs)
 
@@ -152,12 +153,38 @@ def _sharding_aware_unbind_fn(input, *args, **kwargs):
     if hasattr(input, "device_mesh"):
         from torch.distributed.tensor import Replicate
 
-        if _is_sharded(input):
-            input = input.redistribute(
-                input.device_mesh, [Replicate()] * input.device_mesh.ndim
-            )
+        input = input.redistribute(
+            input.device_mesh, [Replicate()] * input.device_mesh.ndim
+        )
         return _original_unbind_fn(input.to_local(), *args, **kwargs)
     return _original_unbind_fn(input, *args, **kwargs)
+
+
+def _sharding_aware_alias(self, *args, **kwargs):
+    if hasattr(self, "device_mesh"):
+        from torch.distributed.tensor import Replicate
+
+        if _is_sharded(self):
+            self = self.redistribute(
+                self.device_mesh, [Replicate()] * self.device_mesh.ndim
+            )
+        # return alias of the local tensor to satisfy the 'aten.alias' requirement
+        return _original_alias(self.to_local(), *args, **kwargs)
+    return _original_alias(self, *args, **kwargs)
+
+
+def _sharding_aware_detach(self, *args, **kwargs):
+    if hasattr(self, "device_mesh"):
+        # detach should ideally work on DTensor, but if it fails, we fall back to replication
+        try:
+            return _original_detach(self, *args, **kwargs)
+        except Exception:
+            from torch.distributed.tensor import Replicate
+            self = self.redistribute(
+                self.device_mesh, [Replicate()] * self.device_mesh.ndim
+            )
+            return _original_detach(self.to_local(), *args, **kwargs)
+    return _original_detach(self, *args, **kwargs)
 
 
 def _sharding_aware_einsum(subscripts, *operands, **kwargs):
@@ -181,6 +208,8 @@ def _sharding_aware_einsum(subscripts, *operands, **kwargs):
 torch.Tensor.reshape = _sharding_aware_reshape
 torch.Tensor.view = _sharding_aware_view
 torch.Tensor.unbind = _sharding_aware_unbind
+torch.Tensor.alias = _sharding_aware_alias
+torch.Tensor.detach = _sharding_aware_detach
 torch.unbind = _sharding_aware_unbind_fn
 torch.einsum = _sharding_aware_einsum
 
