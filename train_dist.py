@@ -49,6 +49,7 @@ def run_training():
     world_size = int(os.environ.get("WORLD_SIZE", "1"))
     
     if backend == "torch":
+        import torch
         import torch.distributed as dist
         if not dist.is_initialized():
             dist.init_process_group(backend="nccl" if torch.cuda.is_available() else "gloo")
@@ -60,7 +61,6 @@ def run_training():
     from keras.distribution import DeviceMesh, DataParallel
     num_gpus = 0
     if backend == "torch":
-        import torch
         num_gpus = torch.cuda.device_count() if torch.cuda.is_available() else 0
     else:
         import jax
