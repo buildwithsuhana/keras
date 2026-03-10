@@ -112,7 +112,6 @@ def _is_sharded(tensor):
 _original_reshape = torch.Tensor.reshape
 _original_view = torch.Tensor.view
 _original_unbind = torch.Tensor.unbind
-_original_alias = torch.Tensor.alias
 _original_detach = torch.Tensor.detach
 _original_einsum = torch.einsum
 _original_unbind_fn = torch.unbind
