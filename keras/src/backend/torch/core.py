@@ -2,6 +2,7 @@ import builtins
 import contextlib
 import functools
 import os
+import threading
 
 import ml_dtypes
 import numpy as np
@@ -19,7 +20,6 @@ from keras.src.backend.common.stateless_scope import get_stateless_scope
 from keras.src.backend.common.stateless_scope import in_stateless_scope
 from keras.src.backend.common.symbolic_scope import SymbolicScope
 from keras.src.backend.config import floatx
-from keras.src.backend.torch import distribution_lib
 
 SUPPORTS_SPARSE_TENSORS = False
 SUPPORTS_RAGGED_TENSORS = False
@@ -102,220 +102,6 @@ def to_torch_dtype(dtype):
     return standardized_dtype
 
 
-def _is_sharded(tensor):
-    if hasattr(tensor, "placements"):
-        from torch.distributed.tensor import Shard
-
-        return any(isinstance(p, Shard) for p in tensor.placements)
-    return False
-
-_original_reshape = torch.Tensor.reshape
-_original_view = torch.Tensor.view
-_original_expand = torch.Tensor.expand
-_original_unbind = torch.Tensor.unbind
-_original_detach = torch.Tensor.detach
-_original_squeeze = torch.Tensor.squeeze
-_original_unsqueeze = torch.Tensor.unsqueeze
-_original_getitem = torch.Tensor.__getitem__
-_original_einsum = torch.einsum
-_original_unbind_fn = torch.unbind
-_original_broadcast_to = torch.broadcast_to
-
-
-def _sharding_aware_reshape(self, *args, **kwargs):
-    if hasattr(self, "device_mesh"):
-        from torch.distributed.tensor import Replicate
-
-        if _is_sharded(self):
-            self = self.redistribute(
-                self.device_mesh, [Replicate()] * self.device_mesh.ndim
-            )
-        res = _original_reshape(self.to_local(), *args, **kwargs)
-        return maybe_distribute_tensor(res)
-    return _original_reshape(self, *args, **kwargs)
-
-
-def _sharding_aware_view(self, *args, **kwargs):
-    if hasattr(self, "device_mesh"):
-        from torch.distributed.tensor import Replicate
-
-        if _is_sharded(self):
-            self = self.redistribute(
-                self.device_mesh, [Replicate()] * self.device_mesh.ndim
-            )
-        res = _original_view(self.to_local(), *args, **kwargs)
-        return maybe_distribute_tensor(res)
-    return _original_view(self, *args, **kwargs)
-
-
-def _sharding_aware_expand(self, *args, **kwargs):
-    if hasattr(self, "device_mesh"):
-        from torch.distributed.tensor import Replicate
-
-        if _is_sharded(self):
-            self = self.redistribute(
-                self.device_mesh, [Replicate()] * self.device_mesh.ndim
-            )
-        res = _original_expand(self.to_local(), *args, **kwargs)
-        return maybe_distribute_tensor(res)
-    return _original_expand(self, *args, **kwargs)
-
-
-def _sharding_aware_unbind(self, *args, **kwargs):
-    if hasattr(self, "device_mesh"):
-        from torch.distributed.tensor import Replicate
-
-        self = self.redistribute(
-            self.device_mesh, [Replicate()] * self.device_mesh.ndim
-        )
-        res = _original_unbind(self.to_local(), *args, **kwargs)
-        return tree.map_structure(maybe_distribute_tensor, res)
-    return _original_unbind(self, *args, **kwargs)
-
-
-def _sharding_aware_unbind_fn(input, *args, **kwargs):
-    if hasattr(input, "device_mesh"):
-        from torch.distributed.tensor import Replicate
-
-        input = input.redistribute(
-            input.device_mesh, [Replicate()] * input.device_mesh.ndim
-        )
-        res = _original_unbind_fn(input.to_local(), *args, **kwargs)
-        return tree.map_structure(maybe_distribute_tensor, res)
-    return _original_unbind_fn(input, *args, **kwargs)
-
-
-def _sharding_aware_detach(self, *args, **kwargs):
-    if hasattr(self, "device_mesh"):
-        # detach should ideally work on DTensor, but if it fails, we fall back to replication
-        try:
-            return _original_detach(self, *args, **kwargs)
-        except Exception:
-            from torch.distributed.tensor import Replicate
-            self = self.redistribute(
-                self.device_mesh, [Replicate()] * self.device_mesh.ndim
-            )
-            res = _original_detach(self.to_local(), *args, **kwargs)
-            return maybe_distribute_tensor(res)
-    return _original_detach(self, *args, **kwargs)
-
-
-def _sharding_aware_squeeze(self, *args, **kwargs):
-    if hasattr(self, "device_mesh"):
-        from torch.distributed.tensor import Replicate
-
-        if _is_sharded(self):
-            self = self.redistribute(
-                self.device_mesh, [Replicate()] * self.device_mesh.ndim
-            )
-        res = _original_squeeze(self.to_local(), *args, **kwargs)
-        return maybe_distribute_tensor(res)
-    return _original_squeeze(self, *args, **kwargs)
-
-
-def _sharding_aware_unsqueeze(self, *args, **kwargs):
-    if hasattr(self, "device_mesh"):
-        from torch.distributed.tensor import Replicate
-
-        if _is_sharded(self):
-            self = self.redistribute(
-                self.device_mesh, [Replicate()] * self.device_mesh.ndim
-            )
-        res = _original_unsqueeze(self.to_local(), *args, **kwargs)
-        return maybe_distribute_tensor(res)
-    return _original_unsqueeze(self, *args, **kwargs)
-
-
-def _sharding_aware_getitem(self, *args, **kwargs):
-    if hasattr(self, "device_mesh"):
-        from torch.distributed.tensor import Replicate
-
-        if _is_sharded(self):
-            self = self.redistribute(
-                self.device_mesh, [Replicate()] * self.device_mesh.ndim
-            )
-        # Use tuple for indexing to avoid deprecation warning
-        index = args[0]
-        if isinstance(index, (list, np.ndarray)):
-            index = tuple(index)
-        res = _original_getitem(self.to_local(), index, **kwargs)
-        return maybe_distribute_tensor(res)
-    return _original_getitem(self, *args, **kwargs)
-
-
-def _sharding_aware_broadcast_to(input, *args, **kwargs):
-    if hasattr(input, "device_mesh"):
-        from torch.distributed.tensor import Replicate
-
-        if _is_sharded(input):
-            input = input.redistribute(
-                input.device_mesh, [Replicate()] * input.device_mesh.ndim
-            )
-        res = _original_broadcast_to(input.to_local(), *args, **kwargs)
-        return maybe_distribute_tensor(res)
-    return _original_broadcast_to(input, *args, **kwargs)
-
-
-def _sharding_aware_einsum(subscripts, *operands, **kwargs):
-    new_operands = []
-    any_dtensor = False
-    for x in operands:
-        if is_tensor(x) and hasattr(x, "device_mesh"):
-            from torch.distributed.tensor import Replicate
-
-            if _is_sharded(x):
-                x = x.redistribute(
-                    x.device_mesh, [Replicate()] * x.device_mesh.ndim
-                )
-            x = x.to_local()
-            any_dtensor = True
-        new_operands.append(x)
-    if any_dtensor:
-        res = _original_einsum(subscripts, *new_operands, **kwargs)
-        return maybe_distribute_tensor(res)
-    return _original_einsum(subscripts, *operands, **kwargs)
-
-
-torch.Tensor.reshape = _sharding_aware_reshape
-torch.Tensor.view = _sharding_aware_view
-torch.Tensor.expand = _sharding_aware_expand
-torch.Tensor.unbind = _sharding_aware_unbind
-torch.Tensor.detach = _sharding_aware_detach
-torch.Tensor.squeeze = _sharding_aware_squeeze
-torch.Tensor.unsqueeze = _sharding_aware_unsqueeze
-torch.Tensor.__getitem__ = _sharding_aware_getitem
-torch.unbind = _sharding_aware_unbind_fn
-torch.broadcast_to = _sharding_aware_broadcast_to
-torch.einsum = _sharding_aware_einsum
-
-
-def _distribution_aware_creation_op(fn):
-    @functools.wraps(fn)
-    def wrapper(*args, **kwargs):
-        res = fn(*args, **kwargs)
-        return maybe_distribute_tensor(res)
-
-    return wrapper
-
-
-for name in [
-    "arange",
-    "ones",
-    "zeros",
-    "eye",
-    "full",
-    "linspace",
-    "logspace",
-    "ones_like",
-    "zeros_like",
-    "rand",
-    "randn",
-    "randint",
-]:
-    if hasattr(torch, name):
-        setattr(torch, name, _distribution_aware_creation_op(getattr(torch, name)))
-
-
 class Variable(KerasVariable):
     def __init__(self, *args, layout=None, **kwargs):
         self._layout = layout
@@ -325,24 +111,18 @@ class Variable(KerasVariable):
         distribution = global_state.get_global_attribute("distribution")
         if self._layout is None and distribution is not None:
             self._layout = distribution.get_variable_layout(self)
-            from keras.src.distribution import TensorLayout
-
             if self._layout is None:
+                from keras.src.distribution import TensorLayout
                 self._layout = TensorLayout(
                     [None] * len(self._shape), distribution.device_mesh
                 )
-
-            if isinstance(self._layout, TensorLayout):
+            if hasattr(self._layout, "backend_layout"):
                 self._layout = self._layout.backend_layout
-            else:
-                self._layout = self._layout
 
     def _initialize(self, value):
-        # Note that variable.shape is needed by distribution_lib
         self._shape = self._validate_shape(value.shape)
         self._initialize_layout()
         if isinstance(value, torch.nn.Parameter):
-            # Reuse same parameter
             self._value = value
         else:
             requires_grad = self.trainable and torch.is_floating_point(
@@ -353,12 +133,14 @@ class Variable(KerasVariable):
                 requires_grad=requires_grad,
             ).to(get_device())
         if self._layout is not None:
+            from keras.src.backend.torch import distribution_lib
             self._value = distribution_lib.distribute_variable(
                 self._value, self._layout
             )
 
     def _direct_assign(self, value):
         if self._layout is not None:
+            from keras.src.backend.torch import distribution_lib
             value = distribution_lib.distribute_variable(value, self._layout)
         with torch.no_grad():
             self.value.copy_(value)
@@ -366,14 +148,12 @@ class Variable(KerasVariable):
     def _convert_to_tensor(self, value, dtype=None):
         return convert_to_tensor(value, dtype=dtype)
 
-    # Overload native accessor.
     @classmethod
     def __torch_function__(cls, func, types, args=(), kwargs=None):
         def unwrap(x):
             if isinstance(x, Variable):
                 return x.value
             return x
-
         if kwargs is None:
             kwargs = {}
         if not all(issubclass(t, (torch.Tensor, Variable)) for t in types):
@@ -390,10 +170,7 @@ class Variable(KerasVariable):
 
     @property
     def value(self):
-        # We cannot chain super() here because it will fail TorchDynamo. The
-        # reason why is unclear.
         def maybe_use_symbolic_tensor(value):
-            # Create and use a symbolic tensor stub in symbolic calls.
             if str(get_device()) == "meta" and str(value.device) != "meta":
                 return torch.nn.Parameter(
                     torch.empty(
@@ -412,10 +189,6 @@ class Variable(KerasVariable):
                 value = self._maybe_autocast(value)
                 return maybe_use_symbolic_tensor(value)
         if self._value is None:
-            # Uninitialized variable. Return a placeholder.
-            # This is fine because it's only ever used
-            # in during shape inference / graph tracing
-            # (anything else would be a bug, to be fixed.)
             value = self._maybe_autocast(
                 self._initializer(self._shape, dtype=self._dtype)
             )
@@ -497,60 +270,13 @@ def convert_to_tensor(x, dtype=None, sparse=None, ragged=None):
     return maybe_distribute_tensor(res)
 
 
-import threading
-
-_DISTRIBUTION_AWARE_ACTIVE = threading.local()
-
-
-def maybe_distribute_tensor(res):
-    if not is_tensor(res):
-        return res
-    # If it's already a DTensor, don't re-distribute
-    if hasattr(res, "device_mesh"):
-        return res
-
-    if getattr(_DISTRIBUTION_AWARE_ACTIVE, "active", False):
-        return res
-
-    distribution = global_state.get_global_attribute("distribution")
-    if distribution is not None:
-        _DISTRIBUTION_AWARE_ACTIVE.active = True
-        try:
-            # Avoid circular import
-            from keras.src.backend.torch import distribution_lib
-            from keras.src.distribution import TensorLayout
-
-            # Ensure tensor is on the correct device for the mesh
-            mesh = distribution.device_mesh.backend_mesh
-            if str(res.device).split(":")[0] != mesh.device_type:
-                res = res.to(mesh.device_type)
-
-            # Use a replicated layout for intermediate tensors by default
-            # BUT if it's too small to be sharded, we MUST use Replicate
-            # to avoid empty tensors on some ranks which cause unpacking errors.
-            layout = TensorLayout([None] * res.ndim, distribution.device_mesh)
-            
-            # Check if any dimension is smaller than the mesh dimension it would be sharded on
-            # For now, intermediate tensors are always Replicated by default in Keras Torch backend
-            # so this is mostly a safeguard.
-            return distribution_lib.distribute_tensor(res, layout)
-        finally:
-            _DISTRIBUTION_AWARE_ACTIVE.active = False
-    return res
-
-
 def convert_to_numpy(x):
     def transform(x):
         if is_tensor(x):
             if x.requires_grad:
                 x = x.detach()
             # Handle Distributed Tensor
-            if hasattr(x, "device_mesh"):
-                from torch.distributed.tensor import Replicate
-                x = x.redistribute(
-                    x.device_mesh, [Replicate()] * x.device_mesh.ndim
-                )
-                x = x.to_local()
+            x = _ensure_replicated_local(x)
             # Tensor has to be moved to CPU before converting to numpy.
             if x.device != torch.device("cpu"):
                 x = x.cpu()
@@ -751,7 +477,7 @@ def associative_scan(f, elems, reverse=False, axis=0):
     if not callable(f):
         raise TypeError(f"`f` should be a callable. Received: f={f}")
     elems_flat = tree.flatten(elems)
-    elems_flat = [convert_to_tensor(elem) for elem in elems_flat]
+    elems_flat = [convert_to_tensor(elem) for elem in tree.flatten(elems_flat)]
     if reverse:
         elems_flat = [torch.flip(elem, (axis,)) for elem in elems_flat]
 
@@ -766,7 +492,7 @@ def associative_scan(f, elems, reverse=False, axis=0):
         return c_flat
 
     num_elems = int(elems_flat[0].shape[axis])
-    if not all(int(elem.shape[axis]) == num_elems for elem in elems_flat[1:]):
+    if not all(int(elem.shape[axis]) == num_elems for i, elem in enumerate(elems_flat)):
         raise ValueError(
             "Array inputs to associative_scan must have the same "
             "first dimension. (saw: {})".format(
@@ -919,13 +645,7 @@ def slice(inputs, start_indices, shape):
     shape_dtype = to_torch_dtype("int64")
     inputs = convert_to_tensor(inputs)
     if hasattr(inputs, "device_mesh"):
-        from torch.distributed.tensor import Replicate
-
-        if _is_sharded(inputs):
-            inputs = inputs.redistribute(
-                inputs.device_mesh, [Replicate()] * inputs.device_mesh.ndim
-            )
-        inputs = inputs.to_local()
+        inputs = _ensure_replicated_local(inputs)
     start_indices = convert_to_tensor(start_indices).to(shape_dtype)
     shape = convert_to_tensor(shape).to(shape_dtype)
 
@@ -945,22 +665,10 @@ def slice_update(inputs, start_indices, updates):
     updates = convert_to_tensor(updates)
 
     if hasattr(inputs, "device_mesh"):
-        from torch.distributed.tensor import Replicate
-
-        if _is_sharded(inputs):
-            inputs = inputs.redistribute(
-                inputs.device_mesh, [Replicate()] * inputs.device_mesh.ndim
-            )
-        inputs = inputs.to_local()
+        inputs = _ensure_replicated_local(inputs)
 
     if hasattr(updates, "device_mesh"):
-        from torch.distributed.tensor import Replicate
-
-        if _is_sharded(updates):
-            updates = updates.redistribute(
-                updates.device_mesh, [Replicate()] * updates.device_mesh.ndim
-            )
-        updates = updates.to_local()
+        updates = _ensure_replicated_local(updates)
 
     python_slice = __builtins__["slice"]
     slices = [
@@ -1094,3 +802,151 @@ class CustomGradientFunction(torch.autograd.Function):
         if not isinstance(grads, tuple):
             grads = (grads,)
         return (None,) + grads
+
+
+# --- Sharding awareness logic ---
+
+def _is_sharded(tensor):
+    if hasattr(tensor, "placements"):
+        from torch.distributed.tensor import Shard
+        return any(isinstance(p, Shard) for p in tensor.placements)
+    return False
+
+
+def _ensure_replicated_local(x):
+    if is_tensor(x) and hasattr(x, "device_mesh"):
+        from torch.distributed.tensor import Replicate
+        if _is_sharded(x):
+            x = x.redistribute(x.device_mesh, [Replicate()] * x.device_mesh.ndim)
+        return x.to_local()
+    return x
+
+
+def _sharding_aware_op(fn):
+    @functools.wraps(fn)
+    def wrapper(self, *args, **kwargs):
+        if hasattr(self, "device_mesh"):
+            res = fn(_ensure_replicated_local(self), *args, **kwargs)
+            return tree.map_structure(maybe_distribute_tensor, res)
+        return fn(self, *args, **kwargs)
+    return wrapper
+
+
+_original_getitem = torch.Tensor.__getitem__
+
+
+def _sharding_aware_getitem(self, *args, **kwargs):
+    if hasattr(self, "device_mesh"):
+        index = args[0]
+        if isinstance(index, (list, np.ndarray)):
+            index = tuple(index)
+        res = _original_getitem(_ensure_replicated_local(self), index, **kwargs)
+        return maybe_distribute_tensor(res)
+    return _original_getitem(self, *args, **kwargs)
+
+
+_original_unbind_fn = torch.unbind
+
+
+def _sharding_aware_unbind_fn(input, *args, **kwargs):
+    if hasattr(input, "device_mesh"):
+        res = _original_unbind_fn(_ensure_replicated_local(input), *args, **kwargs)
+        return tree.map_structure(maybe_distribute_tensor, res)
+    return _original_unbind_fn(input, *args, **kwargs)
+
+
+_original_broadcast_to = torch.broadcast_to
+
+
+def _sharding_aware_broadcast_to(input, *args, **kwargs):
+    if hasattr(input, "device_mesh"):
+        res = _original_broadcast_to(
+            _ensure_replicated_local(input), *args, **kwargs
+        )
+        return maybe_distribute_tensor(res)
+    return _original_broadcast_to(input, *args, **kwargs)
+
+
+_original_einsum = torch.einsum
+
+
+def _sharding_aware_einsum(subscripts, *operands, **kwargs):
+    new_operands = []
+    any_dtensor = False
+    for x in operands:
+        if is_tensor(x) and hasattr(x, "device_mesh"):
+            new_operands.append(_ensure_replicated_local(x))
+            any_dtensor = True
+        else:
+            new_operands.append(x)
+    if any_dtensor:
+        res = _original_einsum(subscripts, *new_operands, **kwargs)
+        return maybe_distribute_tensor(res)
+    return _original_einsum(subscripts, *operands, **kwargs)
+
+
+torch.Tensor.reshape = _sharding_aware_op(torch.Tensor.reshape)
+torch.Tensor.view = _sharding_aware_op(torch.Tensor.view)
+torch.Tensor.expand = _sharding_aware_op(torch.Tensor.expand)
+torch.Tensor.unbind = _sharding_aware_op(torch.Tensor.unbind)
+torch.Tensor.squeeze = _sharding_aware_op(torch.Tensor.squeeze)
+torch.Tensor.unsqueeze = _sharding_aware_op(torch.Tensor.unsqueeze)
+torch.Tensor.__getitem__ = _sharding_aware_getitem
+torch.unbind = _sharding_aware_unbind_fn
+torch.broadcast_to = _sharding_aware_broadcast_to
+torch.einsum = _sharding_aware_einsum
+
+_original_detach = torch.Tensor.detach
+
+
+def _sharding_aware_detach(self, *args, **kwargs):
+    if hasattr(self, "device_mesh"):
+        try:
+            return _original_detach(self, *args, **kwargs)
+        except Exception:
+            res = _original_detach(_ensure_replicated_local(self), *args, **kwargs)
+            return maybe_distribute_tensor(res)
+    return _original_detach(self, *args, **kwargs)
+
+
+torch.Tensor.detach = _sharding_aware_detach
+
+
+def _distribution_aware_creation_op(fn):
+    @functools.wraps(fn)
+    def wrapper(*args, **kwargs):
+        res = fn(*args, **kwargs)
+        return maybe_distribute_tensor(res)
+    return wrapper
+
+
+for name in [
+    "arange", "ones", "zeros", "eye", "full", "linspace", "logspace",
+    "ones_like", "zeros_like", "rand", "randn", "randint",
+]:
+    if hasattr(torch, name):
+        setattr(torch, name, _distribution_aware_creation_op(getattr(torch, name)))
+
+
+_DISTRIBUTION_AWARE_ACTIVE = threading.local()
+
+
+def maybe_distribute_tensor(res):
+    if not is_tensor(res) or hasattr(res, "device_mesh"):
+        return res
+    if getattr(_DISTRIBUTION_AWARE_ACTIVE, "active", False):
+        return res
+    distribution = global_state.get_global_attribute("distribution")
+    if distribution is not None:
+        _DISTRIBUTION_AWARE_ACTIVE.active = True
+        try:
+            from keras.src.backend.torch import distribution_lib
+            from keras.src.distribution import TensorLayout
+            mesh = distribution.device_mesh.backend_mesh
+            if str(res.device).split(":")[0] != mesh.device_type:
+                res = res.to(mesh.device_type)
+            layout = TensorLayout([None] * res.ndim, distribution.device_mesh)
+            return distribution_lib.distribute_tensor(res, layout)
+        finally:
+            _DISTRIBUTION_AWARE_ACTIVE.active = False
+    return res
