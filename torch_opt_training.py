@@ -10,16 +10,14 @@ os.environ["KERAS_DISTRIBUTION_DEBUG"] = "1"
 # Set NCCL environment variables to avoid conflicts
 os.environ["NCCL_DEBUG"] = "WARN"
 os.environ["NCCL_P2P_LEVEL"] = "NVL"
-os.environ["NCCL_BLOCKING_WAIT"] = "1"
+os.environ["TORCH_NCCL_BLOCKING_WAIT"] = "1"  # Updated to use the recommended variable
 
 import numpy as np
 import keras
 import keras_hub
 from keras.distribution import DeviceMesh, LayoutMap, ModelParallel, TensorLayout
 
-
 def train_opt_model_parallel():
-
     # Initialize torch distributed process group
     if not torch.distributed.is_initialized():
         torch.distributed.init_process_group(backend="nccl" if torch.cuda.is_available() else "gloo")
@@ -34,6 +32,15 @@ def train_opt_model_parallel():
 
     # Ensure each process uses its assigned device
     torch.cuda.set_device(rank) if torch.cuda.is_available() else None
+
+    # Register a fallback for unsupported operators
+    from torch.distributed.tensor._sharding_prop import ShardingPropagator
+
+    def fallback_sharding_strategy(op_info):
+        print(f"[WARNING] Operator {op_info.schema} does not have a registered sharding strategy. Falling back to replication.")
+        return None  # Returning None disables sharding for this operator
+
+    ShardingPropagator.register_fallback(fallback_sharding_strategy)
 
     tmp_model = keras_hub.models.OPTBackbone(
         vocabulary_size=1000, num_layers=2, num_heads=2, hidden_dim=64, intermediate_dim=128, max_sequence_length=32, dropout=0.0,
