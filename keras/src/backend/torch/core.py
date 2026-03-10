@@ -257,20 +257,22 @@ def _sharding_aware_broadcast_to(input, *args, **kwargs):
 
 
 def _sharding_aware_einsum(subscripts, *operands, **kwargs):
-    if get_device() == "cpu":
-        new_operands = []
-        any_sharded = False
-        for x in operands:
-            if is_tensor(x) and hasattr(x, "device_mesh") and _is_sharded(x):
-                from torch.distributed.tensor import Replicate
+    new_operands = []
+    any_dtensor = False
+    for x in operands:
+        if is_tensor(x) and hasattr(x, "device_mesh"):
+            from torch.distributed.tensor import Replicate
 
+            if _is_sharded(x):
                 x = x.redistribute(
                     x.device_mesh, [Replicate()] * x.device_mesh.ndim
                 )
-                any_sharded = True
-            new_operands.append(x)
-        if any_sharded:
-            return _original_einsum(subscripts, *new_operands, **kwargs)
+            x = x.to_local()
+            any_dtensor = True
+        new_operands.append(x)
+    if any_dtensor:
+        res = _original_einsum(subscripts, *new_operands, **kwargs)
+        return maybe_distribute_tensor(res)
     return _original_einsum(subscripts, *operands, **kwargs)
 
 
