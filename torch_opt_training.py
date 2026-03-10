@@ -32,11 +32,12 @@ def train_opt_model_parallel():
         world_size = torch.distributed.get_world_size()
     else:
         world_size = 1
-    devices = [f"{default_device}:{i}" for i in range(world_size)]
+    devices = [f"cuda:{i}" for i in range(torch.cuda.device_count())] if torch.cuda.is_available() else [f"cpu:{i}" for i in range(world_size)]
     mesh = DeviceMesh(shape=(world_size,), axis_names=("model",), devices=devices)
 
-    # Ensure each process uses its assigned device
-    torch.cuda.set_device(rank) if torch.cuda.is_available() else None
+    # Assign a unique GPU to each rank
+    if torch.cuda.is_available():
+        torch.cuda.set_device(rank % torch.cuda.device_count())
 
     tmp_model = keras_hub.models.OPTBackbone(
         vocabulary_size=1000, num_layers=2, num_heads=2, hidden_dim=64, intermediate_dim=128, max_sequence_length=32, dropout=0.0,
