@@ -1,28 +1,20 @@
 import os
-import torch  # Ensure torch is imported before usage
+import torch
 
-# Check if GPU is available and set the device accordingly
-default_device = "cuda" if torch.cuda.is_available() else "cpu"
-os.environ["KERAS_TORCH_DEVICE"] = default_device
+# Keras settings
 os.environ["KERAS_BACKEND"] = "torch"
 os.environ["KERAS_DISTRIBUTION_DEBUG"] = "1"
 
-# Set NCCL environment variables to avoid conflicts
+# Set NCCL environment variables
 os.environ["NCCL_DEBUG"] = "WARN"
-os.environ["NCCL_P2P_LEVEL"] = "NVL"
-os.environ["TORCH_NCCL_BLOCKING_WAIT"] = "1"
-
-# Add OMP_NUM_THREADS to avoid system overload
 os.environ["OMP_NUM_THREADS"] = "1"
 
 import numpy as np
 import keras
 import keras_hub
 from keras.distribution import DeviceMesh, LayoutMap, ModelParallel, TensorLayout
-
-# Ensure proper cleanup of distributed process group at the end of the script
-import atexit
 import torch.distributed as dist
+import atexit
 
 def cleanup():
     if dist.is_initialized():
@@ -31,29 +23,30 @@ def cleanup():
 atexit.register(cleanup)
 
 def train_opt_model_parallel():
-    # Initialize torch distributed process group
-    if not torch.distributed.is_initialized():
-        torch.distributed.init_process_group(backend="nccl" if torch.cuda.is_available() else "gloo")
+    if not dist.is_initialized():
+        dist.init_process_group(backend="nccl" if torch.cuda.is_available() else "gloo")
 
     keras.distribution.initialize()
 
-    # Get ranks and world size
     rank = dist.get_rank()
     local_rank = int(os.environ.get("LOCAL_RANK", "0"))
     world_size = dist.get_world_size()
 
-    # Assign a unique GPU to each rank
+    # Device setup
     if torch.cuda.is_available():
-        torch.cuda.set_device(local_rank % torch.cuda.device_count())
-
-    # Setup DeviceMesh
-    if torch.cuda.is_available():
+        torch.cuda.set_device(local_rank)
+        device = f"cuda:{local_rank}"
         devices = [f"cuda:{i}" for i in range(world_size)]
     else:
+        device = "cpu"
         devices = [f"cpu:{i}" for i in range(world_size)]
+    
+    os.environ["KERAS_TORCH_DEVICE"] = device
     
     mesh_shape = (world_size,)
     mesh = DeviceMesh(shape=mesh_shape, axis_names=("model",), devices=devices)
+
+    # ... (Rest of the layout map logic)
 
     tmp_model = keras_hub.models.OPTBackbone(
         vocabulary_size=1000, num_layers=2, num_heads=2, hidden_dim=64, intermediate_dim=128, max_sequence_length=32, dropout=0.0,
@@ -66,7 +59,7 @@ def train_opt_model_parallel():
         axes = [None] * len(var.shape)
         
         # 1. Embeddings: Shard embedding dim
-        if "token_embedding/embeddings" in path:
+        if "embeddings" in path:
             axes[-1] = "model"
             
         # 2. FFN: Standard Colwise/Rowwise
@@ -76,16 +69,30 @@ def train_opt_model_parallel():
             axes[0] = "model"
         elif "feedforward_output_dense/kernel" in path:
             axes[0] = "model"
+        elif "feedforward_output_dense/bias" in path:
+            axes[0] = "model"
             
         # 3. LayerNorm: Shard hidden dim
         elif "layer_norm" in path and ("gamma" in path or "beta" in path):
             axes[0] = "model"
             
-        # 4. Attention: Shard heads
-        elif "self_attention" in path and "/kernel" in path and len(var.shape) == 3:
-            axes[1] = "model"
-        elif "self_attention/attention_output/kernel" in path:
-            axes[0] = "model"
+        # 4. Attention: Shard heads or hidden dim
+        elif "self_attention" in path:
+            if "/kernel" in path:
+                if len(var.shape) == 3: # Multi-head kernels
+                    axes[1] = "model"
+                else: # attention_output kernel
+                    axes[0] = "model"
+            elif "/bias" in path:
+                if len(var.shape) == 2: # Multi-head biases
+                    axes[0] = "model"
+                else: # attention_output bias
+                    axes[0] = "model"
+        
+        # 5. Catch-all for any missed 1D or 2D variables
+        if "model" not in axes:
+            if len(var.shape) > 0:
+                axes[0] = "model"
         
         layout = TensorLayout(axes=tuple(axes), device_mesh=mesh)
         layout_map[path] = layout
