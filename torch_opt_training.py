@@ -12,6 +12,9 @@ os.environ["NCCL_DEBUG"] = "WARN"
 os.environ["NCCL_P2P_LEVEL"] = "NVL"
 os.environ["TORCH_NCCL_BLOCKING_WAIT"] = "1"  # Updated to use the recommended variable
 
+# Add OMP_NUM_THREADS to avoid system overload
+os.environ["OMP_NUM_THREADS"] = "1"
+
 import numpy as np
 import keras
 import keras_hub
@@ -19,6 +22,16 @@ from keras.distribution import DeviceMesh, LayoutMap, ModelParallel, TensorLayou
 
 # Ensure each rank is assigned a unique GPU
 rank = torch.distributed.get_rank() if torch.distributed.is_initialized() else 0
+
+# Ensure proper cleanup of distributed process group at the end of the script
+import atexit
+import torch.distributed as dist
+
+def cleanup():
+    if dist.is_initialized():
+        dist.destroy_process_group()
+
+atexit.register(cleanup)
 
 def train_opt_model_parallel():
     # Initialize torch distributed process group
