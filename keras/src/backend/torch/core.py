@@ -19,6 +19,7 @@ from keras.src.backend.common.stateless_scope import get_stateless_scope
 from keras.src.backend.common.stateless_scope import in_stateless_scope
 from keras.src.backend.common.symbolic_scope import SymbolicScope
 from keras.src.backend.config import floatx
+from keras.src.backend.torch import distribution_lib
 
 SUPPORTS_SPARSE_TENSORS = False
 SUPPORTS_RAGGED_TENSORS = False
@@ -101,18 +102,132 @@ def to_torch_dtype(dtype):
     return standardized_dtype
 
 
+def _is_sharded(tensor):
+    if hasattr(tensor, "placements"):
+        from torch.distributed.tensor import Shard
+
+        return any(isinstance(p, Shard) for p in tensor.placements)
+    return False
+
+
+# Monkeypatch torch.Tensor.reshape, torch.Tensor.view, and torch.einsum
+# to handle DTensors on CPU. PyTorch DTensor on CPU doesn't support
+# flattening sharded dimensions, and native torch.einsum often performs
+# such operations internally.
+_original_reshape = torch.Tensor.reshape
+_original_view = torch.Tensor.view
+_original_einsum = torch.einsum
+
+
+def _sharding_aware_reshape(self, *args, **kwargs):
+    if hasattr(self, "device_mesh") and _is_sharded(self):
+        from torch.distributed.tensor import Replicate
+
+        self = self.redistribute(
+            self.device_mesh, [Replicate()] * self.device_mesh.ndim
+        )
+    return _original_reshape(self, *args, **kwargs)
+
+
+def _sharding_aware_view(self, *args, **kwargs):
+    if hasattr(self, "device_mesh") and _is_sharded(self):
+        from torch.distributed.tensor import Replicate
+
+        self = self.redistribute(
+            self.device_mesh, [Replicate()] * self.device_mesh.ndim
+        )
+    return _original_view(self, *args, **kwargs)
+
+
+def _sharding_aware_einsum(subscripts, *operands, **kwargs):
+    if get_device() == "cpu":
+        new_operands = []
+        any_sharded = False
+        for x in operands:
+            if is_tensor(x) and hasattr(x, "device_mesh") and _is_sharded(x):
+                from torch.distributed.tensor import Replicate
+
+                x = x.redistribute(
+                    x.device_mesh, [Replicate()] * x.device_mesh.ndim
+                )
+                any_sharded = True
+            new_operands.append(x)
+        if any_sharded:
+            return _original_einsum(subscripts, *new_operands, **kwargs)
+    return _original_einsum(subscripts, *operands, **kwargs)
+
+
+torch.Tensor.reshape = _sharding_aware_reshape
+torch.Tensor.view = _sharding_aware_view
+torch.einsum = _sharding_aware_einsum
+
+
+def _distribution_aware_creation_op(fn):
+    @functools.wraps(fn)
+    def wrapper(*args, **kwargs):
+        res = fn(*args, **kwargs)
+        return maybe_distribute_tensor(res)
+
+    return wrapper
+
+
+for name in [
+    "arange",
+    "ones",
+    "zeros",
+    "eye",
+    "full",
+    "linspace",
+    "logspace",
+    "ones_like",
+    "zeros_like",
+    "rand",
+    "randn",
+    "randint",
+]:
+    if hasattr(torch, name):
+        setattr(torch, name, _distribution_aware_creation_op(getattr(torch, name)))
+
+
 class Variable(KerasVariable):
+    def __init__(self, *args, layout=None, **kwargs):
+        self._layout = layout
+        super().__init__(*args, **kwargs)
+
+    def _initialize_layout(self):
+        distribution = global_state.get_global_attribute("distribution")
+        if self._layout is None and distribution is not None:
+            tensor_layout = distribution.get_variable_layout(self)
+            from keras.src.distribution import TensorLayout
+
+            if isinstance(tensor_layout, TensorLayout):
+                self._layout = tensor_layout.backend_layout
+            else:
+                self._layout = tensor_layout
+
     def _initialize(self, value):
+        # Note that variable.shape is needed by distribution_lib
+        self._shape = self._validate_shape(value.shape)
+        self._initialize_layout()
         if isinstance(value, torch.nn.Parameter):
             # Reuse same parameter
             self._value = value
         else:
+            requires_grad = self.trainable and torch.is_floating_point(
+                convert_to_tensor(value, dtype=self._dtype)
+            )
             self._value = torch.nn.Parameter(
                 convert_to_tensor(value, dtype=self._dtype),
-                requires_grad=self.trainable,
+                requires_grad=requires_grad,
             ).to(get_device())
+        if self._layout is not None:
+            self._value = distribution_lib.distribute_variable(
+                self._value, self._layout
+            )
 
     def _direct_assign(self, value):
+        if self._layout is not None:
+            value = distribution_lib.distribute_variable(value, self._layout)
         with torch.no_grad():
             self.value.copy_(value)
 
@@ -122,13 +237,17 @@ class Variable(KerasVariable):
     # Overload native accessor.
     @classmethod
     def __torch_function__(cls, func, types, args=(), kwargs=None):
-        args = [arg.value if isinstance(arg, Variable) else arg for arg in args]
+        def unwrap(x):
+            if isinstance(x, Variable):
+                return x.value
+            return x
+
         if kwargs is None:
             kwargs = {}
-        kwargs = {
-            key: value.value if isinstance(value, Variable) else value
-            for key, value in kwargs.items()
-        }
+        if not all(issubclass(t, (torch.Tensor, Variable)) for t in types):
+            return NotImplemented
+        args = tree.map_structure(unwrap, args)
+        kwargs = tree.map_structure(unwrap, kwargs)
         return func(*args, **kwargs)
 
     def __array__(self, dtype=None):
@@ -208,35 +327,78 @@ def convert_to_tensor(x, dtype=None, sparse=None, ragged=None):
         return x
     if dtype is None:
         if isinstance(x, bool):
-            return torch.as_tensor(x, dtype=torch.bool, device=get_device())
+            res = torch.as_tensor(x, dtype=torch.bool, device=get_device())
         elif isinstance(x, int):
-            return torch.as_tensor(x, dtype=torch.int32, device=get_device())
+            res = torch.as_tensor(x, dtype=torch.int32, device=get_device())
         elif isinstance(x, float):
-            return torch.as_tensor(
+            res = torch.as_tensor(
                 x, dtype=to_torch_dtype(floatx()), device=get_device()
             )
+        else:
+            # Convert to np in case of any array-like that is not list or tuple.
+            if not isinstance(x, (list, tuple)):
+                x = np.array(x)
+            elif len(x) > 0 and any(isinstance(x1, torch.Tensor) for x1 in x):
+                # Handle list or tuple of torch tensors
+                res = torch.stack([convert_to_tensor(x1) for x1 in x])
+                return maybe_distribute_tensor(res)
+            
+            if isinstance(x, np.ndarray):
+                if x.dtype == np.uint32:
+                    # Torch backend does not support uint32.
+                    x = x.astype(np.int64)
+                if standardize_dtype(x.dtype) == "bfloat16":
+                    # Torch backend does not support converting bfloat16 ndarray.
+                    x = x.astype(np.float32)
+                    dtype = "bfloat16"
+                dtype = dtype or x.dtype
+            if dtype is None:
+                dtype = result_type(
+                    *[getattr(item, "dtype", type(item)) for item in tree.flatten(x)]
+                )
+            dtype = to_torch_dtype(dtype)
+            res = torch.as_tensor(x, dtype=dtype, device=get_device())
+    else:
+        dtype = to_torch_dtype(dtype)
+        res = torch.as_tensor(x, dtype=dtype, device=get_device())
+    
+    return maybe_distribute_tensor(res)
 
-    # Convert to np in case of any array-like that is not list or tuple.
-    if not isinstance(x, (list, tuple)):
-        x = np.array(x)
-    elif len(x) > 0 and any(isinstance(x1, torch.Tensor) for x1 in x):
-        # Handle list or tuple of torch tensors
-        return torch.stack([convert_to_tensor(x1) for x1 in x])
-    if isinstance(x, np.ndarray):
-        if x.dtype == np.uint32:
-            # Torch backend does not support uint32.
-            x = x.astype(np.int64)
-        if standardize_dtype(x.dtype) == "bfloat16":
-            # Torch backend does not support converting bfloat16 ndarray.
-            x = x.astype(np.float32)
-            dtype = "bfloat16"
-        dtype = dtype or x.dtype
-    if dtype is None:
-        dtype = result_type(
-            *[getattr(item, "dtype", type(item)) for item in tree.flatten(x)]
-        )
-    dtype = to_torch_dtype(dtype)
-    return torch.as_tensor(x, dtype=dtype, device=get_device())
+
+import threading
+
+_DISTRIBUTION_AWARE_ACTIVE = threading.local()
+
+
+def maybe_distribute_tensor(res):
+    if not is_tensor(res):
+        return res
+    # If it's already a DTensor, don't re-distribute
+    if hasattr(res, "device_mesh"):
+        return res
+
+    if getattr(_DISTRIBUTION_AWARE_ACTIVE, "active", False):
+        return res
+
+    distribution = global_state.get_global_attribute("distribution")
+    if distribution is not None:
+        _DISTRIBUTION_AWARE_ACTIVE.active = True
+        try:
+            # Avoid circular import
+            from keras.src.backend.torch import distribution_lib
+            from keras.src.distribution import TensorLayout
+
+            # Ensure tensor is on the correct device for the mesh
+            mesh = distribution.device_mesh.backend_mesh
+            if str(res.device).split(":")[0] != mesh.device_type:
+                res = res.to(mesh.device_type)
+
+            # Use a replicated layout for intermediate tensors by default
+            layout = TensorLayout([None] * res.ndim, distribution.device_mesh)
+            return distribution_lib.distribute_tensor(res, layout)
+        finally:
+            _DISTRIBUTION_AWARE_ACTIVE.active = False
+    return res
 
 
 def convert_to_numpy(x):
@@ -244,6 +406,13 @@ def convert_to_numpy(x):
         if is_tensor(x):
             if x.requires_grad:
                 x = x.detach()
+            # Handle Distributed Tensor
+            if hasattr(x, "device_mesh"):
+                from torch.distributed.tensor import Replicate
+                x = x.redistribute(
+                    x.device_mesh, [Replicate()] * x.device_mesh.ndim
+                )
+                x = x.to_local()
             # Tensor has to be moved to CPU before converting to numpy.
             if x.device != torch.device("cpu"):
                 x = x.cpu()
@@ -283,9 +452,10 @@ def cast(x, dtype):
         x = x.value
     if is_tensor(x):
         if x.dtype == dtype:
-            return x
+            res = x
         else:
-            return x.to(dtype)
+            res = x.to(dtype)
+        return maybe_distribute_tensor(res)
     return convert_to_tensor(x, dtype)
 
 

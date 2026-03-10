@@ -17,6 +17,12 @@ class TorchLayer(torch.nn.Module):
         if in_stateless_scope():
             return
         self._track_variables()
+        
+        from keras.src.backend.common import global_state
+        distribution = global_state.get_global_attribute("distribution")
+        if distribution is not None:
+            from keras.src.backend.torch import distribution_lib
+            distribution_lib.parallelize_layer(self, distribution)
 
     def _track_variables(self):
         # set torch_params attribute will have module automatically track
