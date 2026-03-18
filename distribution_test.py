@@ -38,9 +38,14 @@ def test_model_parallel():
         devices=devices
     )
     
-    # Simple LayoutMap: we can leave it empty to test default replication
-    # or add specific rules. Here we test the infrastructure.
+    # Shard kernels of all Dense layers (which are very common in OPT)
     layout_map = LayoutMap(mesh)
+    # Most layers in KerasHub use "kernel" as the weight name.
+    # We shard the last dimension (the feature dimension) on the "model" axis.
+    layout_map[".*kernel"] = (None, "model")
+    # We can also shard embeddings if we want
+    layout_map[".*embeddings"] = (None, "model")
+    
     distribution = ModelParallel(layout_map=layout_map, batch_dim_name="model")
 
     # 3. Build Model within the Distribution Scope
