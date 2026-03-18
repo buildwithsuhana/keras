@@ -284,10 +284,20 @@ def _register_sharding_rules():
         ] * output_dim_size
         return OutputSharding(output_spec=tuple(output_spec))
 
-    try:
-        register_prop_rule(torch.ops.aten.unbind.int)(unbind_rule)
-    except Exception:
-        pass
+    # Register for all possible unbind overloads
+    for overload_name in torch.ops.aten.unbind.overloads():
+        overload = getattr(torch.ops.aten.unbind, overload_name)
+        try:
+            register_prop_rule(overload)(unbind_rule)
+        except Exception:
+            pass
+    
+    # Also try the packet itself or default if it exists
+    if hasattr(torch.ops.aten.unbind, "default"):
+        try:
+            register_prop_rule(torch.ops.aten.unbind.default)(unbind_rule)
+        except Exception:
+            pass
 
 
 _register_sharding_rules()
