@@ -221,3 +221,78 @@ def distribute_output(fn):
         return torch_core.convert_to_tensor(res)
 
     return wrapper
+
+
+def _register_sharding_rules():
+    """Register sharding rules for ops missing from PyTorch DTensor."""
+    try:
+        from torch.distributed.tensor._dispatch import register_propagate_rule
+        from torch.distributed.tensor._dtensor_spec import DTensorSpec
+        from torch.distributed.tensor._sharding_prop import (
+            OutputSharding,
+            PropagatedSharding,
+        )
+        from torch.distributed.tensor.placements import Replicate, Shard
+    except ImportError:
+        return
+
+    def unbind_rule(op_schema):
+        input_spec = op_schema.args[0]
+        dim = op_schema.args[1] if len(op_schema.args) > 1 else 0
+        if dim < 0:
+            dim += input_spec.ndim
+
+        # For unbind, we currently just replicate if the unbind dim is sharded.
+        # Otherwise, we preserve the sharding by adjusting shard indices.
+        new_placements = []
+        needs_redistribute = False
+        for placement in input_spec.placements:
+            if isinstance(placement, Shard):
+                if placement.dim == dim:
+                    needs_redistribute = True
+                    break
+                elif placement.dim > dim:
+                    new_placements.append(Shard(placement.dim - 1))
+                else:
+                    new_placements.append(Shard(placement.dim))
+            else:
+                new_placements.append(Replicate())
+
+        if needs_redistribute:
+            # Replicate the input if the unbind dimension is sharded
+            return OutputSharding(
+                output_spec=[
+                    DTensorSpec(
+                        mesh=input_spec.mesh,
+                        placements=tuple(
+                            [Replicate()] * len(input_spec.placements)
+                        ),
+                        tensor_meta=input_spec.tensor_meta,
+                    )
+                ]
+                * input_spec.shape[dim],
+                redistribute_input=[
+                    DTensorSpec(
+                        mesh=input_spec.mesh,
+                        placements=tuple(
+                            [Replicate()] * len(input_spec.placements)
+                        ),
+                        tensor_meta=input_spec.tensor_meta,
+                    )
+                ],
+            )
+
+        output_spec = [
+            DTensorSpec(
+                mesh=input_spec.mesh,
+                placements=tuple(new_placements),
+            )
+        ] * input_spec.shape[dim]
+        return OutputSharding(output_spec=output_spec)
+
+    try:
+        register_propagate_rule(torch.ops.aten.unbind.int, unbind_rule)
+    except:
+        pass
+_register_sharding_rules()
+
