@@ -241,6 +241,7 @@ def _register_sharding_rules():
         return
 
     def unbind_rule(op_schema):
+        print(f"DEBUG: unbind_rule called for {op_schema.op}")
         input_spec = op_schema.args_schema[0]
         dim = op_schema.args_schema[1] if len(op_schema.args_schema) > 1 else 0
         if dim < 0:
@@ -289,15 +290,17 @@ def _register_sharding_rules():
         overload = getattr(torch.ops.aten.unbind, overload_name)
         try:
             register_prop_rule(overload)(unbind_rule)
-        except Exception:
-            pass
+            print(f"DEBUG: Registered unbind rule for {overload}")
+        except Exception as e:
+            print(f"DEBUG: Failed to register unbind rule for {overload}: {e}")
     
     # Also try the packet itself or default if it exists
     if hasattr(torch.ops.aten.unbind, "default"):
         try:
             register_prop_rule(torch.ops.aten.unbind.default)(unbind_rule)
-        except Exception:
-            pass
+            print(f"DEBUG: Registered unbind rule for aten.unbind.default")
+        except Exception as e:
+            print(f"DEBUG: Failed to register unbind rule for aten.unbind.default: {e}")
 
 
 _register_sharding_rules()
