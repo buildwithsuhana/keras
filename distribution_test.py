@@ -1,4 +1,8 @@
 import os
+import sys
+
+# Ensure local keras is used
+sys.path.insert(0, os.path.abspath("."))
 
 # Set backend to torch before anything else
 os.environ["KERAS_BACKEND"] = "torch"

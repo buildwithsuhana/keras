@@ -44,7 +44,9 @@ def get_device_count(device_type=None):
 
 def initialize(job_addresses=None, num_processes=None, process_id=None):
     """Initialize the process group for distributed training."""
+    print(f"DEBUG: initialize(job_addresses={job_addresses}, num_processes={num_processes}, process_id={process_id}) called")
     if torch.distributed.is_initialized():
+        print("DEBUG: torch.distributed already initialized")
         return
 
     if job_addresses:
@@ -63,7 +65,9 @@ def initialize(job_addresses=None, num_processes=None, process_id=None):
         torch.cuda.set_device(local_rank)
 
     backend = "nccl" if torch.cuda.is_available() else "gloo"
+    print(f"DEBUG: Initializing process group with backend={backend}, rank={os.environ.get('RANK')}, world_size={os.environ.get('WORLD_SIZE')}")
     torch.distributed.init_process_group(backend=backend)
+    print("DEBUG: torch.distributed.init_process_group() completed")
 
 
 def num_processes():
@@ -86,7 +90,21 @@ def process_id():
 
 def _to_backend_mesh(keras_mesh):
     """Convert Keras DeviceMesh to PyTorch DeviceMesh."""
-    device_type = "cuda" if torch.cuda.is_available() else "cpu"
+    print(f"DEBUG: _to_backend_mesh(keras_mesh={keras_mesh}) called")
+    from keras.src.backend.torch import core
+
+    device_name = core.get_device()
+    print(f"DEBUG: core.get_device() returned {device_name}")
+    if "cuda" in device_name:
+        device_type = "cuda"
+    elif "mps" in device_name:
+        device_type = "mps"
+    elif "xpu" in device_name:
+        device_type = "xpu"
+    else:
+        device_type = "cpu"
+
+    print(f"DEBUG: Initializing torch DeviceMesh with device_type={device_type}, mesh_shape={tuple(keras_mesh.shape)}")
     return init_device_mesh(
         device_type,
         mesh_shape=tuple(keras_mesh.shape),
@@ -225,7 +243,9 @@ def distribute_output(fn):
 
 def _register_sharding_rules():
     """Register sharding rules for ops missing from PyTorch DTensor."""
+    print("DEBUG: _register_sharding_rules() starting...")
     try:
+        from torch.distributed.tensor._api import DTensor
         from torch.distributed.tensor._dtensor_spec import DTensorSpec, TensorMeta
         from torch.distributed.tensor._op_schema import (
             OpSchema,
@@ -237,62 +257,81 @@ def _register_sharding_rules():
             shift_shard_dims_after_remove,
         )
         from torch.distributed.tensor.placement_types import Replicate
-    except ImportError:
+    except ImportError as e:
+        print(f"DEBUG: Import failure in _register_sharding_rules: {e}")
         return
 
     def unbind_rule(op_schema):
-        print(f"DEBUG: unbind_rule called for {op_schema.op}")
-        input_spec = op_schema.args_schema[0]
-        dim = op_schema.args_schema[1] if len(op_schema.args_schema) > 1 else 0
-        if dim < 0:
-            dim += input_spec.ndim
+        print(f"DEBUG: unbind_rule TRIGGERED for {op_schema.op}")
+        try:
+            input_spec = op_schema.args_schema[0]
+            dim = op_schema.args_schema[1] if len(op_schema.args_schema) > 1 else 0
+            if dim < 0:
+                dim += input_spec.ndim
 
-        if is_tensor_dim_sharded(input_spec, dim=dim):
-            # Replicate the input if the unbind dimension is sharded
-            replicate_spec = DTensorSpec(
-                mesh=input_spec.mesh,
-                placements=tuple([Replicate()] * len(input_spec.placements)),
-                tensor_meta=input_spec.tensor_meta,
-            )
-            return OutputSharding(
-                output_spec=None,
-                needs_redistribute=True,
-                redistribute_schema=OpSchema(
-                    op=op_schema.op,
-                    args_schema=(replicate_spec, dim),
-                    kwargs_schema=op_schema.kwargs_schema,
-                ),
-            )
+            print(f"DEBUG: unbind_rule processing: dim={dim}, input_spec={input_spec}")
 
-        output_placements = tuple(
-            shift_shard_dims_after_remove(input_spec.placements, dim)
-        )
-        output_shape = list(input_spec.shape)
-        output_dim_size = output_shape.pop(dim)
-        output_stride = list(input_spec.stride)
-        output_stride.pop(dim)
+            if is_tensor_dim_sharded(input_spec, dim=dim):
+                print(f"DEBUG: unbind dim {dim} IS sharded, triggering redistribution to replicate")
+                # Replicate the input if the unbind dimension is sharded
+                replicate_spec = DTensorSpec(
+                    mesh=input_spec.mesh,
+                    placements=tuple([Replicate()] * len(input_spec.placements)),
+                    tensor_meta=input_spec.tensor_meta,
+                )
+                return OutputSharding(
+                    output_spec=None,
+                    needs_redistribute=True,
+                    redistribute_schema=OpSchema(
+                        op=op_schema.op,
+                        args_schema=(replicate_spec, dim),
+                        kwargs_schema=op_schema.kwargs_schema,
+                    ),
+                )
 
-        output_spec = [
-            DTensorSpec(
-                mesh=input_spec.mesh,
-                placements=output_placements,
-                tensor_meta=TensorMeta(
-                    shape=torch.Size(output_shape),
-                    stride=tuple(output_stride),
-                    dtype=input_spec.tensor_meta.dtype,
-                ),
+            output_placements = tuple(
+                shift_shard_dims_after_remove(input_spec.placements, dim)
             )
-        ] * output_dim_size
-        return OutputSharding(output_spec=tuple(output_spec))
+            output_shape = list(input_spec.shape)
+            output_dim_size = output_shape.pop(dim)
+            output_stride = list(input_spec.stride)
+            output_stride.pop(dim)
+
+            print(f"DEBUG: unbind dim {dim} NOT sharded, producing {output_dim_size} outputs")
+
+            output_spec = [
+                DTensorSpec(
+                    mesh=input_spec.mesh,
+                    placements=output_placements,
+                    tensor_meta=TensorMeta(
+                        shape=torch.Size(output_shape),
+                        stride=tuple(output_stride),
+                        dtype=input_spec.tensor_meta.dtype,
+                    ),
+                )
+            ] * output_dim_size
+            return OutputSharding(output_spec=tuple(output_spec))
+        except Exception as e:
+            print(f"DEBUG: Error in unbind_rule implementation: {e}")
+            import traceback
+            traceback.print_exc()
+            raise e
 
     # Register for all possible unbind overloads
-    for overload_name in torch.ops.aten.unbind.overloads():
-        overload = getattr(torch.ops.aten.unbind, overload_name)
-        try:
-            register_prop_rule(overload)(unbind_rule)
-            print(f"DEBUG: Registered unbind rule for {overload}")
-        except Exception as e:
-            print(f"DEBUG: Failed to register unbind rule for {overload}: {e}")
+    try:
+        overloads = torch.ops.aten.unbind.overloads()
+        print(f"DEBUG: Found unbind overloads: {overloads}")
+        for overload_name in overloads:
+            overload = getattr(torch.ops.aten.unbind, overload_name)
+            try:
+                register_prop_rule(overload)(unbind_rule)
+                # Verify registration
+                is_reg = overload in DTensor._op_dispatcher.sharding_propagator.op_to_rules
+                print(f"DEBUG: Registered and verified unbind rule for {overload}: {is_reg}")
+            except Exception as e:
+                print(f"DEBUG: Failed to register unbind rule for {overload}: {e}")
+    except Exception as e:
+        print(f"DEBUG: Error during overload iteration: {e}")
     
     # Also try the packet itself or default if it exists
     if hasattr(torch.ops.aten.unbind, "default"):
@@ -302,7 +341,11 @@ def _register_sharding_rules():
         except Exception as e:
             print(f"DEBUG: Failed to register unbind rule for aten.unbind.default: {e}")
 
+    print("DEBUG: _register_sharding_rules() completed.")
+
 
 _register_sharding_rules()
+
+
 
 
