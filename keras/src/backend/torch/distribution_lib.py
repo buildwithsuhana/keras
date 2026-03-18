@@ -226,13 +226,17 @@ def distribute_output(fn):
 def _register_sharding_rules():
     """Register sharding rules for ops missing from PyTorch DTensor."""
     try:
-        from torch.distributed.tensor._dtensor_spec import DTensorSpec
+        from torch.distributed.tensor._dtensor_spec import DTensorSpec, TensorMeta
         from torch.distributed.tensor._op_schema import (
             OpSchema,
             OutputSharding,
         )
         from torch.distributed.tensor._ops.registration import register_prop_rule
-        from torch.distributed.tensor.placement_types import Replicate, Shard
+        from torch.distributed.tensor._ops.utils import (
+            is_tensor_dim_sharded,
+            shift_shard_dims_after_remove,
+        )
+        from torch.distributed.tensor.placement_types import Replicate
     except ImportError:
         return
 
@@ -242,15 +246,7 @@ def _register_sharding_rules():
         if dim < 0:
             dim += input_spec.ndim
 
-        # For unbind, we currently just replicate if the unbind dim is sharded.
-        # Otherwise, we preserve the sharding by adjusting shard indices.
-        needs_redistribute = False
-        for placement in input_spec.placements:
-            if isinstance(placement, Shard) and placement.dim == dim:
-                needs_redistribute = True
-                break
-
-        if needs_redistribute:
+        if is_tensor_dim_sharded(input_spec, dim=dim):
             # Replicate the input if the unbind dimension is sharded
             replicate_spec = DTensorSpec(
                 mesh=input_spec.mesh,
@@ -267,22 +263,25 @@ def _register_sharding_rules():
                 ),
             )
 
-        new_placements = []
-        for placement in input_spec.placements:
-            if isinstance(placement, Shard):
-                if placement.dim > dim:
-                    new_placements.append(Shard(placement.dim - 1))
-                else:
-                    new_placements.append(Shard(placement.dim))
-            else:
-                new_placements.append(Replicate())
+        output_placements = tuple(
+            shift_shard_dims_after_remove(input_spec.placements, dim)
+        )
+        output_shape = list(input_spec.shape)
+        output_dim_size = output_shape.pop(dim)
+        output_stride = list(input_spec.stride)
+        output_stride.pop(dim)
 
         output_spec = [
             DTensorSpec(
                 mesh=input_spec.mesh,
-                placements=tuple(new_placements),
+                placements=output_placements,
+                tensor_meta=TensorMeta(
+                    shape=torch.Size(output_shape),
+                    stride=tuple(output_stride),
+                    dtype=input_spec.tensor_meta.dtype,
+                ),
             )
-        ] * input_spec.shape[dim]
+        ] * output_dim_size
         return OutputSharding(output_spec=tuple(output_spec))
 
     try:
