@@ -226,61 +226,56 @@ def distribute_output(fn):
 def _register_sharding_rules():
     """Register sharding rules for ops missing from PyTorch DTensor."""
     try:
-        from torch.distributed.tensor._dispatch import register_propagate_rule
         from torch.distributed.tensor._dtensor_spec import DTensorSpec
-        from torch.distributed.tensor._sharding_prop import (
+        from torch.distributed.tensor._op_schema import (
+            OpSchema,
             OutputSharding,
-            PropagatedSharding,
         )
-        from torch.distributed.tensor.placements import Replicate, Shard
+        from torch.distributed.tensor._ops.registration import register_prop_rule
+        from torch.distributed.tensor.placement_types import Replicate, Shard
     except ImportError:
         return
 
     def unbind_rule(op_schema):
-        input_spec = op_schema.args[0]
-        dim = op_schema.args[1] if len(op_schema.args) > 1 else 0
+        input_spec = op_schema.args_schema[0]
+        dim = op_schema.args_schema[1] if len(op_schema.args_schema) > 1 else 0
         if dim < 0:
             dim += input_spec.ndim
 
         # For unbind, we currently just replicate if the unbind dim is sharded.
         # Otherwise, we preserve the sharding by adjusting shard indices.
-        new_placements = []
         needs_redistribute = False
         for placement in input_spec.placements:
+            if isinstance(placement, Shard) and placement.dim == dim:
+                needs_redistribute = True
+                break
+
+        if needs_redistribute:
+            # Replicate the input if the unbind dimension is sharded
+            replicate_spec = DTensorSpec(
+                mesh=input_spec.mesh,
+                placements=tuple([Replicate()] * len(input_spec.placements)),
+                tensor_meta=input_spec.tensor_meta,
+            )
+            return OutputSharding(
+                output_spec=None,
+                needs_redistribute=True,
+                redistribute_schema=OpSchema(
+                    op=op_schema.op,
+                    args_schema=(replicate_spec, dim),
+                    kwargs_schema=op_schema.kwargs_schema,
+                ),
+            )
+
+        new_placements = []
+        for placement in input_spec.placements:
             if isinstance(placement, Shard):
-                if placement.dim == dim:
-                    needs_redistribute = True
-                    break
-                elif placement.dim > dim:
+                if placement.dim > dim:
                     new_placements.append(Shard(placement.dim - 1))
                 else:
                     new_placements.append(Shard(placement.dim))
             else:
                 new_placements.append(Replicate())
-
-        if needs_redistribute:
-            # Replicate the input if the unbind dimension is sharded
-            return OutputSharding(
-                output_spec=[
-                    DTensorSpec(
-                        mesh=input_spec.mesh,
-                        placements=tuple(
-                            [Replicate()] * len(input_spec.placements)
-                        ),
-                        tensor_meta=input_spec.tensor_meta,
-                    )
-                ]
-                * input_spec.shape[dim],
-                redistribute_input=[
-                    DTensorSpec(
-                        mesh=input_spec.mesh,
-                        placements=tuple(
-                            [Replicate()] * len(input_spec.placements)
-                        ),
-                        tensor_meta=input_spec.tensor_meta,
-                    )
-                ],
-            )
 
         output_spec = [
             DTensorSpec(
@@ -288,11 +283,14 @@ def _register_sharding_rules():
                 placements=tuple(new_placements),
             )
         ] * input_spec.shape[dim]
-        return OutputSharding(output_spec=output_spec)
+        return OutputSharding(output_spec=tuple(output_spec))
 
     try:
-        register_propagate_rule(torch.ops.aten.unbind.int, unbind_rule)
-    except:
+        register_prop_rule(torch.ops.aten.unbind.int)(unbind_rule)
+    except Exception:
         pass
+
+
 _register_sharding_rules()
+
 
