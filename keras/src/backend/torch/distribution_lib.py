@@ -118,19 +118,17 @@ def _to_backend_layout(tensor_layout):
         return None
 
     keras_mesh = tensor_layout.device_mesh
-    if keras_mesh.backend_mesh is not None:
-        torch_mesh = keras_mesh.backend_mesh
-    else:
-        torch_mesh = _to_backend_mesh(keras_mesh)
+    torch_mesh = keras_mesh.backend_mesh or _to_backend_mesh(keras_mesh)
 
     placements = []
     for mesh_dim_name in keras_mesh.axis_names:
         shard_dim = None
         if tensor_layout.axes is not None:
-            for tensor_dim, axis_name in enumerate(tensor_layout.axes):
-                if axis_name == mesh_dim_name:
-                    shard_dim = tensor_dim
-                    break
+            try:
+                shard_dim = tensor_layout.axes.index(mesh_dim_name)
+            except ValueError:
+                shard_dim = None
+
         if shard_dim is not None:
             placements.append(Shard(shard_dim))
         else:
@@ -251,14 +249,42 @@ def _register_sharding_rules():
             OpSchema,
             OutputSharding,
         )
-        from torch.distributed.tensor._ops.registration import register_prop_rule
-        from torch.distributed.tensor._ops.utils import (
-            is_tensor_dim_sharded,
-            shift_shard_dims_after_remove,
-        )
         from torch.distributed.tensor.placement_types import Replicate
+        
+        # Robust import for registration function
+        register_prop_rule = None
+        try:
+            from torch.distributed.tensor._ops.registration import register_prop_rule
+        except ImportError:
+            try:
+                from torch.distributed.tensor.registration import register_prop_rule
+            except ImportError:
+                print("DEBUG: Could not find register_prop_rule, will use direct registration")
+
+        # Robust import for utils
+        try:
+            from torch.distributed.tensor._ops.utils import (
+                is_tensor_dim_sharded,
+                shift_shard_dims_after_remove,
+            )
+        except ImportError:
+            # Fallback implementations if utils are missing
+            def is_tensor_dim_sharded(spec, dim):
+                from torch.distributed.tensor.placement_types import Shard
+                return any(isinstance(p, Shard) and p.dim == dim for p in spec.placements)
+
+            def shift_shard_dims_after_remove(placements, remove_dim):
+                from torch.distributed.tensor.placement_types import Shard
+                new_placements = []
+                for p in placements:
+                    if isinstance(p, Shard) and p.dim > remove_dim:
+                        new_placements.append(Shard(p.dim - 1))
+                    else:
+                        new_placements.append(p)
+                return new_placements
+
     except ImportError as e:
-        print(f"DEBUG: Import failure in _register_sharding_rules: {e}")
+        print(f"DEBUG: Critical import failure in _register_sharding_rules: {e}")
         return
 
     def unbind_rule(op_schema):
@@ -269,7 +295,7 @@ def _register_sharding_rules():
             if dim < 0:
                 dim += input_spec.ndim
 
-            print(f"DEBUG: unbind_rule processing: dim={dim}, input_spec={input_spec}")
+            print(f"DEBUG: unbind_rule processing: dim={dim}")
 
             if is_tensor_dim_sharded(input_spec, dim=dim):
                 print(f"DEBUG: unbind dim {dim} IS sharded, triggering redistribution to replicate")
@@ -313,9 +339,7 @@ def _register_sharding_rules():
             return OutputSharding(output_spec=tuple(output_spec))
         except Exception as e:
             print(f"DEBUG: Error in unbind_rule implementation: {e}")
-            import traceback
-            traceback.print_exc()
-            raise e
+            return OutputSharding(None)
 
     # Register for all possible unbind overloads
     try:
@@ -324,7 +348,14 @@ def _register_sharding_rules():
         for overload_name in overloads:
             overload = getattr(torch.ops.aten.unbind, overload_name)
             try:
-                register_prop_rule(overload)(unbind_rule)
+                if register_prop_rule is not None:
+                    register_prop_rule(overload)(unbind_rule)
+                else:
+                    # Direct registration if helper is missing
+                    DTensor._op_dispatcher.sharding_propagator.register_sharding_prop_rule(
+                        overload, unbind_rule
+                    )
+                
                 # Verify registration
                 is_reg = overload in DTensor._op_dispatcher.sharding_propagator.op_to_rules
                 print(f"DEBUG: Registered and verified unbind rule for {overload}: {is_reg}")
@@ -336,7 +367,12 @@ def _register_sharding_rules():
     # Also try the packet itself or default if it exists
     if hasattr(torch.ops.aten.unbind, "default"):
         try:
-            register_prop_rule(torch.ops.aten.unbind.default)(unbind_rule)
+            if register_prop_rule is not None:
+                register_prop_rule(torch.ops.aten.unbind.default)(unbind_rule)
+            else:
+                DTensor._op_dispatcher.sharding_propagator.register_sharding_prop_rule(
+                    torch.ops.aten.unbind.default, unbind_rule
+                )
             print(f"DEBUG: Registered unbind rule for aten.unbind.default")
         except Exception as e:
             print(f"DEBUG: Failed to register unbind rule for aten.unbind.default: {e}")

@@ -109,6 +109,7 @@ class Variable(KerasVariable):
         super().__init__(*args, **kwargs)
 
     def _initialize(self, value):
+        self._shape = tuple(value.shape)
         self._initialize_layout()
         if self._layout is not None:
             from keras.src.backend.torch.distribution_lib import (
