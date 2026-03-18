@@ -24,8 +24,7 @@ def test_model_parallel():
         print(f"Starting ModelParallel test with {world_size} processes using OPT 125M...")
 
     # 2. Define the Distribution Strategy
-    # We use 'cpu' for testing to avoid needing multiple GPUs
-    device_type = "cpu"
+    device_type = "gpu"
     devices = keras.distribution.list_devices(device_type)
     
     # Create a 1D mesh for model parallelism

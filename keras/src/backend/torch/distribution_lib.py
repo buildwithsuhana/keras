@@ -139,6 +139,11 @@ def distribute_tensor(tensor, layout):
     if isinstance(layout, TensorLayout):
         layout = layout.backend_layout
 
+    if isinstance(tensor, DTensor):
+        return tensor.redistribute(
+            device_mesh=layout.device_mesh, placements=layout.placements
+        )
+
     return torch_distribute_tensor(
         tensor, device_mesh=layout.device_mesh, placements=layout.placements
     )

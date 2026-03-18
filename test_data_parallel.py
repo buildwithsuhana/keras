@@ -26,7 +26,7 @@ def test_data_parallel():
         print(f"Starting DataParallel test with {world_size} processes using OPT 125M...")
 
     # 2. Define the Distribution Strategy
-    device_type = "cpu"
+    device_type = "gpu"
     devices = keras.distribution.list_devices(device_type)
     
     # For DataParallel, we just need the devices
