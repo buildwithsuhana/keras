@@ -9,6 +9,8 @@ from keras.src import callbacks as callbacks_module
 from keras.src import optimizers as optimizers_module
 from keras.src import tree
 from keras.src.backend import config
+from keras.src.backend.torch import distribution_lib as torch_distribution_lib
+from keras.src.distribution import distribution_lib
 from keras.src.trainers import trainer as base_trainer
 from keras.src.trainers.data_adapters import array_slicing
 from keras.src.trainers.data_adapters import data_adapter_utils
@@ -17,12 +19,46 @@ from keras.src.utils import traceback_utils
 from keras.src.utils.python_utils import pythonify_logs
 
 
+class _KerasModuleWrapper(torch.nn.Module):
+    """Wraps a Keras model so DDP sees standard torch.nn.Parameters."""
+
+    def __init__(self, keras_model):
+        super().__init__()
+        object.__setattr__(self, "_keras_model", keras_model)
+        for i, v in enumerate(keras_model.trainable_weights):
+            self.register_parameter(f"p{i}", v.value)
+
+    def forward(self, *args, **kwargs):
+        return self._keras_model(*args, **kwargs)
+
+
 class TorchTrainer(base_trainer.Trainer):
     def __init__(self):
         super().__init__()
         self.train_function = None
         self.test_function = None
         self.predict_function = None
+        self._ddp_model = None
+
+    def _maybe_distribute_data(self, data, dist):
+        if dist is not None and isinstance(dist, distribution_lib.ModelParallel):
+            return tree.map_structure(
+                lambda t: (
+                    torch_distribution_lib.distribute_data_input(
+                        t, dist.get_data_layout(t.shape), dist.batch_dim_name
+                    )
+                    if isinstance(t, (torch.Tensor, np.ndarray, list, tuple))
+                    else t
+                ),
+                data,
+            )
+        return data
+
+    def __call__(self, *args, **kwargs):
+        dist = distribution_lib.distribution()
+        args = self._maybe_distribute_data(args, dist)
+        kwargs = self._maybe_distribute_data(kwargs, dist)
+        return super().__call__(*args, **kwargs)
 
     def _should_torch_compile(self):
         # require torch>=2.1.0 to enable dynamo since it
@@ -38,14 +74,29 @@ class TorchTrainer(base_trainer.Trainer):
 
         return self.jit_compile
 
-    def train_step(self, data):
+    def _get_model_to_use(self, dist):
+        if dist is not None and isinstance(dist, distribution_lib.DataParallel):
+            return self._ddp_model
+        return self
+
+    def _prepare_data(self, data):
         x, y, sample_weight = data_adapter_utils.unpack_x_y_sample_weight(data)
+        dist = distribution_lib.distribution()
+        x = self._maybe_distribute_data(x, dist)
+        y = self._maybe_distribute_data(y, dist)
+        return x, y, sample_weight, dist
+
+    def _call_model(self, x, dist, training=False):
+        model = self._get_model_to_use(dist)
+        if self._call_has_training_arg:
+            return model(x, training=training)
+        return model(x)
+
+    def train_step(self, data):
+        x, y, sample_weight, dist = self._prepare_data(data)
 
         # Compute predictions
-        if self._call_has_training_arg:
-            y_pred = self(x, training=True)
-        else:
-            y_pred = self(x)
+        y_pred = self._call_model(x, dist, training=True)
 
         # Call torch.nn.Module.zero_grad() to clear the leftover gradients
         # for the weights from the previous train step.
@@ -81,15 +132,10 @@ class TorchTrainer(base_trainer.Trainer):
         return self.compute_metrics(x, y, y_pred, sample_weight=sample_weight)
 
     def test_step(self, data):
-        (
-            x,
-            y,
-            sample_weight,
-        ) = data_adapter_utils.unpack_x_y_sample_weight(data)
-        if self._call_has_training_arg:
-            y_pred = self(x, training=False)
-        else:
-            y_pred = self(x)
+        x, y, sample_weight, dist = self._prepare_data(data)
+
+        y_pred = self._call_model(x, dist, training=False)
+
         loss = self._compute_loss(
             x=x, y=y, y_pred=y_pred, sample_weight=sample_weight, training=False
         )
@@ -103,11 +149,31 @@ class TorchTrainer(base_trainer.Trainer):
 
     def predict_step(self, data):
         x, _, _ = data_adapter_utils.unpack_x_y_sample_weight(data)
+
+        dist = distribution_lib.distribution()
+        x = self._maybe_distribute_data(x, dist)
+
         if self._call_has_training_arg:
             y_pred = self(x, training=False)
         else:
             y_pred = self(x)
         return y_pred
+
+    def _initialize_ddp_model(self, dist):
+        if (
+            dist is not None
+            and isinstance(dist, distribution_lib.DataParallel)
+            and self._ddp_model is None
+        ):
+            wrapper = _KerasModuleWrapper(self)
+            self._ddp_model = torch.nn.parallel.DistributedDataParallel(
+                wrapper,
+                device_ids=(
+                    [torch.cuda.current_device()]
+                    if torch.cuda.is_available()
+                    else None
+                ),
+            )
 
     def make_train_function(self, force=False):
         if self.train_function is not None and not force:
@@ -118,6 +184,8 @@ class TorchTrainer(base_trainer.Trainer):
                 "`steps_per_execution` must be 1 with the PyTorch backend. "
                 f"Received: steps_per_execution={self.steps_per_execution}"
             )
+
+        self._initialize_ddp_model(distribution_lib.distribution())
 
         def one_step_on_data(data):
             """Runs a single training step on a batch of data."""
@@ -138,6 +206,8 @@ class TorchTrainer(base_trainer.Trainer):
                 "`steps_per_execution` must be 1 with the PyTorch backend. "
                 f"Received: steps_per_execution={self.steps_per_execution}"
             )
+
+        self._initialize_ddp_model(distribution_lib.distribution())
 
         def one_step_on_data(data):
             """Runs a single test step on a batch of data."""
@@ -275,6 +345,7 @@ class TorchTrainer(base_trainer.Trainer):
                     break
 
             # Override with model metrics instead of last step logs if needed.
+            self._sync_metrics()
             epoch_logs = dict(self._get_metrics_result_or_logs(logs))
 
             # Switch the torch Module back to testing mode.
@@ -387,12 +458,25 @@ class TorchTrainer(base_trainer.Trainer):
             callbacks.on_test_batch_end(end_step, logs)
             if self.stop_evaluating:
                 break
+        self._sync_metrics()
         logs = pythonify_logs(self._get_metrics_result_or_logs(logs))
         callbacks.on_test_end(logs)
 
         if return_dict:
             return logs
         return self._flatten_metrics_in_order(logs)
+
+    def _sync_metrics(self):
+        if torch.distributed.is_initialized():
+            for metric in self.metrics:
+                for variable in metric.variables:
+                    value = variable.value
+                    if hasattr(value, "to_local"):
+                        value = value.to_local()
+                    torch.distributed.all_reduce(
+                        value, op=torch.distributed.ReduceOp.SUM
+                    )
+                    variable.assign(value)
 
     @traceback_utils.filter_traceback
     def predict(

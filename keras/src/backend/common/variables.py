@@ -205,8 +205,8 @@ class Variable:
                 self._shape = self._validate_shape(shape)
                 self._initialize_with_initializer(initializer)
             else:
+                self._shape = self._validate_shape(initializer.shape)
                 self._initialize(initializer)
-                self._shape = self._validate_shape(self._value.shape)
         self._ndim = len(self._shape)
 
     def _deferred_initialize(self):

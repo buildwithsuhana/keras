@@ -21,6 +21,7 @@ class ArrayDataAdapter(DataAdapter):
         steps=None,
         shuffle=False,
         class_weight=None,
+        distribution=None,
     ):
         if not can_convert_arrays((x, y, sample_weight)):
             raise ValueError(
@@ -91,6 +92,7 @@ class ArrayDataAdapter(DataAdapter):
         self._batch_size = batch_size
         self._partial_batch_size = num_samples % batch_size
         self._shuffle = shuffle
+        self.distribution = distribution
 
     def get_numpy_iterator(self):
         inputs = array_slicing.convert_to_sliceable(
@@ -289,7 +291,22 @@ class ArrayDataAdapter(DataAdapter):
             def __len__(self):
                 return len(self.sampler)
 
-        if self._shuffle == "batch":
+        from keras.src.distribution import distribution_lib
+        if (
+            self.distribution is not None
+            and isinstance(self.distribution, distribution_lib.DataParallel)
+        ):
+            batch_sampler = torch.utils.data.BatchSampler(
+                torch.utils.data.distributed.DistributedSampler(
+                    range(self._num_samples),
+                    num_replicas=self.distribution._num_process,
+                    rank=self.distribution._process_id,
+                    shuffle=self._shuffle,
+                ),
+                batch_size=self._batch_size,
+                drop_last=False,
+            )
+        elif self._shuffle == "batch":
             batch_sampler = RandomBatchSampler(
                 torch.utils.data.BatchSampler(
                     range(self._num_samples),

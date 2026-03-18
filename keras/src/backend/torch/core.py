@@ -18,6 +18,8 @@ from keras.src.backend.common.stateless_scope import StatelessScope
 from keras.src.backend.common.stateless_scope import get_stateless_scope
 from keras.src.backend.common.stateless_scope import in_stateless_scope
 from keras.src.backend.common.symbolic_scope import SymbolicScope
+from keras.src.backend.torch.distribution_lib import distribute_output
+from keras.src.backend.torch.distribution_lib import maybe_distribute_tensor
 from keras.src.backend.config import floatx
 
 SUPPORTS_SPARSE_TENSORS = False
@@ -102,8 +104,21 @@ def to_torch_dtype(dtype):
 
 
 class Variable(KerasVariable):
+    def __init__(self, *args, layout=None, **kwargs):
+        self._layout = layout
+        super().__init__(*args, **kwargs)
+
     def _initialize(self, value):
-        if isinstance(value, torch.nn.Parameter):
+        self._initialize_layout()
+        if self._layout is not None:
+            from keras.src.backend.torch.distribution_lib import (
+                distribute_tensor,
+            )
+
+            value = convert_to_tensor(value, dtype=self._dtype)
+            value = distribute_tensor(value, self._layout)
+            self._value = torch.nn.Parameter(value, requires_grad=self.trainable)
+        elif isinstance(value, torch.nn.Parameter):
             # Reuse same parameter
             self._value = value
         else:
@@ -112,9 +127,35 @@ class Variable(KerasVariable):
                 requires_grad=self.trainable,
             ).to(get_device())
 
+    def _initialize_layout(self):
+        distribution = global_state.get_global_attribute("distribution")
+        if self._layout is None and distribution is not None:
+            from keras.src.distribution.distribution_lib import ModelParallel
+
+            if not isinstance(distribution, ModelParallel):
+                return
+
+            tensor_layout = distribution.get_variable_layout(self)
+            from keras.src.distribution.distribution_lib import TensorLayout
+
+            if isinstance(tensor_layout, TensorLayout):
+                self._layout = tensor_layout.backend_layout
+            else:
+                self._layout = tensor_layout
+
     def _direct_assign(self, value):
-        with torch.no_grad():
-            self.value.copy_(value)
+        if self._layout is not None:
+            from keras.src.backend.torch.distribution_lib import (
+                distribute_tensor,
+            )
+
+            with torch.no_grad():
+                value = convert_to_tensor(value, dtype=self._dtype).detach()
+                value = distribute_tensor(value, self._layout)
+                self.value.copy_(value)
+        else:
+            with torch.no_grad():
+                self.value.copy_(value)
 
     def _convert_to_tensor(self, value, dtype=None):
         return convert_to_tensor(value, dtype=dtype)
@@ -205,19 +246,25 @@ def convert_to_tensor(x, dtype=None, sparse=None, ragged=None):
                 x = x.to(device)
         if dtype is not None:
             x = x.to(to_torch_dtype(dtype))
-        return x
+        return maybe_distribute_tensor(x)
     if dtype is None:
         if isinstance(x, bool):
-            return torch.as_tensor(x, dtype=torch.bool, device=get_device())
+            return maybe_distribute_tensor(
+                torch.as_tensor(x, dtype=torch.bool, device=get_device())
+            )
         elif isinstance(x, int):
             if x < -(2**31) or x >= 2**31:
-                return torch.as_tensor(
-                    x, dtype=torch.int64, device=get_device()
+                return maybe_distribute_tensor(
+                    torch.as_tensor(x, dtype=torch.int64, device=get_device())
                 )
-            return torch.as_tensor(x, dtype=torch.int32, device=get_device())
+            return maybe_distribute_tensor(
+                torch.as_tensor(x, dtype=torch.int32, device=get_device())
+            )
         elif isinstance(x, float):
-            return torch.as_tensor(
-                x, dtype=to_torch_dtype(floatx()), device=get_device()
+            return maybe_distribute_tensor(
+                torch.as_tensor(
+                    x, dtype=to_torch_dtype(floatx()), device=get_device()
+                )
             )
 
     # Convert to np in case of any array-like that is not list or tuple.
@@ -225,7 +272,9 @@ def convert_to_tensor(x, dtype=None, sparse=None, ragged=None):
         x = np.array(x)
     elif len(x) > 0 and any(isinstance(x1, torch.Tensor) for x1 in x):
         # Handle list or tuple of torch tensors
-        return torch.stack([convert_to_tensor(x1) for x1 in x])
+        return maybe_distribute_tensor(
+            torch.stack([convert_to_tensor(x1) for x1 in x])
+        )
     if isinstance(x, np.ndarray):
         if x.dtype == np.uint32:
             # Torch backend does not support uint32.
@@ -240,12 +289,16 @@ def convert_to_tensor(x, dtype=None, sparse=None, ragged=None):
             *[getattr(item, "dtype", type(item)) for item in tree.flatten(x)]
         )
     dtype = to_torch_dtype(dtype)
-    return torch.as_tensor(x, dtype=dtype, device=get_device())
+    return maybe_distribute_tensor(
+        torch.as_tensor(x, dtype=dtype, device=get_device())
+    )
 
 
 def convert_to_numpy(x):
     def transform(x):
         if is_tensor(x):
+            if hasattr(x, "to_local"):
+                x = x.to_local()
             if x.requires_grad:
                 x = x.detach()
             # Tensor has to be moved to CPU before converting to numpy.
@@ -281,6 +334,7 @@ def shape(x):
     return tuple(x.shape)
 
 
+@distribute_output
 def cast(x, dtype):
     dtype = to_torch_dtype(dtype)
     if isinstance(x, Variable):
@@ -309,11 +363,12 @@ def compute_output_spec(fn, *args, **kwargs):
                 for i, e in enumerate(shape):
                     if e is None:
                         shape[i] = fill_value
-            return torch.ones(
+            res = torch.ones(
                 size=shape,
                 dtype=TORCH_DTYPES[x.dtype],
                 device=get_device(),
             )
+            return maybe_distribute_tensor(res)
         return x
 
     def convert_torch_to_keras_tensor(x):

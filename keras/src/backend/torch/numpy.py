@@ -16,6 +16,7 @@ from keras.src.backend.torch.core import convert_to_tensor
 from keras.src.backend.torch.core import get_device
 from keras.src.backend.torch.core import is_tensor
 from keras.src.backend.torch.core import to_torch_dtype
+from keras.src.backend.torch.distribution_lib import distribute_output
 
 TORCH_INT_TYPES = (
     torch.int8,
@@ -220,6 +221,7 @@ def max(x, axis=None, keepdims=False, initial=None):
     return result
 
 
+@distribute_output
 def ones(shape, dtype=None):
     dtype = to_torch_dtype(dtype or config.floatx())
     if isinstance(shape, int):
@@ -227,6 +229,7 @@ def ones(shape, dtype=None):
     return torch.ones(size=shape, dtype=dtype, device=get_device())
 
 
+@distribute_output
 def zeros(shape, dtype=None):
     dtype = to_torch_dtype(dtype or config.floatx())
     if isinstance(shape, int):
@@ -312,6 +315,7 @@ def append(x1, x2, axis=None):
     return torch.cat((x1, x2), dim=axis)
 
 
+@distribute_output
 def arange(start, stop=None, step=None, dtype=None):
     if dtype is None:
         dtypes_to_resolve = [getattr(start, "dtype", type(start))]
@@ -557,6 +561,7 @@ def blackman(x):
     return torch.signal.windows.blackman(x)
 
 
+@distribute_output
 def broadcast_to(x, shape):
     x = convert_to_tensor(x)
     return torch.broadcast_to(x, shape)
@@ -801,6 +806,7 @@ def exp2(x):
     return torch.exp2(x)
 
 
+@distribute_output
 def expand_dims(x, axis):
     x = convert_to_tensor(x)
     axis = to_tuple_or_list(axis)
@@ -1296,6 +1302,7 @@ def min(x, axis=None, keepdims=False, initial=None):
     return result
 
 
+@distribute_output
 def minimum(x1, x2):
     if not isinstance(x1, (int, float)):
         x1 = convert_to_tensor(x1)
@@ -1690,6 +1697,7 @@ def repeat(x, repeats, axis=None):
     return torch.repeat_interleave(x, repeats, dim=axis)
 
 
+@distribute_output
 def reshape(x, newshape):
     if not isinstance(newshape, (list, tuple)):
         newshape = (newshape,)
@@ -1793,6 +1801,7 @@ def array_split(x, indices_or_sections, axis=0):
     return list(out)
 
 
+@distribute_output
 def stack(x, axis=0):
     x = [convert_to_tensor(elem) for elem in x]
     return torch.stack(x, dim=axis)

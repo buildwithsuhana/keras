@@ -10,14 +10,44 @@ from keras.src.trainers.data_adapters.data_adapter import DataAdapter
 class TorchDataLoaderAdapter(DataAdapter):
     """Adapter that handles `torch.utils.data.DataLoader`."""
 
-    def __init__(self, dataloader):
+    def __init__(
+        self,
+        dataloader,
+        y=None,
+        sample_weight=None,
+        class_weight=None,
+        distribution=None,
+    ):
         import torch
+
+        from keras.src import backend
+        from keras.src.distribution import distribution_lib
 
         if not isinstance(dataloader, torch.utils.data.DataLoader):
             raise ValueError(
                 f"Expected argument `dataloader` to be an instance of"
                 f"`torch.utils.data.DataLoader`. Received: {dataloader}"
             )
+
+        if y is not None or sample_weight is not None:
+            raise ValueError(
+                "When providing `x` as a torch DataLoader, `y` and "
+                "`sample_weight` should not be passed. Instead, they "
+                "should be included as part of the DataLoader."
+            )
+        if class_weight is not None:
+            raise ValueError(
+                "Argument `class_weight` is not supported for torch "
+                "DataLoader inputs. You can modify your `__getitem__` method "
+                "to return input tensor, label and class_weight. "
+            )
+
+        if (
+            backend.backend() == "torch"
+            and distribution is not None
+            and isinstance(distribution, distribution_lib.DataParallel)
+        ):
+            dataloader = _add_distributed_sampler(dataloader)
 
         self._dataloader = dataloader
         self._output_signature = None
@@ -83,3 +113,26 @@ class TorchDataLoaderAdapter(DataAdapter):
     @property
     def partial_batch_size(self):
         return self._partial_batch_size
+
+
+def _add_distributed_sampler(dataloader):
+    import torch
+
+    sampler = torch.utils.data.distributed.DistributedSampler(
+        dataloader.dataset,
+        num_replicas=torch.distributed.get_world_size(),
+        rank=torch.distributed.get_rank(),
+        shuffle=True,
+    )
+    return torch.utils.data.DataLoader(
+        dataloader.dataset,
+        sampler=sampler,
+        batch_size=dataloader.batch_size,
+        num_workers=dataloader.num_workers,
+        collate_fn=dataloader.collate_fn,
+        pin_memory=dataloader.pin_memory,
+        drop_last=dataloader.drop_last,
+        timeout=dataloader.timeout,
+        worker_init_fn=dataloader.worker_init_fn,
+        persistent_workers=dataloader.persistent_workers,
+    )

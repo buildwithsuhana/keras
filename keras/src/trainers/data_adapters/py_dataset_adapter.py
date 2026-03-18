@@ -203,6 +203,7 @@ class PyDatasetAdapter(DataAdapter):
         x,
         class_weight=None,
         shuffle=False,
+        distribution=None,
     ):
         self.py_dataset = x
         self.class_weight = class_weight
@@ -210,6 +211,7 @@ class PyDatasetAdapter(DataAdapter):
         self.shuffle = shuffle
         self._output_signature = None
         self._within_epoch = False
+        self.distribution = distribution
 
         workers = self.py_dataset.workers
         use_multiprocessing = self.py_dataset.use_multiprocessing
@@ -252,14 +254,37 @@ class PyDatasetAdapter(DataAdapter):
 
     def _infinite_generator(self):
         for i in itertools.count():
+            if (
+                self.distribution is not None
+                and self.distribution.auto_shard_dataset
+            ):
+                num_processes = self.distribution._num_process
+                process_id = self.distribution._process_id
+                if i % num_processes != process_id:
+                    continue
             yield self._standardize_batch(self.py_dataset[i])
 
-    def _finite_generator(self):
+    def _get_sharded_indices(self):
         indices = range(self.py_dataset.num_batches)
         if self.shuffle:
             indices = list(indices)
             random.shuffle(indices)
 
+        if (
+            self.distribution is not None
+            and self.distribution.auto_shard_dataset
+        ):
+            num_processes = self.distribution._num_process
+            process_id = self.distribution._process_id
+            indices = [
+                i
+                for i in indices
+                if i % num_processes == process_id
+            ]
+        return indices
+
+    def _finite_generator(self):
+        indices = self._get_sharded_indices()
         for i in indices:
             yield self._standardize_batch(self.py_dataset[i])
 
