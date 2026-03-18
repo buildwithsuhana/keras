@@ -120,8 +120,8 @@ class Variable(KerasVariable):
             value = distribute_tensor(value, self._layout)
             self._value = torch.nn.Parameter(value, requires_grad=self.trainable)
         elif isinstance(value, torch.nn.Parameter):
-            # Reuse same parameter
-            self._value = value
+            # Reuse same parameter, but ensure correct device
+            self._value = value.to(get_device())
         else:
             self._value = torch.nn.Parameter(
                 convert_to_tensor(value, dtype=self._dtype),

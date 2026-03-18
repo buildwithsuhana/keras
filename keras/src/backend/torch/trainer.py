@@ -165,6 +165,11 @@ class TorchTrainer(base_trainer.Trainer):
             and isinstance(dist, distribution_lib.DataParallel)
             and self._ddp_model is None
         ):
+            # Move the model to the correct device before wrapping in DDP.
+            from keras.src.backend.torch import core as torch_core
+
+            self.to(torch_core.get_device())
+
             wrapper = _KerasModuleWrapper(self)
             self._ddp_model = torch.nn.parallel.DistributedDataParallel(
                 wrapper,
