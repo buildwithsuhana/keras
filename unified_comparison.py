@@ -25,8 +25,8 @@ from keras.src.distribution.distribution_lib import (
 
 def run_training():
     # 2. Initialize Distributed Environment
-    # On Kaggle, both JAX and Torch will detect the 2 GPUs
-    keras.distribution.initialize()
+    if backend == "torch":
+        keras.distribution.initialize()
     
     rank = int(os.environ.get("RANK", "0"))
     world_size = int(os.environ.get("WORLD_SIZE", "2"))
