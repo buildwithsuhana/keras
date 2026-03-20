@@ -46,14 +46,9 @@ def run_training():
     )
     
     layout_map = LayoutMap(mesh)
-    # Shard ALL major layers
-    layout_map[".*embeddings.*"] = ("model", None)
-    layout_map[".*query_dense.*kernel"] = (None, "model")
-    layout_map[".*key_dense.*kernel"] = (None, "model")
-    layout_map[".*value_dense.*kernel"] = (None, "model")
-    layout_map[".*attention.*output_dense.*kernel"] = ("model", None)
-    layout_map[".*ffn_intermediate.*kernel"] = (None, "model")
-    layout_map[".*ffn_output.*kernel"] = ("model", None)
+    # Shard all kernels and embeddings
+    layout_map[".*embeddings"] = ("model", None)
+    layout_map[".*kernel"] = (None, "model")
     
     distribution = ModelParallel(layout_map=layout_map, batch_dim_name="model")
 
@@ -131,6 +126,7 @@ def run_training():
         
         if backend == "torch":
             # Sum local losses and divide by world_size to get global mean
+            from keras.src.backend.torch import core as torch_core
             t_loss = torch.tensor(local_loss, device=torch_core.get_device())
             torch.distributed.all_reduce(t_loss, op=torch.distributed.ReduceOp.SUM)
             initial_loss = t_loss.item() / world_size
@@ -181,6 +177,7 @@ def run_training():
 
         final_loss_local = history_rest.history["loss"][-1]
         if backend == "torch":
+            from keras.src.backend.torch import core as torch_core
             t_loss = torch.tensor(final_loss_local, device=torch_core.get_device())
             torch.distributed.all_reduce(t_loss, op=torch.distributed.ReduceOp.SUM)
             final_loss = t_loss.item() / world_size
