@@ -61,12 +61,15 @@ def run_training():
             jit_compile=False,
         )
 
-        # 6. Load Fixed Synthetic Data
+        # 6. Load Fixed Synthetic Data (Full data on all ranks)
         x = {
             "token_ids": np.load("data_cmp/x_token_ids.npy"),
             "padding_mask": np.load("data_cmp/x_padding_mask.npy"),
         }
         y = np.load("data_cmp/y.npy")
+
+        if rank == 0:
+            print(f"[{backend}] Data loaded. Global batch size: {y.shape[0]}")
 
         # Step 0: Compare initial loss
         out0 = model.predict(x, batch_size=8, verbose=0)
@@ -103,7 +106,7 @@ def run_training():
 
         weight_before = keras.ops.convert_to_numpy(target_weight.value).copy()
 
-        # Run 1 step with shuffle=False
+        # Run 1 step with global batch_size=8 and shuffle=False
         model.fit(x, y, epochs=1, steps_per_epoch=1, batch_size=8, shuffle=False, verbose=0)
         
         weight_after = keras.ops.convert_to_numpy(target_weight.value)
@@ -113,7 +116,7 @@ def run_training():
             np.save(f"dp_update_step1_{backend}.npy", update)
             print(f"[{backend}] Step 1 update captured.")
 
-        # 8. Complete Training (Total 10 Epochs) with shuffle=False
+        # 8. Complete Training (Total 10 Epochs) with global batch_size=8
         history_rest = model.fit(
             x, y,
             initial_epoch=1,

@@ -46,8 +46,9 @@ def run_training():
     )
     
     layout_map = LayoutMap(mesh)
-    # Shard all kernels and embeddings
-    layout_map[".*embeddings"] = ("model", None)
+    # Shard kernels. Shard embeddings on hidden dim (column-parallel) 
+    # for better stability in PyTorch DTensor.
+    layout_map[".*embeddings"] = (None, "model")
     layout_map[".*kernel"] = (None, "model")
     
     distribution = ModelParallel(layout_map=layout_map, batch_dim_name="model")
@@ -75,28 +76,6 @@ def run_training():
             model.load_weights(weights_file)
             if rank == 0:
                 print(f"[{backend}] Initial weights loaded.")
-            
-            # --- PYTORCH SHARDING VERIFICATION ---
-            from torch.distributed.tensor import DTensor
-            sharded_weights = []
-            for w in model.trainable_weights:
-                if isinstance(w.value, DTensor):
-                    # Check if any placement is Shard
-                    is_sharded = any(p.is_shard() for p in w.value.placements)
-                    if is_sharded:
-                        sharded_weights.append(w.path)
-            
-            if rank == 0:
-                print(f"[{backend}] SHARDING VERIFICATION:")
-                print(f"[{backend}] Total weights: {len(model.trainable_weights)}")
-                print(f"[{backend}] Sharded weights (DTensor): {len(sharded_weights)}")
-                if len(sharded_weights) > 0:
-                    sample_w = model.trainable_weights[1].value # Pick a kernel
-                    print(f"[{backend}] Sample weight ({model.trainable_weights[1].path}):")
-                    print(f"[{backend}]   - Global shape: {sample_w.shape}")
-                    print(f"[{backend}]   - Placements: {sample_w.placements}")
-                    print(f"[{backend}]   - Local shape: {sample_w.to_local().shape}")
-            # ---------------------------------------
 
         # Use Adam with explicit epsilon and NO JIT
         model.compile(
@@ -105,17 +84,21 @@ def run_training():
             jit_compile=False,
         )
 
-        # 6. Load Fixed Synthetic Data
+        # 6. Load Fixed Synthetic Data (Full data on all ranks)
         x = {
             "token_ids": np.load("data_cmp/x_token_ids.npy"),
             "padding_mask": np.load("data_cmp/x_padding_mask.npy"),
         }
         y = np.load("data_cmp/y.npy")
 
+        if rank == 0:
+            print(f"[{backend}] Data loaded. Global batch size: {y.shape[0]}")
+
         # Step 0: Compare initial loss to verify sync
-        # We must calculate GLOBAL loss to match JAX
+        # Calculate GLOBAL loss. Keras predict will handle sharding.
         out0 = model.predict(x, batch_size=8, verbose=0)
         
+        # JAX out0 is (8, 32, 768). Torch out0 is (4, 32, 768) per rank.
         y_local = y
         if backend == "torch":
             start = rank * 4
@@ -125,7 +108,6 @@ def run_training():
         local_loss = np.mean(np.square(out0 - y_local))
         
         if backend == "torch":
-            # Sum local losses and divide by world_size to get global mean
             from keras.src.backend.torch import core as torch_core
             t_loss = torch.tensor(local_loss, device=torch_core.get_device())
             torch.distributed.all_reduce(t_loss, op=torch.distributed.ReduceOp.SUM)
@@ -142,7 +124,6 @@ def run_training():
         target_weight = None
         for w in model.trainable_weights:
             if "kernel" in w.path:
-                # Pick a weight that is actually sharded
                 if hasattr(w.value, "shape") and tuple(w.value.shape) != tuple(w.shape):
                     target_weight = w
                     break
@@ -155,7 +136,7 @@ def run_training():
 
         weight_before = keras.ops.convert_to_numpy(target_weight.value).copy()
 
-        # Run 1 step with shuffle=False
+        # Run 1 step with global batch_size=8 and shuffle=False
         model.fit(x, y, epochs=1, steps_per_epoch=1, batch_size=8, shuffle=False, verbose=0)
         
         weight_after = keras.ops.convert_to_numpy(target_weight.value)
@@ -165,7 +146,7 @@ def run_training():
             np.save(f"update_step1_{backend}.npy", update)
             print(f"[{backend}] Step 1 update captured.")
 
-        # 8. Complete Training (Total 10 Epochs) with shuffle=False
+        # 8. Complete Training (Total 10 Epochs) with global batch_size=8
         history_rest = model.fit(
             x, y,
             initial_epoch=1,
