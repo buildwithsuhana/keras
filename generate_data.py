@@ -3,7 +3,7 @@ import os
 
 # Generate fixed float32 data for comparison
 np.random.seed(42)
-batch_size = 4
+batch_size = 8
 seq_len = 32
 x_token_ids = np.random.randint(0, 50272, size=(batch_size, seq_len)).astype("int32")
 x_padding_mask = np.ones((batch_size, seq_len), dtype="int32")

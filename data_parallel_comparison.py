@@ -1,28 +1,20 @@
 import os
 import sys
-import numpy as np
-import keras
 
 # 1. Environment and Backend Setup
 backend = sys.argv[1]
 os.environ["KERAS_BACKEND"] = backend
 
-if backend == "jax":
-    import jax
-    jax.config.update("jax_enable_x64", True)
-
-# Set global precision to float64 for bit-accuracy
-keras.config.set_floatx("float64")
-
-import torch
+import numpy as np
+import keras
 import keras_hub
-from keras.src.distribution.distribution_lib import (
-    DataParallel,
-)
+from keras.src.distribution.distribution_lib import DataParallel
 
 def run_training():
     # 2. Initialize Distributed Environment
-    keras.distribution.initialize()
+    # JAX doesn't need this for single-process, Torch does.
+    if backend == "torch":
+        keras.distribution.initialize()
     
     rank = int(os.environ.get("RANK", "0"))
     world_size = int(os.environ.get("WORLD_SIZE", "2"))
@@ -33,59 +25,61 @@ def run_training():
     # 3. Deterministic Seeds
     keras.utils.set_random_seed(42)
 
-    # 4. Define Distribution Strategy
+    # 4. Define Distribution Strategy (DataParallel)
     devices = keras.distribution.list_devices("gpu")
     if len(devices) < 2:
         devices = keras.distribution.list_devices("cpu")
-        
-    # For DataParallel, we just need the devices
     distribution = DataParallel(devices=devices[:2])
 
     # 5. Build and Compile Model
     with distribution.scope():
         model = keras_hub.models.OPTBackbone.from_preset("opt_125m_en")
         
-        # Aggressively disable SDPA and Dropout for reproducibility
+        # Disable SDPA and Dropout for reproducibility
         for layer in model._flatten_layers(recursive=True):
             if hasattr(layer, "use_scaled_dot_product_attention"):
                 layer.use_scaled_dot_product_attention = False
-            if hasattr(layer, "_use_scaled_dot_product_attention"):
-                layer._use_scaled_dot_product_attention = False
-            if hasattr(layer, "_use_sdpa"):
-                layer._use_sdpa = False
             if hasattr(layer, "dropout"):
                 try: layer.dropout = 0.0
                 except: pass
-            if hasattr(layer, "dropout_rate"):
-                layer.dropout_rate = 0.0
-            if hasattr(layer, "rate"):
-                layer.rate = 0.0
 
-        # Use Adam with float64
         model.compile(
             optimizer=keras.optimizers.Adam(learning_rate=0.001),
             loss="mse",
         )
 
-        # 6. Load Fixed Synthetic Data
-        # For DataParallel, we pass the FULL batch to fit()
-        # and Keras handles sharding it across GPUs.
-        x = {
+        # 6. Load Fixed Synthetic Data (Batch size 8)
+        x_full = {
             "token_ids": np.load("data_cmp/x_token_ids.npy"),
             "padding_mask": np.load("data_cmp/x_padding_mask.npy"),
         }
-        y = np.load("data_cmp/y.npy")
+        y_full = np.load("data_cmp/y.npy")
 
-        # 7. Step 1: Capture Weight Updates
-        # In DataParallel, weights are NOT sharded, so shape is global.
-        target_weight = model.trainable_weights[0]
+        # In DP, each process sees a slice of the global batch
+        # World size is 2. Global batch is 8. Local is 4.
+        start = rank * 4
+        end = (rank + 1) * 4
+        x = {k: v[start:end] for k, v in x_full.items()}
+        y = y_full[start:end]
 
+        if rank == 0:
+            print(f"[{backend}] Data loaded. Local batch shape: {y.shape}")
+
+        # 7. Capture Weight Updates
+        # For DP, we'll pick the first kernel
+        target_weight = None
+        for w in model.trainable_weights:
+            if "kernel" in w.path:
+                target_weight = w
+                break
+        
         if rank == 0:
             print(f"[{backend}] Target weight for comparison: {target_weight.path}")
 
         weight_before = keras.ops.convert_to_numpy(target_weight.value).copy()
 
         # Run 1 step
+        # Since we pass local data, we set steps_per_epoch=1
         model.fit(x, y, epochs=1, steps_per_epoch=1, verbose=0)
         
         weight_after = keras.ops.convert_to_numpy(target_weight.value)
@@ -93,7 +87,7 @@ def run_training():
         
         if rank == 0:
             np.save(f"dp_update_step1_{backend}.npy", update)
-            print(f"[{backend}] Step 1 DP weight update captured.")
+            print(f"[{backend}] Step 1 update captured.")
 
         # 8. Complete Training (Total 10 Epochs)
         history_rest = model.fit(
@@ -109,7 +103,7 @@ def run_training():
         if rank == 0:
             with open(f"dp_loss_{backend}.txt", "w") as f:
                 f.write(str(float(final_loss)))
-            print(f"[{backend}] Final DP loss: {final_loss}")
+            print(f"[{backend}] Final loss: {final_loss}")
 
 if __name__ == "__main__":
     try:
