@@ -341,41 +341,79 @@ def _register_sharding_rules():
             print(f"DEBUG: Error in unbind_rule implementation: {e}")
             return OutputSharding(None)
 
-    # Register for all possible unbind overloads
+    def view_rule(op_schema):
+        try:
+            input_spec = op_schema.args_schema[0]
+            if not isinstance(input_spec, DTensorSpec):
+                return OutputSharding(None)
+
+            # Check if any dimension is sharded
+            from torch.distributed.tensor.placement_types import Shard
+
+            is_sharded = any(isinstance(p, Shard) for p in input_spec.placements)
+
+            if is_sharded:
+                # Replicate before view to avoid strict_view errors in PyTorch
+                # which happen when flattening sharded dimensions.
+                replicate_spec = DTensorSpec(
+                    mesh=input_spec.mesh,
+                    placements=tuple([Replicate()] * len(input_spec.placements)),
+                    tensor_meta=input_spec.tensor_meta,
+                )
+                return OutputSharding(
+                    output_spec=None,
+                    needs_redistribute=True,
+                    redistribute_schema=OpSchema(
+                        op=op_schema.op,
+                        args_schema=(replicate_spec,) + op_schema.args_schema[1:],
+                        kwargs_schema=op_schema.kwargs_schema,
+                    ),
+                )
+            # If not sharded, just return a Replicated spec.
+            # ShardingPropagator will fix the tensor_meta.
+            return OutputSharding(output_spec=input_spec)
+        except Exception:
+            pass
+        return OutputSharding(None)
+
+    # Register for unbind
     try:
+        sharding_propagator = DTensor._op_dispatcher.sharding_propagator
         overloads = torch.ops.aten.unbind.overloads()
-        print(f"DEBUG: Found unbind overloads: {overloads}")
         for overload_name in overloads:
             overload = getattr(torch.ops.aten.unbind, overload_name)
             try:
+                if overload in sharding_propagator.op_strategy_funcs:
+                    del sharding_propagator.op_strategy_funcs[overload]
                 if register_prop_rule is not None:
                     register_prop_rule(overload)(unbind_rule)
                 else:
-                    # Direct registration if helper is missing
-                    DTensor._op_dispatcher.sharding_propagator.register_sharding_prop_rule(
+                    sharding_propagator.register_sharding_prop_rule(
                         overload, unbind_rule
                     )
-                
-                # Verify registration
-                is_reg = overload in DTensor._op_dispatcher.sharding_propagator.op_to_rules
-                print(f"DEBUG: Registered and verified unbind rule for {overload}: {is_reg}")
-            except Exception as e:
-                print(f"DEBUG: Failed to register unbind rule for {overload}: {e}")
-    except Exception as e:
-        print(f"DEBUG: Error during overload iteration: {e}")
-    
-    # Also try the packet itself or default if it exists
-    if hasattr(torch.ops.aten.unbind, "default"):
+            except Exception:
+                pass
+    except Exception:
+        pass
+
+    # Register for view/reshape
+    view_ops = [
+        torch.ops.aten.view.default,
+        torch.ops.aten._unsafe_view.default,
+        torch.ops.aten.reshape.default,
+    ]
+    for op in view_ops:
         try:
+            if op in sharding_propagator.op_strategy_funcs:
+                del sharding_propagator.op_strategy_funcs[op]
             if register_prop_rule is not None:
-                register_prop_rule(torch.ops.aten.unbind.default)(unbind_rule)
+                register_prop_rule(op)(view_rule)
             else:
-                DTensor._op_dispatcher.sharding_propagator.register_sharding_prop_rule(
-                    torch.ops.aten.unbind.default, unbind_rule
+                sharding_propagator.register_sharding_prop_rule(
+                    op, view_rule
                 )
-            print(f"DEBUG: Registered unbind rule for aten.unbind.default")
-        except Exception as e:
-            print(f"DEBUG: Failed to register unbind rule for aten.unbind.default: {e}")
+        except Exception:
+            pass
 
     print("DEBUG: _register_sharding_rules() completed.")
 
