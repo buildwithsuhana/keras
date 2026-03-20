@@ -48,10 +48,15 @@ def run_training():
     layout_map = LayoutMap(mesh)
     # Shard kernels. Shard embeddings on hidden dim (column-parallel) 
     # for better stability in PyTorch DTensor.
+    layout_map = LayoutMap(mesh)
+    # Shard all kernels and embeddings on the hidden dimension.
+    # We use (None, "model") to ensure the batch dimension remains replicated.
+    # This ensures both backends process the exact same data samples.
     layout_map[".*embeddings"] = (None, "model")
     layout_map[".*kernel"] = (None, "model")
     
-    distribution = ModelParallel(layout_map=layout_map, batch_dim_name="model")
+    # Use ModelParallel without sharding the batch dimension
+    distribution = ModelParallel(layout_map=layout_map, batch_dim_name=None)
 
     # 5. Build and Compile Model
     with distribution.scope():
@@ -94,29 +99,14 @@ def run_training():
         if rank == 0:
             print(f"[{backend}] Data loaded. Global batch size: {y.shape[0]}")
 
-        # Step 0: Compare initial loss to verify sync
-        # Calculate GLOBAL loss. Keras predict will handle sharding.
+        # Step 0: Compare initial loss
+        # Since data is replicated and weights are sharded, out0 will be (8, 32, 768) 
+        # on all ranks (Keras ModelParallel handles the internal sync).
         out0 = model.predict(x, batch_size=8, verbose=0)
+        initial_loss = np.mean(np.square(out0 - y))
         
-        # JAX out0 is (8, 32, 768). Torch out0 is (4, 32, 768) per rank.
-        y_local = y
-        if backend == "torch":
-            start = rank * 4
-            end = (rank + 1) * 4
-            y_local = y[start:end]
-            
-        local_loss = np.mean(np.square(out0 - y_local))
-        
-        if backend == "torch":
-            from keras.src.backend.torch import core as torch_core
-            t_loss = torch.tensor(local_loss, device=torch_core.get_device())
-            torch.distributed.all_reduce(t_loss, op=torch.distributed.ReduceOp.SUM)
-            initial_loss = t_loss.item() / world_size
-        else:
-            initial_loss = local_loss
-
         if rank == 0:
-            print(f"[{backend}] Initial Loss (Step 0, Global): {initial_loss:.12f}")
+            print(f"[{backend}] Initial Loss (Step 0): {initial_loss:.12f}")
             with open(f"initial_loss_{backend}.txt", "w") as f:
                 f.write(str(float(initial_loss)))
 
@@ -156,19 +146,12 @@ def run_training():
             verbose=1 if rank == 0 else 0,
         )
 
-        final_loss_local = history_rest.history["loss"][-1]
-        if backend == "torch":
-            from keras.src.backend.torch import core as torch_core
-            t_loss = torch.tensor(final_loss_local, device=torch_core.get_device())
-            torch.distributed.all_reduce(t_loss, op=torch.distributed.ReduceOp.SUM)
-            final_loss = t_loss.item() / world_size
-        else:
-            final_loss = final_loss_local
+        final_loss = history_rest.history["loss"][-1]
         
         if rank == 0:
             with open(f"loss_{backend}.txt", "w") as f:
                 f.write(str(float(final_loss)))
-            print(f"[{backend}] Final loss (Global): {final_loss}")
+            print(f"[{backend}] Final loss: {final_loss}")
 
 if __name__ == "__main__":
     try:

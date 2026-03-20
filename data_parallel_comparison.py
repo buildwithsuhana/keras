@@ -74,10 +74,11 @@ def run_training():
         # Step 0: Compare initial loss
         out0 = model.predict(x, batch_size=8, verbose=0)
         
+        # In DataParallel, Keras shards the 8 inputs automatically for Torch.
+        # Rank 0 gets 4, Rank 1 gets 4. JAX gets 8.
         y_local = y
         if backend == "torch":
-            start = rank * 4
-            end = (rank + 1) * 4
+            start, end = rank * 4, (rank + 1) * 4
             y_local = y[start:end]
             
         local_loss = np.mean(np.square(out0 - y_local))
