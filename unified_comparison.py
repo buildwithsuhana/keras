@@ -83,12 +83,26 @@ def run_training():
             loss="mse",
         )
 
-        # 6. Load Fixed Synthetic Data
-        x = {
+        # 6. Load Fixed Synthetic Data (Batch size 8)
+        x_full = {
             "token_ids": np.load("data_cmp/x_token_ids.npy"),
             "padding_mask": np.load("data_cmp/x_padding_mask.npy"),
         }
-        y = np.load("data_cmp/y.npy")
+        y_full = np.load("data_cmp/y.npy")
+
+        if backend == "jax":
+            # JAX handles all devices in one process, use full data
+            x, y = x_full, y_full
+        else:
+            # Torch handles one process per device, load local shard
+            # Each process takes 4 samples (Total 8)
+            start = rank * 4
+            end = (rank + 1) * 4
+            x = {k: v[start:end] for k, v in x_full.items()}
+            y = y_full[start:end]
+
+        if rank == 0:
+            print(f"[{backend}] Data loaded. Global batch size: 8")
 
         # 7. Step 1: Capture Weight Updates
         target_weight = None

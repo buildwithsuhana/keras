@@ -55,15 +55,18 @@ def run_training():
         }
         y_full = np.load("data_cmp/y.npy")
 
-        # In DP, each process sees a slice of the global batch
-        # World size is 2. Global batch is 8. Local is 4.
-        start = rank * 4
-        end = (rank + 1) * 4
-        x = {k: v[start:end] for k, v in x_full.items()}
-        y = y_full[start:end]
+        if backend == "jax":
+            # JAX handles all devices in one process, use full data
+            x, y = x_full, y_full
+        else:
+            # Torch multi-process: each rank loads its slice
+            start = rank * 4
+            end = (rank + 1) * 4
+            x = {k: v[start:end] for k, v in x_full.items()}
+            y = y_full[start:end]
 
         if rank == 0:
-            print(f"[{backend}] Data loaded. Local batch shape: {y.shape}")
+            print(f"[{backend}] Data loaded. Global batch size: 8")
 
         # 7. Capture Weight Updates
         # For DP, we'll pick the first kernel
