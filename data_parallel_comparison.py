@@ -43,30 +43,32 @@ def run_training():
                 try: layer.dropout = 0.0
                 except: pass
 
+        # Synchronize initial weights
+        weights_file = "initial_weights_dp.weights.h5"
+        if backend == "jax":
+            model.save_weights(weights_file)
+            if rank == 0:
+                print(f"[{backend}] Initial weights saved.")
+        else:
+            model.load_weights(weights_file)
+            if rank == 0:
+                print(f"[{backend}] Initial weights loaded.")
+
         model.compile(
-            optimizer=keras.optimizers.Adam(learning_rate=0.001),
+            optimizer=keras.optimizers.Adam(learning_rate=0.001, epsilon=1e-7),
             loss="mse",
+            jit_compile=False,
         )
 
-        # 6. Load Fixed Synthetic Data (Batch size 8)
-        x_full = {
+        # 6. Load Fixed Synthetic Data (Full data on all ranks)
+        x = {
             "token_ids": np.load("data_cmp/x_token_ids.npy"),
             "padding_mask": np.load("data_cmp/x_padding_mask.npy"),
         }
-        y_full = np.load("data_cmp/y.npy")
-
-        if backend == "jax":
-            # JAX handles all devices in one process, use full data
-            x, y = x_full, y_full
-        else:
-            # Torch multi-process: each rank loads its slice
-            start = rank * 4
-            end = (rank + 1) * 4
-            x = {k: v[start:end] for k, v in x_full.items()}
-            y = y_full[start:end]
+        y = np.load("data_cmp/y.npy")
 
         if rank == 0:
-            print(f"[{backend}] Data loaded. Global batch size: 8")
+            print(f"[{backend}] Data loaded. Global batch size: {y.shape[0]}")
 
         # 7. Capture Weight Updates
         # For DP, we'll pick the first kernel
@@ -82,8 +84,8 @@ def run_training():
         weight_before = keras.ops.convert_to_numpy(target_weight.value).copy()
 
         # Run 1 step
-        # Since we pass local data, we set steps_per_epoch=1
-        model.fit(x, y, epochs=1, steps_per_epoch=1, verbose=0)
+        # Use explicit global batch_size
+        model.fit(x, y, epochs=1, steps_per_epoch=1, batch_size=8, verbose=0)
         
         weight_after = keras.ops.convert_to_numpy(target_weight.value)
         update = weight_after - weight_before
@@ -97,7 +99,7 @@ def run_training():
             x, y,
             initial_epoch=1,
             epochs=10,
-            batch_size=4,
+            batch_size=8,
             verbose=1 if rank == 0 else 0,
         )
 
