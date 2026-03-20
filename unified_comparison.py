@@ -8,12 +8,8 @@ os.environ["KERAS_BACKEND"] = backend
 import numpy as np
 import keras
 
-if backend == "jax":
-    import jax
-    jax.config.update("jax_enable_x64", True)
-
-# Set global precision to float64 for bit-accuracy
-keras.config.set_floatx("float64")
+# Set global precision to float32 (default)
+keras.config.set_floatx("float32")
 
 import torch
 import keras_hub

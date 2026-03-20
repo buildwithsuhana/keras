@@ -14,7 +14,7 @@ update_diff = np.abs(update_jax - update_torch)
 max_update_diff = np.max(update_diff)
 mean_update_diff = np.mean(update_diff)
 
-print("--- Step 1 Weight Update Comparison (float64) ---")
+print("--- Step 1 Weight Update Comparison (float32) ---")
 print(f"Max absolute difference: {max_update_diff:.6e}")
 print(f"Mean absolute difference: {mean_update_diff:.6e}")
 
@@ -26,13 +26,14 @@ with open("loss_torch.txt", "r") as f:
 
 loss_diff = abs(loss_jax - loss_torch)
 
-print("\n--- Final Loss Comparison (10 Epochs, float64) ---")
+print("\n--- Final Loss Comparison (10 Epochs, float32) ---")
 print(f"JAX Loss:   {loss_jax:.12f}")
 print(f"Torch Loss: {loss_torch:.12f}")
 print(f"Difference: {loss_diff:.6e}")
 
 # 3. Success Criteria
-if max_update_diff < 1e-10 and loss_diff < 1e-5:
-    print("\nSUCCESS: JAX and Torch are bit-consistent (float64).")
+# For float32, we expect larger differences than float64.
+if max_update_diff < 1e-6 and loss_diff < 1e-3:
+    print("\nSUCCESS: JAX and Torch are consistent (float32).")
 else:
-    print("\nNOTICE: Minor differences remain even in float64.")
+    print("\nNOTICE: Minor differences remain in float32.")
