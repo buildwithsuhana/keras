@@ -350,13 +350,11 @@ def _register_sharding_rules():
             # Check if any dimension is sharded
             # Check if any placement is not Replicate (Shard or Partial)
             is_sharded = any(not p.is_replicate() for p in input_spec.placements)
-            print(f"DEBUG: view_rule triggered for {op_schema.op}. "
-                  f"Input placements: {input_spec.placements}, "
-                  f"sharded: {is_sharded}")
-
+            
             if is_sharded:
-                # Replicate before view to avoid strict_view errors in PyTorch
-                # which happen when flattening sharded dimensions.
+                print(f"DEBUG: view_rule triggered for {op_schema.op}. "
+                      f"Input sharded/partial: {input_spec.placements}. Suggesting Replicate.")
+                # Replicate before view to avoid strict_view errors in PyTorch.
                 replicate_spec = DTensorSpec(
                     mesh=input_spec.mesh,
                     placements=tuple([Replicate()] * len(input_spec.placements)),
@@ -371,11 +369,18 @@ def _register_sharding_rules():
                         kwargs_schema=op_schema.kwargs_schema,
                     ),
                 )
-            # If not sharded, just return a Replicated spec.
-            # ShardingPropagator will fix the tensor_meta.
-            return OutputSharding(output_spec=input_spec)
+            
+            # If already Replicated, return a fresh spec with correct placements.
+            # We do NOT provide tensor_meta here so that the ShardingPropagator
+            # can fill it in with the correct output shape/strides.
+            return OutputSharding(
+                output_spec=DTensorSpec(
+                    mesh=input_spec.mesh,
+                    placements=input_spec.placements
+                )
+            )
         except Exception as e:
-            print(f"DEBUG: Error in view_rule: {e}")
+            print(f"DEBUG: Error in view_rule for {op_schema.op}: {e}")
         return OutputSharding(None)
 
     # Register for unbind
