@@ -348,9 +348,11 @@ def _register_sharding_rules():
                 return OutputSharding(None)
 
             # Check if any dimension is sharded
-            from torch.distributed.tensor.placement_types import Shard
-
-            is_sharded = any(isinstance(p, Shard) for p in input_spec.placements)
+            # Check if any placement is not Replicate (Shard or Partial)
+            is_sharded = any(not p.is_replicate() for p in input_spec.placements)
+            print(f"DEBUG: view_rule triggered for {op_schema.op}. "
+                  f"Input placements: {input_spec.placements}, "
+                  f"sharded: {is_sharded}")
 
             if is_sharded:
                 # Replicate before view to avoid strict_view errors in PyTorch
@@ -372,8 +374,8 @@ def _register_sharding_rules():
             # If not sharded, just return a Replicated spec.
             # ShardingPropagator will fix the tensor_meta.
             return OutputSharding(output_spec=input_spec)
-        except Exception:
-            pass
+        except Exception as e:
+            print(f"DEBUG: Error in view_rule: {e}")
         return OutputSharding(None)
 
     # Register for unbind
@@ -399,6 +401,7 @@ def _register_sharding_rules():
     # Register for view/reshape
     view_ops = [
         torch.ops.aten.view.default,
+        torch.ops.aten.view.dtype,
         torch.ops.aten._unsafe_view.default,
         torch.ops.aten.reshape.default,
     ]
