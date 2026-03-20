@@ -2,7 +2,6 @@ import os
 
 # Set backend to torch before anything else
 os.environ["KERAS_BACKEND"] = "torch"
-os.environ["KERAS_TORCH_DEVICE"] = "cpu"
 
 import torch
 import numpy as np

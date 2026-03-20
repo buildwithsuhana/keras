@@ -352,8 +352,6 @@ def _register_sharding_rules():
             is_sharded = any(not p.is_replicate() for p in input_spec.placements)
             
             if is_sharded:
-                print(f"DEBUG: view_rule triggered for {op_schema.op}. "
-                      f"Input sharded/partial: {input_spec.placements}. Suggesting Replicate.")
                 # Replicate before view to avoid strict_view errors in PyTorch.
                 replicate_spec = DTensorSpec(
                     mesh=input_spec.mesh,
@@ -379,8 +377,8 @@ def _register_sharding_rules():
                     placements=input_spec.placements
                 )
             )
-        except Exception as e:
-            print(f"DEBUG: Error in view_rule for {op_schema.op}: {e}")
+        except Exception:
+            pass
         return OutputSharding(None)
 
     # Register for unbind

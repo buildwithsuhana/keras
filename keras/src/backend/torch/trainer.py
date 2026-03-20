@@ -168,16 +168,17 @@ class TorchTrainer(base_trainer.Trainer):
             # Move the model to the correct device before wrapping in DDP.
             from keras.src.backend.torch import core as torch_core
 
-            self.to(torch_core.get_device())
+            device = torch_core.get_device()
+            self.to(device)
+
+            device_ids = None
+            if "cuda" in str(device):
+                device_ids = [torch.cuda.current_device()]
 
             wrapper = _KerasModuleWrapper(self)
             self._ddp_model = torch.nn.parallel.DistributedDataParallel(
                 wrapper,
-                device_ids=(
-                    [torch.cuda.current_device()]
-                    if torch.cuda.is_available()
-                    else None
-                ),
+                device_ids=device_ids,
             )
 
     def make_train_function(self, force=False):
