@@ -71,16 +71,23 @@ def run_training():
         # Step 0: Compare initial loss
         out0 = model.predict(x, batch_size=8, verbose=0)
         
-        # In multi-process (Torch), we only get local predictions
         y_local = y
         if backend == "torch":
             start = rank * 4
             end = (rank + 1) * 4
             y_local = y[start:end]
             
-        initial_loss = np.mean(np.square(out0 - y_local))
+        local_loss = np.mean(np.square(out0 - y_local))
+        if backend == "torch":
+            from keras.src.backend.torch import core as torch_core
+            t_loss = torch.tensor(local_loss, device=torch_core.get_device())
+            torch.distributed.all_reduce(t_loss, op=torch.distributed.ReduceOp.SUM)
+            initial_loss = t_loss.item() / world_size
+        else:
+            initial_loss = local_loss
+
         if rank == 0:
-            print(f"[{backend}] Initial Loss (Step 0): {initial_loss:.12f}")
+            print(f"[{backend}] Initial Loss (Step 0, Global): {initial_loss:.12f}")
             with open(f"dp_initial_loss_{backend}.txt", "w") as f:
                 f.write(str(float(initial_loss)))
 
@@ -116,12 +123,19 @@ def run_training():
             verbose=1 if rank == 0 else 0,
         )
 
-        final_loss = keras.ops.convert_to_numpy(history_rest.history["loss"][-1])
+        final_loss_local = history_rest.history["loss"][-1]
+        if backend == "torch":
+            from keras.src.backend.torch import core as torch_core
+            t_loss = torch.tensor(final_loss_local, device=torch_core.get_device())
+            torch.distributed.all_reduce(t_loss, op=torch.distributed.ReduceOp.SUM)
+            final_loss = t_loss.item() / world_size
+        else:
+            final_loss = final_loss_local
         
         if rank == 0:
             with open(f"dp_loss_{backend}.txt", "w") as f:
                 f.write(str(float(final_loss)))
-            print(f"[{backend}] Final loss: {final_loss}")
+            print(f"[{backend}] Final loss (Global): {final_loss}")
 
 if __name__ == "__main__":
     try:
