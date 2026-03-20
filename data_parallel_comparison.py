@@ -33,7 +33,8 @@ def run_training():
 
     # 5. Build and Compile Model
     with distribution.scope():
-        model = keras_hub.models.OPTBackbone.from_preset("opt_125m_en")
+        # Force float32 preset loading
+        model = keras_hub.models.OPTBackbone.from_preset("opt_125m_en", dtype="float32")
         
         # Disable SDPA and Dropout for reproducibility
         for layer in model._flatten_layers(recursive=True):
@@ -60,18 +61,22 @@ def run_training():
             jit_compile=False,
         )
 
-        # 6. Load Fixed Synthetic Data (Full data on all ranks)
+        # 6. Load Fixed Synthetic Data
         x = {
             "token_ids": np.load("data_cmp/x_token_ids.npy"),
             "padding_mask": np.load("data_cmp/x_padding_mask.npy"),
         }
         y = np.load("data_cmp/y.npy")
 
+        # Step 0: Compare initial loss
+        out0 = model.predict(x, batch_size=8, verbose=0)
+        initial_loss = np.mean(np.square(out0 - y))
         if rank == 0:
-            print(f"[{backend}] Data loaded. Global batch size: {y.shape[0]}")
+            print(f"[{backend}] Initial Loss (Step 0): {initial_loss:.12f}")
+            with open(f"dp_initial_loss_{backend}.txt", "w") as f:
+                f.write(str(float(initial_loss)))
 
         # 7. Capture Weight Updates
-        # For DP, we'll pick the first kernel
         target_weight = None
         for w in model.trainable_weights:
             if "kernel" in w.path:
@@ -83,9 +88,8 @@ def run_training():
 
         weight_before = keras.ops.convert_to_numpy(target_weight.value).copy()
 
-        # Run 1 step
-        # Use explicit global batch_size
-        model.fit(x, y, epochs=1, steps_per_epoch=1, batch_size=8, verbose=0)
+        # Run 1 step with shuffle=False
+        model.fit(x, y, epochs=1, steps_per_epoch=1, batch_size=8, shuffle=False, verbose=0)
         
         weight_after = keras.ops.convert_to_numpy(target_weight.value)
         update = weight_after - weight_before
@@ -94,12 +98,13 @@ def run_training():
             np.save(f"dp_update_step1_{backend}.npy", update)
             print(f"[{backend}] Step 1 update captured.")
 
-        # 8. Complete Training (Total 10 Epochs)
+        # 8. Complete Training (Total 10 Epochs) with shuffle=False
         history_rest = model.fit(
             x, y,
             initial_epoch=1,
             epochs=10,
             batch_size=8,
+            shuffle=False,
             verbose=1 if rank == 0 else 0,
         )
 
