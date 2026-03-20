@@ -80,6 +80,28 @@ def run_training():
             model.load_weights(weights_file)
             if rank == 0:
                 print(f"[{backend}] Initial weights loaded.")
+            
+            # --- PYTORCH SHARDING VERIFICATION ---
+            from torch.distributed.tensor import DTensor
+            sharded_weights = []
+            for w in model.trainable_weights:
+                if isinstance(w.value, DTensor):
+                    # Check if any placement is Shard
+                    is_sharded = any(p.is_shard() for p in w.value.placements)
+                    if is_sharded:
+                        sharded_weights.append(w.path)
+            
+            if rank == 0:
+                print(f"[{backend}] SHARDING VERIFICATION:")
+                print(f"[{backend}] Total weights: {len(model.trainable_weights)}")
+                print(f"[{backend}] Sharded weights (DTensor): {len(sharded_weights)}")
+                if len(sharded_weights) > 0:
+                    sample_w = model.trainable_weights[1].value # Pick a kernel
+                    print(f"[{backend}] Sample weight ({model.trainable_weights[1].path}):")
+                    print(f"[{backend}]   - Global shape: {sample_w.shape}")
+                    print(f"[{backend}]   - Placements: {sample_w.placements}")
+                    print(f"[{backend}]   - Local shape: {sample_w.to_local().shape}")
+            # ---------------------------------------
 
         # Use Adam with explicit epsilon and NO JIT
         model.compile(
