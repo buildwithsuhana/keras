@@ -70,7 +70,15 @@ def run_training():
 
         # Step 0: Compare initial loss
         out0 = model.predict(x, batch_size=8, verbose=0)
-        initial_loss = np.mean(np.square(out0 - y))
+        
+        # In multi-process (Torch), we only get local predictions
+        y_local = y
+        if backend == "torch":
+            start = rank * 4
+            end = (rank + 1) * 4
+            y_local = y[start:end]
+            
+        initial_loss = np.mean(np.square(out0 - y_local))
         if rank == 0:
             print(f"[{backend}] Initial Loss (Step 0): {initial_loss:.12f}")
             with open(f"dp_initial_loss_{backend}.txt", "w") as f:
