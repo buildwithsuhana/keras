@@ -1,11 +1,12 @@
 import os
 import sys
-import numpy as np
-import keras
 
 # 1. Environment and Backend Setup
 backend = sys.argv[1]
 os.environ["KERAS_BACKEND"] = backend
+
+import numpy as np
+import keras
 
 if backend == "jax":
     import jax
