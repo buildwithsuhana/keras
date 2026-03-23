@@ -384,7 +384,12 @@ def argmax(x, axis=None, keepdims=False):
     if standardize_dtype(x.dtype) == "bool":
         x = cast(x, "uint8")
 
-    return cast(torch.argmax(x, dim=axis, keepdim=keepdims), dtype="int32")
+    from keras.src.backend.torch.core import _apply_replicated
+
+    return cast(
+        _apply_replicated(torch.argmax, x, dim=axis, keepdim=keepdims),
+        dtype="int32",
+    )
 
 
 def argmin(x, axis=None, keepdims=False):
@@ -394,7 +399,12 @@ def argmin(x, axis=None, keepdims=False):
     if standardize_dtype(x.dtype) == "bool":
         x = cast(x, "uint8")
 
-    return cast(torch.argmin(x, dim=axis, keepdim=keepdims), dtype="int32")
+    from keras.src.backend.torch.core import _apply_replicated
+
+    return cast(
+        _apply_replicated(torch.argmin, x, dim=axis, keepdim=keepdims),
+        dtype="int32",
+    )
 
 
 def argsort(x, axis=-1):
@@ -408,7 +418,11 @@ def argsort(x, axis=-1):
         axis = -1
         x = x.reshape(-1)
 
-    return cast(torch.argsort(x, dim=axis, stable=True), dtype="int32")
+    from keras.src.backend.torch.core import _apply_replicated
+
+    return cast(
+        _apply_replicated(torch.argsort, x, dim=axis, stable=True), dtype="int32"
+    )
 
 
 def array(x, dtype=None):

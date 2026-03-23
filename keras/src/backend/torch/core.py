@@ -256,6 +256,28 @@ def _maybe_promote_to_dtensor(res):
     return res
 
 
+def _apply_replicated(fn, x, *args, **kwargs):
+    from torch.distributed.tensor import DTensor, Replicate
+    if isinstance(x, DTensor):
+        torch_mesh = x.device_mesh
+        placements = [Replicate()] * torch_mesh.ndim
+        # Redistribute to replicated before applying the function locally.
+        x_replicated = x.redistribute(torch_mesh, placements).to_local()
+        res = fn(x_replicated, *args, **kwargs)
+        if isinstance(res, torch.Tensor):
+            return DTensor.from_local(res, torch_mesh, placements)
+        if isinstance(res, (tuple, list)):
+            return type(res)(
+                [
+                    DTensor.from_local(r, torch_mesh, placements)
+                    if isinstance(r, torch.Tensor) else r
+                    for r in res
+                ]
+            )
+        return res
+    return fn(x, *args, **kwargs)
+
+
 def convert_to_tensor(x, dtype=None, sparse=None, ragged=None):
     if sparse:
         raise ValueError("`sparse=True` is not supported with torch backend")
