@@ -180,6 +180,10 @@ class TorchTrainer(base_trainer.Trainer):
             return tree.map_structure(distribute_inputs, data)
         return data
 
+    def _symbolic_build(self, iterator=None, data_batch=None):
+        with torch_distribution_lib.sharding_scope():
+            return super()._symbolic_build(iterator=iterator, data_batch=data_batch)
+
     def make_train_function(self, force=False):
         if self.train_function is not None and not force:
             return self.train_function
