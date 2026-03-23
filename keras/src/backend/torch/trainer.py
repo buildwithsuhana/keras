@@ -59,24 +59,6 @@ class TorchTrainer(base_trainer.Trainer):
         x, y, sample_weight = data_adapter_utils.unpack_x_y_sample_weight(data)
 
         dist = distribution_lib.distribution()
-        if dist is not None and isinstance(dist, distribution_lib.ModelParallel):
-            # ModelParallel: Distribute input data
-            def distribute_inputs(tensor):
-                if tensor is None:
-                    return None
-                layout = dist.get_data_layout(tensor.shape)
-                return torch_distribution_lib.distribute_data_input(
-                    tensor, layout, dist.batch_dim_name
-                )
-
-            x = tree.map_structure(distribute_inputs, x)
-            if y is not None:
-                y = tree.map_structure(distribute_inputs, y)
-            if sample_weight is not None:
-                sample_weight = tree.map_structure(
-                    distribute_inputs, sample_weight
-                )
-
         # Compute predictions
         if dist is not None and isinstance(dist, distribution_lib.DataParallel):
             # DataParallel: Use DDP model
@@ -131,24 +113,6 @@ class TorchTrainer(base_trainer.Trainer):
         ) = data_adapter_utils.unpack_x_y_sample_weight(data)
 
         dist = distribution_lib.distribution()
-        if dist is not None and isinstance(dist, distribution_lib.ModelParallel):
-            # ModelParallel: Distribute input data
-            def distribute_inputs(tensor):
-                if tensor is None:
-                    return None
-                layout = dist.get_data_layout(tensor.shape)
-                return torch_distribution_lib.distribute_data_input(
-                    tensor, layout, dist.batch_dim_name
-                )
-
-            x = tree.map_structure(distribute_inputs, x)
-            if y is not None:
-                y = tree.map_structure(distribute_inputs, y)
-            if sample_weight is not None:
-                sample_weight = tree.map_structure(
-                    distribute_inputs, sample_weight
-                )
-
         if dist is not None and isinstance(dist, distribution_lib.DataParallel):
             # DataParallel: Use DDP model
             if self._call_has_training_arg:
@@ -176,18 +140,6 @@ class TorchTrainer(base_trainer.Trainer):
         x, _, _ = data_adapter_utils.unpack_x_y_sample_weight(data)
 
         dist = distribution_lib.distribution()
-        if dist is not None and isinstance(dist, distribution_lib.ModelParallel):
-            # ModelParallel: Distribute input data
-            def distribute_inputs(tensor):
-                if tensor is None:
-                    return None
-                layout = dist.get_data_layout(tensor.shape)
-                return torch_distribution_lib.distribute_data_input(
-                    tensor, layout, dist.batch_dim_name
-                )
-
-            x = tree.map_structure(distribute_inputs, x)
-
         if dist is not None and isinstance(dist, distribution_lib.DataParallel):
             # DataParallel: Use DDP model
             if self._call_has_training_arg:
@@ -208,6 +160,25 @@ class TorchTrainer(base_trainer.Trainer):
             for metric in self.metrics:
                 for variable in metric.variables:
                     torch_distribution_lib.all_reduce(variable.value, op="sum")
+
+    def _distribute_data(self, data):
+        dist = distribution_lib.distribution()
+        if dist is not None and isinstance(dist, distribution_lib.ModelParallel):
+            from torch.distributed.tensor import DTensor
+
+            def distribute_inputs(tensor):
+                if tensor is None or isinstance(tensor, DTensor):
+                    return tensor
+                # Ensure it's a tensor
+                if not isinstance(tensor, torch.Tensor):
+                    tensor = torch.as_tensor(tensor)
+                layout = dist.get_data_layout(tensor.shape)
+                return torch_distribution_lib.distribute_data_input(
+                    tensor, layout, dist.batch_dim_name
+                )
+
+            return tree.map_structure(distribute_inputs, data)
+        return data
 
     def make_train_function(self, force=False):
         if self.train_function is not None and not force:
@@ -234,7 +205,7 @@ class TorchTrainer(base_trainer.Trainer):
 
         def one_step_on_data(data):
             """Runs a single training step on a batch of data."""
-            data = data[0]
+            data = self._distribute_data(data[0])
             with torch_distribution_lib.sharding_scope():
                 return self.train_step(data)
 
@@ -255,7 +226,7 @@ class TorchTrainer(base_trainer.Trainer):
 
         def one_step_on_data(data):
             """Runs a single test step on a batch of data."""
-            data = data[0]
+            data = self._distribute_data(data[0])
             with torch.no_grad():
                 with torch_distribution_lib.sharding_scope():
                     return self.test_step(data)
@@ -277,7 +248,7 @@ class TorchTrainer(base_trainer.Trainer):
 
         def one_step_on_data(data):
             """Runs a predict test step on a batch of data."""
-            data = data[0]
+            data = self._distribute_data(data[0])
             with torch.no_grad():
                 with torch_distribution_lib.sharding_scope():
                     return self.predict_step(data)
