@@ -13,40 +13,51 @@ from torch.distributed.tensor import Replicate
 from torch.distributed.tensor import Shard
 from torch.distributed.tensor import distribute_tensor as torch_distribute_tensor
 
+from keras.src.utils.module_utils import torch_xla
+
+
+def _get_torch_device_type(device_type):
+    """Normalize device type to PyTorch conventions."""
+    device_type = (device_type or "gpu").lower()
+    if device_type == "gpu":
+        return "cuda"
+    if device_type == "tpu":
+        return "xla"
+    return device_type
+
+
+def _get_device_count(device_type):
+    """Return the number of available devices for a given type."""
+    device_type = _get_torch_device_type(device_type)
+    if torch.distributed.is_initialized():
+        return torch.distributed.get_world_size()
+    if "WORLD_SIZE" in os.environ:
+        return int(os.environ["WORLD_SIZE"])
+
+    if device_type == "cuda":
+        return torch.cuda.device_count() or 1
+    if device_type == "xla" and torch_xla.available:
+        import torch_xla.core.xla_model as xm
+
+        return len(xm.get_xla_supported_devices())
+    return 1
+
 
 def list_devices(device_type=None):
     """Return all the available devices based on the device type."""
-    device_type = (device_type or "gpu").lower()
-    if torch.distributed.is_initialized():
-        count = torch.distributed.get_world_size()
-    elif "WORLD_SIZE" in os.environ:
-        count = int(os.environ["WORLD_SIZE"])
-    else:
-        # Fallback to local device count
-        if device_type.startswith("gpu"):
-            count = torch.cuda.device_count() or 1
-        else:
-            count = 1
+    count = _get_device_count(device_type)
+    device_type = _get_torch_device_type(device_type)
     return [f"{device_type}:{i}" for i in range(count)]
 
 
 def get_device_count(device_type=None):
     """Returns the number of available devices."""
-    if torch.distributed.is_initialized():
-        return torch.distributed.get_world_size()
-    if "WORLD_SIZE" in os.environ:
-        return int(os.environ["WORLD_SIZE"])
-    device_type = (device_type or "gpu").lower()
-    if device_type.startswith("gpu"):
-        return torch.cuda.device_count() or 1
-    return 1
+    return _get_device_count(device_type)
 
 
 def initialize(job_addresses=None, num_processes=None, process_id=None):
     """Initialize the process group for distributed training."""
-    print(f"DEBUG: initialize(job_addresses={job_addresses}, num_processes={num_processes}, process_id={process_id}) called")
     if torch.distributed.is_initialized():
-        print("DEBUG: torch.distributed already initialized")
         return
 
     if job_addresses:
@@ -64,10 +75,14 @@ def initialize(job_addresses=None, num_processes=None, process_id=None):
     if torch.cuda.is_available():
         torch.cuda.set_device(local_rank)
 
-    backend = "nccl" if torch.cuda.is_available() else "gloo"
-    print(f"DEBUG: Initializing process group with backend={backend}, rank={os.environ.get('RANK')}, world_size={os.environ.get('WORLD_SIZE')}")
+    if torch_xla.available:
+        import torch_xla.distributed.xla_backend as xla_backend
+
+        backend = "xla"
+    else:
+        backend = "nccl" if torch.cuda.is_available() else "gloo"
+
     torch.distributed.init_process_group(backend=backend)
-    print("DEBUG: torch.distributed.init_process_group() completed")
 
 
 def num_processes():
@@ -90,11 +105,9 @@ def process_id():
 
 def _to_backend_mesh(keras_mesh):
     """Convert Keras DeviceMesh to PyTorch DeviceMesh."""
-    print(f"DEBUG: _to_backend_mesh(keras_mesh={keras_mesh}) called")
     from keras.src.backend.torch import core
 
     device_name = core.get_device()
-    print(f"DEBUG: core.get_device() returned {device_name}")
     if "cuda" in device_name:
         device_type = "cuda"
     elif "mps" in device_name:
@@ -104,7 +117,6 @@ def _to_backend_mesh(keras_mesh):
     else:
         device_type = "cpu"
 
-    print(f"DEBUG: Initializing torch DeviceMesh with device_type={device_type}, mesh_shape={tuple(keras_mesh.shape)}")
     return init_device_mesh(
         device_type,
         mesh_shape=tuple(keras_mesh.shape),
