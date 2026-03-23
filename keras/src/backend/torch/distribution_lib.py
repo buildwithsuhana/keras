@@ -253,7 +253,6 @@ def distribute_output(fn):
 
 def _register_sharding_rules():
     """Register sharding rules for ops missing from PyTorch DTensor."""
-    print("DEBUG: _register_sharding_rules() starting...")
     try:
         from torch.distributed.tensor._api import DTensor
         from torch.distributed.tensor._dtensor_spec import DTensorSpec, TensorMeta
@@ -271,7 +270,7 @@ def _register_sharding_rules():
             try:
                 from torch.distributed.tensor.registration import register_prop_rule
             except ImportError:
-                print("DEBUG: Could not find register_prop_rule, will use direct registration")
+                pass
 
         # Robust import for utils
         try:
@@ -296,21 +295,17 @@ def _register_sharding_rules():
                 return new_placements
 
     except ImportError as e:
-        print(f"DEBUG: Critical import failure in _register_sharding_rules: {e}")
         return
 
     def unbind_rule(op_schema):
-        print(f"DEBUG: unbind_rule TRIGGERED for {op_schema.op}")
         try:
             input_spec = op_schema.args_schema[0]
             dim = op_schema.args_schema[1] if len(op_schema.args_schema) > 1 else 0
             if dim < 0:
                 dim += input_spec.ndim
 
-            print(f"DEBUG: unbind_rule processing: dim={dim}")
 
             if is_tensor_dim_sharded(input_spec, dim=dim):
-                print(f"DEBUG: unbind dim {dim} IS sharded, triggering redistribution to replicate")
                 # Replicate the input if the unbind dimension is sharded
                 replicate_spec = DTensorSpec(
                     mesh=input_spec.mesh,
@@ -335,7 +330,6 @@ def _register_sharding_rules():
             output_stride = list(input_spec.stride)
             output_stride.pop(dim)
 
-            print(f"DEBUG: unbind dim {dim} NOT sharded, producing {output_dim_size} outputs")
 
             output_spec = [
                 DTensorSpec(
@@ -350,7 +344,6 @@ def _register_sharding_rules():
             ] * output_dim_size
             return OutputSharding(output_spec=tuple(output_spec))
         except Exception as e:
-            print(f"DEBUG: Error in unbind_rule implementation: {e}")
             return OutputSharding(None)
 
     def view_rule(op_schema):
@@ -432,8 +425,6 @@ def _register_sharding_rules():
                 )
         except Exception:
             pass
-
-    print("DEBUG: _register_sharding_rules() completed.")
 
 
 _register_sharding_rules()
