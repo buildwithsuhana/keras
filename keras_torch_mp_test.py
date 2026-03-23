@@ -1,8 +1,10 @@
 import os
 import torch
 
-# SET BACKEND BEFORE IMPORTING KERAS
+# Configure environment for distributed training and to avoid conflicts
 os.environ["KERAS_BACKEND"] = "torch"
+os.environ["NCCL_P2P_DISABLE"] = "1"
+os.environ["TF_CPP_MIN_LOG_LEVEL"] = "3" # Quiet TF logs
 # Detect if GPU is available
 device_type = "gpu" if torch.cuda.is_available() else "cpu"
 keras_device = "cuda" if torch.cuda.is_available() else "cpu"
@@ -22,8 +24,13 @@ def run_test(rank, world_size):
     os.environ["LOCAL_RANK"] = str(rank)
     os.environ["WORLD_SIZE"] = str(world_size)
     os.environ["KERAS_TORCH_DEVICE"] = keras_device
+    # Force GPU to specific device
+    if torch.cuda.is_available():
+        os.environ["CUDA_VISIBLE_DEVICES"] = str(rank)
+        torch.cuda.set_device(0) # In the process's view, it only has one GPU
     
     # Initialize Keras distribution system
+    print(f"Rank {rank} initializing distribution...")
     keras.distribution.initialize()
     
     # Get available devices
@@ -44,6 +51,7 @@ def run_test(rank, world_size):
     
     with distribution.scope():
         # Simple MLP model
+        print(f"Rank {rank} creating model...")
         model = keras.Sequential([
             layers.Dense(128, activation="relu", name="dense_1"),
             layers.Dense(64, name="dense_2")

@@ -102,7 +102,7 @@ def _to_backend_layout(tensor_layout):
     from torch.distributed.tensor import Replicate, Shard
 
     keras_mesh = tensor_layout.device_mesh
-    torch_mesh = _to_backend_mesh(keras_mesh)
+    torch_mesh = keras_mesh.backend_mesh
 
     placements = []
     for mesh_dim_name in keras_mesh.axis_names:
