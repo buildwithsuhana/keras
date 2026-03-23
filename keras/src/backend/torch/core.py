@@ -658,6 +658,11 @@ def scatter_update(inputs, indices, updates, reduction=None):
     inputs = convert_to_tensor(inputs)
     indices = convert_to_tensor(indices, dtype="int64")
     updates = convert_to_tensor(updates, dtype=inputs.dtype)
+
+    from keras.src.backend.torch import distribution_lib
+
+    inputs, updates = distribution_lib.auto_promote_tensors(inputs, updates)
+
     indices = torch.transpose(indices, 0, 1)
     idx = tuple(indices)
 
@@ -697,8 +702,11 @@ def slice(inputs, start_indices, shape):
 
     python_slice = __builtins__["slice"]
     slices = [
-        python_slice(start_index, start_index + length)
-        for start_index, length in zip(start_indices, shape)
+        python_slice(int(start_index), int(start_index + length))
+        for start_index, length in zip(
+            convert_to_numpy(start_indices).tolist(),
+            convert_to_numpy(shape).tolist(),
+        )
     ]
     return inputs[tuple(slices)]
 
@@ -709,10 +717,17 @@ def slice_update(inputs, start_indices, updates):
     start_indices = convert_to_tensor(start_indices).to(shape_dtype)
     updates = convert_to_tensor(updates)
 
+    from keras.src.backend.torch import distribution_lib
+
+    inputs, updates = distribution_lib.auto_promote_tensors(inputs, updates)
+
     python_slice = __builtins__["slice"]
     slices = [
-        python_slice(start_index, start_index + update_length)
-        for start_index, update_length in zip(start_indices, updates.shape)
+        python_slice(int(start_index), int(start_index + update_length))
+        for start_index, update_length in zip(
+            convert_to_numpy(start_indices).tolist(),
+            updates.shape,
+        )
     ]
     outputs = torch.clone(inputs)
     outputs[tuple(slices)] = updates
