@@ -67,6 +67,10 @@ def rot90(array, k=1, axes=(0, 1)):
 def add(x1, x2):
     x1 = convert_to_tensor(x1)
     x2 = convert_to_tensor(x2)
+
+    from keras.src.backend.torch import distribution_lib
+
+    x1, x2 = distribution_lib.auto_promote_tensors(x1, x2)
     return torch.add(x1, x2)
 
 
@@ -94,6 +98,15 @@ def subtract(x1, x2):
         x1 = cast(x1, x2.dtype)
     if standardize_dtype(x2.dtype) == "bool":
         x2 = cast(x2, x1.dtype)
+
+    from keras.src.backend.torch import distribution_lib
+
+    x1, x2 = distribution_lib.auto_promote_tensors(x1, x2)
+    return torch.subtract(x1, x2)
+
+    from keras.src.backend.torch import distribution_lib
+
+    x1, x2 = distribution_lib.auto_promote_tensors(x1, x2)
     return torch.subtract(x1, x2)
 
 
@@ -150,12 +163,20 @@ def matmul(x1, x2):
 
     x1 = cast(x1, compute_dtype)
     x2 = cast(x2, compute_dtype)
+
+    from keras.src.backend.torch import distribution_lib
+
+    x1, x2 = distribution_lib.auto_promote_tensors(x1, x2)
     return cast(torch.matmul(x1, x2), result_dtype)
 
 
 def multiply(x1, x2):
     x1 = convert_to_tensor(x1)
     x2 = convert_to_tensor(x2)
+
+    from keras.src.backend.torch import distribution_lib
+
+    x1, x2 = distribution_lib.auto_promote_tensors(x1, x2)
     return torch.multiply(x1, x2)
 
 
@@ -190,6 +211,10 @@ def mean(x, axis=None, keepdims=False):
     # Cast input to compute dtype before mean to avoid dtype kwarg
     # which causes issues with ONNX export (dtype kwarg not supported)
     x = cast(x, compute_dtype)
+
+    from keras.src.backend.torch import distribution_lib
+
+    x = distribution_lib.auto_promote_tensors(x)[0]
     result = torch.mean(x, axis, keepdims)
     return cast(result, result_dtype)
 
@@ -224,14 +249,18 @@ def ones(shape, dtype=None):
     dtype = to_torch_dtype(dtype or config.floatx())
     if isinstance(shape, int):
         shape = (shape,)
-    return torch.ones(size=shape, dtype=dtype, device=get_device())
+    return convert_to_tensor(
+        torch.ones(size=shape, dtype=dtype, device=get_device())
+    )
 
 
 def zeros(shape, dtype=None):
     dtype = to_torch_dtype(dtype or config.floatx())
     if isinstance(shape, int):
         shape = (shape,)
-    return torch.zeros(size=shape, dtype=dtype, device=get_device())
+    return convert_to_tensor(
+        torch.zeros(size=shape, dtype=dtype, device=get_device())
+    )
 
 
 def zeros_like(x, dtype=None):
@@ -325,8 +354,8 @@ def arange(start, stop=None, step=None, dtype=None):
         start, stop = 0, start
     if step is None:
         step = 1
-    return torch.arange(
-        start, stop, step=step, dtype=dtype, device=get_device()
+    return convert_to_tensor(
+        torch.arange(start, stop, step=step, dtype=dtype, device=get_device())
     )
 
 
@@ -856,10 +885,15 @@ def full_like(x, fill_value, dtype=None):
     return full(shape=x.shape, fill_value=fill_value, dtype=dtype)
 
 
-def gcd(x1, x2):
+def add(x1, x2):
     x1 = convert_to_tensor(x1)
     x2 = convert_to_tensor(x2)
-    return torch.gcd(x1, x2)
+
+    from keras.src.backend.torch import distribution_lib
+
+    x1, x2 = distribution_lib.auto_promote_tensors(x1, x2)
+    return torch.add(x1, x2)
+
 
 
 def geomspace(start, stop, num=50, endpoint=True, dtype=None, axis=0):
@@ -1014,18 +1048,6 @@ def isposinf(x):
 def isreal(x):
     x = convert_to_tensor(x)
     return torch.isreal(x)
-
-
-def kron(x1, x2):
-    x1 = convert_to_tensor(x1)
-    x2 = convert_to_tensor(x2)
-    return torch.kron(x1, x2)
-
-
-def lcm(x1, x2):
-    x1 = convert_to_tensor(x1)
-    x2 = convert_to_tensor(x2)
-    return torch.lcm(x1, x2)
 
 
 def ldexp(x1, x2):
@@ -1307,6 +1329,10 @@ def minimum(x1, x2):
     )
     x1 = convert_to_tensor(x1, dtype)
     x2 = convert_to_tensor(x2, dtype)
+
+    from keras.src.backend.torch import distribution_lib
+
+    x1, x2 = distribution_lib.auto_promote_tensors(x1, x2)
     return torch.minimum(x1, x2)
 
 
@@ -1824,6 +1850,9 @@ def take(x, indices, axis=None):
     )
     if x.ndim == 2 and axis == 0:
         # This case is equivalent to embedding lookup.
+        from keras.src.backend.torch import distribution_lib
+
+        indices, x = distribution_lib.auto_promote_tensors(indices, x)
         return torch.nn.functional.embedding(indices, x)
     if axis is None:
         x = torch.reshape(x, (-1,))
@@ -1989,12 +2018,18 @@ def vectorize(pyfunc, *, excluded=None, signature=None):
 
 
 def where(condition, x1=None, x2=None):
+    from keras.src.backend.torch import distribution_lib
+
     condition = convert_to_tensor(condition, dtype=bool)
     if x1 is not None and x2 is not None:
         x1 = convert_to_tensor(x1)
         x2 = convert_to_tensor(x2)
+        condition, x1, x2 = distribution_lib.auto_promote_tensors(
+            condition, x1, x2
+        )
         return torch.where(condition, x1, x2)
     else:
+        condition = distribution_lib.auto_promote_tensors(condition)[0]
         return torch.where(condition)
 
 
