@@ -316,6 +316,19 @@ def any(x, axis=None, keepdims=False):
 
 def amax(x, axis=None, keepdims=False):
     x = convert_to_tensor(x)
+    from torch.distributed.tensor import DTensor
+
+    from keras.src.backend.torch.core import _maybe_promote_to_dtensor
+
+    if isinstance(x, DTensor):
+        if axis is None:
+            return _maybe_promote_to_dtensor(torch.amax(x.to_local()))
+        if axis == () or axis == []:
+            return x
+        return _maybe_promote_to_dtensor(
+            torch.amax(x.to_local(), dim=axis, keepdim=keepdims)
+        )
+
     if axis is None:
         return torch.amax(x)
     if axis == () or axis == []:
@@ -326,6 +339,19 @@ def amax(x, axis=None, keepdims=False):
 
 def amin(x, axis=None, keepdims=False):
     x = convert_to_tensor(x)
+    from torch.distributed.tensor import DTensor
+
+    from keras.src.backend.torch.core import _maybe_promote_to_dtensor
+
+    if isinstance(x, DTensor):
+        if axis is None:
+            return _maybe_promote_to_dtensor(torch.amin(x.to_local()))
+        if axis == () or axis == []:
+            return x
+        return _maybe_promote_to_dtensor(
+            torch.amin(x.to_local(), dim=axis, keepdim=keepdims)
+        )
+
     if axis is None:
         return torch.amin(x)
     if axis == () or axis == []:
@@ -404,26 +430,39 @@ def arctanh(x):
 
 def argmax(x, axis=None, keepdims=False):
     x = convert_to_tensor(x)
+    from torch.distributed.tensor import DTensor
 
     # TODO: torch.argmax doesn't support bool
     if standardize_dtype(x.dtype) == "bool":
         x = cast(x, "uint8")
+
+    if isinstance(x, DTensor):
+        return cast(
+            torch.argmax(x.to_local(), dim=axis, keepdim=keepdims), dtype="int32"
+        )
 
     return cast(torch.argmax(x, dim=axis, keepdim=keepdims), dtype="int32")
 
 
 def argmin(x, axis=None, keepdims=False):
     x = convert_to_tensor(x)
+    from torch.distributed.tensor import DTensor
 
     # TODO: torch.argmin doesn't support bool
     if standardize_dtype(x.dtype) == "bool":
         x = cast(x, "uint8")
+
+    if isinstance(x, DTensor):
+        return cast(
+            torch.argmin(x.to_local(), dim=axis, keepdim=keepdims), dtype="int32"
+        )
 
     return cast(torch.argmin(x, dim=axis, keepdim=keepdims), dtype="int32")
 
 
 def argsort(x, axis=-1):
     x = convert_to_tensor(x)
+    from torch.distributed.tensor import DTensor
 
     # TODO: torch.argsort doesn't support bool
     if standardize_dtype(x.dtype) == "bool":
@@ -432,6 +471,12 @@ def argsort(x, axis=-1):
     if axis is None:
         axis = -1
         x = x.reshape(-1)
+
+    if isinstance(x, DTensor):
+        return cast(
+            torch.argsort(x.to_local(), dim=axis, stable=True), dtype="int32"
+        )
+
     return cast(torch.argsort(x, dim=axis, stable=True), dtype="int32")
 
 
