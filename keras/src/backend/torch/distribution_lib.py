@@ -231,26 +231,3 @@ def all_reduce(tensor, op="sum"):
         if op.lower() == "mean":
             tensor /= torch.distributed.get_world_size()
     return tensor
-
-
-def auto_promote_tensors(*args):
-    """Promotes regular tensors to DTensors if mixed with DTensors."""
-    from torch.distributed.tensor import DTensor, Replicate
-
-    dtensor = None
-    for arg in args:
-        if isinstance(arg, DTensor):
-            dtensor = arg
-            break
-
-    if dtensor is None:
-        return args
-
-    mesh = dtensor.device_mesh
-    new_args = []
-    for arg in args:
-        if isinstance(arg, torch.Tensor) and not isinstance(arg, DTensor):
-            placements = [Replicate()] * mesh.ndim
-            arg = DTensor.from_local(arg, mesh, placements)
-        new_args.append(arg)
-    return tuple(new_args)

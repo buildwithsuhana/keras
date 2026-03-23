@@ -67,10 +67,6 @@ def rot90(array, k=1, axes=(0, 1)):
 def add(x1, x2):
     x1 = convert_to_tensor(x1)
     x2 = convert_to_tensor(x2)
-
-    from keras.src.backend.torch import distribution_lib
-
-    x1, x2 = distribution_lib.auto_promote_tensors(x1, x2)
     return torch.add(x1, x2)
 
 
@@ -98,15 +94,6 @@ def subtract(x1, x2):
         x1 = cast(x1, x2.dtype)
     if standardize_dtype(x2.dtype) == "bool":
         x2 = cast(x2, x1.dtype)
-
-    from keras.src.backend.torch import distribution_lib
-
-    x1, x2 = distribution_lib.auto_promote_tensors(x1, x2)
-    return torch.subtract(x1, x2)
-
-    from keras.src.backend.torch import distribution_lib
-
-    x1, x2 = distribution_lib.auto_promote_tensors(x1, x2)
     return torch.subtract(x1, x2)
 
 
@@ -163,20 +150,12 @@ def matmul(x1, x2):
 
     x1 = cast(x1, compute_dtype)
     x2 = cast(x2, compute_dtype)
-
-    from keras.src.backend.torch import distribution_lib
-
-    x1, x2 = distribution_lib.auto_promote_tensors(x1, x2)
     return cast(torch.matmul(x1, x2), result_dtype)
 
 
 def multiply(x1, x2):
     x1 = convert_to_tensor(x1)
     x2 = convert_to_tensor(x2)
-
-    from keras.src.backend.torch import distribution_lib
-
-    x1, x2 = distribution_lib.auto_promote_tensors(x1, x2)
     return torch.multiply(x1, x2)
 
 
@@ -211,10 +190,6 @@ def mean(x, axis=None, keepdims=False):
     # Cast input to compute dtype before mean to avoid dtype kwarg
     # which causes issues with ONNX export (dtype kwarg not supported)
     x = cast(x, compute_dtype)
-
-    from keras.src.backend.torch import distribution_lib
-
-    x = distribution_lib.auto_promote_tensors(x)[0]
     result = torch.mean(x, axis, keepdims)
     return cast(result, result_dtype)
 
@@ -316,19 +291,6 @@ def any(x, axis=None, keepdims=False):
 
 def amax(x, axis=None, keepdims=False):
     x = convert_to_tensor(x)
-    from torch.distributed.tensor import DTensor
-
-    from keras.src.backend.torch.core import _maybe_promote_to_dtensor
-
-    if isinstance(x, DTensor):
-        if axis is None:
-            return _maybe_promote_to_dtensor(torch.amax(x.to_local()))
-        if axis == () or axis == []:
-            return x
-        return _maybe_promote_to_dtensor(
-            torch.amax(x.to_local(), dim=axis, keepdim=keepdims)
-        )
-
     if axis is None:
         return torch.amax(x)
     if axis == () or axis == []:
@@ -339,19 +301,6 @@ def amax(x, axis=None, keepdims=False):
 
 def amin(x, axis=None, keepdims=False):
     x = convert_to_tensor(x)
-    from torch.distributed.tensor import DTensor
-
-    from keras.src.backend.torch.core import _maybe_promote_to_dtensor
-
-    if isinstance(x, DTensor):
-        if axis is None:
-            return _maybe_promote_to_dtensor(torch.amin(x.to_local()))
-        if axis == () or axis == []:
-            return x
-        return _maybe_promote_to_dtensor(
-            torch.amin(x.to_local(), dim=axis, keepdim=keepdims)
-        )
-
     if axis is None:
         return torch.amin(x)
     if axis == () or axis == []:
@@ -430,39 +379,26 @@ def arctanh(x):
 
 def argmax(x, axis=None, keepdims=False):
     x = convert_to_tensor(x)
-    from torch.distributed.tensor import DTensor
 
     # TODO: torch.argmax doesn't support bool
     if standardize_dtype(x.dtype) == "bool":
         x = cast(x, "uint8")
-
-    if isinstance(x, DTensor):
-        return cast(
-            torch.argmax(x.to_local(), dim=axis, keepdim=keepdims), dtype="int32"
-        )
 
     return cast(torch.argmax(x, dim=axis, keepdim=keepdims), dtype="int32")
 
 
 def argmin(x, axis=None, keepdims=False):
     x = convert_to_tensor(x)
-    from torch.distributed.tensor import DTensor
 
     # TODO: torch.argmin doesn't support bool
     if standardize_dtype(x.dtype) == "bool":
         x = cast(x, "uint8")
-
-    if isinstance(x, DTensor):
-        return cast(
-            torch.argmin(x.to_local(), dim=axis, keepdim=keepdims), dtype="int32"
-        )
 
     return cast(torch.argmin(x, dim=axis, keepdim=keepdims), dtype="int32")
 
 
 def argsort(x, axis=-1):
     x = convert_to_tensor(x)
-    from torch.distributed.tensor import DTensor
 
     # TODO: torch.argsort doesn't support bool
     if standardize_dtype(x.dtype) == "bool":
@@ -471,11 +407,6 @@ def argsort(x, axis=-1):
     if axis is None:
         axis = -1
         x = x.reshape(-1)
-
-    if isinstance(x, DTensor):
-        return cast(
-            torch.argsort(x.to_local(), dim=axis, stable=True), dtype="int32"
-        )
 
     return cast(torch.argsort(x, dim=axis, stable=True), dtype="int32")
 
@@ -930,17 +861,6 @@ def full_like(x, fill_value, dtype=None):
     return full(shape=x.shape, fill_value=fill_value, dtype=dtype)
 
 
-def add(x1, x2):
-    x1 = convert_to_tensor(x1)
-    x2 = convert_to_tensor(x2)
-
-    from keras.src.backend.torch import distribution_lib
-
-    x1, x2 = distribution_lib.auto_promote_tensors(x1, x2)
-    return torch.add(x1, x2)
-
-
-
 def geomspace(start, stop, num=50, endpoint=True, dtype=None, axis=0):
     if axis != 0:
         raise ValueError(
@@ -1374,10 +1294,6 @@ def minimum(x1, x2):
     )
     x1 = convert_to_tensor(x1, dtype)
     x2 = convert_to_tensor(x2, dtype)
-
-    from keras.src.backend.torch import distribution_lib
-
-    x1, x2 = distribution_lib.auto_promote_tensors(x1, x2)
     return torch.minimum(x1, x2)
 
 
@@ -1895,9 +1811,6 @@ def take(x, indices, axis=None):
     )
     if x.ndim == 2 and axis == 0:
         # This case is equivalent to embedding lookup.
-        from keras.src.backend.torch import distribution_lib
-
-        indices, x = distribution_lib.auto_promote_tensors(indices, x)
         return torch.nn.functional.embedding(indices, x)
     if axis is None:
         x = torch.reshape(x, (-1,))
@@ -2063,18 +1976,12 @@ def vectorize(pyfunc, *, excluded=None, signature=None):
 
 
 def where(condition, x1=None, x2=None):
-    from keras.src.backend.torch import distribution_lib
-
     condition = convert_to_tensor(condition, dtype=bool)
     if x1 is not None and x2 is not None:
         x1 = convert_to_tensor(x1)
         x2 = convert_to_tensor(x2)
-        condition, x1, x2 = distribution_lib.auto_promote_tensors(
-            condition, x1, x2
-        )
         return torch.where(condition, x1, x2)
     else:
-        condition = distribution_lib.auto_promote_tensors(condition)[0]
         return torch.where(condition)
 
 

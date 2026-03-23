@@ -244,11 +244,13 @@ def _maybe_promote_to_dtensor(res):
     ):
         from torch.distributed.tensor import DTensor, Replicate
 
-        if not isinstance(res, DTensor):
-            from keras.src.backend.torch import distribution_lib
-
+        if (
+            isinstance(res, torch.Tensor)
+            and not isinstance(res, DTensor)
+            and not res.is_meta
+        ):
             keras_mesh = distribution.device_mesh
-            torch_mesh = distribution_lib._to_backend_mesh(keras_mesh)
+            torch_mesh = keras_mesh.backend_mesh
             placements = [Replicate()] * torch_mesh.ndim
             res = DTensor.from_local(res, torch_mesh, placements)
     return res
@@ -659,10 +661,6 @@ def scatter_update(inputs, indices, updates, reduction=None):
     indices = convert_to_tensor(indices, dtype="int64")
     updates = convert_to_tensor(updates, dtype=inputs.dtype)
 
-    from keras.src.backend.torch import distribution_lib
-
-    inputs, updates = distribution_lib.auto_promote_tensors(inputs, updates)
-
     indices = torch.transpose(indices, 0, 1)
     idx = tuple(indices)
 
@@ -716,10 +714,6 @@ def slice_update(inputs, start_indices, updates):
     inputs = convert_to_tensor(inputs)
     start_indices = convert_to_tensor(start_indices).to(shape_dtype)
     updates = convert_to_tensor(updates)
-
-    from keras.src.backend.torch import distribution_lib
-
-    inputs, updates = distribution_lib.auto_promote_tensors(inputs, updates)
 
     python_slice = __builtins__["slice"]
     slices = [
