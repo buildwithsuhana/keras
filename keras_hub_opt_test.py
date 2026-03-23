@@ -1,45 +1,46 @@
 import os
-import torch
+import sys
+import torch.multiprocessing as mp
 
-# Configure environment for distributed training and to avoid conflicts
-os.environ["KERAS_BACKEND"] = "torch"
-os.environ["NCCL_P2P_DISABLE"] = "1"
-os.environ["TF_CPP_MIN_LOG_LEVEL"] = "3" # Quiet TF logs
-# Detect if GPU is available
-device_type = "gpu" if torch.cuda.is_available() else "cpu"
-keras_device = "cuda" if torch.cuda.is_available() else "cpu"
-os.environ["KERAS_TORCH_DEVICE"] = keras_device
+# DO NOT import keras or torch at top level to avoid premature CUDA initialization
 
-import numpy as np
-import keras
-import keras_hub
-from keras.distribution import DeviceMesh, LayoutMap, ModelParallel, TensorLayout
-from keras.src.backend.torch import distribution_lib as torch_dist_lib
-
-# For this test, we simulate multi-process distribution
 def run_test(rank, world_size):
-    # Configure environment for each process
-    os.environ["MASTER_ADDR"] = "localhost"
+    # Set environment variables for this process - MUST BE FIRST
+    os.environ["CUDA_VISIBLE_DEVICES"] = str(rank)
+    os.environ["KERAS_BACKEND"] = "torch"
+    os.environ["MASTER_ADDR"] = "127.0.0.1"
     os.environ["MASTER_PORT"] = "29513"
     os.environ["RANK"] = str(rank)
-    os.environ["LOCAL_RANK"] = str(rank)
+    os.environ["LOCAL_RANK"] = "0"
     os.environ["WORLD_SIZE"] = str(world_size)
-    os.environ["KERAS_TORCH_DEVICE"] = keras_device
-    # Force GPU to specific device
-    if torch.cuda.is_available():
-        os.environ["CUDA_VISIBLE_DEVICES"] = str(rank)
-        torch.cuda.set_device(0) # In the process's view, it only has one GPU
+    os.environ["NCCL_P2P_DISABLE"] = "1"
+    os.environ["TF_CPP_MIN_LOG_LEVEL"] = "3"
+    os.environ["TF_FORCE_GPU_ALLOW_GROWTH"] = "true"
+    
+    # Now safe to import
+    import torch
+    import keras
+    import keras_hub
+    from keras.distribution import DeviceMesh, LayoutMap, ModelParallel, TensorLayout
+    from keras.src.backend.torch import distribution_lib as torch_dist_lib
+    from keras.src import tree
+
+    # Set device
+    torch.cuda.set_device(0)
     
     # Initialize Keras distribution system
     print(f"Rank {rank} initializing distribution...")
     keras.distribution.initialize()
+    print(f"Rank {rank} distribution initialized.")
     
     # Get available devices
-    devices = keras.distribution.list_devices(device_type)
-    print(f"Rank {rank}/{world_size} starting with devices: {devices}")
+    devices = keras.distribution.list_devices("gpu")
+    print(f"Rank {rank}/{world_size} starting with local devices: {devices}")
     
     # Create a 1D device mesh for ModelParallel
-    mesh = DeviceMesh(shape=(world_size,), axis_names=("model",), devices=devices[:world_size])
+    # For DTensor, we need the global view of devices
+    global_devices = [f"gpu:{i}" for i in range(world_size)]
+    mesh = DeviceMesh(shape=(world_size,), axis_names=("model",), devices=global_devices)
     
     # Define layout map
     layout_map = LayoutMap(mesh)
@@ -80,7 +81,6 @@ def run_test(rank, world_size):
                 return torch_dist_lib.distribute_data_input(tensor, layout, distribution.batch_dim_name)
             return tensor
             
-        from keras.src import tree
         sharded_inputs = tree.map_structure(shard_input, inputs)
         
         # Forward pass to build
@@ -100,13 +100,20 @@ def run_test(rank, world_size):
         torch.distributed.destroy_process_group()
 
 if __name__ == "__main__":
-    # Pre-download the preset to avoid multiple processes colliding
+    # Pre-download using a clean subprocess to avoid parent process touching GPU
+    import subprocess
     print("Pre-downloading preset...")
-    keras_hub.models.OPTCausalLM.from_preset("opt_125m_en", load_weights=False)
+    subprocess.run([sys.executable, "-c", "import os; os.environ['CUDA_VISIBLE_DEVICES']=''; os.environ['KERAS_BACKEND']='torch'; import keras_hub; keras_hub.models.OPTCausalLM.from_preset('opt_125m_en', load_weights=False)"])
     
-    # Simulate devices using processes
-    world_size = torch.cuda.device_count() if torch.cuda.is_available() else 2
-    import torch.multiprocessing as mp
+    # Determine world size
+    import torch
+    if torch.cuda.is_available():
+        world_size = torch.cuda.device_count()
+    else:
+        world_size = 2
+        
+    # Use 'spawn' to ensure a clean slate for each process
+    mp.set_start_method('spawn', force=True)
     try:
         mp.spawn(run_test, args=(world_size,), nprocs=world_size, join=True)
     except Exception as e:
