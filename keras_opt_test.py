@@ -9,7 +9,7 @@ def run_test(rank, world_size):
     os.environ["CUDA_VISIBLE_DEVICES"] = str(rank)
     os.environ["KERAS_BACKEND"] = "torch"
     os.environ["MASTER_ADDR"] = "127.0.0.1"
-    os.environ["MASTER_PORT"] = "29513"
+    os.environ["MASTER_PORT"] = "29507"
     os.environ["RANK"] = str(rank)
     os.environ["LOCAL_RANK"] = "0"
     os.environ["WORLD_SIZE"] = str(world_size)
@@ -21,9 +21,7 @@ def run_test(rank, world_size):
     import torch
     import keras
     import keras_hub
-    from keras.distribution import DeviceMesh, LayoutMap, ModelParallel, TensorLayout
-    from keras.src.backend.torch import distribution_lib as torch_dist_lib
-    from keras.src import tree
+    from keras.distribution import DataParallel
 
     # Set device
     torch.cuda.set_device(0)
@@ -37,18 +35,9 @@ def run_test(rank, world_size):
     devices = keras.distribution.list_devices("gpu")
     print(f"Rank {rank}/{world_size} starting with local devices: {devices}")
     
-    # Create a 1D device mesh for ModelParallel
-    # For DTensor, we need the global view of devices
+    # Create DataParallel strategy
     global_devices = [f"gpu:{i}" for i in range(world_size)]
-    mesh = DeviceMesh(shape=(world_size,), axis_names=("model",), devices=global_devices)
-    
-    # Define layout map
-    layout_map = LayoutMap(mesh)
-    layout_map[".*dense.*kernel"] = TensorLayout(axes=(None, "model"), device_mesh=mesh)
-    layout_map[".*embeddings/embeddings"] = TensorLayout(axes=("model", None), device_mesh=mesh)
-    
-    # Create the ModelParallel distribution strategy
-    distribution = ModelParallel(layout_map=layout_map, batch_dim_name="model", auto_shard_dataset=False)
+    distribution = DataParallel(devices=global_devices, auto_shard_dataset=False)
     
     with distribution.scope():
         # Load the OPT 125M model from Keras Hub
@@ -63,44 +52,23 @@ def run_test(rank, world_size):
             weighted_metrics=["accuracy"]
         )
         
-        # Build the model manually by calling it with sharded data
-        print(f"Rank {rank} building model...")
-        x_str = ["Keras Hub is great.", "Distributed training works with ModelParallel!"] * 2
-        preprocessor = model.preprocessor
-        processed_data = preprocessor(x_str[:2]) # Get a small batch
-        
-        if isinstance(processed_data, tuple):
-            inputs = processed_data[0]
-        else:
-            inputs = processed_data
-            
-        # Manually shard inputs
-        def shard_input(tensor):
-            if isinstance(tensor, torch.Tensor):
-                layout = distribution.get_data_layout(tensor.shape)
-                return torch_dist_lib.distribute_data_input(tensor, layout, distribution.batch_dim_name)
-            return tensor
-            
-        sharded_inputs = tree.map_structure(shard_input, inputs)
-        
-        # Forward pass to build
-        with torch_dist_lib.sharding_scope():
-            model(sharded_inputs)
-        print(f"Rank {rank} model built successfully.")
+        # Generate dummy data
+        x = ["Keras Hub is great.", "Distributed training works with PyTorch!"] * 4
+        y = x
         
         # Execute fit
         print(f"Rank {rank} starting fit...")
-        model.fit(x_str, x_str, epochs=1, batch_size=2)
+        model.fit(x, y, epochs=1, batch_size=2)
         
         if rank == 0:
-            print("Successfully finished model.fit on OPT-125M with ModelParallel!")
+            print("Successfully finished model.fit on OPT-125M with DataParallel!")
 
     # Cleanup
     if torch.distributed.is_initialized():
         torch.distributed.destroy_process_group()
 
 if __name__ == "__main__":
-    # Pre-download using a clean subprocess to avoid parent process touching GPU
+    # Pre-download using a clean subprocess
     import subprocess
     print("Pre-downloading preset...")
     subprocess.run([sys.executable, "-c", "import os; os.environ['CUDA_VISIBLE_DEVICES']=''; os.environ['KERAS_BACKEND']='torch'; import keras_hub; keras_hub.models.OPTCausalLM.from_preset('opt_125m_en', load_weights=False)"])
@@ -112,7 +80,7 @@ if __name__ == "__main__":
     else:
         world_size = 2
         
-    # Use 'spawn' to ensure a clean slate for each process
+    # Use 'spawn' to ensure a clean slate
     mp.set_start_method('spawn', force=True)
     try:
         mp.spawn(run_test, args=(world_size,), nprocs=world_size, join=True)
