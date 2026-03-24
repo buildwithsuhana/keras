@@ -84,6 +84,9 @@ def _to_backend_layout(tensor_layout):
     if tensor_layout is None:
         return None
 
+    if isinstance(tensor_layout, DTensorLayout):
+        return tensor_layout
+
     from keras.src.distribution.distribution_lib import TensorLayout
     from torch.distributed.tensor import Replicate
     from torch.distributed.tensor import Shard
@@ -109,7 +112,7 @@ def _to_backend_layout(tensor_layout):
         else:
             placements.append(Replicate())
 
-    return torch_mesh, tuple(placements)
+    return DTensorLayout(torch_mesh, tuple(placements))
 
 
 class DTensorLayout:
@@ -131,19 +134,21 @@ def distribute_tensor(tensor, layout):
     if torch_layout is None:
         return tensor
 
-    torch_mesh, placements = torch_layout
     if isinstance(tensor, DTensor):
         if (
-            tensor.device_mesh == torch_mesh
-            and tuple(tensor.placements) == placements
+            tensor.device_mesh == torch_layout.device_mesh
+            and tuple(tensor.placements) == torch_layout.placements
         ):
             return tensor
         return tensor.redistribute(
-            device_mesh=torch_mesh, placements=placements
+            device_mesh=torch_layout.device_mesh,
+            placements=torch_layout.placements,
         )
 
     return torch_distribute_tensor(
-        tensor, device_mesh=torch_mesh, placements=placements
+        tensor,
+        device_mesh=torch_layout.device_mesh,
+        placements=torch_layout.placements,
     )
 
 
