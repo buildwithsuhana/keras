@@ -122,30 +122,35 @@ class Variable(KerasVariable):
                 self._layout = tensor_layout
 
     def _initialize(self, value):
-        self._shape = self._validate_shape(value.shape)
+        self._shape = tuple(value.shape)
         self._initialize_layout()
-        
-        if self._layout is not None:
-            from torch.distributed.tensor import DTensor
+
+        distribution = global_state.get_global_attribute("distribution")
+        from keras.src.distribution.distribution_lib import ModelParallel
+
+        if self._layout is not None and isinstance(distribution, ModelParallel):
+            from keras.src.backend.torch import distribution_lib
+
             value = convert_to_tensor(value, dtype=self._dtype)
-            value = DTensor.from_local(
-                value,
-                device_mesh=self._layout.device_mesh,
-                placements=self._layout.placements,
+            value = distribution_lib.distribute_tensor(value, self._layout)
+            self._value = torch.nn.Parameter(
+                value, requires_grad=self.trainable
             )
-            self._value = torch.nn.Parameter(value, requires_grad=self.trainable)
+        elif isinstance(value, torch.nn.Parameter):
+            # Reuse same parameter
+            self._value = value
         else:
             self._value = torch.nn.Parameter(
                 convert_to_tensor(value, dtype=self._dtype),
                 requires_grad=self.trainable,
             ).to(get_device())
 
-    # def _initialize_with_initializer(self, initializer):
-    #     self._shape = self._validate_shape(self._shape)
-    #     value = self._convert_to_tensor(
-    #         initializer(self._shape, dtype=self._dtype)
-    #     )
-    #     self._initialize(value)
+    def _initialize_with_initializer(self, initializer):
+        self._shape = self._validate_shape(self._shape)
+        value = self._convert_to_tensor(
+            initializer(self._shape, dtype=self._dtype)
+        )
+        self._initialize(value)
 
     def _direct_assign(self, value):
         with torch.no_grad():
