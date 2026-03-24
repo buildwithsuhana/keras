@@ -84,12 +84,21 @@ def _to_backend_layout(tensor_layout):
     if tensor_layout is None:
         return None
 
+    if isinstance(tensor_layout, DTensorLayout):
+        return tensor_layout
+
+    from keras.src.distribution.distribution_lib import TensorLayout
     from torch.distributed.tensor import Replicate
     from torch.distributed.tensor import Shard
 
-    keras_mesh = tensor_layout.device_mesh
-    torch_mesh = keras_mesh.backend_mesh
+    if isinstance(tensor_layout, (tuple, list)):
+        dist = distribution()
+        if dist is None:
+            return None
+        tensor_layout = TensorLayout(tensor_layout, dist.device_mesh)
 
+    keras_mesh = tensor_layout.device_mesh
+    torch_mesh = _to_backend_mesh(keras_mesh)
     placements = []
     for mesh_dim_name in keras_mesh.axis_names:
         shard_dim = None
@@ -121,26 +130,25 @@ def distribute_tensor(tensor, layout):
         distribute_tensor as torch_distribute_tensor,
     )
 
-    if layout is None:
+    torch_layout = _to_backend_layout(layout)
+    if torch_layout is None:
         return tensor
-
-    from keras.src.distribution import TensorLayout
-
-    if isinstance(layout, TensorLayout):
-        layout = _to_backend_layout(layout)
 
     if isinstance(tensor, DTensor):
         if (
-            tensor.device_mesh == layout.device_mesh
-            and tensor.placements == layout.placements
+            tensor.device_mesh == torch_layout.device_mesh
+            and tuple(tensor.placements) == torch_layout.placements
         ):
             return tensor
         return tensor.redistribute(
-            device_mesh=layout.device_mesh, placements=layout.placements
+            device_mesh=torch_layout.device_mesh,
+            placements=torch_layout.placements,
         )
 
     return torch_distribute_tensor(
-        tensor, device_mesh=layout.device_mesh, placements=layout.placements
+        tensor,
+        device_mesh=torch_layout.device_mesh,
+        placements=torch_layout.placements,
     )
 
 
@@ -154,28 +162,17 @@ def distribute_variable(value, layout):
 
 def distribute_data_input(per_process_batch, layout, batch_dim_name=None):
     """Distribute the input data with the corresponding layout."""
-    if layout is None:
+    torch_layout = _to_backend_layout(layout)
+    if torch_layout is None:
         return per_process_batch
 
     from torch.distributed.tensor import DTensor
 
-    from keras.src.distribution.distribution_lib import TensorLayout
-
-    if isinstance(layout, TensorLayout):
-        layout = _to_backend_layout(layout)
-
     return DTensor.from_local(
         per_process_batch,
-        device_mesh=layout.device_mesh,
-        placements=layout.placements,
+        device_mesh=torch_layout.device_mesh,
+        placements=torch_layout.placements,
     )
-
-
-def distribution():
-    """Returns the current distribution strategy."""
-    from keras.src.distribution import distribution_lib
-
-    return distribution_lib.distribution()
 
 
 @contextlib.contextmanager
