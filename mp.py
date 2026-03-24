@@ -84,8 +84,7 @@ def run_test(rank, world_size):
         sharded_inputs = tree.map_structure(shard_input, inputs)
         
         # Forward pass to build
-        with torch_dist_lib.sharding_scope():
-            model(sharded_inputs)
+        model(sharded_inputs)
         print(f"Rank {rank} model built successfully.")
         
         # Execute fit
