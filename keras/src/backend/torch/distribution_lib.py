@@ -84,11 +84,18 @@ def _to_backend_layout(tensor_layout):
     if tensor_layout is None:
         return None
 
+    from keras.src.distribution.distribution_lib import TensorLayout
     from torch.distributed.tensor import Replicate
     from torch.distributed.tensor import Shard
 
+    if isinstance(tensor_layout, (tuple, list)):
+        dist = distribution()
+        if dist is None:
+            return None
+        tensor_layout = TensorLayout(tensor_layout, dist.device_mesh)
+
     keras_mesh = tensor_layout.device_mesh
-    torch_mesh = _to_backend_mesh(keras_mesh)    
+    torch_mesh = _to_backend_mesh(keras_mesh)
     placements = []
     for mesh_dim_name in keras_mesh.axis_names:
         shard_dim = None
@@ -101,7 +108,7 @@ def _to_backend_layout(tensor_layout):
             placements.append(Shard(shard_dim))
         else:
             placements.append(Replicate())
-    
+
     return torch_mesh, tuple(placements)
 
 
@@ -120,7 +127,21 @@ def distribute_tensor(tensor, layout):
         distribute_tensor as torch_distribute_tensor,
     )
 
-    torch_mesh, placements = _to_backend_layout(layout)
+    torch_layout = _to_backend_layout(layout)
+    if torch_layout is None:
+        return tensor
+
+    torch_mesh, placements = torch_layout
+    if isinstance(tensor, DTensor):
+        if (
+            tensor.device_mesh == torch_mesh
+            and tuple(tensor.placements) == placements
+        ):
+            return tensor
+        return tensor.redistribute(
+            device_mesh=torch_mesh, placements=placements
+        )
+
     return torch_distribute_tensor(
         tensor, device_mesh=torch_mesh, placements=placements
     )
@@ -136,12 +157,13 @@ def distribute_variable(value, layout):
 
 def distribute_data_input(per_process_batch, layout, batch_dim_name=None):
     """Distribute the input data with the corresponding layout."""
-    if layout is None:
+    torch_layout = _to_backend_layout(layout)
+    if torch_layout is None:
         return per_process_batch
 
     from torch.distributed.tensor import DTensor
 
-    torch_mesh, placements = _to_backend_layout(layout)
+    torch_mesh, placements = torch_layout
     return DTensor.from_local(
         per_process_batch, device_mesh=torch_mesh, placements=placements
     )
