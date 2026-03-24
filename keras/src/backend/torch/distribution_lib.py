@@ -164,14 +164,6 @@ def distribute_data_input(tensor, layout, batch_dim_name=None):
     from keras.src.distribution.distribution_lib import TensorLayout
 
     if isinstance(layout, TensorLayout):
-        layout = _to_backend_layout(layout)
-
-    mesh = layout.device_mesh
-    placements = []
-    if isinstance(layout, DTensorLayout):
-        pass
-    from keras.src.distribution.distribution_lib import TensorLayout
-    if isinstance(layout, TensorLayout):
         mesh = layout.device_mesh.backend_mesh
         placements = []
         for i, axis_name in enumerate(layout.axes):
@@ -181,8 +173,10 @@ def distribute_data_input(tensor, layout, batch_dim_name=None):
                 placements.append(Shard(i))
             else:
                 placements.append(Replicate())
-        return DTensor.from_local(tensor, device_mesh=mesh, placements=placements)
-    
+        return DTensor.from_local(
+            tensor, device_mesh=mesh, placements=placements
+        )
+
     return DTensor.from_local(
         tensor,
         device_mesh=layout.device_mesh,
@@ -195,6 +189,16 @@ def distribution():
     from keras.src.distribution import distribution_lib
 
     return distribution_lib.distribution()
+
+
+@contextlib.contextmanager
+def no_sync(model):
+    """Context manager to prevent gradient synchronization."""
+    if hasattr(model, "no_sync"):
+        with model.no_sync():
+            yield
+    else:
+        yield
 
 
 @contextlib.contextmanager

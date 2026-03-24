@@ -65,25 +65,30 @@ class TorchTrainer(base_trainer.Trainer):
         )
 
         if use_ddp:
-            # Handle gradient accumulation with DDP no_sync()
             gradient_accumulation_steps = getattr(
-                self.optimizer, "gradient_accumulation_steps", None
-            )
-            if gradient_accumulation_steps:
-                is_update_step = (
-                    self.optimizer.iterations + 1
-                ) % gradient_accumulation_steps == 0
-            else:
-                is_update_step = True
+                self.optimizer, "gradient_accumulation_steps", 1
+            ) or 1
+            
+            current_micro_batch = int(self.optimizer._iterations) % gradient_accumulation_steps
+            is_first_micro_batch = (current_micro_batch == 0)
+            is_last_micro_batch = (current_micro_batch == gradient_accumulation_steps - 1)
 
-            if not is_update_step:
-                ctx = self._ddp_model.no_sync()
+            if not is_last_micro_batch:
+                ctx = torch_distribution_lib.no_sync(self._ddp_model)
             else:
                 ctx = contextlib.nullcontext()
         else:
+            is_first_micro_batch = True
+            is_last_micro_batch = True
             ctx = contextlib.nullcontext()
 
         with ctx:
+            if use_ddp:
+                if is_first_micro_batch:
+                    self.zero_grad()
+            else:
+                self.zero_grad()
+
             # Compute predictions
             if use_ddp:
                 if self._call_has_training_arg:
@@ -95,10 +100,6 @@ class TorchTrainer(base_trainer.Trainer):
                     y_pred = self(x, training=True)
                 else:
                     y_pred = self(x)
-
-            # Call torch.nn.Module.zero_grad() to clear the leftover gradients
-            # for the weights from the previous train step.
-            self.zero_grad()
 
             loss = self._compute_loss(
                 x=x,
@@ -122,12 +123,26 @@ class TorchTrainer(base_trainer.Trainer):
                 # for the weights.
                 loss.backward()
 
-                trainable_weights = self.trainable_weights[:]
-                gradients = [v.value.grad for v in trainable_weights]
+                if use_ddp:
+                    if is_last_micro_batch:
+                        trainable_weights = self.trainable_weights[:]
+                        gradients = [v.value.grad for v in trainable_weights]
+                        old_steps = self.optimizer.gradient_accumulation_steps
+                        self.optimizer.gradient_accumulation_steps = None
+                        try:
+                            with torch.no_grad():
+                                self.optimizer.apply(gradients, trainable_weights)
+                        finally:
+                            self.optimizer.gradient_accumulation_steps = old_steps
+                    else:
+                        self.optimizer._iterations.assign_add(1)
+                else:
+                    trainable_weights = self.trainable_weights[:]
+                    gradients = [v.value.grad for v in trainable_weights]
 
-                # Update weights
-                with torch.no_grad():
-                    self.optimizer.apply(gradients, trainable_weights)
+                    # Update weights
+                    with torch.no_grad():
+                        self.optimizer.apply(gradients, trainable_weights)
             else:
                 warnings.warn("The model does not have any trainable weights.")
 
