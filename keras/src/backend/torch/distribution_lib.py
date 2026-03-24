@@ -152,20 +152,39 @@ def distribute_variable(value, layout):
     return dtensor
 
 
-def distribute_data_input(per_process_batch, layout, batch_dim_name=None):
-    """Distribute the input data with the corresponding layout."""
+def distribute_data_input(tensor, layout, batch_dim_name=None):
+    """Distribute a local data tensor according to a TensorLayout."""
     if layout is None:
-        return per_process_batch
+        return tensor
 
     from torch.distributed.tensor import DTensor
+    from torch.distributed.tensor import Replicate
+    from torch.distributed.tensor import Shard
 
     from keras.src.distribution.distribution_lib import TensorLayout
 
     if isinstance(layout, TensorLayout):
         layout = _to_backend_layout(layout)
 
+    mesh = layout.device_mesh
+    placements = []
+    if isinstance(layout, DTensorLayout):
+        pass
+    from keras.src.distribution.distribution_lib import TensorLayout
+    if isinstance(layout, TensorLayout):
+        mesh = layout.device_mesh.backend_mesh
+        placements = []
+        for i, axis_name in enumerate(layout.axes):
+            if axis_name == batch_dim_name:
+                placements.append(Shard(i))
+            elif axis_name is not None:
+                placements.append(Shard(i))
+            else:
+                placements.append(Replicate())
+        return DTensor.from_local(tensor, device_mesh=mesh, placements=placements)
+    
     return DTensor.from_local(
-        per_process_batch,
+        tensor,
         device_mesh=layout.device_mesh,
         placements=layout.placements,
     )

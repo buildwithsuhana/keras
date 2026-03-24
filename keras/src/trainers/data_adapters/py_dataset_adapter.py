@@ -203,13 +203,23 @@ class PyDatasetAdapter(DataAdapter):
         x,
         class_weight=None,
         shuffle=False,
+        distribution=None,
     ):
         self.py_dataset = x
         self.class_weight = class_weight
         self.enqueuer = None
         self.shuffle = shuffle
+        self.distribution = distribution
         self._output_signature = None
         self._within_epoch = False
+
+        self.num_process = 1
+        self.process_id = 0
+        if self.distribution is not None and getattr(
+            self.distribution, "_is_multi_process", False
+        ):
+            self.num_process = self.distribution._num_process
+            self.process_id = self.distribution._process_id
 
         workers = self.py_dataset.workers
         use_multiprocessing = self.py_dataset.use_multiprocessing
@@ -220,6 +230,8 @@ class PyDatasetAdapter(DataAdapter):
                 use_multiprocessing=use_multiprocessing,
                 max_queue_size=self.py_dataset.max_queue_size,
                 shuffle=self.shuffle,
+                num_process=self.num_process,
+                process_id=self.process_id,
             )
 
     def _standardize_batch(self, batch):
@@ -252,7 +264,8 @@ class PyDatasetAdapter(DataAdapter):
 
     def _infinite_generator(self):
         for i in itertools.count():
-            yield self._standardize_batch(self.py_dataset[i])
+            if i % self.num_process == self.process_id:
+                yield self._standardize_batch(self.py_dataset[i])
 
     def _finite_generator(self):
         indices = range(self.py_dataset.num_batches)
@@ -261,7 +274,8 @@ class PyDatasetAdapter(DataAdapter):
             random.shuffle(indices)
 
         for i in indices:
-            yield self._standardize_batch(self.py_dataset[i])
+            if i % self.num_process == self.process_id:
+                yield self._standardize_batch(self.py_dataset[i])
 
     def _infinite_enqueuer_generator(self):
         self.enqueuer.start()
@@ -271,11 +285,20 @@ class PyDatasetAdapter(DataAdapter):
     def _finite_enqueuer_generator(self):
         self.enqueuer.start()
         num_batches = self.py_dataset.num_batches
+        # Note: OrderedEnqueuer already handles sharding if num_process > 1
         for i, batch in enumerate(self.enqueuer.get()):
             yield self._standardize_batch(batch)
-            if i >= num_batches - 1:
+            if i >= self.num_batches_per_process - 1:
                 self.enqueuer.stop()
                 return
+
+    @property
+    def num_batches_per_process(self):
+        if self.py_dataset.num_batches is None:
+            return None
+        num_batches = self.py_dataset.num_batches
+        # Sharded count
+        return (num_batches + self.num_process - 1 - self.process_id) // self.num_process
 
     def _get_iterator(self):
         if self.enqueuer is None:
@@ -349,6 +372,8 @@ class PyDatasetAdapter(DataAdapter):
 
     @property
     def num_batches(self):
+        if self.num_process > 1:
+            return self.num_batches_per_process
         return self.py_dataset.num_batches
 
     @property
@@ -579,15 +604,22 @@ class OrderedEnqueuer(PyDatasetEnqueuer):
         use_multiprocessing=False,
         max_queue_size=10,
         shuffle=False,
+        num_process=1,
+        process_id=0,
     ):
         super().__init__(
             py_dataset, workers, use_multiprocessing, max_queue_size
         )
         self.shuffle = shuffle
+        self.num_process = num_process
+        self.process_id = process_id
         if self.py_dataset.num_batches is None:
             # For infinite datasets, `self.indices` is created here once for all
             # so that subsequent runs resume from where they stopped.
-            self.indices = itertools.count()
+            self.indices = (
+                i for i in itertools.count()
+                if i % self.num_process == self.process_id
+            )
 
     def _get_executor_init(self, workers):
         """Gets the Pool initializer for multiprocessing.
@@ -623,7 +655,10 @@ class OrderedEnqueuer(PyDatasetEnqueuer):
                 if self.shuffle:
                     indices = list(indices)
                     random.shuffle(indices)
-                self.indices = iter(indices)
+                self.indices = (
+                    i for i in indices
+                    if i % self.num_process == self.process_id
+                )
             self._send_py_dataset()  # Share the initial py_dataset
 
             with closing(self.executor_fn(_SHARED_SEQUENCES)) as executor:
