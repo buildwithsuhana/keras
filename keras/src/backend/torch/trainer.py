@@ -226,10 +226,9 @@ class TorchTrainer(base_trainer.Trainer):
         return data
 
     def _symbolic_build(self, iterator=None, data_batch=None):
-        with torch_distribution_lib.sharding_scope():
-            return super()._symbolic_build(
-                iterator=iterator, data_batch=data_batch
-            )
+        return super()._symbolic_build(
+            iterator=iterator, data_batch=data_batch
+        )
 
     def make_train_function(self, force=False):
         if self.train_function is not None and not force:
@@ -256,8 +255,7 @@ class TorchTrainer(base_trainer.Trainer):
         def one_step_on_data(data):
             """Runs a single training step on a batch of data."""
             data = self._distribute_data(data[0])
-            with torch_distribution_lib.sharding_scope():
-                return self.train_step(data)
+            return self.train_step(data)
 
         if self._should_torch_compile():
             self.train_function = torch.compile(one_step_on_data)
@@ -278,8 +276,7 @@ class TorchTrainer(base_trainer.Trainer):
             """Runs a single test step on a batch of data."""
             data = self._distribute_data(data[0])
             with torch.no_grad():
-                with torch_distribution_lib.sharding_scope():
-                    return self.test_step(data)
+                return self.test_step(data)
 
         if self._should_torch_compile():
             self.test_function = torch.compile(one_step_on_data)
@@ -300,8 +297,7 @@ class TorchTrainer(base_trainer.Trainer):
             """Runs a predict test step on a batch of data."""
             data = self._distribute_data(data[0])
             with torch.no_grad():
-                with torch_distribution_lib.sharding_scope():
-                    return self.predict_step(data)
+                return self.predict_step(data)
 
         if self._should_torch_compile():
             self.predict_function = torch.compile(one_step_on_data)
