@@ -200,7 +200,10 @@ class TorchTrainer(base_trainer.Trainer):
         if dist is not None:
             for metric in self.metrics:
                 for variable in metric.variables:
-                    torch_distribution_lib.all_reduce(variable.value, op="sum")
+                    synced_value = torch_distribution_lib.all_reduce(
+                        variable.value, op="sum"
+                    )
+                    variable.assign(synced_value)
 
     def _distribute_data(self, data):
         dist = distribution_lib.distribution()

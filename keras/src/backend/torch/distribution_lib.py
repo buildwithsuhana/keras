@@ -166,13 +166,17 @@ def distribute_data_input(tensor, layout, batch_dim_name=None):
     if isinstance(layout, TensorLayout):
         mesh = layout.device_mesh.backend_mesh
         placements = []
-        for i, axis_name in enumerate(layout.axes):
-            if axis_name == batch_dim_name:
-                placements.append(Shard(i))
-            elif axis_name is not None:
-                placements.append(Shard(i))
+        for mesh_dim_name in layout.device_mesh.axis_names:
+            shard_dim = None
+            for i, axis_name in enumerate(layout.axes):
+                if axis_name == mesh_dim_name:
+                    shard_dim = i
+                    break
+            if shard_dim is not None:
+                placements.append(Shard(shard_dim))
             else:
                 placements.append(Replicate())
+
         return DTensor.from_local(
             tensor, device_mesh=mesh, placements=placements
         )
