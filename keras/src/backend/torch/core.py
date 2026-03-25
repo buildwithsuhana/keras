@@ -212,6 +212,7 @@ class Variable(KerasVariable):
         else:
             res = self._maybe_autocast(self._value)
 
+        res = _maybe_promote_to_dtensor(res)
         return maybe_use_symbolic_tensor(res)
 
 
@@ -230,6 +231,28 @@ class Variable(KerasVariable):
             return super().__eq__(other)
         except Exception:
             return False
+
+
+def _maybe_promote_to_dtensor(res):
+    from keras.src.backend.torch import distribution_lib
+
+    dist = distribution_lib.distribution()
+    from keras.src.distribution.distribution_lib import ModelParallel
+
+    if isinstance(dist, ModelParallel):
+        from torch.distributed.tensor import DTensor
+        from torch.distributed.tensor import Replicate
+
+        if (
+            isinstance(res, torch.Tensor)
+            and not isinstance(res, DTensor)
+            and not res.is_meta
+            and res.device.type == "cuda"
+        ):
+            torch_mesh = dist.device_mesh.backend_mesh
+            placements = [Replicate()] * torch_mesh.ndim
+            return DTensor.from_local(res, torch_mesh, placements)
+    return res
 
 
 def convert_to_tensor(x, dtype=None, sparse=None, ragged=None):
@@ -287,7 +310,7 @@ def convert_to_tensor(x, dtype=None, sparse=None, ragged=None):
         dtype = to_torch_dtype(dtype)
         res = torch.as_tensor(x, dtype=dtype, device=get_device())
 
-    return res
+    return _maybe_promote_to_dtensor(res)
 
 
 def convert_to_numpy(x):
@@ -343,7 +366,7 @@ def cast(x, dtype):
             res = x.to(dtype)
     else:
         res = convert_to_tensor(x, dtype)
-    return res
+    return _maybe_promote_to_dtensor(res)
 
 
 # Shape / dtype inference util

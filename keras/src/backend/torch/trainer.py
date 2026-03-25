@@ -226,13 +226,9 @@ class TorchTrainer(base_trainer.Trainer):
         return data
 
     def _symbolic_build(self, iterator=None, data_batch=None):
-        if data_batch is None and iterator is not None:
-            for _, _, data in iterator:
-                data_batch = data[0]
-                break
-            iterator.reset()
-        data_batch = self._distribute_data(data_batch)
-        return super()._symbolic_build(data_batch=data_batch)
+        return super()._symbolic_build(
+            iterator=iterator, data_batch=data_batch
+        )
 
     def make_train_function(self, force=False):
         if self.train_function is not None and not force:
