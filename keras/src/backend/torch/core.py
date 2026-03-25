@@ -212,7 +212,6 @@ class Variable(KerasVariable):
         else:
             res = self._maybe_autocast(self._value)
 
-        res = _maybe_promote_to_dtensor(res)
         return maybe_use_symbolic_tensor(res)
 
 
@@ -334,7 +333,7 @@ def convert_to_tensor(x, dtype=None, sparse=None, ragged=None):
         dtype = to_torch_dtype(dtype)
         res = torch.as_tensor(x, dtype=dtype, device=get_device())
 
-    return _maybe_promote_to_dtensor(res)
+    return res
 
 
 def convert_to_numpy(x):
@@ -390,7 +389,7 @@ def cast(x, dtype):
             res = x.to(dtype)
     else:
         res = convert_to_tensor(x, dtype)
-    return _maybe_promote_to_dtensor(res)
+    return res
 
 
 # Shape / dtype inference util
