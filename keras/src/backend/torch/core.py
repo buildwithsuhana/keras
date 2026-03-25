@@ -248,6 +248,7 @@ def _maybe_promote_to_dtensor(res):
             and not isinstance(res, DTensor)
             and not res.is_meta
             and res.device.type == "cuda"
+            and res.ndim > 0
         ):
             torch_mesh = dist.device_mesh.backend_mesh
             placements = [Replicate()] * torch_mesh.ndim
