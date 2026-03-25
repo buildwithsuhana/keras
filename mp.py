@@ -22,8 +22,6 @@ def run_test(rank, world_size):
     import keras
     import keras_hub
     from keras.distribution import DeviceMesh, LayoutMap, ModelParallel, TensorLayout
-    from keras.src.backend.torch import distribution_lib as torch_dist_lib
-    from keras.src import tree
 
     # Set device
     torch.cuda.set_device(0)
@@ -48,7 +46,7 @@ def run_test(rank, world_size):
     layout_map[".*embeddings/embeddings"] = TensorLayout(axes=("model", None), device_mesh=mesh)
     
     # Create the ModelParallel distribution strategy
-    distribution = ModelParallel(layout_map=layout_map, batch_dim_name="model", auto_shard_dataset=False)
+    distribution = ModelParallel(layout_map=layout_map, batch_dim_name="model")
     
     with distribution.scope():
         # Load the OPT 125M model from Keras Hub
@@ -63,33 +61,9 @@ def run_test(rank, world_size):
             weighted_metrics=["accuracy"]
         )
         
-        # Build the model manually by calling it with sharded data
-        print(f"Rank {rank} building model...")
-        x_str = ["Keras Hub is great.", "Distributed training works with ModelParallel!"] * 2
-        preprocessor = model.preprocessor
-        processed_data = preprocessor(x_str[:2]) # Get a small batch
-        
-        if isinstance(processed_data, tuple):
-            inputs = processed_data[0]
-        else:
-            inputs = processed_data
-            
-        # Manually shard inputs
-        def shard_input(tensor):
-            if isinstance(tensor, torch.Tensor):
-                layout = distribution.get_data_layout(tensor.shape)
-                return torch_dist_lib.distribute_data_input(tensor, layout, distribution.batch_dim_name)
-            return tensor
-            
-        sharded_inputs = tree.map_structure(shard_input, inputs)
-        
-        # Forward pass to build
-        with torch_dist_lib.sharding_scope():
-            model(sharded_inputs)
-        print(f"Rank {rank} model built successfully.")
-        
         # Execute fit
         print(f"Rank {rank} starting fit...")
+        x_str = ["Keras Hub is great.", "Distributed training works with ModelParallel!"] * 2
         model.fit(x_str, x_str, epochs=1, batch_size=2)
         
         if rank == 0:

@@ -239,9 +239,7 @@ def _maybe_promote_to_dtensor(res):
     distribution = global_state.get_global_attribute("distribution")
     from keras.src.distribution.distribution_lib import ModelParallel
 
-    if isinstance(
-        distribution, ModelParallel
-    ) and global_state.get_global_attribute("enable_torch_sharding", False):
+    if isinstance(distribution, ModelParallel):
         from torch.distributed.tensor import DTensor
         from torch.distributed.tensor import Replicate
 
