@@ -3,8 +3,6 @@ import os
 
 import torch
 
-from keras.src.backend.common import global_state
-
 
 def list_devices(device_type=None):
     """Return all the available devices based on the device type."""

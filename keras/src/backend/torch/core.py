@@ -232,52 +232,6 @@ class Variable(KerasVariable):
             return False
 
 
-def _maybe_promote_to_dtensor(res):
-    from keras.src.backend.common import global_state
-
-    distribution = global_state.get_global_attribute("distribution")
-    from keras.src.distribution.distribution_lib import ModelParallel
-
-    if isinstance(distribution, ModelParallel):
-        from torch.distributed.tensor import DTensor
-        from torch.distributed.tensor import Replicate
-
-        if (
-            isinstance(res, torch.Tensor)
-            and not isinstance(res, DTensor)
-            and not res.is_meta
-        ):
-            keras_mesh = distribution.device_mesh
-            torch_mesh = keras_mesh.backend_mesh
-            placements = [Replicate()] * torch_mesh.ndim
-            res = DTensor.from_local(res, torch_mesh, placements)
-    return res
-
-
-def _apply_replicated(fn, x, *args, **kwargs):
-    from torch.distributed.tensor import DTensor
-    from torch.distributed.tensor import Replicate
-
-    if isinstance(x, DTensor):
-        torch_mesh = x.device_mesh
-        placements = [Replicate()] * torch_mesh.ndim
-        x_replicated = x.redistribute(torch_mesh, placements).to_local()
-        res = fn(x_replicated, *args, **kwargs)
-        if isinstance(res, torch.Tensor):
-            return DTensor.from_local(res, torch_mesh, placements)
-        if isinstance(res, (tuple, list)):
-            return type(res)(
-                [
-                    DTensor.from_local(r, torch_mesh, placements)
-                    if isinstance(r, torch.Tensor)
-                    else r
-                    for r in res
-                ]
-            )
-        return res
-    return fn(x, *args, **kwargs)
-
-
 def convert_to_tensor(x, dtype=None, sparse=None, ragged=None):
     if sparse:
         raise ValueError("`sparse=True` is not supported with torch backend")
