@@ -46,7 +46,7 @@ def run_test(rank, world_size):
     layout_map[".*embeddings/embeddings"] = TensorLayout(axes=("model", None), device_mesh=mesh)
     
     # Create the ModelParallel distribution strategy
-    distribution = ModelParallel(layout_map=layout_map, batch_dim_name="model")
+    distribution = ModelParallel(layout_map=layout_map, batch_dim_name="model", auto_shard_dataset=False)
     
     with distribution.scope():
         # Load the OPT 125M model from Keras Hub
