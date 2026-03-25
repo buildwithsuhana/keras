@@ -5,8 +5,10 @@ import torch.multiprocessing as mp
 # DO NOT import keras or torch at top level to avoid premature CUDA initialization
 
 def run_test(rank, world_size):
+    import torch
     # Set environment variables for this process - MUST BE FIRST
-    os.environ["CUDA_VISIBLE_DEVICES"] = str(rank)
+    if torch.cuda.is_available():
+        os.environ["CUDA_VISIBLE_DEVICES"] = str(rank)
     os.environ["KERAS_BACKEND"] = "torch"
     os.environ["MASTER_ADDR"] = "127.0.0.1"
     os.environ["MASTER_PORT"] = "29513"
@@ -18,13 +20,13 @@ def run_test(rank, world_size):
     os.environ["TF_FORCE_GPU_ALLOW_GROWTH"] = "true"
     
     # Now safe to import
-    import torch
     import keras
     import keras_hub
     from keras.distribution import DeviceMesh, LayoutMap, ModelParallel, TensorLayout
 
     # Set device
-    torch.cuda.set_device(0)
+    if torch.cuda.is_available():
+        torch.cuda.set_device(0)
     
     # Initialize Keras distribution system
     print(f"Rank {rank} initializing distribution...")
@@ -32,12 +34,13 @@ def run_test(rank, world_size):
     print(f"Rank {rank} distribution initialized.")
     
     # Get available devices
-    devices = keras.distribution.list_devices("gpu")
+    device_type = "gpu" if torch.cuda.is_available() else "cpu"
+    devices = keras.distribution.list_devices(device_type)
     print(f"Rank {rank}/{world_size} starting with local devices: {devices}")
     
     # Create a 1D device mesh for ModelParallel
     # For DTensor, we need the global view of devices
-    global_devices = [f"gpu:{i}" for i in range(world_size)]
+    global_devices = [f"{device_type}:{i}" for i in range(world_size)]
     mesh = DeviceMesh(shape=(world_size,), axis_names=("model",), devices=global_devices)
     
     # Define layout map
@@ -48,13 +51,13 @@ def run_test(rank, world_size):
     # Create the ModelParallel distribution strategy
     distribution = ModelParallel(layout_map=layout_map, batch_dim_name="model", auto_shard_dataset=False)
     
+    # Load the OPT 125M model from Keras Hub (outside scope to avoid DTensor issues during build)
+    print(f"Rank {rank} loading model...")
+    model = keras_hub.models.OPTCausalLM.from_preset("opt_125m_en", load_weights=False)
+    print(f"Rank {rank} model loaded.")
+    
     with distribution.scope():
-        # Load the OPT 125M model from Keras Hub
-        print(f"Rank {rank} loading model...")
-        model = keras_hub.models.OPTCausalLM.from_preset("opt_125m_en", load_weights=False)
-        print(f"Rank {rank} model loaded.")
-        
-        # Compile the model
+        # Recompile the model to apply distribution layouts
         model.compile(
             optimizer="adam",
             loss="sparse_categorical_crossentropy",
