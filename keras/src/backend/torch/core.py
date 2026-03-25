@@ -212,6 +212,7 @@ class Variable(KerasVariable):
         else:
             res = self._maybe_autocast(self._value)
 
+        res = _maybe_promote_to_dtensor(res)
         return maybe_use_symbolic_tensor(res)
 
 
@@ -230,6 +231,30 @@ class Variable(KerasVariable):
             return super().__eq__(other)
         except Exception:
             return False
+
+
+def _maybe_promote_to_dtensor(res):
+    from keras.src.backend.common import global_state
+
+    distribution = global_state.get_global_attribute("distribution")
+    from keras.src.distribution.distribution_lib import ModelParallel
+
+    if isinstance(
+        distribution, ModelParallel
+    ) and global_state.get_global_attribute("enable_torch_sharding", False):
+        from torch.distributed.tensor import DTensor
+        from torch.distributed.tensor import Replicate
+
+        if (
+            isinstance(res, torch.Tensor)
+            and not isinstance(res, DTensor)
+            and not res.is_meta
+        ):
+            keras_mesh = distribution.device_mesh
+            torch_mesh = keras_mesh.backend_mesh
+            placements = [Replicate()] * torch_mesh.ndim
+            res = DTensor.from_local(res, torch_mesh, placements)
+    return res
 
 
 def _apply_replicated(fn, x, *args, **kwargs):
@@ -311,7 +336,7 @@ def convert_to_tensor(x, dtype=None, sparse=None, ragged=None):
         dtype = to_torch_dtype(dtype)
         res = torch.as_tensor(x, dtype=dtype, device=get_device())
 
-    return res
+    return _maybe_promote_to_dtensor(res)
 
 
 def convert_to_numpy(x):
@@ -367,7 +392,7 @@ def cast(x, dtype):
             res = x.to(dtype)
     else:
         res = convert_to_tensor(x, dtype)
-    return res
+    return _maybe_promote_to_dtensor(res)
 
 
 # Shape / dtype inference util

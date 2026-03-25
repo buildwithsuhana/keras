@@ -205,6 +205,21 @@ def no_sync(model):
         yield
 
 
+@contextlib.contextmanager
+def sharding_scope():
+    """Context manager to enable automatic sharding in convert_to_tensor."""
+    previous_value = global_state.get_global_attribute(
+        "enable_torch_sharding", False
+    )
+    global_state.set_global_attribute("enable_torch_sharding", True)
+    try:
+        yield
+    finally:
+        global_state.set_global_attribute(
+            "enable_torch_sharding", previous_value
+        )
+
+
 def all_reduce(tensor, op="sum"):
     """Perform all-reduce on the tensor."""
     if not torch.distributed.is_initialized():
