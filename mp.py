@@ -7,13 +7,12 @@ import torch.multiprocessing as mp
 def run_test(rank, world_size):
     import torch
     # Set environment variables for this process - MUST BE FIRST
-    if torch.cuda.is_available():
-        os.environ["CUDA_VISIBLE_DEVICES"] = str(rank)
+    # Removed CUDA_VISIBLE_DEVICES masking for proper global device visibility
     os.environ["KERAS_BACKEND"] = "torch"
     os.environ["MASTER_ADDR"] = "127.0.0.1"
     os.environ["MASTER_PORT"] = "29513"
     os.environ["RANK"] = str(rank)
-    os.environ["LOCAL_RANK"] = "0"
+    os.environ["LOCAL_RANK"] = str(rank)
     os.environ["WORLD_SIZE"] = str(world_size)
     os.environ["NCCL_P2P_DISABLE"] = "1"
     os.environ["TF_CPP_MIN_LOG_LEVEL"] = "3"
@@ -24,9 +23,7 @@ def run_test(rank, world_size):
     import keras_hub
     from keras.distribution import DeviceMesh, LayoutMap, ModelParallel, TensorLayout
 
-    # Set device
-    if torch.cuda.is_available():
-        torch.cuda.set_device(0)
+    # Device set in distribution_lib.initialize() via LOCAL_RANK
     
     # Initialize Keras distribution system
     print(f"Rank {rank} initializing distribution...")

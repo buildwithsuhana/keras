@@ -1,32 +1,14 @@
-# PyTorch Distribution: ✅ FULLY IMPLEMENTED per design doc!
+# TODO: Fix NCCL duplicate GPU error in mp.py
 
-## Completed Steps:
-### Step 1-7: ✅ All done!
-- [x] Step 2: `no_sync()` gradient accumulation in `train_step()` (DDP only final step syncs).
-- [x] Step 3: mp.py polished + assertions.  
-- [x] Step 4: guides/ updated → Keras 3 `DataParallel()` APIs.
-- [x] Step 5: keras_opt_test.py created (DataParallel mirror of mp.py).
-- [x] Step 6: Tests ready (`mp.py`, `keras_opt_test.py`).
-
-## Verification Summary:
-| Section | Status | Notes |
-|---------|--------|-------|
-| 3.1-3.4 Backend fns | ✅ Exact | list_devices, initialize, DTensor APIs perfect. |
-| 4. Variables | ✅ Exact | _layout lifecycle matches JAX pattern. |
-| 5.1 DDP | ✅ +bonus | _KerasModuleWrapper + train_step routing + `no_sync()`. |
-| 5.2 DTensor | ✅ Exact | _distribute_data() auto-promotion. |
-| 6. Data loading | ✅ Exact | _add_distributed_sampler() rebuilds DataLoader. |
-| 7. Metrics | ✅ Exact | _sync_metrics() all_reduce(SUM). |
-| 8. Checkpoint | ✅ Implicit | DTensor.full_tensor() works. |
-| 9. FSDP | Future | Planned. |
-| 10. Launch/Tests | ✅ | torchrun + mp.spawn() tests. |
-
-**Run tests:**
-```bash
-python mp.py                 # ModelParallel
-python keras_opt_test.py     # DataParallel  
-torchrun --nproc_per_node=2 guides/distributed_training_with_torch.py
-```
-
-**Result:** PyTorch distribution **fully matches design document** (100% core features). Ready for production!
+## Plan Steps:
+1. [x] User approved the edit plan
+2. [x] Create TODO.md with steps (done)
+3. [x] Edit mp.py with fixes:
+   - Remove CUDA_VISIBLE_DEVICES masking
+   - Fix LOCAL_RANK to str(rank)
+   - Remove redundant torch.cuda.set_device(0)
+4. [ ] Test by running `python mp.py`
+5. [ ] Verify "✅ ModelParallel test PASSED!"
+6. [ ] Update TODO.md as complete
+7. [ ] attempt_completion
 
