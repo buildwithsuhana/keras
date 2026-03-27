@@ -131,10 +131,8 @@ class Variable(KerasVariable):
         if self._layout is not None and isinstance(distribution, ModelParallel):
             from keras.src.backend.torch import distribution_lib
 
-            value = convert_to_tensor(value, dtype=self._dtype)
-            value = distribution_lib.distribute_tensor(value, self._layout)
-            self._value = torch.nn.Parameter(
-                value, requires_grad=self.trainable
+            self._value = distribution_lib.distribute_variable(
+                value, self._layout
             )
         elif isinstance(value, torch.nn.Parameter):
             # Reuse same parameter

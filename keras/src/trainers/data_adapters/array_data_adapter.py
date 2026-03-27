@@ -21,12 +21,15 @@ class ArrayDataAdapter(DataAdapter):
         steps=None,
         shuffle=False,
         class_weight=None,
+        distribution=None,
     ):
         if not can_convert_arrays((x, y, sample_weight)):
             raise ValueError(
                 "Expected all elements of `x` to be array-like. "
                 f"Received invalid types: x={x}"
             )
+
+        self._distribution = distribution
 
         if sample_weight is not None:
             if class_weight is not None:
@@ -259,6 +262,7 @@ class ArrayDataAdapter(DataAdapter):
         import torch
 
         from keras.src.backend.torch.core import convert_to_tensor
+        from keras.src.distribution import distribution_lib
 
         class ArrayDataset(torch.utils.data.Dataset):
             def __init__(self, array):
@@ -289,7 +293,27 @@ class ArrayDataAdapter(DataAdapter):
             def __len__(self):
                 return len(self.sampler)
 
-        if self._shuffle == "batch":
+        use_distributed_sampler = (
+            self._distribution is not None
+            and isinstance(self._distribution, distribution_lib.DataParallel)
+            and self._distribution.auto_shard_dataset
+        )
+
+        if use_distributed_sampler:
+            from keras.src.backend.torch import (
+                distribution_lib as torch_dist_lib,
+            )
+
+            sampler = torch.utils.data.distributed.DistributedSampler(
+                range(self._num_samples),
+                num_replicas=torch_dist_lib.num_processes(),
+                rank=torch_dist_lib.process_id(),
+                shuffle=bool(self._shuffle),
+            )
+            batch_sampler = torch.utils.data.BatchSampler(
+                sampler, batch_size=self._batch_size, drop_last=False
+            )
+        elif self._shuffle == "batch":
             batch_sampler = RandomBatchSampler(
                 torch.utils.data.BatchSampler(
                     range(self._num_samples),

@@ -56,6 +56,7 @@ def get_data_adapter(
             shuffle=shuffle,
             batch_size=batch_size,
             steps=steps_per_epoch,
+            distribution=distribution,
         )
     elif is_tf_dataset(x):
         # Unsupported args: y, sample_weight, shuffle
@@ -82,7 +83,12 @@ def get_data_adapter(
             raise_unsupported_arg(
                 "sample_weights", "the sample weights", "PyDataset"
             )
-        return PyDatasetAdapter(x, class_weight=class_weight, shuffle=shuffle)
+        return PyDatasetAdapter(
+            x,
+            class_weight=class_weight,
+            shuffle=shuffle,
+            distribution=distribution,
+        )
         # TODO: should we warn or not?
         # if x.num_batches is None and shuffle:
         #     warnings.warn(
@@ -107,8 +113,10 @@ def get_data_adapter(
                 "#supporting-sampleweight-amp-classweight for more details. "
                 f"Received: class_weight={class_weight}"
             )
-        if distribution is not None and isinstance(
-            distribution, distribution_lib.DataParallel
+        if (
+            distribution is not None
+            and isinstance(distribution, distribution_lib.DataParallel)
+            and distribution.auto_shard_dataset
         ):
             x = _add_distributed_sampler(x, distribution)
         return TorchDataLoaderAdapter(x)

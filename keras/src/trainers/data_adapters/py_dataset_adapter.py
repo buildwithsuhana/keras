@@ -203,6 +203,7 @@ class PyDatasetAdapter(DataAdapter):
         x,
         class_weight=None,
         shuffle=False,
+        distribution=None,
     ):
         self.py_dataset = x
         self.class_weight = class_weight
@@ -210,6 +211,7 @@ class PyDatasetAdapter(DataAdapter):
         self.shuffle = shuffle
         self._output_signature = None
         self._within_epoch = False
+        self._distribution = distribution
 
         workers = self.py_dataset.workers
         use_multiprocessing = self.py_dataset.use_multiprocessing
@@ -221,6 +223,31 @@ class PyDatasetAdapter(DataAdapter):
                 max_queue_size=self.py_dataset.max_queue_size,
                 shuffle=self.shuffle,
             )
+
+    def _get_indices(self):
+        num_batches = self.py_dataset.num_batches
+        if num_batches is not None:
+            indices = range(num_batches)
+            if self.shuffle:
+                indices = list(indices)
+                random.shuffle(indices)
+
+            from keras.src.distribution import distribution_lib
+
+            if (
+                self._distribution is not None
+                and isinstance(self._distribution, distribution_lib.DataParallel)
+                and self._distribution.auto_shard_dataset
+            ):
+                num_processes = self._distribution._num_process
+                process_id = self._distribution._process_id
+                indices = [
+                    indices[i]
+                    for i in range(len(indices))
+                    if i % num_processes == process_id
+                ]
+            return indices
+        return None
 
     def _standardize_batch(self, batch):
         if isinstance(batch, dict):
@@ -255,11 +282,7 @@ class PyDatasetAdapter(DataAdapter):
             yield self._standardize_batch(self.py_dataset[i])
 
     def _finite_generator(self):
-        indices = range(self.py_dataset.num_batches)
-        if self.shuffle:
-            indices = list(indices)
-            random.shuffle(indices)
-
+        indices = self._get_indices()
         for i in indices:
             yield self._standardize_batch(self.py_dataset[i])
 
@@ -271,6 +294,9 @@ class PyDatasetAdapter(DataAdapter):
     def _finite_enqueuer_generator(self):
         self.enqueuer.start()
         num_batches = self.py_dataset.num_batches
+        # If the enqueuer is not aware of sharding, we must filter here.
+        # However, it is more efficient to shard the indices passed to the
+        # enqueuer.
         for i, batch in enumerate(self.enqueuer.get()):
             yield self._standardize_batch(batch)
             if i >= num_batches - 1:
@@ -284,6 +310,14 @@ class PyDatasetAdapter(DataAdapter):
             else:
                 return self._finite_generator()
         else:
+            # Re-configure enqueuer indices if needed
+            if (
+                self._distribution is not None
+                and self.py_dataset.num_batches is not None
+            ):
+                indices = self._get_indices()
+                self.enqueuer.indices = iter(indices)
+
             if self.py_dataset.num_batches is None:
                 return self._infinite_enqueuer_generator()
             else:
