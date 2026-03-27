@@ -3,6 +3,8 @@ import os
 
 import torch
 
+from keras.src.backend.common import global_state
+
 
 def list_devices(device_type=None):
     """Return all the available devices based on the device type."""
@@ -150,37 +152,20 @@ def distribute_variable(value, layout):
     return dtensor
 
 
-def distribute_data_input(tensor, layout, batch_dim_name=None):
-    """Distribute a local data tensor according to a TensorLayout."""
+def distribute_data_input(per_process_batch, layout, batch_dim_name=None):
+    """Distribute the input data with the corresponding layout."""
     if layout is None:
-        return tensor
+        return per_process_batch
 
     from torch.distributed.tensor import DTensor
-    from torch.distributed.tensor import Replicate
-    from torch.distributed.tensor import Shard
 
     from keras.src.distribution.distribution_lib import TensorLayout
 
     if isinstance(layout, TensorLayout):
-        mesh = layout.device_mesh.backend_mesh
-        placements = []
-        for mesh_dim_name in layout.device_mesh.axis_names:
-            shard_dim = None
-            for i, axis_name in enumerate(layout.axes):
-                if axis_name == mesh_dim_name:
-                    shard_dim = i
-                    break
-            if shard_dim is not None:
-                placements.append(Shard(shard_dim))
-            else:
-                placements.append(Replicate())
-
-        return DTensor.from_local(
-            tensor, device_mesh=mesh, placements=placements
-        )
+        layout = _to_backend_layout(layout)
 
     return DTensor.from_local(
-        tensor,
+        per_process_batch,
         device_mesh=layout.device_mesh,
         placements=layout.placements,
     )
@@ -194,13 +179,18 @@ def distribution():
 
 
 @contextlib.contextmanager
-def no_sync(model):
-    """Context manager to prevent gradient synchronization."""
-    if hasattr(model, "no_sync"):
-        with model.no_sync():
-            yield
-    else:
+def sharding_scope():
+    """Context manager to enable automatic sharding in convert_to_tensor."""
+    previous_value = global_state.get_global_attribute(
+        "enable_torch_sharding", False
+    )
+    global_state.set_global_attribute("enable_torch_sharding", True)
+    try:
         yield
+    finally:
+        global_state.set_global_attribute(
+            "enable_torch_sharding", previous_value
+        )
 
 
 def all_reduce(tensor, op="sum"):

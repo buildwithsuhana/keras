@@ -82,12 +82,7 @@ def get_data_adapter(
             raise_unsupported_arg(
                 "sample_weights", "the sample weights", "PyDataset"
             )
-        return PyDatasetAdapter(
-            x,
-            class_weight=class_weight,
-            shuffle=shuffle,
-            distribution=distribution,
-        )
+        return PyDatasetAdapter(x, class_weight=class_weight, shuffle=shuffle)
         # TODO: should we warn or not?
         # if x.num_batches is None and shuffle:
         #     warnings.warn(

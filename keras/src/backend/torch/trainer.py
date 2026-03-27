@@ -55,96 +55,51 @@ class TorchTrainer(base_trainer.Trainer):
         return self.jit_compile
 
     def train_step(self, data):
-        import contextlib
-
         x, y, sample_weight = data_adapter_utils.unpack_x_y_sample_weight(data)
 
         dist = distribution_lib.distribution()
-        use_ddp = dist is not None and isinstance(
-            dist, distribution_lib.DataParallel
-        )
-
-        if use_ddp:
-            gradient_accumulation_steps = getattr(
-                self.optimizer, "gradient_accumulation_steps", 1
-            ) or 1
-            
-            current_micro_batch = int(self.optimizer._iterations) % gradient_accumulation_steps
-            is_first_micro_batch = (current_micro_batch == 0)
-            is_last_micro_batch = (current_micro_batch == gradient_accumulation_steps - 1)
-
-            if not is_last_micro_batch:
-                ctx = torch_distribution_lib.no_sync(self._ddp_model)
+        # Compute predictions
+        if dist is not None and isinstance(dist, distribution_lib.DataParallel):
+            if self._call_has_training_arg:
+                y_pred = self._ddp_model(x, training=True)
             else:
-                ctx = contextlib.nullcontext()
+                y_pred = self._ddp_model(x)
         else:
-            is_first_micro_batch = True
-            is_last_micro_batch = True
-            ctx = contextlib.nullcontext()
-
-        with ctx:
-            if use_ddp:
-                if is_first_micro_batch:
-                    self.zero_grad()
+            if self._call_has_training_arg:
+                y_pred = self(x, training=True)
             else:
-                self.zero_grad()
+                y_pred = self(x)
 
-            # Compute predictions
-            if use_ddp:
-                if self._call_has_training_arg:
-                    y_pred = self._ddp_model(x, training=True)
-                else:
-                    y_pred = self._ddp_model(x)
-            else:
-                if self._call_has_training_arg:
-                    y_pred = self(x, training=True)
-                else:
-                    y_pred = self(x)
+        # Call torch.nn.Module.zero_grad() to clear the leftover gradients
+        # for the weights from the previous train step.
+        self.zero_grad()
 
-            loss = self._compute_loss(
-                x=x,
-                y=y,
-                y_pred=y_pred,
-                sample_weight=sample_weight,
-                training=True,
-            )
-            self._loss_tracker.update_state(
-                loss,
-                sample_weight=next(
-                    i for i in tree.flatten(x) if i is not None
-                ).shape[0],
-            )
-            if self.optimizer is not None:
-                loss = self.optimizer.scale_loss(loss)
+        loss = self._compute_loss(
+            x=x, y=y, y_pred=y_pred, sample_weight=sample_weight, training=True
+        )
+        self._loss_tracker.update_state(
+            loss,
+            sample_weight=next(
+                i for i in tree.flatten(x) if i is not None
+            ).shape[0],
+        )
+        if self.optimizer is not None:
+            loss = self.optimizer.scale_loss(loss)
 
-            # Compute gradients
-            if self.trainable_weights:
-                # Call torch.Tensor.backward() on the loss to compute gradients
-                # for the weights.
-                loss.backward()
+        # Compute gradients
+        if self.trainable_weights:
+            # Call torch.Tensor.backward() on the loss to compute gradients
+            # for the weights.
+            loss.backward()
 
-                if use_ddp:
-                    if is_last_micro_batch:
-                        trainable_weights = self.trainable_weights[:]
-                        gradients = [v.value.grad for v in trainable_weights]
-                        old_steps = self.optimizer.gradient_accumulation_steps
-                        self.optimizer.gradient_accumulation_steps = None
-                        try:
-                            with torch.no_grad():
-                                self.optimizer.apply(gradients, trainable_weights)
-                        finally:
-                            self.optimizer.gradient_accumulation_steps = old_steps
-                    else:
-                        self.optimizer._iterations.assign_add(1)
-                else:
-                    trainable_weights = self.trainable_weights[:]
-                    gradients = [v.value.grad for v in trainable_weights]
+            trainable_weights = self.trainable_weights[:]
+            gradients = [v.value.grad for v in trainable_weights]
 
-                    # Update weights
-                    with torch.no_grad():
-                        self.optimizer.apply(gradients, trainable_weights)
-            else:
-                warnings.warn("The model does not have any trainable weights.")
+            # Update weights
+            with torch.no_grad():
+                self.optimizer.apply(gradients, trainable_weights)
+        else:
+            warnings.warn("The model does not have any trainable weights.")
 
         return self.compute_metrics(x, y, y_pred, sample_weight=sample_weight)
 
@@ -200,10 +155,7 @@ class TorchTrainer(base_trainer.Trainer):
         if dist is not None:
             for metric in self.metrics:
                 for variable in metric.variables:
-                    synced_value = torch_distribution_lib.all_reduce(
-                        variable.value, op="sum"
-                    )
-                    variable.assign(synced_value)
+                    torch_distribution_lib.all_reduce(variable.value, op="sum")
 
     def _distribute_data(self, data):
         dist = distribution_lib.distribution()
@@ -226,9 +178,10 @@ class TorchTrainer(base_trainer.Trainer):
         return data
 
     def _symbolic_build(self, iterator=None, data_batch=None):
-        return super()._symbolic_build(
-            iterator=iterator, data_batch=data_batch
-        )
+        with torch_distribution_lib.sharding_scope():
+            return super()._symbolic_build(
+                iterator=iterator, data_batch=data_batch
+            )
 
     def make_train_function(self, force=False):
         if self.train_function is not None and not force:
@@ -255,7 +208,8 @@ class TorchTrainer(base_trainer.Trainer):
         def one_step_on_data(data):
             """Runs a single training step on a batch of data."""
             data = self._distribute_data(data[0])
-            return self.train_step(data)
+            with torch_distribution_lib.sharding_scope():
+                return self.train_step(data)
 
         if self._should_torch_compile():
             self.train_function = torch.compile(one_step_on_data)
@@ -276,7 +230,8 @@ class TorchTrainer(base_trainer.Trainer):
             """Runs a single test step on a batch of data."""
             data = self._distribute_data(data[0])
             with torch.no_grad():
-                return self.test_step(data)
+                with torch_distribution_lib.sharding_scope():
+                    return self.test_step(data)
 
         if self._should_torch_compile():
             self.test_function = torch.compile(one_step_on_data)
@@ -297,7 +252,8 @@ class TorchTrainer(base_trainer.Trainer):
             """Runs a predict test step on a batch of data."""
             data = self._distribute_data(data[0])
             with torch.no_grad():
-                return self.predict_step(data)
+                with torch_distribution_lib.sharding_scope():
+                    return self.predict_step(data)
 
         if self._should_torch_compile():
             self.predict_function = torch.compile(one_step_on_data)
