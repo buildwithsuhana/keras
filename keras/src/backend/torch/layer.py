@@ -37,8 +37,14 @@ class TorchLayer(torch.nn.Module):
             self, prefix, recurse, remove_duplicate
         )
 
+    def __call__(self, *args, **kwargs):
+        from keras.src.backend.torch import distribution_lib
+
+        with distribution_lib.sharding_scope():
+            return Operation.__call__(self, *args, **kwargs)
+
     def forward(self, *args, **kwargs):
-        return Operation.__call__(self, *args, **kwargs)
+        return self.__call__(*args, **kwargs)
 
     def _setattr_hook(self, name, value):
         from keras.src.layers import Layer
