@@ -1,3 +1,4 @@
+import contextlib
 import warnings
 
 import numpy as np
@@ -58,48 +59,68 @@ class TorchTrainer(base_trainer.Trainer):
         x, y, sample_weight = data_adapter_utils.unpack_x_y_sample_weight(data)
 
         dist = distribution_lib.distribution()
-        # Compute predictions
-        if dist is not None and isinstance(dist, distribution_lib.DataParallel):
-            if self._call_has_training_arg:
-                y_pred = self._ddp_model(x, training=True)
-            else:
-                y_pred = self._ddp_model(x)
-        else:
-            if self._call_has_training_arg:
-                y_pred = self(x, training=True)
-            else:
-                y_pred = self(x)
-
-        # Call torch.nn.Module.zero_grad() to clear the leftover gradients
-        # for the weights from the previous train step.
-        self.zero_grad()
-
-        loss = self._compute_loss(
-            x=x, y=y, y_pred=y_pred, sample_weight=sample_weight, training=True
+        use_ddp = dist is not None and isinstance(
+            dist, distribution_lib.DataParallel
         )
-        self._loss_tracker.update_state(
-            loss,
-            sample_weight=next(
-                i for i in tree.flatten(x) if i is not None
-            ).shape[0],
-        )
-        if self.optimizer is not None:
-            loss = self.optimizer.scale_loss(loss)
 
-        # Compute gradients
-        if self.trainable_weights:
-            # Call torch.Tensor.backward() on the loss to compute gradients
-            # for the weights.
-            loss.backward()
-
-            trainable_weights = self.trainable_weights[:]
-            gradients = [v.value.grad for v in trainable_weights]
-
-            # Update weights
-            with torch.no_grad():
-                self.optimizer.apply(gradients, trainable_weights)
+        # Handle gradient accumulation with DDP no_sync()
+        if use_ddp and self.gradient_accumulation_steps > 1:
+            if not self._should_apply_optimizer:
+                context = self._ddp_model.no_sync()
+            else:
+                context = contextlib.nullcontext()
         else:
-            warnings.warn("The model does not have any trainable weights.")
+            context = contextlib.nullcontext()
+
+        with context:
+            # Compute predictions
+            if use_ddp:
+                if self._call_has_training_arg:
+                    y_pred = self._ddp_model(x, training=True)
+                else:
+                    y_pred = self._ddp_model(x)
+            else:
+                if self._call_has_training_arg:
+                    y_pred = self(x, training=True)
+                else:
+                    y_pred = self(x)
+
+            # Call torch.nn.Module.zero_grad() if we're at the start of
+            # an accumulation cycle.
+            if self._should_apply_optimizer or self.gradient_accumulation_steps == 1:
+                self.zero_grad()
+
+            loss = self._compute_loss(
+                x=x,
+                y=y,
+                y_pred=y_pred,
+                sample_weight=sample_weight,
+                training=True,
+            )
+            self._loss_tracker.update_state(
+                loss,
+                sample_weight=next(
+                    i for i in tree.flatten(x) if i is not None
+                ).shape[0],
+            )
+            if self.optimizer is not None:
+                loss = self.optimizer.scale_loss(loss)
+
+            # Compute gradients
+            if self.trainable_weights:
+                # Call torch.Tensor.backward() on the loss to compute gradients
+                # for the weights.
+                loss.backward()
+
+                if self._should_apply_optimizer:
+                    trainable_weights = self.trainable_weights[:]
+                    gradients = [v.value.grad for v in trainable_weights]
+
+                    # Update weights
+                    with torch.no_grad():
+                        self.optimizer.apply(gradients, trainable_weights)
+            else:
+                warnings.warn("The model does not have any trainable weights.")
 
         return self.compute_metrics(x, y, y_pred, sample_weight=sample_weight)
 
