@@ -6,16 +6,12 @@ import torch.multiprocessing as mp
 
 def run_test(rank, world_size):
     # Set environment variables for this process - MUST BE FIRST
-    os.environ["CUDA_VISIBLE_DEVICES"] = str(rank)
     os.environ["KERAS_BACKEND"] = "torch"
-    os.environ["MASTER_ADDR"] = "127.0.0.1"
-    os.environ["MASTER_PORT"] = "29513"
     os.environ["RANK"] = str(rank)
-    os.environ["LOCAL_RANK"] = "0"
+    os.environ["LOCAL_RANK"] = str(rank)
     os.environ["WORLD_SIZE"] = str(world_size)
     os.environ["NCCL_P2P_DISABLE"] = "1"
     os.environ["TF_CPP_MIN_LOG_LEVEL"] = "3"
-    os.environ["TF_FORCE_GPU_ALLOW_GROWTH"] = "true"
     
     # Now safe to import
     import torch
@@ -101,19 +97,29 @@ def run_test(rank, world_size):
 if __name__ == "__main__":
     # Pre-download using a clean subprocess to avoid parent process touching GPU
     import subprocess
-    print("Pre-downloading preset...")
-    subprocess.run([sys.executable, "-c", "import os; os.environ['CUDA_VISIBLE_DEVICES']=''; os.environ['KERAS_BACKEND']='torch'; import keras_hub; keras_hub.models.OPTCausalLM.from_preset('opt_125m_en', load_weights=False)"])
-    
-    # Determine world size
-    import torch
-    if torch.cuda.is_available():
-        world_size = torch.cuda.device_count()
-    else:
+    print("Pre-downloading preset and checking GPU count...")
+    # Get world size without initializing CUDA in parent
+    world_size_cmd = "import torch; print(torch.cuda.device_count() if torch.cuda.is_available() else 2)"
+    try:
+        result = subprocess.run(
+            [sys.executable, "-c", f"import os; os.environ['CUDA_VISIBLE_DEVICES']=''; {world_size_cmd}"],
+            capture_output=True, text=True, check=True
+        )
+        world_size = int(result.stdout.strip())
+    except Exception:
         world_size = 2
-        
+
+    # Pre-download preset
+    subprocess.run([sys.executable, "-c", "import os; os.environ['CUDA_VISIBLE_DEVICES']=''; os.environ['KERAS_BACKEND']='torch'; import keras_hub; keras_hub.models.OPTCausalLM.from_preset('opt_125m_en', load_weights=False)"])
+
+    print(f"Starting distributed test with world_size={world_size}...")
+
     # Use 'spawn' to ensure a clean slate for each process
     mp.set_start_method('spawn', force=True)
     try:
+        # Set Master address and port in parent so children inherit or can see them
+        os.environ["MASTER_ADDR"] = "localhost"
+        os.environ["MASTER_PORT"] = "29515"
         mp.spawn(run_test, args=(world_size,), nprocs=world_size, join=True)
     except Exception as e:
         print(f"Test failed with error: {e}")
