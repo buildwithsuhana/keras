@@ -72,12 +72,15 @@ def run_test(rank, world_size):
         if rank == 0:
             print("Successfully finished model.fit on OPT-125M with ModelParallel!")
 
-    # Cleanup
+# Cleanup
     if torch.distributed.is_initialized():
         torch.distributed.destroy_process_group()
+    
+    # Verify distribution cleanup
+    assert keras.distribution.distribution() is None, f"Rank {rank}: Distribution not cleaned up!"
 
 if __name__ == "__main__":
-    # Pre-download using a clean subprocess to avoid parent process touching GPU
+    # Pre-download using a clean subprocess
     import subprocess
     print("Pre-downloading preset...")
     subprocess.run([sys.executable, "-c", "import os; os.environ['CUDA_VISIBLE_DEVICES']=''; os.environ['KERAS_BACKEND']='torch'; import keras_hub; keras_hub.models.OPTCausalLM.from_preset('opt_125m_en', load_weights=False)"])
@@ -85,13 +88,15 @@ if __name__ == "__main__":
     # Determine world size
     import torch
     if torch.cuda.is_available():
-        world_size = torch.cuda.device_count()
+        world_size = min(torch.cuda.device_count(), 2)  # Limit for test
     else:
         world_size = 2
         
-    # Use 'spawn' to ensure a clean slate for each process
+    # Use 'spawn' for clean slate
     mp.set_start_method('spawn', force=True)
     try:
         mp.spawn(run_test, args=(world_size,), nprocs=world_size, join=True)
+        print("✅ ModelParallel test PASSED!")
     except Exception as e:
-        print(f"Test failed with error: {e}")
+        print(f"❌ ModelParallel test FAILED: {e}")
+

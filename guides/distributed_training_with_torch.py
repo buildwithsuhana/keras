@@ -224,10 +224,19 @@ def prepare_dataloader(dataset, current_gpu_index, num_gpus, batch_size):
     return dataloader
 
 
-def per_device_launch_fn(current_gpu_index, num_gpu):
-    # Setup the process groups
-    setup_device(current_gpu_index, num_gpu)
+# Keras 3 approach using distribution APIs (replaces manual DDP)
+print("\n🆕 KERAS 3 APPROACH (Recommended):")
+print("Use `keras.distribution.DataParallel()` + `model.fit()`")
 
+def keras3_data_parallel_example():
+    """Modern Keras 3 DataParallel training - automatic DDP + DistributedSampler."""
+    # Initialize distribution (torchrun handles env vars)
+    keras.distribution.initialize()
+    
+    # Auto-detect GPUs → 1D DeviceMesh
+    devices = keras.distribution.list_devices("gpu")
+    distribution = keras.distribution.DataParallel(devices=devices)
+    
     dataset = get_dataset()
     model = get_model()
 

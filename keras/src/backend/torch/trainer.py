@@ -1,3 +1,4 @@
+import contextlib
 import warnings
 
 import numpy as np
@@ -55,6 +56,7 @@ class TorchTrainer(base_trainer.Trainer):
         return self.jit_compile
 
     def train_step(self, data):
+        """Override to support gradient accumulation with DDP `no_sync()`."""
         x, y, sample_weight = data_adapter_utils.unpack_x_y_sample_weight(data)
 
         dist = distribution_lib.distribution()
@@ -86,18 +88,37 @@ class TorchTrainer(base_trainer.Trainer):
         if self.optimizer is not None:
             loss = self.optimizer.scale_loss(loss)
 
-        # Compute gradients
+        # Compute gradients (with DDP no_sync() if accumulation_steps provided)
         if self.trainable_weights:
-            # Call torch.Tensor.backward() on the loss to compute gradients
-            # for the weights.
-            loss.backward()
+            ddp_ctx = None
+            if (
+                dist is not None
+                and isinstance(dist, distribution_lib.DataParallel)
+                and self._ddp_model is not None
+                and hasattr(self.optimizer, "accumulation_steps")
+                and self.optimizer.accumulation_steps > 1
+            ):
+                # no_sync() for all but final microbatch (accumulation mod == 0)
+                if self.optimizer._current_step % self.optimizer.accumulation_steps != 0:
+                    ddp_ctx = self._ddp_model.no_sync()
+                else:
+                    ddp_ctx = contextlib.nullcontext()
+            
+            with ddp_ctx or contextlib.nullcontext():
+                # Call torch.Tensor.backward() on the loss to compute gradients
+                # for the weights.
+                loss.backward()
 
             trainable_weights = self.trainable_weights[:]
             gradients = [v.value.grad for v in trainable_weights]
 
-            # Update weights
-            with torch.no_grad():
-                self.optimizer.apply(gradients, trainable_weights)
+            # Update weights (only on final accumulation step)
+            if (
+                not hasattr(self.optimizer, "accumulation_steps")
+                or self.optimizer._current_step % self.optimizer.accumulation_steps == 0
+            ):
+                with torch.no_grad():
+                    self.optimizer.apply(gradients, trainable_weights)
         else:
             warnings.warn("The model does not have any trainable weights.")
 
