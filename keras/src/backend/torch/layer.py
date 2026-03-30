@@ -21,9 +21,20 @@ class TorchLayer(torch.nn.Module):
     def _track_variables(self):
         # set torch_params attribute will have module automatically track
         # parameters.
-        self._torch_params = torch.nn.ParameterDict(
-            {variable.path: variable.value for variable in self.variables}
-        )
+        params = {}
+        for variable in self.variables:
+            value = variable.value
+            if not isinstance(value, torch.nn.Parameter):
+                requires_grad = getattr(variable, "trainable", False)
+                if (
+                    requires_grad
+                    and not torch.is_floating_point(value)
+                    and not torch.is_complex(value)
+                ):
+                    requires_grad = False
+                value = torch.nn.Parameter(value, requires_grad=requires_grad)
+            params[variable.path] = value
+        self._torch_params = torch.nn.ParameterDict(params)
 
     def named_parameters(
         self,
@@ -63,7 +74,19 @@ class TorchLayer(torch.nn.Module):
     def _post_track_variable(self, variable):
         if hasattr(self, "_torch_params"):
             if variable.path not in self.torch_params:
-                self.torch_params[variable.path] = variable.value
+                value = variable.value
+                if not isinstance(value, torch.nn.Parameter):
+                    requires_grad = getattr(variable, "trainable", False)
+                    if (
+                        requires_grad
+                        and not torch.is_floating_point(value)
+                        and not torch.is_complex(value)
+                    ):
+                        requires_grad = False
+                    value = torch.nn.Parameter(
+                        value, requires_grad=requires_grad
+                    )
+                self.torch_params[variable.path] = value
 
     def _post_untrack_variable(self, variable):
         if hasattr(self, "_torch_params"):
