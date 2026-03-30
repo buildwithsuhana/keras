@@ -138,9 +138,17 @@ class Variable(KerasVariable):
             # Reuse same parameter
             self._value = value
         else:
+            tensor = convert_to_tensor(value, dtype=self._dtype)
+            requires_grad = self.trainable
+            if (
+                requires_grad
+                and not torch.is_floating_point(tensor)
+                and not torch.is_complex(tensor)
+            ):
+                requires_grad = False
             self._value = torch.nn.Parameter(
-                convert_to_tensor(value, dtype=self._dtype),
-                requires_grad=self.trainable,
+                tensor,
+                requires_grad=requires_grad,
             ).to(get_device())
 
     def _initialize_with_initializer(self, initializer):
@@ -182,13 +190,23 @@ class Variable(KerasVariable):
         def maybe_use_symbolic_tensor(value):
             # Create and use a symbolic tensor stub in symbolic calls.
             if str(get_device()) == "meta" and str(value.device) != "meta":
+                dtype = to_torch_dtype(self._dtype)
+                requires_grad = self.trainable
+                if (
+                    requires_grad
+                    and not torch.is_floating_point(
+                        torch.empty(0, dtype=dtype)
+                    )
+                    and not torch.is_complex(torch.empty(0, dtype=dtype))
+                ):
+                    requires_grad = False
                 return torch.nn.Parameter(
                     torch.empty(
                         size=self._shape,
-                        dtype=to_torch_dtype(self._dtype),
+                        dtype=dtype,
                         device="meta",
                     ),
-                    requires_grad=self.trainable,
+                    requires_grad=requires_grad,
                 )
             return value
 

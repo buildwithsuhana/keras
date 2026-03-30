@@ -163,7 +163,10 @@ def distribute_variable(value, layout):
     """Distribute the variable based on the layout."""
     dtensor = distribute_tensor(value, layout)
     if isinstance(value, torch.nn.Parameter):
-        return torch.nn.Parameter(dtensor, requires_grad=value.requires_grad)
+        requires_grad = value.requires_grad
+        if requires_grad and not torch.is_floating_point(dtensor) and not torch.is_complex(dtensor):
+            requires_grad = False
+        return torch.nn.Parameter(dtensor, requires_grad=requires_grad)
     return dtensor
 
 
