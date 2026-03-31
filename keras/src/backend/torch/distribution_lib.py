@@ -1,4 +1,5 @@
 import contextlib
+import datetime
 import os
 
 import torch
@@ -56,8 +57,12 @@ def initialize(job_addresses=None, num_processes=None, process_id=None):
         backend = "gloo"
 
     if not torch.distributed.is_initialized():
+        timeout = os.environ.get("TORCH_DIST_TIMEOUT", "1800")
         torch.distributed.init_process_group(
-            backend=backend, rank=rank, world_size=world_size
+            backend=backend,
+            rank=rank,
+            world_size=world_size,
+            timeout=datetime.timedelta(seconds=int(timeout)),
         )
 
 
@@ -87,11 +92,14 @@ def _to_backend_mesh(keras_mesh):
     """Converts Keras DeviceMesh to PyTorch DeviceMesh."""
     from torch.distributed.device_mesh import init_device_mesh
 
-    return init_device_mesh(
+    mesh = init_device_mesh(
         "cuda" if torch.cuda.is_available() else "cpu",
         mesh_shape=tuple(keras_mesh.shape),
         mesh_dim_names=tuple(keras_mesh.axis_names),
     )
+    if torch.distributed.is_initialized():
+        torch.distributed.barrier()
+    return mesh
 
 
 def _to_backend_layout(tensor_layout):
@@ -176,6 +184,9 @@ def distribute_data_input(per_process_batch, layout, batch_dim_name=None):
         return per_process_batch
 
     from torch.distributed.tensor import DTensor
+
+    if isinstance(per_process_batch, DTensor):
+        return per_process_batch
 
     from keras.src.distribution.distribution_lib import TensorLayout
 

@@ -23,11 +23,15 @@ def run_test(rank, world_size):
 
     # Set device
     local_rank = int(os.environ.get("LOCAL_RANK", rank))
-    torch.cuda.set_device(local_rank)
+    if torch.cuda.is_available():
+        torch.cuda.set_device(local_rank)
     
     # Initialize Keras distribution system
     print(f"Rank {rank} initializing distribution (local_rank: {local_rank})...")
     keras.distribution.initialize()
+    if torch.distributed.is_initialized():
+        print(f"Rank {rank} process group initialized. Backend: {torch.distributed.get_backend()}")
+        torch.distributed.barrier()
     print(f"Rank {rank} distribution initialized.")
     
     # Get available devices
@@ -47,18 +51,27 @@ def run_test(rank, world_size):
     # Create the ModelParallel distribution strategy
     distribution = ModelParallel(layout_map=layout_map, batch_dim_name="model", auto_shard_dataset=False)
     
+    print(f"Rank {rank} entering distribution scope...")
     with distribution.scope():
         # Load the OPT 125M model from Keras Hub
+        if torch.distributed.is_initialized():
+            torch.distributed.barrier()
         print(f"Rank {rank} loading model...")
         model = keras_hub.models.OPTCausalLM.from_preset("opt_125m_en", load_weights=False)
+        if torch.distributed.is_initialized():
+            torch.distributed.barrier()
         print(f"Rank {rank} model loaded.")
         
         # Compile the model
+        print(f"Rank {rank} compiling model...")
         model.compile(
             optimizer="adam",
             loss="sparse_categorical_crossentropy",
             weighted_metrics=["accuracy"]
         )
+        if torch.distributed.is_initialized():
+            torch.distributed.barrier()
+        print(f"Rank {rank} model compiled.")
         
         # Build the model manually by calling it with sharded data
         print(f"Rank {rank} building model...")
