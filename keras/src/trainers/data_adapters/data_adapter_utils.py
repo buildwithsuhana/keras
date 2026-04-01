@@ -279,6 +279,30 @@ def get_numpy_iterator(iterable):
         yield tree.map_structure(convert_to_numpy, batch, none_is_leaf=False)
 
 
+def _add_distributed_sampler(dataloader, distribution):
+    import torch
+    import torch.utils.data as torch_data
+
+    sampler = torch_data.distributed.DistributedSampler(
+        dataloader.dataset,
+        num_replicas=distribution._num_process,
+        rank=distribution._process_id,
+        shuffle=True,
+    )
+    return torch_data.DataLoader(
+        dataloader.dataset,
+        sampler=sampler,
+        batch_size=dataloader.batch_size,
+        num_workers=dataloader.num_workers,
+        collate_fn=dataloader.collate_fn,
+        pin_memory=dataloader.pin_memory,
+        drop_last=dataloader.drop_last,
+        timeout=dataloader.timeout,
+        worker_init_fn=dataloader.worker_init_fn,
+        persistent_workers=dataloader.persistent_workers,
+    )
+
+
 def get_torch_dataloader(iterable):
     import torch.utils.data as torch_data
 

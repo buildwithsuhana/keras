@@ -18,6 +18,7 @@ from keras.src.backend.common.stateless_scope import StatelessScope
 from keras.src.backend.common.stateless_scope import get_stateless_scope
 from keras.src.backend.common.stateless_scope import in_stateless_scope
 from keras.src.backend.common.symbolic_scope import SymbolicScope
+from keras.src.backend.torch import distribution_lib
 from keras.src.backend.config import floatx
 
 SUPPORTS_SPARSE_TENSORS = False
@@ -102,8 +103,32 @@ def to_torch_dtype(dtype):
 
 
 class Variable(KerasVariable):
+    def __init__(self, *args, layout=None, **kwargs):
+        self._layout = layout
+        super().__init__(*args, **kwargs)
+
+    def _initialize_layout(self):
+        distribution = global_state.get_global_attribute("distribution")
+        if self._layout is None and distribution is not None:
+            from keras.src.distribution.distribution_lib import ModelParallel
+
+            if isinstance(distribution, ModelParallel):
+                tensor_layout = distribution.get_variable_layout(self)
+                from keras.src.distribution import TensorLayout
+
+                if isinstance(tensor_layout, TensorLayout):
+                    self._layout = tensor_layout.backend_layout
+                else:
+                    self._layout = tensor_layout
+
     def _initialize(self, value):
-        if isinstance(value, torch.nn.Parameter):
+        self._shape = self._validate_shape(value.shape)
+        self._initialize_layout()
+        if self._layout is not None:
+            self._value = distribution_lib.distribute_variable(
+                value, self._layout
+            )
+        elif isinstance(value, torch.nn.Parameter):
             # Reuse same parameter
             self._value = value
         else:
@@ -114,7 +139,11 @@ class Variable(KerasVariable):
 
     def _direct_assign(self, value):
         with torch.no_grad():
-            self.value.copy_(value)
+            if self._layout is not None:
+                value = distribution_lib.distribute_tensor(value, self._layout)
+                self.value.copy_(value)
+            else:
+                self.value.copy_(value)
 
     def _convert_to_tensor(self, value, dtype=None):
         return convert_to_tensor(value, dtype=dtype)

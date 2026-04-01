@@ -107,6 +107,11 @@ def get_data_adapter(
                 "#supporting-sampleweight-amp-classweight for more details. "
                 f"Received: class_weight={class_weight}"
             )
+        if distribution is not None and isinstance(
+            distribution, distribution_lib.DataParallel
+        ):
+            from keras.src.trainers.data_adapters import data_adapter_utils
+            x = data_adapter_utils._add_distributed_sampler(x, distribution)
         return TorchDataLoaderAdapter(x)
         # TODO: should we warn or not?
         # warnings.warn(
@@ -125,27 +130,13 @@ def get_data_adapter(
                 "the sample weights",
                 "grain.Dataset and grain.DataLoader",
             )
-        if class_weight is not None:
-            raise ValueError(
-                "Argument `class_weight` is not supported for grain.Dataset "
-                f"and grain.DataLoader inputs. You can modify your "
-                "`__getitem__ ` method to return input tensor, label and "
-                "class_weight. "
-                f"Received: class_weight={class_weight}"
-            )
-        return GrainDatasetAdapter(x)
-        # TODO: should we warn or not?
-        # warnings.warn(
-        #     "`shuffle=True` was passed, but will be ignored since the "
-        #     "data `x` was provided as a grain dataset. The grain dataset "
-        #     "is expected to already be shuffled."
-        # )
-    elif isinstance(x, types.GeneratorType):
+        return GrainDatasetAdapter(x, class_weight=class_weight)
+    elif isinstance(x, types.GeneratorType) or hasattr(x, "__next__"):
         if y is not None:
-            raise_unsupported_arg("y", "the targets", "PyDataset")
+            raise_unsupported_arg("y", "the targets", "Python generator")
         if sample_weight is not None:
             raise_unsupported_arg(
-                "sample_weights", "the sample weights", "PyDataset"
+                "sample_weights", "the sample weights", "Python generator"
             )
         if class_weight is not None:
             raise ValueError(
