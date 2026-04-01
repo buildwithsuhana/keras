@@ -30,19 +30,38 @@ def get_device_count(device_type=None):
 
 def initialize(job_addresses=None, num_processes=None, process_id=None):
     """Initialize the distribution system."""
-    local_rank = int(os.environ.get("LOCAL_RANK", 0))
-    rank = int(os.environ.get("RANK", 0))
-    world_size = int(os.environ.get("WORLD_SIZE", 1))
-
-    if torch.cuda.is_available():
-        torch.cuda.set_device(local_rank)
-        backend = "nccl"
-    else:
-        backend = "gloo"
+    if num_processes is not None:
+        os.environ["WORLD_SIZE"] = str(num_processes)
+    if process_id is not None:
+        os.environ["RANK"] = str(process_id)
 
     if not torch.distributed.is_initialized():
+        init_method = None
+        if job_addresses:
+            master_addr = job_addresses.split(",")[0]
+            if ":" not in master_addr:
+                master_addr = f"{master_addr}:12355"
+            init_method = f"tcp://{master_addr}"
+        elif (
+            "MASTER_ADDR" not in os.environ or "MASTER_PORT" not in os.environ
+        ):
+            init_method = "tcp://localhost:12355"
+
+        rank = int(os.environ.get("RANK", 0))
+        world_size = int(os.environ.get("WORLD_SIZE", 1))
+        local_rank = int(os.environ.get("LOCAL_RANK", 0))
+
+        if torch.cuda.is_available():
+            torch.cuda.set_device(local_rank)
+            backend = "nccl"
+        else:
+            backend = "gloo"
+
         torch.distributed.init_process_group(
-            backend=backend, rank=rank, world_size=world_size
+            backend=backend,
+            init_method=init_method,
+            rank=rank,
+            world_size=world_size,
         )
 
 
