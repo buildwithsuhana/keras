@@ -1,0 +1,77 @@
+import os
+
+# Set backend to torch
+os.environ["KERAS_BACKEND"] = "torch"
+
+import keras
+import keras_hub
+import numpy as np
+from keras import distribution
+
+# 1. Initialize the distribution system
+# This handles the torch.distributed initialization
+distribution.initialize()
+
+# 2. Setup the DeviceMesh
+# We'll use all available devices for a "model" parallel axis
+num_devices = distribution.get_device_count()
+devices = distribution.list_devices()
+device_mesh = distribution.DeviceMesh(
+    shape=(num_devices,),
+    axis_names=("model",),
+    devices=devices,
+)
+
+# 3. Define the LayoutMap for OPT-125m sharding
+# This defines how specific weights are sharded across the "model" axis
+layout_map = distribution.LayoutMap(device_mesh)
+
+# Shard Attention kernels
+# query, key, value are sharded on the output dimension (heads)
+layout_map[".*self_attention/query/kernel"] = (None, "model")
+layout_map[".*self_attention/key/kernel"] = (None, "model")
+layout_map[".*self_attention/value/kernel"] = (None, "model")
+# attention_output is sharded on the input dimension
+layout_map[".*self_attention/attention_output/kernel"] = ("model", None)
+
+# Shard Feed-forward kernels
+# intermediate dense is sharded on output
+layout_map[".*feedforward_intermediate_dense/kernel"] = (None, "model")
+# output dense is sharded on input
+layout_map[".*feedforward_output_dense/kernel"] = ("model", None)
+
+# 4. Create the ModelParallel distribution
+dist = distribution.ModelParallel(
+    layout_map=layout_map,
+    batch_dim_name="batch", # Batch is replicated if "batch" axis is not in mesh
+)
+
+# 5. Load the model within the distribution scope
+# Everything created inside this scope will follow the distribution strategy
+with dist.scope():
+    print(f"Process {distribution.process_id()} loading model...")
+    model = keras_hub.models.OPTCausalLM.from_preset("opt_125m_en", load_weights=True)
+
+    # 6. Prepare some test data
+    data = [
+        "Keras Hub and PyTorch make model parallelism easy.",
+        "This is a test of OPT-125m with ModelParallel distribution.",
+    ]
+
+    # 7. Compile and run fit
+    model.compile(
+        optimizer=keras.optimizers.Adam(1e-5),
+        loss=keras.losses.SparseCategoricalCrossentropy(from_logits=True),
+    )
+
+    print(f"Process {distribution.process_id()} starting training...")
+    # Use a small number of steps for a quick test
+    model.fit(x=data, y=data, batch_size=2, epochs=1)
+
+    # 8. Test generation
+    print(f"Process {distribution.process_id()} testing generation...")
+    generated = model.generate(data, max_length=20)
+
+if distribution.process_id() == 0:
+    print("\nSUCCESS: Model parallelism test completed!")
+    print(f"Generated text: {generated}")
