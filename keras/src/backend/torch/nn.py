@@ -1204,6 +1204,50 @@ def dot_product_attention(
     key = torch.transpose(key, axis0, axis1)
     value = torch.transpose(value, axis0, axis1)
 
+    from torch.distributed.tensor import DTensor
+    from torch.distributed.tensor import Replicate
+    from torch.distributed.tensor import Shard
+
+    if isinstance(query, DTensor):
+        # We need to handle DTensor carefully because SDPA might try to
+        # view/reshape the tensor in a way that merges sharded dimensions,
+        # which is not supported by DTensor sharding propagation rules.
+        # If the sharding is on Batch or Heads dimension, we can safely
+        # perform SDPA on local tensors.
+        safe_for_local = True
+        for placement in query.placements:
+            if isinstance(placement, Shard):
+                if placement.dim not in (0, 1):
+                    safe_for_local = False
+                    break
+        if safe_for_local:
+            device_mesh = query.device_mesh
+            placements = query.placements
+            query = query.to_local()
+            key = key.to_local()
+            value = value.to_local()
+            if isinstance(mask, DTensor):
+                mask = mask.to_local()
+        else:
+            # If sharded on T or H, we must redistribute to Replicated
+            # to ensure correctness of attention.
+            query = query.redistribute(
+                query.device_mesh, [Replicate()] * query.device_mesh.ndim
+            )
+            key = key.redistribute(
+                key.device_mesh, [Replicate()] * key.device_mesh.ndim
+            )
+            value = value.redistribute(
+                value.device_mesh, [Replicate()] * value.device_mesh.ndim
+            )
+            if isinstance(mask, DTensor):
+                mask = mask.redistribute(
+                    mask.device_mesh, [Replicate()] * mask.device_mesh.ndim
+                )
+            safe_for_local = False
+    else:
+        safe_for_local = False
+
     if flash_attention is None:
         flash_attention = _can_use_flash_attention(
             query, key, value, mask, is_causal
@@ -1236,6 +1280,11 @@ def dot_product_attention(
             attn_mask=mask,
             is_causal=is_causal,
             scale=scale,
+        )
+
+    if safe_for_local:
+        attention_output = DTensor.from_local(
+            attention_output, device_mesh, placements
         )
     return torch.transpose(attention_output, axis1, axis0)
 
