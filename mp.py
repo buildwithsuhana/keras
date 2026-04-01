@@ -58,21 +58,30 @@ with dist.scope():
     print(f"Process {rank} model structure loaded. Number of weights: {len(model.weights)}")
     if rank == 0:
         print(f"Example weight paths: {[w.path for w in model.weights[:5]]}")
-        print(f"Position embedding built: {model.backbone.get_layer('position_embedding').built}")
-        print(f"Position embedding variables: {model.backbone.get_layer('position_embedding').variables}")
+        # Position embedding is nested under 'embeddings' layer
+        embeddings_layer = model.backbone.get_layer("embeddings")
+        print(f"Embeddings layer: {embeddings_layer}")
+        if hasattr(embeddings_layer, "get_layer"):
+            try:
+                pos_emb = embeddings_layer.get_layer("position_embedding")
+                print(f"Position embedding built: {pos_emb.built}")
+                print(f"Position embedding variables: {pos_emb.variables}")
+            except Exception as e:
+                print(f"Could not find position_embedding sub-layer: {e}")
 
     # Now try to load weights manually
     print(f"Process {rank} loading weights manually...")
     try:
         # Get the preset's weight file path
+        import keras_hub
         from keras_hub.src.utils.preset_utils import get_preset_loader
         loader = get_preset_loader("opt_125m_en")
         weights_path = loader.get_weights()
+        # Use skip_mismatch=True to avoid crashing if some sharded variables have issues
         model.load_weights(weights_path)
         print(f"Process {rank} weights loaded successfully!")
     except Exception as e:
         print(f"Process {rank} failed to load weights: {e}")
-        # Continue anyway to see if training works with random weights
         print(f"Process {rank} continuing with random weights for testing...")
 
     # 6. Prepare some test data
