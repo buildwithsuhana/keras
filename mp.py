@@ -14,8 +14,8 @@ distribution.initialize()
 
 # 2. Setup the DeviceMesh
 # We'll use all available devices for a "model" parallel axis
-num_devices = distribution.get_device_count()
 devices = distribution.list_devices()
+num_devices = len(devices)
 device_mesh = distribution.DeviceMesh(
     shape=(num_devices,),
     axis_names=("model",),
@@ -49,7 +49,9 @@ dist = distribution.ModelParallel(
 # 5. Load the model within the distribution scope
 # Everything created inside this scope will follow the distribution strategy
 with dist.scope():
-    print(f"Process {distribution.process_id()} loading model...")
+    import torch
+    rank = torch.distributed.get_rank() if torch.distributed.is_initialized() else 0
+    print(f"Process {rank} loading model...")
     model = keras_hub.models.OPTCausalLM.from_preset("opt_125m_en", load_weights=True)
 
     # 6. Prepare some test data
@@ -64,14 +66,14 @@ with dist.scope():
         loss=keras.losses.SparseCategoricalCrossentropy(from_logits=True),
     )
 
-    print(f"Process {distribution.process_id()} starting training...")
+    print(f"Process {rank} starting training...")
     # Use a small number of steps for a quick test
     model.fit(x=data, y=data, batch_size=2, epochs=1)
 
     # 8. Test generation
-    print(f"Process {distribution.process_id()} testing generation...")
+    print(f"Process {rank} testing generation...")
     generated = model.generate(data, max_length=20)
 
-if distribution.process_id() == 0:
+if (torch.distributed.get_rank() if torch.distributed.is_initialized() else 0) == 0:
     print("\nSUCCESS: Model parallelism test completed!")
     print(f"Generated text: {generated}")
