@@ -23,6 +23,8 @@ def worker(rank, world_size, port):
     os.environ["WORLD_SIZE"] = str(world_size)
     os.environ["LOCAL_RANK"] = str(rank)
 
+    import keras
+    keras.config.set_floatx("float32")
     from keras.src.backend.torch import distribution_lib as torch_dist_lib
     
     # 2. Initialize Distributed Backend
@@ -37,10 +39,9 @@ def worker(rank, world_size, port):
     )
 
     # 4. Define Layout Map for OPT
-    # Shard the vocabulary (embedding) and the feed-forward layers
+    # Shard the feed-forward layers and attention projections
     layout_map = LayoutMap(mesh)
-    # Note: Using regex to match Keras Hub parameter names
-    layout_map[".*token_embedding/embeddings"] = (None, "model")
+    # layout_map[".*token_embedding/embeddings"] = (None, "model")
     layout_map[".*query/kernel"] = (None, "model")
     layout_map[".*key/kernel"] = (None, "model")
     layout_map[".*value/kernel"] = (None, "model")
@@ -51,14 +52,20 @@ def worker(rank, world_size, port):
     # 5. Create ModelParallel Distribution
     distribution = ModelParallel(
         layout_map=layout_map, 
-        batch_dim_name="batch"
+        batch_dim_name="batch",
+        auto_shard_dataset=False
     )
 
     # 6. Load Model within Distribution Scope
     print(f"Process {rank}: Loading OPT-125M...")
     with distribution.scope():
         # Loading the backbone
-        model = keras_hub.models.OPTBackbone.from_preset("opt_125m")
+        model = keras_hub.models.OPTBackbone.from_preset("opt_125m_en")
+    
+    # Verify all weights
+    if rank == 0:
+        for v in model.weights:
+            print(f"Weight: {v.path}, sharded: {getattr(v, '_layout', None) is not None}")
     
     # 7. Verify Sharding
     from torch.distributed.tensor import DTensor
@@ -76,32 +83,76 @@ def worker(rank, world_size, port):
     else:
         print(f"Process {rank}: FAILURE - Query kernel is a regular tensor.")
 
-    # 8. Run Forward Pass
+    # Run Forward Pass
     print(f"Process {rank}: Running forward pass...")
     # Generate dummy input (batch_size=1, seq_len=8)
     # Use torch.long for token IDs
     input_ids = torch.randint(0, 1000, (1, 8)).to(torch.long)
     padding_mask = torch.ones((1, 8)).to(torch.long)
-    
+
     input_data = {
         "token_ids": input_ids,
         "padding_mask": padding_mask,
     }
-    
+
     # Distribute input data (batch parallel)
     input_data = {
         k: torch_dist_lib.distribute_data_input(
             v, distribution.get_data_layout(v.shape), distribution.batch_dim_name
         ) for k, v in input_data.items()
     }
-    
-    output = model(input_data)
-    # Backbone returns a dictionary or tensor depending on version/config
-    if isinstance(output, dict):
-        output = output["sequence_output"]
+
+    # Debug: Check embedding output manually
+    with distribution.scope():
+        # Input ids are already sharded by distribute_data_input
+        token_emb = model.embeddings.token_embedding(input_data["token_ids"])
+        print(f"Process {rank}: token_embedding output type: {type(token_emb)}")
         
-    print(f"Process {rank}: Output shape: {output.shape}")
-    print(f"Process {rank}: Output is DTensor: {isinstance(output, DTensor)}")
+        pos_emb = model.embeddings.position_embedding(token_emb)
+        print(f"Process {rank}: position_embedding output type: {type(pos_emb)}")
+        
+        # Combined embedding
+        combined = model.embeddings(input_data["token_ids"])
+        print(f"Process {rank}: model.embeddings() combined output type: {type(combined)}")
+        
+        # Check dropout or layer norm if they are present in embeddings
+        # model.embeddings is usually TokenAndPositionEmbedding
+        # It might have a layer_norm or dropout
+        if hasattr(model.embeddings, "layer_norm"):
+            ln_out = model.embeddings.layer_norm(combined)
+            print(f"Process {rank}: embeddings.layer_norm output type: {type(ln_out)}")
+        if hasattr(model.embeddings, "dropout"):
+            dr_out = model.embeddings.dropout(combined)
+            print(f"Process {rank}: embeddings.dropout output type: {type(dr_out)}")
+
+        print(f"Process {rank}: Testing model.fit()...")
+        model.compile(optimizer="adam", loss="sparse_categorical_crossentropy")
+        
+        # Dummy target data (batch_size=1, seq_len=8)
+        # Using a simple 1D array as labels, OPTBackbone might need specific shapes
+        # If it returns sequence_output (B, S, D), loss might fail without a head.
+        # But we can at least see if it executes.
+        # Actually, OPTBackbone output is (B, S, D). sparse_categorical_crossentropy 
+        # expects (B, S) targets for (B, S, V) outputs.
+        # Since we don't have a head, we'll just use a dummy loss or just run fit
+        # with a small number of steps.
+        
+        labels = torch.randint(0, 100, (1, 8))
+        
+        # We need to distribute labels as well
+        labels = torch_dist_lib.distribute_data_input(
+            labels, distribution.get_data_layout(labels.shape), distribution.batch_dim_name
+        )
+        
+        # backbone doesn't have a head, so we might need to add one or use a custom loss
+        # to avoid shape mismatch. 
+        # Let's just try to run it.
+        try:
+            model.fit(input_data, labels, epochs=1, steps_per_epoch=1)
+            print(f"Process {rank}: model.fit() SUCCESS")
+        except Exception as e:
+            print(f"Process {rank}: model.fit() FAILED with {e}")
+            raise e
 
     # Cleanup
     dist.destroy_process_group()

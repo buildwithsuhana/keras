@@ -203,11 +203,13 @@ class PyDatasetAdapter(DataAdapter):
         x,
         class_weight=None,
         shuffle=False,
+        distribution=None,
     ):
         self.py_dataset = x
         self.class_weight = class_weight
         self.enqueuer = None
         self.shuffle = shuffle
+        self.distribution = distribution
         self._output_signature = None
         self._within_epoch = False
 

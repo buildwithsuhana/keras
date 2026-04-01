@@ -115,7 +115,27 @@ class TorchTrainer(base_trainer.Trainer):
         if self.trainable_weights:
             # Call torch.Tensor.backward() on the loss to compute gradients
             # for the weights.
-            loss.backward()
+            import contextlib
+
+            dist = distribution_lib.distribution()
+            if (
+                dist is not None
+                and isinstance(dist, distribution_lib.DataParallel)
+                and hasattr(self, "_ddp_model")
+            ):
+                # If we are in a multi-step execution (gradient accumulation),
+                # we only want to sync gradients on the last step.
+                # Currently TorchTrainer only supports steps_per_execution=1,
+                # but we add this for completeness and future-proofing.
+                # If we had a 'is_last_step' flag, we would use it here.
+                # For now, DDP will sync on every backward call which is
+                # correct for steps_per_execution=1.
+                context = contextlib.nullcontext()
+            else:
+                context = contextlib.nullcontext()
+
+            with context:
+                loss.backward()
 
             trainable_weights = self.trainable_weights[:]
             gradients = [v.value.grad for v in trainable_weights]

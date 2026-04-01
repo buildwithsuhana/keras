@@ -495,7 +495,8 @@ class DataParallel(Distribution):
 
     def get_data_layout(self, data_shape):
         data_shard_spec = [None] * len(data_shape)
-        data_shard_spec[0] = self.batch_dim_name  # Shard on the first dim
+        if len(data_shard_spec) > 0:
+            data_shard_spec[0] = self.batch_dim_name  # Shard on the first dim
         return TensorLayout(data_shard_spec, self.device_mesh)
 
     def get_variable_layout(self, variable):
@@ -664,7 +665,8 @@ class ModelParallel(Distribution):
 
     def get_data_layout(self, data_shape):
         data_shard_spec = [None] * len(data_shape)
-        data_shard_spec[0] = self.batch_dim_name  # Shard on the first dim
+        if len(data_shard_spec) > 0:
+            data_shard_spec[0] = self.batch_dim_name  # Shard on the first dim
         return TensorLayout(data_shard_spec, self.device_mesh)
 
     def get_variable_layout(self, variable):

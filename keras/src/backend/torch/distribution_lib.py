@@ -10,11 +10,13 @@ try:
     from torch.distributed.tensor import DTensor
     from torch.distributed.tensor import Replicate
     from torch.distributed.tensor import Shard
+    from torch.distributed.tensor import Partial
 except ImportError:
     init_device_mesh = None
     DTensor = None
     Replicate = None
     Shard = None
+    Partial = None
 
 
 def list_devices(device_type=None):
@@ -102,6 +104,12 @@ def process_id():
     return 0
 
 
+def distribution():
+    """Retrieve the current distribution strategy."""
+    from keras.src.distribution import distribution_lib
+    return distribution_lib.distribution()
+
+
 def _to_backend_mesh(keras_mesh):
     """Convert Keras DeviceMesh to PyTorch DeviceMesh."""
     if init_device_mesh is None:
@@ -159,15 +167,21 @@ def distribute_tensor(tensor, layout):
         torch_mesh, placements = layout
 
     import torch.distributed.tensor as dist_tensor
+
+    if isinstance(tensor, DTensor):
+        if tensor.device_mesh == torch_mesh and tensor.placements == placements:
+            return tensor
+        return tensor.redistribute(device_mesh=torch_mesh, placements=placements)
+
     return dist_tensor.distribute_tensor(
         tensor, device_mesh=torch_mesh, placements=placements
     )
 
 
-def distribute_variable(value, layout):
+def distribute_variable(value, layout, requires_grad=True):
     """Distribute the variable based on the layout."""
     dtensor = distribute_tensor(value, layout)
-    return torch.nn.Parameter(dtensor, requires_grad=True)
+    return torch.nn.Parameter(dtensor, requires_grad=requires_grad)
 
 
 def distribute_data_input(per_process_batch, layout, batch_dim_name=None):
@@ -185,7 +199,20 @@ def distribute_data_input(per_process_batch, layout, batch_dim_name=None):
     if isinstance(layout, TensorLayout):
         torch_mesh, placements = _to_backend_layout(layout)
     else:
+        # Support (mesh, placements) tuple
         torch_mesh, placements = layout
+
+    if isinstance(per_process_batch, DTensor):
+        has_partial = any(isinstance(p, Partial) for p in per_process_batch.placements)
+        if (
+            per_process_batch.device_mesh == torch_mesh
+            and per_process_batch.placements == placements
+            and not has_partial
+        ):
+            return per_process_batch
+        return per_process_batch.redistribute(
+            device_mesh=torch_mesh, placements=placements
+        )
 
     if not isinstance(per_process_batch, torch.Tensor):
         from keras.src.backend.torch.core import convert_to_tensor
@@ -196,9 +223,17 @@ def distribute_data_input(per_process_batch, layout, batch_dim_name=None):
     if per_process_batch.device.type != device:
         per_process_batch = per_process_batch.to(device)
 
-    return DTensor.from_local(
+    # If the tensor is rank 0 or 1, we often want to replicate it 
+    # instead of sharding it, to avoid issues with operations that 
+    # don't support sharded small tensors.
+    if per_process_batch.ndim < 2:
+        from torch.distributed.tensor import Replicate
+        placements = tuple(Replicate() for _ in placements)
+
+    res = DTensor.from_local(
         per_process_batch, device_mesh=torch_mesh, placements=placements
     )
+    return res
 
 
 def all_reduce(tensor, op="sum"):

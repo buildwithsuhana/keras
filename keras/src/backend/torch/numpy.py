@@ -190,8 +190,9 @@ def mean(x, axis=None, keepdims=False):
     # Cast input to compute dtype before mean to avoid dtype kwarg
     # which causes issues with ONNX export (dtype kwarg not supported)
     x = cast(x, compute_dtype)
-    result = torch.mean(x, axis, keepdims)
-    return cast(result, result_dtype)
+    result = torch.mean(x, dim=axis, keepdim=keepdims)
+    return convert_to_tensor(cast(result, result_dtype))
+
 
 
 def max(x, axis=None, keepdims=False, initial=None):
@@ -325,9 +326,10 @@ def arange(start, stop=None, step=None, dtype=None):
         start, stop = 0, start
     if step is None:
         step = 1
-    return torch.arange(
+    res = torch.arange(
         start, stop, step=step, dtype=dtype, device=get_device()
     )
+    return convert_to_tensor(res)
 
 
 def arccos(x):

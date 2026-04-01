@@ -10,6 +10,7 @@ import torch
 from keras.src import tree
 from keras.src.backend.common import KerasVariable
 from keras.src.backend.common import global_state
+from keras.src.backend.common import is_float_dtype
 from keras.src.backend.common import standardize_dtype
 from keras.src.backend.common.backend_utils import slice_along_axis
 from keras.src.backend.common.dtypes import result_type
@@ -108,7 +109,7 @@ class Variable(KerasVariable):
         super().__init__(*args, **kwargs)
 
     def _initialize_layout(self):
-        distribution = global_state.get_global_attribute("distribution")
+        distribution = distribution_lib.distribution()
         if self._layout is None and distribution is not None:
             from keras.src.distribution.distribution_lib import ModelParallel
 
@@ -124,9 +125,10 @@ class Variable(KerasVariable):
     def _initialize(self, value):
         self._shape = self._validate_shape(value.shape)
         self._initialize_layout()
+        requires_grad = self.trainable and is_float_dtype(self._dtype)
         if self._layout is not None:
             self._value = distribution_lib.distribute_variable(
-                value, self._layout
+                value, self._layout, requires_grad=requires_grad
             )
         elif isinstance(value, torch.nn.Parameter):
             # Reuse same parameter
@@ -134,13 +136,15 @@ class Variable(KerasVariable):
         else:
             self._value = torch.nn.Parameter(
                 convert_to_tensor(value, dtype=self._dtype),
-                requires_grad=self.trainable,
+                requires_grad=requires_grad,
             ).to(get_device())
 
     def _direct_assign(self, value):
         with torch.no_grad():
             if self._layout is not None:
-                value = distribution_lib.distribute_tensor(value, self._layout)
+                from torch.distributed.tensor import DTensor
+                if not isinstance(value, DTensor):
+                    value = distribution_lib.distribute_tensor(value, self._layout)
                 self.value.copy_(value)
             else:
                 self.value.copy_(value)
@@ -151,14 +155,55 @@ class Variable(KerasVariable):
     # Overload native accessor.
     @classmethod
     def __torch_function__(cls, func, types, args=(), kwargs=None):
-        args = [arg.value if isinstance(arg, Variable) else arg for arg in args]
+        def _get_value(x):
+            if isinstance(x, Variable):
+                return x.value
+            return x
+
+        args = [_get_value(arg) for arg in args]
         if kwargs is None:
             kwargs = {}
-        kwargs = {
-            key: value.value if isinstance(value, Variable) else value
-            for key, value in kwargs.items()
-        }
-        return func(*args, **kwargs)
+        kwargs = {key: _get_value(value) for key, value in kwargs.items()}
+
+        # Promotion logic for DTensor
+        from torch.distributed.tensor import DTensor
+        all_args = tree.flatten(args) + tree.flatten(kwargs)
+        dtensors = [x for x in all_args if isinstance(x, DTensor)]
+        if dtensors:
+            mesh = dtensors[0].device_mesh
+            placements = dtensors[0].placements
+
+            def _maybe_promote(x):
+                if isinstance(x, torch.Tensor) and not isinstance(x, DTensor):
+                    from torch.distributed.tensor import Replicate
+                    replicated_placements = tuple(Replicate() for _ in placements)
+                    return DTensor.from_local(x, mesh, replicated_placements)
+                return x
+
+            args = tree.map_structure(_maybe_promote, args)
+            kwargs = tree.map_structure(_maybe_promote, kwargs)
+
+        res = func(*args, **kwargs)
+
+        # Promotion logic for DTensor result
+        if dtensors and isinstance(res, torch.Tensor) and not isinstance(res, DTensor):
+            # Pick the mesh and placements from the first DTensor
+            mesh = dtensors[0].device_mesh
+            placements = dtensors[0].placements
+            from torch.distributed.tensor import Replicate
+
+            # Check if it is a shape-like tensor (rank 0 or 1)
+            if res.ndim < 2:
+                res_placements = tuple(Replicate() for _ in placements)
+            else:
+                # Attempt to find compatible placements or default to Replicate
+                # For simplicity and robustness, we replicate newly created 
+                # tensors from operations that lost DTensor metadata.
+                res_placements = tuple(Replicate() for _ in placements)
+
+            return DTensor.from_local(res, mesh, res_placements)
+
+        return res
 
     def __array__(self, dtype=None):
         value = convert_to_numpy(self.value)
@@ -223,9 +268,29 @@ def convert_to_tensor(x, dtype=None, sparse=None, ragged=None):
         raise ValueError("`sparse=True` is not supported with torch backend")
     if ragged:
         raise ValueError("`ragged=True` is not supported with torch backend")
-    if isinstance(x, Variable) or is_tensor(x):
+    
+    from torch.distributed.tensor import DTensor
+    distribution = distribution_lib.distribution()
+    from keras.src.distribution.distribution_lib import ModelParallel
+
+    if isinstance(x, Variable) or is_tensor(x) or isinstance(x, DTensor):
         if isinstance(x, Variable):
             x = x.value
+        
+        # If it's already a DTensor, just return it (maybe with cast)
+        if isinstance(x, DTensor):
+            if dtype is not None:
+                x = x.to(to_torch_dtype(dtype))
+            
+            # Automatic promotion for ModelParallel (redistribute if Partial)
+            if distribution is not None and isinstance(distribution, ModelParallel):
+                from torch.distributed.tensor import Partial
+                if any(isinstance(p, Partial) for p in x.placements):
+                    return distribution_lib.distribute_data_input(
+                        x, distribution.get_data_layout(x.shape)
+                    )
+            return x
+
         device = get_device()
         if x.device != device:
             if x.is_meta:
@@ -234,27 +299,49 @@ def convert_to_tensor(x, dtype=None, sparse=None, ragged=None):
                 x = x.to(device)
         if dtype is not None:
             x = x.to(to_torch_dtype(dtype))
+        
+        # Automatic promotion for ModelParallel
+        if distribution is not None and isinstance(distribution, ModelParallel):
+            return distribution_lib.distribute_data_input(
+                x, distribution.get_data_layout(x.shape)
+            )
         return x
     if dtype is None:
         if isinstance(x, bool):
-            return torch.as_tensor(x, dtype=torch.bool, device=get_device())
+            res = torch.as_tensor(x, dtype=torch.bool, device=get_device())
         elif isinstance(x, int):
             if x < -(2**31) or x >= 2**31:
-                return torch.as_tensor(
+                res = torch.as_tensor(
                     x, dtype=torch.int64, device=get_device()
                 )
-            return torch.as_tensor(x, dtype=torch.int32, device=get_device())
+            else:
+                res = torch.as_tensor(x, dtype=torch.int32, device=get_device())
         elif isinstance(x, float):
-            return torch.as_tensor(
+            res = torch.as_tensor(
                 x, dtype=to_torch_dtype(floatx()), device=get_device()
             )
+        else:
+            res = None
+            
+        if res is not None:
+            if distribution is not None and isinstance(distribution, ModelParallel):
+                return distribution_lib.distribute_data_input(
+                    res, distribution.get_data_layout(res.shape)
+                )
+            return res
 
     # Convert to np in case of any array-like that is not list or tuple.
     if not isinstance(x, (list, tuple)):
         x = np.array(x)
-    elif len(x) > 0 and any(isinstance(x1, torch.Tensor) for x1 in x):
+    elif len(x) > 0 and any(isinstance(x1, (torch.Tensor, DTensor)) for x1 in x):
         # Handle list or tuple of torch tensors
-        return torch.stack([convert_to_tensor(x1) for x1 in x])
+        res = torch.stack([convert_to_tensor(x1) for x1 in x])
+        if distribution is not None and isinstance(distribution, ModelParallel):
+            return distribution_lib.distribute_data_input(
+                res, distribution.get_data_layout(res.shape)
+            )
+        return res
+        
     if isinstance(x, np.ndarray):
         if x.dtype == np.uint32:
             # Torch backend does not support uint32.
@@ -269,11 +356,25 @@ def convert_to_tensor(x, dtype=None, sparse=None, ragged=None):
             *[getattr(item, "dtype", type(item)) for item in tree.flatten(x)]
         )
     dtype = to_torch_dtype(dtype)
-    return torch.as_tensor(x, dtype=dtype, device=get_device())
+    res = torch.as_tensor(x, dtype=dtype, device=get_device())
+    if distribution is not None and isinstance(distribution, ModelParallel):
+        return distribution_lib.distribute_data_input(
+            res, distribution.get_data_layout(res.shape)
+        )
+    return res
 
 
 def convert_to_numpy(x):
+    from torch.distributed.tensor import DTensor, Replicate
+    
     def transform(x):
+        if isinstance(x, DTensor):
+            # If it's a DTensor, we want to convert it to a regular tensor.
+            # If it's Partial, we must redistribute it to Replicate first.
+            if any(p.is_partial() for p in x.placements):
+                x = x.redistribute(x.device_mesh, [Replicate()] * x.device_mesh.ndim)
+            x = x.to_local()
+
         if is_tensor(x):
             if x.requires_grad:
                 x = x.detach()
@@ -314,12 +415,27 @@ def cast(x, dtype):
     dtype = to_torch_dtype(dtype)
     if isinstance(x, Variable):
         x = x.value
-    if is_tensor(x):
+
+    from torch.distributed.tensor import DTensor
+    distribution = distribution_lib.distribution()
+    from keras.src.distribution.distribution_lib import ModelParallel
+
+    if is_tensor(x) or isinstance(x, DTensor):
         if x.dtype == dtype:
-            return x
+            res = x
         else:
-            return x.to(dtype)
-    return convert_to_tensor(x, dtype)
+            res = x.to(dtype)
+
+        if distribution is not None and isinstance(distribution, ModelParallel):
+            if isinstance(res, DTensor):
+                return res
+            return distribution_lib.distribute_data_input(
+                res, distribution.get_data_layout(res.shape)
+            )
+        return res
+
+    return convert_to_tensor(x, dtype=dtype)
+
 
 
 # Shape / dtype inference util
