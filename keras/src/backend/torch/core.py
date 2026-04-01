@@ -281,14 +281,6 @@ def convert_to_tensor(x, dtype=None, sparse=None, ragged=None):
         if isinstance(x, DTensor):
             if dtype is not None:
                 x = x.to(to_torch_dtype(dtype))
-            
-            # Automatic promotion for ModelParallel (redistribute if Partial)
-            if distribution is not None and isinstance(distribution, ModelParallel):
-                from torch.distributed.tensor import Partial
-                if any(isinstance(p, Partial) for p in x.placements):
-                    return distribution_lib.distribute_data_input(
-                        x, distribution.get_data_layout(x.shape)
-                    )
             return x
 
         device = get_device()
@@ -300,7 +292,6 @@ def convert_to_tensor(x, dtype=None, sparse=None, ragged=None):
         if dtype is not None:
             x = x.to(to_torch_dtype(dtype))
         
-        # Automatic promotion for ModelParallel
         if distribution is not None and isinstance(distribution, ModelParallel):
             return distribution_lib.distribute_data_input(
                 x, distribution.get_data_layout(x.shape)
@@ -365,16 +356,7 @@ def convert_to_tensor(x, dtype=None, sparse=None, ragged=None):
 
 
 def convert_to_numpy(x):
-    from torch.distributed.tensor import DTensor, Replicate
-    
     def transform(x):
-        if isinstance(x, DTensor):
-            # If it's a DTensor, we want to convert it to a regular tensor.
-            # If it's Partial, we must redistribute it to Replicate first.
-            if any(p.is_partial() for p in x.placements):
-                x = x.redistribute(x.device_mesh, [Replicate()] * x.device_mesh.ndim)
-            x = x.to_local()
-
         if is_tensor(x):
             if x.requires_grad:
                 x = x.detach()
@@ -769,10 +751,13 @@ def slice(inputs, start_indices, shape):
 
     python_slice = __builtins__["slice"]
     slices = [
-        python_slice(start_index, start_index + length)
-        for start_index, length in zip(start_indices, shape)
+        python_slice(int(start_index), int(start_index + length))
+        for start_index, length in zip(
+            convert_to_numpy(start_indices).tolist(),
+            convert_to_numpy(shape).tolist(),
+        )
     ]
-    return inputs[slices]
+    return inputs[tuple(slices)]
 
 
 def slice_update(inputs, start_indices, updates):
@@ -783,11 +768,14 @@ def slice_update(inputs, start_indices, updates):
 
     python_slice = __builtins__["slice"]
     slices = [
-        python_slice(start_index, start_index + update_length)
-        for start_index, update_length in zip(start_indices, updates.shape)
+        python_slice(int(start_index), int(start_index + update_length))
+        for start_index, update_length in zip(
+            convert_to_numpy(start_indices).tolist(),
+            updates.shape,
+        )
     ]
     outputs = torch.clone(inputs)
-    outputs[slices] = updates
+    outputs[tuple(slices)] = updates
     return outputs
 
 
