@@ -252,7 +252,7 @@ def _maybe_promote_to_dtensor(res):
             keras_mesh = distribution.device_mesh
             torch_mesh = keras_mesh.backend_mesh
             placements = [Replicate()] * torch_mesh.ndim
-            res = DTensor.from_local(res, torch_mesh, placements)
+            res = DTensor.from_local(res.contiguous(), torch_mesh, placements)
     return res
 
 

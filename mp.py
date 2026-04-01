@@ -74,9 +74,8 @@ with dist.scope():
     try:
         # Get the preset's weight file path
         import keras_hub
-        from keras_hub.src.utils.preset_utils import get_preset_loader
-        loader = get_preset_loader("opt_125m_en")
-        weights_path = loader.get_weights()
+        from keras_hub.src.utils.preset_utils import get_file
+        weights_path = get_file("opt_125m_en", "model.weights.h5")
         # Use skip_mismatch=True to avoid crashing if some sharded variables have issues
         model.load_weights(weights_path)
         print(f"Process {rank} weights loaded successfully!")
