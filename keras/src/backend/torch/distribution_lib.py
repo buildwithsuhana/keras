@@ -89,6 +89,23 @@ def initialize(job_addresses=None, num_processes=None, process_id=None):
 
     dist.init_process_group(backend=backend)
 
+    if DTensor is not None:
+        try:
+            from torch.distributed.tensor._sharding_prop import (
+                register_sharding_prop_rule,
+            )
+            from torch.distributed.tensor._dispatch import OutputSharding
+
+            def unbind_rule(op_schema):
+                return OutputSharding(
+                    output_spec=[op_schema.args_spec[0]]
+                    * op_schema.args[0].shape[0]
+                )
+
+            register_sharding_prop_rule(torch.ops.aten.unbind.int, unbind_rule)
+        except Exception:
+            pass
+
 
 def num_processes():
     """Return the number of processes for the current distribution setting."""

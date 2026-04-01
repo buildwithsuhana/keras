@@ -704,7 +704,7 @@ def scatter(indices, values, shape):
 
     for i in range(indices.shape[0]):
         index = indices[i]
-        zeros[tuple(index)] += values[i]
+        zeros[tuple(index.tolist())] += values[i]
     return zeros
 
 
@@ -713,7 +713,7 @@ def scatter_update(inputs, indices, updates, reduction=None):
     indices = convert_to_tensor(indices, dtype="int64")
     updates = convert_to_tensor(updates, dtype=inputs.dtype)
     indices = torch.transpose(indices, 0, 1)
-    idx = tuple(indices)
+    idx = tuple(indices.tolist())
 
     outputs = torch.clone(inputs)
     if reduction is None:
@@ -726,17 +726,17 @@ def scatter_update(inputs, indices, updates, reduction=None):
         # Associative, so sequential application handles duplicates.
         indices_t = indices.T
         for i in range(indices_t.shape[0]):
-            idx = tuple(indices_t[i])
+            idx = tuple(indices_t[i].tolist())
             outputs[idx] = torch.maximum(outputs[idx], updates[i])
     elif reduction == "min":
         indices_t = indices.T
         for i in range(indices_t.shape[0]):
-            idx = tuple(indices_t[i])
+            idx = tuple(indices_t[i].tolist())
             outputs[idx] = torch.minimum(outputs[idx], updates[i])
     elif reduction == "mul":
         indices_t = indices.T
         for i in range(indices_t.shape[0]):
-            idx = tuple(indices_t[i])
+            idx = tuple(indices_t[i].tolist())
             outputs[idx] = outputs[idx] * updates[i]
     else:
         raise ValueError(f"Unsupported reduction: {reduction}")
