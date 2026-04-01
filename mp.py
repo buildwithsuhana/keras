@@ -17,13 +17,13 @@ from keras.src.distribution import DeviceMesh, LayoutMap, ModelParallel
 
 def worker(rank, world_size, port):
     # 1. Setup Environment
-    os.environ["MASTER_ADDR"] = "localhost"
-    os.environ["MASTER_PORT"] = str(port)
-    os.environ["RANK"] = str(rank)
-    os.environ["WORLD_SIZE"] = str(world_size)
-    os.environ["LOCAL_RANK"] = str(rank)
+    if port is not None:
+        os.environ["MASTER_ADDR"] = "localhost"
+        os.environ["MASTER_PORT"] = str(port)
+        os.environ["RANK"] = str(rank)
+        os.environ["WORLD_SIZE"] = str(world_size)
+        os.environ["LOCAL_RANK"] = str(rank)
 
-    import keras
     keras.config.set_floatx("float32")
     from keras.src.backend.torch import distribution_lib as torch_dist_lib
     
@@ -158,7 +158,14 @@ def worker(rank, world_size, port):
     dist.destroy_process_group()
 
 if __name__ == "__main__":
-    world_size = 2
-    port = random.randint(20000, 30000)
-    print(f"Launching {world_size} processes on port {port}...")
-    mp.spawn(worker, args=(world_size, port), nprocs=world_size, join=True)
+    if "WORLD_SIZE" in os.environ:
+        # Already in a distributed environment (e.g. torchrun)
+        rank = int(os.environ.get("RANK", 0))
+        world_size = int(os.environ.get("WORLD_SIZE", 1))
+        worker(rank, world_size, None)
+    else:
+        # Local execution without torchrun
+        world_size = 2
+        port = random.randint(20000, 30000)
+        print(f"Launching {world_size} processes on port {port}...")
+        mp.spawn(worker, args=(world_size, port), nprocs=world_size, join=True)
