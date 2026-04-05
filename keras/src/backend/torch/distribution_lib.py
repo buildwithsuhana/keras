@@ -1,5 +1,3 @@
-"""Utilities for distribution strategy with Torch backend."""
-
 import os
 
 import torch
@@ -177,19 +175,25 @@ def distribute_data_input(tensor, layout, batch_dim_name):
     )
 
 
-def unbind(tensor, dim=0):
-    """Unbind a tensor, handling both torch.Tensor and DTensor."""
-    if isinstance(tensor, DTensor):
-        local_tensor = tensor.to_local()
+def _patch_dtensor_unbind():
+    """Patch `DTensor.unbind` to handle distributed unbinding."""
+
+    def unbind_via_local(self, dim=0):
+        """Unbind by converting to local, then redistributing as replicated."""
+        local_tensor = self.to_local()
         unbounded = local_tensor.unbind(dim)
         return [
             DTensor.from_local(
                 t,
-                device_mesh=tensor.device_mesh,
+                device_mesh=self.device_mesh,
                 placements=[
-                    Replicate() for _ in range(len(tensor.device_mesh.mesh.shape))
+                    Replicate() for _ in range(len(self.device_mesh.mesh.shape))
                 ],
             )
             for t in unbounded
         ]
-    return tensor.unbind(dim)
+
+    DTensor.unbind = unbind_via_local
+
+
+_patch_dtensor_unbind()
