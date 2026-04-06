@@ -46,10 +46,10 @@ def initialize(job_addresses=None, num_processes=None, process_id=None):
             os.environ["MASTER_ADDR"] = "localhost"
         if "MASTER_PORT" not in os.environ:
             os.environ["MASTER_PORT"] = "29500"
-
-        torch.distributed.init_process_group(
-            backend="nccl" if torch.cuda.is_available() else "gloo"
+        backend = os.environ.get("TORCH_DISTRIBUTED_BACKEND") or (
+            "nccl" if torch.cuda.is_available() else "gloo"
         )
+        torch.distributed.init_process_group(backend=backend)
 
 
 def num_processes():
