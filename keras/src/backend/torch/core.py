@@ -171,19 +171,15 @@ class Variable(KerasVariable):
         # reason why is unclear.
         def maybe_use_symbolic_tensor(value):
             # Create and use a symbolic tensor stub in symbolic calls.
-            if str(get_device()) == "meta":
-                from torch.distributed.tensor import DTensor
-
-                is_dtensor = isinstance(value, DTensor)
-                if is_dtensor or str(value.device) != "meta":
-                    return torch.nn.Parameter(
-                        torch.empty(
-                            size=self._shape,
-                            dtype=to_torch_dtype(self._dtype),
-                            device="meta",
-                        ),
-                        requires_grad=self.trainable,
-                    )
+            if str(get_device()) == "meta" and str(value.device) != "meta":
+                return torch.nn.Parameter(
+                    torch.empty(
+                        size=self._shape,
+                        dtype=to_torch_dtype(self._dtype),
+                        device="meta",
+                    ),
+                    requires_grad=self.trainable,
+                )
             return value
 
         if in_stateless_scope():
