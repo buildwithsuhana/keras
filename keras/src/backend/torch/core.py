@@ -760,6 +760,14 @@ def stop_gradient(variable):
 
 
 def unstack(x, num=None, axis=0):
+    from torch.distributed.tensor import DTensor
+
+    if isinstance(x, DTensor):
+        from keras.src.backend.torch import (
+            distribution_lib as torch_dist_lib,
+        )
+
+        return torch_dist_lib.unbind_dtensor(x, dim=axis)
     return x.unbind(axis)
 
 
