@@ -773,9 +773,7 @@ def stop_gradient(variable):
 
 
 def unstack(x, num=None, axis=0):
-    if num is None:
-        num = x.shape[axis]
-    return [x.select(axis, i) for i in range(num)]
+    return x.unbind(axis)
 
 
 def random_seed_dtype():
