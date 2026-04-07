@@ -18,8 +18,8 @@ from keras.src.backend.common.stateless_scope import StatelessScope
 from keras.src.backend.common.stateless_scope import get_stateless_scope
 from keras.src.backend.common.stateless_scope import in_stateless_scope
 from keras.src.backend.common.symbolic_scope import SymbolicScope
-from keras.src.backend.torch import distribution_lib as torch_dist_lib
 from keras.src.backend.config import floatx
+from keras.src.backend.torch import distribution_lib as torch_dist_lib
 
 SUPPORTS_SPARSE_TENSORS = False
 SUPPORTS_RAGGED_TENSORS = False
@@ -239,13 +239,9 @@ def convert_to_tensor(x, dtype=None, sparse=None, ragged=None):
             x = torch.as_tensor(x, dtype=torch.bool, device=get_device())
         elif isinstance(x, int):
             if x < -(2**31) or x >= 2**31:
-                x = torch.as_tensor(
-                    x, dtype=torch.int64, device=get_device()
-                )
+                x = torch.as_tensor(x, dtype=torch.int64, device=get_device())
             else:
-                x = torch.as_tensor(
-                    x, dtype=torch.int32, device=get_device()
-                )
+                x = torch.as_tensor(x, dtype=torch.int32, device=get_device())
         elif isinstance(x, float):
             x = torch.as_tensor(
                 x, dtype=to_torch_dtype(floatx()), device=get_device()

@@ -205,8 +205,8 @@ class PyDatasetAdapter(DataAdapter):
         shuffle=False,
         distribution=None,
     ):
-        from keras.src.distribution import distribution_lib
         from keras.src.backend import distribution_lib as backend_dist_lib
+        from keras.src.distribution import distribution_lib
 
         self.py_dataset = x
         self.class_weight = class_weight
