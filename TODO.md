@@ -1,0 +1,1 @@
+# Fix Torch ModelParallel unbind error for Embeddings\n\n1. ✅ Understand issue: DTensor unbind.int missing strategy in Embedding.build under ModelParallel scope.\n2. Read core.py for Variable impl.\n3. Edit distribution_lib.py: Auto-replicate embedding vars.\n4. Test: KERAS_BACKEND=torch python3 tests/distributed_torch_mp_test.py\n5. Multi-GPU test.\n6. attempt_completion\n

@@ -129,7 +129,6 @@ def distribute_tensor(tensor, layout):
 
     if isinstance(layout, TensorLayout):
         layout = _to_backend_layout(layout)
-
     if isinstance(layout, DTensorLayout):
         torch_mesh, placements = layout.device_mesh, layout.placements
     elif isinstance(layout, (list, tuple)):
@@ -212,3 +211,12 @@ def unbind_dtensor(dtensor, dim=0):
         )
         for t in unbounded
     ]
+
+
+# Patch DTensor.unbind: PyTorch's DTensor lacks a registered sharding strategy
+# for unbind, which breaks tensor iteration in embedding layers.
+def _dtensor_unbind_patched(self, dim=0):
+    return unbind_dtensor(self, dim=dim)
+
+
+DTensor.unbind = _dtensor_unbind_patched
