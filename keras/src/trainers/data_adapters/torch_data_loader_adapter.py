@@ -50,11 +50,17 @@ class TorchDataLoaderAdapter(DataAdapter):
 
             if num_replicas is not None and rank is not None:
                 # Reconstruct the DataLoader with a DistributedSampler
+                # Respect the original dataloader's shuffle setting if provided
+                shuffle = getattr(dataloader, 'shuffle', True)
+                if hasattr(dataloader, 'sampler') and dataloader.sampler is not None:
+                    # If a custom sampler was provided, default to shuffle=False
+                    shuffle = False
+                
                 sampler = torch.utils.data.distributed.DistributedSampler(
                     dataloader.dataset,
                     num_replicas=num_replicas,
                     rank=rank,
-                    shuffle=True,
+                    shuffle=shuffle,
                 )
                 dataloader = torch.utils.data.DataLoader(
                     dataloader.dataset,

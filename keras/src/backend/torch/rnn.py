@@ -3,6 +3,7 @@ import torch
 from keras.src import tree
 from keras.src.backend.torch.core import convert_to_tensor
 from keras.src.backend.torch.core import get_device
+from keras.src.backend.torch.core import unstack
 
 
 def rnn(
@@ -74,7 +75,7 @@ def rnn(
         # individually.  The result of this will be a tuple of lists, each of
         # the item in tuple is list of the tensor with shape (batch, feature)
         def _process_single_input_t(input_t):
-            input_t = torch.unbind(input_t)  # unstack for time_step dim
+            input_t = unstack(input_t)  # unstack for time_step dim
             if go_backwards:
                 input_t = input_t[::-1]
             return input_t
@@ -91,7 +92,7 @@ def rnn(
             return tree.pack_sequence_as(inputs, inp)
 
         if mask is not None:
-            mask_list = torch.unbind(mask)
+            mask_list = unstack(mask)
             if go_backwards:
                 mask_list = torch.flip(mask_list, dims=mask_list.shape)
 
@@ -170,9 +171,9 @@ def rnn(
 
         input_ta = tuple(
             (
-                list(torch.unbind(input_))
+                list(unstack(input_))
                 if not go_backwards
-                else list(torch.unbind(torch.flip(input_, [0])))
+                else list(unstack(torch.flip(input_, [0])))
             )
             for input_ in flattened_inputs
         )
@@ -209,7 +210,7 @@ def rnn(
             if go_backwards:
                 mask = torch.flip(mask, [0])
 
-            mask_ta = list(torch.unbind(mask))
+            mask_ta = list(unstack(mask))
 
             def masking_fn(time):
                 return mask_ta[time]
@@ -323,6 +324,7 @@ def rnn(
                 Args:
                     time: Current timestep value.
                     output_ta_t: TensorArray.
+                    prev_output: tuple of outputs from time - 1.
                     *states: List of states.
 
                 Returns:

@@ -274,21 +274,25 @@ def convert_to_tensor(x, dtype=None, sparse=None, ragged=None):
             dtype = to_torch_dtype(dtype)
             x = torch.as_tensor(x, dtype=dtype, device=get_device())
 
-    from keras.src.distribution import distribution_lib as dist_lib
-
-    dist = dist_lib.distribution()
-    if (
-        dist is not None
-        and isinstance(dist, dist_lib.ModelParallel)
-        and is_tensor(x)
-    ):
+    # Fast early-exit: only check distribution if we have a tensor
+    # and we're in a context that might use ModelParallel
+    if is_tensor(x):
+        from keras.src.distribution import distribution_lib as dist_lib
         from torch.distributed.tensor import DTensor
 
-        if not isinstance(x, DTensor):
+        # Avoid function call overhead when distribution is not active
+        dist = dist_lib.distribution()
+        if (
+            dist is not None
+            and isinstance(dist, dist_lib.ModelParallel)
+            and not isinstance(x, DTensor)
+        ):
+            # Distribute tensor replicated across all devices for ModelParallel
             from keras.src.distribution import TensorLayout
-
+            
             layout = TensorLayout([None] * x.ndim, dist.device_mesh)
             x = dist_lib.distribute_tensor(x, layout)
+    
     return x
 
 
@@ -752,6 +756,10 @@ def stop_gradient(variable):
 
 
 def unstack(x, num=None, axis=0):
+    from torch.distributed.tensor import DTensor
+
+    if isinstance(x, DTensor):
+        return torch_dist_lib.unbind_dtensor(x, dim=axis)
     return x.unbind(axis)
 
 

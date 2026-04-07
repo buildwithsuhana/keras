@@ -53,6 +53,19 @@ class TorchTrainer(base_trainer.Trainer):
 
         return self.jit_compile
 
+    def _setup_ddp(self):
+        from keras.src.distribution import distribution_lib as dist_lib
+
+        dist = dist_lib.distribution()
+        if dist is not None and isinstance(dist, dist_lib.DataParallel):
+            if not hasattr(self, "_ddp_model"):
+                self._ddp_model = torch.nn.parallel.DistributedDataParallel(
+                    _KerasModuleWrapper(self),
+                    device_ids=[torch.cuda.current_device()]
+                    if torch.cuda.is_available()
+                    else None,
+                )
+
     def _distribute_inputs(self, dist, data, replicate=False):
         from keras.src.backend.torch import distribution_lib as torch_dist_lib
         from keras.src.distribution import distribution_lib
@@ -185,6 +198,12 @@ class TorchTrainer(base_trainer.Trainer):
         return y_pred
 
     def _sync_metrics(self):
+        """Synchronize metric values across all distributed ranks.
+        
+        For DataParallel: syncs metric accumulators (e.g., loss total, count).
+        For ModelParallel: gathers full DTensor variables, syncs, then assignments
+        automatically redistribute according to their layouts.
+        """
         from keras.src.distribution import distribution_lib as dist_lib
 
         dist_obj = dist_lib.distribution()
@@ -194,13 +213,17 @@ class TorchTrainer(base_trainer.Trainer):
             for metric in self.metrics:
                 for variable in metric.variables:
                     val = variable.value
+                    
                     if isinstance(val, DTensor):
-                        local_val = val.to_local()
+                        # For DTensor variables: gather full tensor, sync, then assign
+                        # (assignment will automatically redistribute per the variable's layout)
+                        full_val = val.full_tensor()
                         torch.distributed.all_reduce(
-                            local_val, op=torch.distributed.ReduceOp.SUM
+                            full_val, op=torch.distributed.ReduceOp.SUM
                         )
-                        variable.assign(local_val)
+                        variable.assign(full_val)
                     else:
+                        # For regular tensors: in-place all_reduce and assign
                         torch.distributed.all_reduce(
                             val, op=torch.distributed.ReduceOp.SUM
                         )
@@ -216,21 +239,8 @@ class TorchTrainer(base_trainer.Trainer):
                 f"Received: steps_per_execution={self.steps_per_execution}"
             )
 
-        from keras.src.distribution import distribution_lib as dist_lib
-
-        dist = dist_lib.distribution()
-        if dist is not None and isinstance(dist, dist_lib.DataParallel):
-            if not hasattr(self, "_ddp_model"):
-                object.__setattr__(
-                    self,
-                    "_ddp_model",
-                    torch.nn.parallel.DistributedDataParallel(
-                        _KerasModuleWrapper(self),
-                        device_ids=[torch.cuda.current_device()]
-                        if torch.cuda.is_available()
-                        else None,
-                    ),
-                )
+        # Initialize DDP wrapper if needed
+        self._setup_ddp()
 
         def one_step_on_data(data):
             """Runs a single training step on a batch of data."""
@@ -252,21 +262,8 @@ class TorchTrainer(base_trainer.Trainer):
                 f"Received: steps_per_execution={self.steps_per_execution}"
             )
 
-        from keras.src.distribution import distribution_lib as dist_lib
-
-        dist = dist_lib.distribution()
-        if dist is not None and isinstance(dist, dist_lib.DataParallel):
-            if not hasattr(self, "_ddp_model"):
-                object.__setattr__(
-                    self,
-                    "_ddp_model",
-                    torch.nn.parallel.DistributedDataParallel(
-                        _KerasModuleWrapper(self),
-                        device_ids=[torch.cuda.current_device()]
-                        if torch.cuda.is_available()
-                        else None,
-                    ),
-                )
+        # Initialize DDP wrapper if needed
+        self._setup_ddp()
 
         def one_step_on_data(data):
             """Runs a single test step on a batch of data."""
@@ -289,21 +286,8 @@ class TorchTrainer(base_trainer.Trainer):
                 f"Received: steps_per_execution={self.steps_per_execution}"
             )
 
-        from keras.src.distribution import distribution_lib as dist_lib
-
-        dist = dist_lib.distribution()
-        if dist is not None and isinstance(dist, dist_lib.DataParallel):
-            if not hasattr(self, "_ddp_model"):
-                object.__setattr__(
-                    self,
-                    "_ddp_model",
-                    torch.nn.parallel.DistributedDataParallel(
-                        _KerasModuleWrapper(self),
-                        device_ids=[torch.cuda.current_device()]
-                        if torch.cuda.is_available()
-                        else None,
-                    ),
-                )
+        # Initialize DDP wrapper if needed
+        self._setup_ddp()
 
         def one_step_on_data(data):
             """Runs a predict test step on a batch of data."""
