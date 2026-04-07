@@ -104,7 +104,15 @@ def _to_backend_layout(tensor_layout):
         else:
             placements.append(Replicate())
 
-    return torch_mesh, tuple(placements)
+    return DTensorLayout(torch_mesh, tuple(placements))
+
+
+class DTensorLayout:
+    """Wraps a torch DeviceMesh + placements for use as a backend layout."""
+
+    def __init__(self, device_mesh, placements):
+        self.device_mesh = device_mesh
+        self.placements = placements
 
 
 def distribute_tensor(tensor, layout):
@@ -120,12 +128,13 @@ def distribute_tensor(tensor, layout):
     from keras.src.distribution import TensorLayout
 
     if isinstance(layout, TensorLayout):
-        backend_layout = _to_backend_layout(layout)
-        if backend_layout is None:
-            return tensor
-        torch_mesh, placements = backend_layout
-    else:
+        layout = _to_backend_layout(layout)
+    if isinstance(layout, DTensorLayout):
+        torch_mesh, placements = layout.device_mesh, layout.placements
+    elif isinstance(layout, (list, tuple)):
         torch_mesh, placements = layout
+    else:
+        return tensor
 
     if isinstance(tensor, DTensor):
         return tensor.redistribute(
@@ -143,7 +152,9 @@ def distribute_variable(value, layout, trainable=True):
 
     dist = dist_lib.distribution()
     if not isinstance(dist, dist_lib.ModelParallel):
-        return torch.nn.Parameter(value, requires_grad=trainable)
+        return torch.nn.Parameter(value, requires_grad=trainable).to(
+            _to_backend_device(None)
+        )
 
     dtensor = distribute_tensor(value, layout)
     return torch.nn.Parameter(dtensor, requires_grad=trainable)
@@ -164,12 +175,15 @@ def distribute_data_input(tensor, layout, batch_dim_name):
     from keras.src.distribution import TensorLayout
 
     if isinstance(layout, TensorLayout):
-        backend_layout = _to_backend_layout(layout)
-        if backend_layout is None:
-            return tensor
-        torch_mesh, placements = backend_layout
-    else:
+        layout = _to_backend_layout(layout)
+
+    if isinstance(layout, DTensorLayout):
+        torch_mesh, placements = layout.device_mesh, layout.placements
+    elif isinstance(layout, (list, tuple)):
         torch_mesh, placements = layout
+    else:
+        return tensor
+
     return DTensor.from_local(
         tensor, device_mesh=torch_mesh, placements=placements
     )
