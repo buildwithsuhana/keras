@@ -1,1 +1,10 @@
-# Fix Torch ModelParallel unbind error for Embeddings\n\n1. ✅ Understand issue: DTensor unbind.int missing strategy in Embedding.build under ModelParallel scope.\n2. Read core.py for Variable impl.\n3. Edit distribution_lib.py: Auto-replicate embedding vars.\n4. Test: KERAS_BACKEND=torch python3 tests/distributed_torch_mp_test.py\n5. Multi-GPU test.\n6. attempt_completion\n
+# TODO: Fix DTensor.unbind global patch
+
+## Steps:
+✅ Step 1: Remove monkey-patch from keras/src/backend/torch/distribution_lib.py (done)
+- [ ] Step 2: Test distribution_lib_test.py (run pytest)
+- [ ] Step 3: Verify distributed training (embedding iteration)
+- [ ] Step 3: Verify with pytest keras/src/backend/torch/distribution_lib_test.py
+- [ ] Step 4: Run distributed model parallel tests (e.g., embedding layers)
+- [ ] Step 5: Mark complete and remove TODO.md
+
