@@ -49,7 +49,6 @@ class TorchDataLoaderAdapter(DataAdapter):
                         rank = process_id // processes_per_replica
 
             if num_replicas is not None and rank is not None:
-                # Reconstruct the DataLoader with a DistributedSampler
                 sampler = torch.utils.data.distributed.DistributedSampler(
                     dataloader.dataset,
                     num_replicas=num_replicas,
