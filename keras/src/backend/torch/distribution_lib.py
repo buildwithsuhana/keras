@@ -189,34 +189,4 @@ def distribute_data_input(tensor, layout, batch_dim_name):
     )
 
 
-def unbind_dtensor(dtensor, dim=0):
-    """Unbind a distributed tensor by converting to local, then redistributing.
 
-    Args:
-        dtensor: A DTensor to unbind.
-        dim: The dimension along which to unbind.
-
-    Returns:
-        A list of DTensors, each replicated across the mesh.
-    """
-    local_tensor = dtensor.to_local()
-    unbounded = local_tensor.unbind(dim)
-    return [
-        DTensor.from_local(
-            t,
-            device_mesh=dtensor.device_mesh,
-            placements=[
-                Replicate() for _ in range(len(dtensor.device_mesh.mesh.shape))
-            ],
-        )
-        for t in unbounded
-    ]
-
-
-# Patch DTensor.unbind: PyTorch's DTensor lacks a registered sharding strategy
-# for unbind, which breaks tensor iteration in embedding layers.
-def _dtensor_unbind_patched(self, dim=0):
-    return unbind_dtensor(self, dim=dim)
-
-
-DTensor.unbind = _dtensor_unbind_patched

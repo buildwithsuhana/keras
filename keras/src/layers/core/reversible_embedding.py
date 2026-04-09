@@ -148,19 +148,15 @@ class ReversibleEmbedding(layers.Embedding):
         return None
 
     def compute_output_shape(self, input_shape, reverse=False):
-        output_shape = list(input_shape)
+        output_shape = tuple(input_shape)
         if reverse:
-            output_shape[-1] = self.input_dim
+            output_shape = output_shape[:-1] + (self.input_dim,)
         else:
-            output_shape += [self.output_dim]
+            output_shape = output_shape + (self.output_dim,)
         return output_shape
 
     def compute_output_spec(self, inputs, reverse=False):
-        output_shape = list(inputs.shape)
-        if reverse:
-            output_shape[-1] = self.input_dim
-        else:
-            output_shape += [self.output_dim]
+        output_shape = self.compute_output_shape(inputs.shape, reverse=reverse)
         return KerasTensor(output_shape, dtype=self.compute_dtype)
 
     def get_config(self):
