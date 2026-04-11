@@ -68,10 +68,15 @@ def process_id():
 
 def _to_backend_device(device_name):
     """Map a Keras device name to a Torch device."""
-    local_rank = int(os.environ.get("LOCAL_RANK", 0))
-    if torch.cuda.is_available():
-        return torch.device(f"cuda:{local_rank}")
-    return torch.device("cpu")
+    if device_name is None:
+        local_rank = int(os.environ.get("LOCAL_RANK", 0))
+        if torch.cuda.is_available():
+            return torch.device(f"cuda:{local_rank}")
+        return torch.device("cpu")
+    
+    if device_name.startswith("gpu"):
+        return torch.device("cuda" + device_name[3:])
+    return torch.device(device_name)
 
 
 def _to_backend_mesh(keras_mesh):
