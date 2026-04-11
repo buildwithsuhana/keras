@@ -1,7 +1,12 @@
-# TODO: Fix performance issue in torch/core.py convert_to_tensor
+# Fix DDP Recursion Issue in Keras Torch Backend
 
 ## Steps:
-1. [x] Add `from torch.distributed.tensor import DTensor` to the imports in `keras/src/backend/torch/core.py`.
-2. [x] Update the if-condition in `convert_to_tensor` to include `and not isinstance(x, DTensor)` before creating TensorLayout.
-3. [ ] Verify the changes and complete the task.
+- [x] 1. Read full content of keras/src/backend/torch/trainer.py to analyze exact structure
+- [x] 2. Implement _KerasModuleWrapper.forward() fix (strip training kwarg)
+- [x] 3. Add _in_ddp_context flag and train/eval guards
+- [ ] 4. Test with PYTHONPATH=. KERAS_BACKEND=torch python3 dp.py
+- [ ] 5. Verify both processes complete fit() successfully
+- [ ] 6. Update TODO with completion status and attempt_completion
+
+Current progress: Plan approved, starting implementation.
 

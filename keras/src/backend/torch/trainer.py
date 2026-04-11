@@ -29,6 +29,7 @@ class _KerasModuleWrapper(torch.nn.Module):
             self.register_buffer(f"b{i}", v.value)
 
     def forward(self, *args, **kwargs):
+        kwargs.pop('training', None)
         return self._keras_model(*args, **kwargs)
 
 
@@ -38,6 +39,7 @@ class TorchTrainer(base_trainer.Trainer):
         self.train_function = None
         self.test_function = None
         self.predict_function = None
+        self._in_ddp_context = False
 
     def _should_torch_compile(self):
         # require torch>=2.1.0 to enable dynamo since it
@@ -65,6 +67,7 @@ class TorchTrainer(base_trainer.Trainer):
                     if torch.cuda.is_available()
                     else None,
                 )
+                self._in_ddp_context = True
 
     def compile(self, *args, **kwargs):
         super().compile(*args, **kwargs)
@@ -206,22 +209,11 @@ class TorchTrainer(base_trainer.Trainer):
 
         dist_obj = dist_lib.distribution()
         if dist_obj is not None and torch.distributed.is_initialized():
-            from torch.distributed.tensor import DTensor
-
             for metric in self.metrics:
                 for variable in metric.variables:
-                    val = variable.value
-                    if isinstance(val, DTensor):
-                        local_val = val.to_local()
-                        torch.distributed.all_reduce(
-                            local_val, op=torch.distributed.ReduceOp.SUM
-                        )
-                        variable.assign(local_val)
-                    else:
-                        torch.distributed.all_reduce(
-                            val, op=torch.distributed.ReduceOp.SUM
-                        )
-                        variable.assign(val)
+                    torch.distributed.all_reduce(
+                        variable.value, op=torch.distributed.ReduceOp.SUM
+                    )
 
     def make_train_function(self, force=False):
         if self.train_function is not None and not force:
@@ -403,7 +395,8 @@ class TorchTrainer(base_trainer.Trainer):
             # Switch the torch Module to training mode. Inform torch layers to
             # do training behavior in case the user did not use `self.training`
             # when implementing a custom layer with torch layers.
-            self.train()
+            if not self._in_ddp_context:
+                self.train()
 
             logs = {}
             for begin_step, end_step, data in epoch_iterator:
@@ -422,7 +415,8 @@ class TorchTrainer(base_trainer.Trainer):
             epoch_logs = dict(self._get_metrics_result_or_logs(logs))
 
             # Switch the torch Module back to testing mode.
-            self.eval()
+            if not self._in_ddp_context:
+                self.eval()
 
             # Run validation.
             if validation_data is not None and self._should_eval(
@@ -518,7 +512,8 @@ class TorchTrainer(base_trainer.Trainer):
             )
 
         # Switch the torch Module back to testing mode.
-        self.eval()
+        if not self._in_ddp_context:
+            self.eval()
 
         self.make_test_function()
         self.stop_evaluating = False
@@ -579,7 +574,8 @@ class TorchTrainer(base_trainer.Trainer):
             return outputs
 
         # Switch the torch Module back to testing mode.
-        self.eval()
+        if not self._in_ddp_context:
+            self.eval()
 
         self.make_predict_function()
         self.stop_predicting = False
