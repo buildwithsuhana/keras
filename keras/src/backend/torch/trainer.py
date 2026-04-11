@@ -189,22 +189,11 @@ class TorchTrainer(base_trainer.Trainer):
 
         dist_obj = dist_lib.distribution()
         if dist_obj is not None and torch.distributed.is_initialized():
-            from torch.distributed.tensor import DTensor
-
             for metric in self.metrics:
                 for variable in metric.variables:
-                    val = variable.value
-                    if isinstance(val, DTensor):
-                        local_val = val.to_local()
-                        torch.distributed.all_reduce(
-                            local_val, op=torch.distributed.ReduceOp.SUM
-                        )
-                        variable.assign(local_val)
-                    else:
-                        torch.distributed.all_reduce(
-                            val, op=torch.distributed.ReduceOp.SUM
-                        )
-                        variable.assign(val)
+                    torch.distributed.all_reduce(
+                        variable.value, op=torch.distributed.ReduceOp.SUM
+                    )
 
     def make_train_function(self, force=False):
         if self.train_function is not None and not force:
