@@ -157,9 +157,7 @@ def distribute_variable(value, layout, trainable=True):
 
     dist = dist_lib.distribution()
     if not isinstance(dist, dist_lib.ModelParallel):
-        return torch.nn.Parameter(value, requires_grad=trainable).to(
-            _to_backend_device(None)
-        )
+        return torch.nn.Parameter(value, requires_grad=trainable)
 
     dtensor = distribute_tensor(value, layout)
     return torch.nn.Parameter(dtensor, requires_grad=trainable)

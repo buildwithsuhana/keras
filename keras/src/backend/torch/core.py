@@ -20,6 +20,7 @@ from keras.src.backend.common.stateless_scope import in_stateless_scope
 from keras.src.backend.common.symbolic_scope import SymbolicScope
 from keras.src.backend.config import floatx
 from keras.src.backend.torch import distribution_lib as torch_dist_lib
+from torch.distributed.tensor import DTensor
 
 SUPPORTS_SPARSE_TENSORS = False
 SUPPORTS_RAGGED_TENSORS = False
@@ -281,14 +282,12 @@ def convert_to_tensor(x, dtype=None, sparse=None, ragged=None):
         dist is not None
         and isinstance(dist, dist_lib.ModelParallel)
         and is_tensor(x)
+        and not isinstance(x, DTensor)
     ):
-        from torch.distributed.tensor import DTensor
+        from keras.src.distribution import TensorLayout
 
-        if not isinstance(x, DTensor):
-            from keras.src.distribution import TensorLayout
-
-            layout = TensorLayout([None] * x.ndim, dist.device_mesh)
-            x = dist_lib.distribute_tensor(x, layout)
+        layout = TensorLayout([None] * x.ndim, dist.device_mesh)
+        x = torch_dist_lib.distribute_tensor(x, layout)
     return x
 
 
