@@ -211,8 +211,11 @@ class TorchTrainer(base_trainer.Trainer):
         if dist_obj is not None and torch.distributed.is_initialized():
             for metric in self.metrics:
                 for variable in metric.variables:
+                    v = variable.value
+                    if hasattr(v, "device_mesh"):
+                        v = v.to_local()
                     torch.distributed.all_reduce(
-                        variable.value, op=torch.distributed.ReduceOp.SUM
+                        v, op=torch.distributed.ReduceOp.SUM
                     )
 
     def make_train_function(self, force=False):
