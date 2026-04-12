@@ -98,15 +98,16 @@ def process_id():
 
 def _to_backend_device(device_name):
     """Map a Keras device name to a Torch device."""
-    if device_name is None:
-        local_rank = int(os.environ.get("LOCAL_RANK", 0))
-        if torch.cuda.is_available():
-            return torch.device(f"cuda:{local_rank}")
-        return torch.device("cpu")
-    
-    if device_name.startswith("gpu"):
-        return torch.device("cuda" + device_name[3:])
-    return torch.device(device_name)
+    if device_name is not None:
+        device_name = device_name.lower()
+        if "gpu" in device_name:
+            device_name = device_name.replace("gpu", "cuda")
+        return torch.device(device_name)
+
+    local_rank = int(os.environ.get("LOCAL_RANK", 0))
+    if torch.cuda.is_available():
+        return torch.device(f"cuda:{local_rank}")
+    return torch.device("cpu")
 
 
 def _to_backend_mesh(keras_mesh):
@@ -154,6 +155,7 @@ def distribute_tensor(tensor, layout):
     """Distribute a Torch tensor according to a layout."""
     if layout is None:
         return tensor
+
     from keras.src.distribution import distribution_lib as dist_lib
 
     dist = dist_lib.distribution()
@@ -183,6 +185,9 @@ def distribute_tensor(tensor, layout):
 
 def distribute_variable(value, layout, trainable=True):
     """Create a distributed Torch parameter."""
+    if layout is None:
+        return torch.nn.Parameter(value, requires_grad=trainable)
+
     from keras.src.distribution import distribution_lib as dist_lib
 
     dist = dist_lib.distribution()

@@ -276,11 +276,10 @@ def convert_to_tensor(x, dtype=None, sparse=None, ragged=None):
             x = torch.as_tensor(x, dtype=dtype, device=get_device())
 
     dist = global_state.get_global_attribute("distribution")
-    if (
-        dist is not None
-        and is_tensor(x)
-        and not isinstance(x, DTensor)
-    ):
+    if dist is None:
+        return x
+
+    if is_tensor(x) and not isinstance(x, DTensor):
         from keras.src.distribution import distribution_lib as dist_lib
 
         if isinstance(dist, dist_lib.ModelParallel):

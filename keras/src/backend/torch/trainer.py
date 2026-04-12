@@ -29,7 +29,6 @@ class _KerasModuleWrapper(torch.nn.Module):
             self.register_buffer(f"b{i}", v.value)
 
     def forward(self, *args, **kwargs):
-        kwargs.pop("training", None)
         return self._keras_model(*args, **kwargs)
 
 
@@ -218,6 +217,7 @@ class TorchTrainer(base_trainer.Trainer):
                     torch.distributed.all_reduce(
                         v, op=torch.distributed.ReduceOp.SUM
                     )
+                    variable.assign(v)
 
     def make_train_function(self, force=False):
         if self.train_function is not None and not force:
