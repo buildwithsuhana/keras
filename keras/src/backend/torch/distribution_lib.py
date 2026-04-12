@@ -10,9 +10,31 @@ from torch.distributed.tensor._op_schema import OpSchema
 from torch.distributed.tensor._op_schema import OpSpec
 from torch.distributed.tensor._op_schema import OpStrategy
 from torch.distributed.tensor._op_schema import RuntimeSchemaInfo
-from torch.distributed.tensor._ops import normalize_dim
-from torch.distributed.tensor._ops import register_op_strategy
-from torch.distributed.tensor._ops import shift_shard_dims_after_remove
+
+try:
+    from torch.distributed.tensor._ops import register_op_strategy
+except ImportError:
+    try:
+        from torch.distributed.tensor._ops.utils import register_op_strategy
+    except ImportError:
+        # Fallback for very old/new versions
+        register_op_strategy = DTensor._op_dispatcher.sharding_propagator.register_op_strategy
+
+
+def normalize_dim(dim, ndim):
+    """Normalize a dimension index."""
+    return dim if dim >= 0 else dim + ndim
+
+
+def shift_shard_dims_after_remove(placements, remove_dim=0):
+    """Shift sharded dimensions after removing a dimension."""
+    new_placements = []
+    for p in placements:
+        if isinstance(p, Shard) and p.dim > remove_dim:
+            new_placements.append(Shard(p.dim - 1))
+        else:
+            new_placements.append(p)
+    return tuple(new_placements)
 
 
 def list_devices(device_type=None):
