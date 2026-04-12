@@ -29,7 +29,7 @@ class _KerasModuleWrapper(torch.nn.Module):
             self.register_buffer(f"b{i}", v.value)
 
     def forward(self, *args, **kwargs):
-        kwargs.pop('training', None)
+        kwargs.pop("training", None)
         return self._keras_model(*args, **kwargs)
 
 
@@ -61,12 +61,13 @@ class TorchTrainer(base_trainer.Trainer):
         dist = dist_lib.distribution()
         if dist is not None and isinstance(dist, dist_lib.DataParallel):
             if not hasattr(self, "_ddp_model"):
-                self._ddp_model = torch.nn.parallel.DistributedDataParallel(
+                ddp_model = torch.nn.parallel.DistributedDataParallel(
                     _KerasModuleWrapper(self),
                     device_ids=[torch.cuda.current_device()]
                     if torch.cuda.is_available()
                     else None,
                 )
+                object.__setattr__(self, "_ddp_model", ddp_model)
                 self._in_ddp_context = True
 
     def compile(self, *args, **kwargs):
@@ -398,7 +399,9 @@ class TorchTrainer(base_trainer.Trainer):
             # Switch the torch Module to training mode. Inform torch layers to
             # do training behavior in case the user did not use `self.training`
             # when implementing a custom layer with torch layers.
-            if not self._in_ddp_context:
+            if self._in_ddp_context:
+                self._ddp_model.train()
+            else:
                 self.train()
 
             logs = {}
@@ -418,7 +421,9 @@ class TorchTrainer(base_trainer.Trainer):
             epoch_logs = dict(self._get_metrics_result_or_logs(logs))
 
             # Switch the torch Module back to testing mode.
-            if not self._in_ddp_context:
+            if self._in_ddp_context:
+                self._ddp_model.eval()
+            else:
                 self.eval()
 
             # Run validation.
@@ -515,7 +520,9 @@ class TorchTrainer(base_trainer.Trainer):
             )
 
         # Switch the torch Module back to testing mode.
-        if not self._in_ddp_context:
+        if self._in_ddp_context:
+            self._ddp_model.eval()
+        else:
             self.eval()
 
         self.make_test_function()
@@ -577,7 +584,9 @@ class TorchTrainer(base_trainer.Trainer):
             return outputs
 
         # Switch the torch Module back to testing mode.
-        if not self._in_ddp_context:
+        if self._in_ddp_context:
+            self._ddp_model.eval()
+        else:
             self.eval()
 
         self.make_predict_function()
@@ -663,3 +672,8 @@ class TorchTrainer(base_trainer.Trainer):
 class TorchEpochIterator(EpochIterator):
     def _get_iterator(self):
         return self.data_adapter.get_torch_dataloader()
+
+
+class TorchTrainerModel(TorchTrainer):
+    def __init__(self, *args, **kwargs):
+        super().__init__(*args, **kwargs)
