@@ -5,6 +5,14 @@ from torch.distributed.device_mesh import init_device_mesh
 from torch.distributed.tensor import DTensor
 from torch.distributed.tensor import Replicate
 from torch.distributed.tensor import Shard
+from torch.distributed.tensor._dtensor_spec import DTensorSpec
+from torch.distributed.tensor._op_schema import OpSchema
+from torch.distributed.tensor._op_schema import OpSpec
+from torch.distributed.tensor._op_schema import OpStrategy
+from torch.distributed.tensor._op_schema import RuntimeSchemaInfo
+from torch.distributed.tensor._ops import normalize_dim
+from torch.distributed.tensor._ops import register_op_strategy
+from torch.distributed.tensor._ops import shift_shard_dims_after_remove
 
 
 def list_devices(device_type=None):
@@ -192,34 +200,57 @@ def distribute_data_input(tensor, layout, batch_dim_name):
     )
 
 
-def unbind_dtensor(dtensor, dim=0):
-    """Unbind a distributed tensor by converting to local, then redistributing.
+@register_op_strategy(torch.ops.aten.unbind.int, schema_info=RuntimeSchemaInfo(1))
+def _unbind_op_strategy(op_schema: OpSchema):
+    """Registered sharding strategy for `torch.ops.aten.unbind.int`."""
+    input_strategy = op_schema.args_schema[0]
+    dim = op_schema.args_schema[1] if len(op_schema.args_schema) > 1 else 0
+    dim = normalize_dim(dim, input_strategy.ndim)
 
-    Args:
-        dtensor: A DTensor to unbind.
-        dim: The dimension along which to unbind.
+    mesh = input_strategy.mesh
+    new_strategy = OpStrategy([])
 
-    Returns:
-        A list of DTensors, each replicated across the mesh.
-    """
-    local_tensor = dtensor.to_local()
-    unbounded = local_tensor.unbind(dim)
-    return [
-        DTensor.from_local(
-            t,
-            device_mesh=dtensor.device_mesh,
-            placements=[
-                Replicate() for _ in range(len(dtensor.device_mesh.mesh.shape))
-            ],
+    for arg_strategy in input_strategy.strategies:
+        arg_spec = arg_strategy.output_spec
+        # Check if sharded along dim
+        is_sharded = any(
+            isinstance(p, Shard) and p.dim == dim for p in arg_spec.placements
         )
-        for t in unbounded
-    ]
 
-
-# Patch DTensor.unbind: PyTorch's DTensor lacks a registered sharding strategy
-# for unbind, which breaks tensor iteration in embedding layers.
-def _dtensor_unbind_patched(self, dim=0):
-    return unbind_dtensor(self, dim=dim)
-
-
-DTensor.unbind = _dtensor_unbind_patched
+        if is_sharded:
+            # If sharded along unbind dim, suggest replication.
+            replicated_placements = tuple(
+                Replicate() for _ in arg_spec.placements
+            )
+            replicated_spec = DTensorSpec(
+                mesh=mesh,
+                placements=replicated_placements,
+                tensor_meta=arg_spec.tensor_meta,
+            )
+            output_placements = tuple(Replicate() for _ in arg_spec.placements)
+            output_spec = DTensorSpec(
+                mesh=mesh,
+                placements=output_placements,
+            )
+            new_strategy.strategies.append(
+                OpSpec(
+                    output_specs=(output_spec,) * input_strategy.shape[dim],
+                    input_specs=(replicated_spec,),
+                )
+            )
+        else:
+            # Not sharded along dim, forward sharding
+            output_placements = shift_shard_dims_after_remove(
+                arg_spec.placements, dim
+            )
+            output_spec = DTensorSpec(
+                mesh=mesh,
+                placements=tuple(output_placements),
+            )
+            new_strategy.strategies.append(
+                OpSpec(
+                    output_specs=(output_spec,) * input_strategy.shape[dim],
+                    input_specs=(arg_spec,),
+                )
+            )
+    return new_strategy
