@@ -5,6 +5,53 @@ from torch.distributed.device_mesh import init_device_mesh
 from torch.distributed.tensor import DTensor
 from torch.distributed.tensor import Replicate
 from torch.distributed.tensor import Shard
+from torch.distributed.tensor._dtensor_spec import DTensorSpec
+from torch.distributed.tensor._op_schema import OpSchema
+from torch.distributed.tensor._op_schema import OpSpec
+from torch.distributed.tensor._op_schema import OpStrategy
+from torch.distributed.tensor._op_schema import RuntimeSchemaInfo
+
+try:
+    from torch.distributed.tensor._ops import register_op_strategy
+except ImportError:
+    try:
+        from torch.distributed.tensor._ops.utils import register_op_strategy
+    except ImportError:
+        # Fallback for very old/new versions
+        register_op_strategy = (
+            DTensor._op_dispatcher.sharding_propagator.register_op_strategy
+        )
+
+
+def normalize_dim(dim, ndim):
+    """Normalize a dimension index."""
+    return dim if dim >= 0 else dim + ndim
+
+
+def shift_shard_dims_after_remove(placements, remove_dim=0):
+    """Shift sharded dimensions after removing a dimension."""
+    new_placements = []
+    for p in placements:
+        if isinstance(p, Shard) and p.dim > remove_dim:
+            new_placements.append(Shard(p.dim - 1))
+        else:
+            new_placements.append(p)
+    return tuple(new_placements)
+
+
+_UNBIND_REGISTERED = False
+
+
+def _register_unbind_strategy():
+    global _UNBIND_REGISTERED
+    if _UNBIND_REGISTERED:
+        return
+
+    # Use the function call version of the decorator to register
+    register_op_strategy(
+        torch.ops.aten.unbind.int, schema_info=RuntimeSchemaInfo(1)
+    )(_unbind_op_strategy)
+    _UNBIND_REGISTERED = True
 
 
 def list_devices(device_type=None):
@@ -68,6 +115,12 @@ def process_id():
 
 def _to_backend_device(device_name):
     """Map a Keras device name to a Torch device."""
+    if device_name is not None:
+        device_name = device_name.lower()
+        if "gpu" in device_name:
+            device_name = device_name.replace("gpu", "cuda")
+        return torch.device(device_name)
+
     local_rank = int(os.environ.get("LOCAL_RANK", 0))
     if torch.cuda.is_available():
         return torch.device(f"cuda:{local_rank}")
@@ -119,11 +172,14 @@ def distribute_tensor(tensor, layout):
     """Distribute a Torch tensor according to a layout."""
     if layout is None:
         return tensor
+
     from keras.src.distribution import distribution_lib as dist_lib
 
     dist = dist_lib.distribution()
     if not isinstance(dist, dist_lib.ModelParallel):
         return tensor
+
+    _register_unbind_strategy()
 
     from keras.src.distribution import TensorLayout
 
@@ -148,13 +204,14 @@ def distribute_tensor(tensor, layout):
 
 def distribute_variable(value, layout, trainable=True):
     """Create a distributed Torch parameter."""
+    if layout is None:
+        return torch.nn.Parameter(value, requires_grad=trainable)
+
     from keras.src.distribution import distribution_lib as dist_lib
 
     dist = dist_lib.distribution()
     if not isinstance(dist, dist_lib.ModelParallel):
-        return torch.nn.Parameter(value, requires_grad=trainable).to(
-            _to_backend_device(None)
-        )
+        return torch.nn.Parameter(value, requires_grad=trainable)
 
     dtensor = distribute_tensor(value, layout)
     return torch.nn.Parameter(dtensor, requires_grad=trainable)
@@ -169,6 +226,8 @@ def distribute_data_input(tensor, layout, batch_dim_name):
     dist = dist_lib.distribution()
     if not isinstance(dist, dist_lib.ModelParallel):
         return tensor
+
+    _register_unbind_strategy()
 
     if isinstance(tensor, DTensor):
         return tensor
@@ -189,34 +248,56 @@ def distribute_data_input(tensor, layout, batch_dim_name):
     )
 
 
-def unbind_dtensor(dtensor, dim=0):
-    """Unbind a distributed tensor by converting to local, then redistributing.
+def _unbind_op_strategy(op_schema: OpSchema):
+    """Registered sharding strategy for `torch.ops.aten.unbind.int`."""
+    input_strategy = op_schema.args_schema[0]
+    dim = op_schema.args_schema[1] if len(op_schema.args_schema) > 1 else 0
+    dim = normalize_dim(dim, input_strategy.ndim)
 
-    Args:
-        dtensor: A DTensor to unbind.
-        dim: The dimension along which to unbind.
+    mesh = input_strategy.mesh
+    new_strategy = OpStrategy([])
 
-    Returns:
-        A list of DTensors, each replicated across the mesh.
-    """
-    local_tensor = dtensor.to_local()
-    unbounded = local_tensor.unbind(dim)
-    return [
-        DTensor.from_local(
-            t,
-            device_mesh=dtensor.device_mesh,
-            placements=[
-                Replicate() for _ in range(len(dtensor.device_mesh.mesh.shape))
-            ],
+    for arg_strategy in input_strategy.strategies:
+        arg_spec = arg_strategy.output_spec
+        # Check if sharded along dim
+        is_sharded = any(
+            isinstance(p, Shard) and p.dim == dim for p in arg_spec.placements
         )
-        for t in unbounded
-    ]
 
-
-# Patch DTensor.unbind: PyTorch's DTensor lacks a registered sharding strategy
-# for unbind, which breaks tensor iteration in embedding layers.
-def _dtensor_unbind_patched(self, dim=0):
-    return unbind_dtensor(self, dim=dim)
-
-
-DTensor.unbind = _dtensor_unbind_patched
+        if is_sharded:
+            # If sharded along unbind dim, suggest replication.
+            replicated_placements = tuple(
+                Replicate() for _ in arg_spec.placements
+            )
+            replicated_spec = DTensorSpec(
+                mesh=mesh,
+                placements=replicated_placements,
+                tensor_meta=arg_spec.tensor_meta,
+            )
+            output_placements = tuple(Replicate() for _ in arg_spec.placements)
+            output_spec = DTensorSpec(
+                mesh=mesh,
+                placements=output_placements,
+            )
+            new_strategy.strategies.append(
+                OpSpec(
+                    output_specs=(output_spec,) * input_strategy.shape[dim],
+                    input_specs=(replicated_spec,),
+                )
+            )
+        else:
+            # Not sharded along dim, forward sharding
+            output_placements = shift_shard_dims_after_remove(
+                arg_spec.placements, dim
+            )
+            output_spec = DTensorSpec(
+                mesh=mesh,
+                placements=tuple(output_placements),
+            )
+            new_strategy.strategies.append(
+                OpSpec(
+                    output_specs=(output_spec,) * input_strategy.shape[dim],
+                    input_specs=(arg_spec,),
+                )
+            )
+    return new_strategy

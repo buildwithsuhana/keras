@@ -38,6 +38,7 @@ class TorchTrainer(base_trainer.Trainer):
         self.train_function = None
         self.test_function = None
         self.predict_function = None
+        self._in_ddp_context = False
 
     def _should_torch_compile(self):
         # require torch>=2.1.0 to enable dynamo since it
@@ -52,6 +53,25 @@ class TorchTrainer(base_trainer.Trainer):
             self.jit_compile = False
 
         return self.jit_compile
+
+    def _setup_ddp(self):
+        from keras.src.distribution import distribution_lib as dist_lib
+
+        dist = dist_lib.distribution()
+        if dist is not None and isinstance(dist, dist_lib.DataParallel):
+            if not hasattr(self, "_ddp_model"):
+                ddp_model = torch.nn.parallel.DistributedDataParallel(
+                    _KerasModuleWrapper(self),
+                    device_ids=[torch.cuda.current_device()]
+                    if torch.cuda.is_available()
+                    else None,
+                )
+                object.__setattr__(self, "_ddp_model", ddp_model)
+                self._in_ddp_context = True
+
+    def compile(self, *args, **kwargs):
+        super().compile(*args, **kwargs)
+        self._setup_ddp()
 
     def _distribute_inputs(self, dist, data, replicate=False):
         from keras.src.backend.torch import distribution_lib as torch_dist_lib
@@ -189,22 +209,15 @@ class TorchTrainer(base_trainer.Trainer):
 
         dist_obj = dist_lib.distribution()
         if dist_obj is not None and torch.distributed.is_initialized():
-            from torch.distributed.tensor import DTensor
-
             for metric in self.metrics:
                 for variable in metric.variables:
-                    val = variable.value
-                    if isinstance(val, DTensor):
-                        local_val = val.to_local()
-                        torch.distributed.all_reduce(
-                            local_val, op=torch.distributed.ReduceOp.SUM
-                        )
-                        variable.assign(local_val)
-                    else:
-                        torch.distributed.all_reduce(
-                            val, op=torch.distributed.ReduceOp.SUM
-                        )
-                        variable.assign(val)
+                    v = variable.value
+                    if hasattr(v, "device_mesh"):
+                        v = v.to_local()
+                    torch.distributed.all_reduce(
+                        v, op=torch.distributed.ReduceOp.SUM
+                    )
+                    variable.assign(v)
 
     def make_train_function(self, force=False):
         if self.train_function is not None and not force:
@@ -216,21 +229,7 @@ class TorchTrainer(base_trainer.Trainer):
                 f"Received: steps_per_execution={self.steps_per_execution}"
             )
 
-        from keras.src.distribution import distribution_lib as dist_lib
-
-        dist = dist_lib.distribution()
-        if dist is not None and isinstance(dist, dist_lib.DataParallel):
-            if not hasattr(self, "_ddp_model"):
-                object.__setattr__(
-                    self,
-                    "_ddp_model",
-                    torch.nn.parallel.DistributedDataParallel(
-                        _KerasModuleWrapper(self),
-                        device_ids=[torch.cuda.current_device()]
-                        if torch.cuda.is_available()
-                        else None,
-                    ),
-                )
+        self._setup_ddp()
 
         def one_step_on_data(data):
             """Runs a single training step on a batch of data."""
@@ -252,21 +251,7 @@ class TorchTrainer(base_trainer.Trainer):
                 f"Received: steps_per_execution={self.steps_per_execution}"
             )
 
-        from keras.src.distribution import distribution_lib as dist_lib
-
-        dist = dist_lib.distribution()
-        if dist is not None and isinstance(dist, dist_lib.DataParallel):
-            if not hasattr(self, "_ddp_model"):
-                object.__setattr__(
-                    self,
-                    "_ddp_model",
-                    torch.nn.parallel.DistributedDataParallel(
-                        _KerasModuleWrapper(self),
-                        device_ids=[torch.cuda.current_device()]
-                        if torch.cuda.is_available()
-                        else None,
-                    ),
-                )
+        self._setup_ddp()
 
         def one_step_on_data(data):
             """Runs a single test step on a batch of data."""
@@ -289,21 +274,7 @@ class TorchTrainer(base_trainer.Trainer):
                 f"Received: steps_per_execution={self.steps_per_execution}"
             )
 
-        from keras.src.distribution import distribution_lib as dist_lib
-
-        dist = dist_lib.distribution()
-        if dist is not None and isinstance(dist, dist_lib.DataParallel):
-            if not hasattr(self, "_ddp_model"):
-                object.__setattr__(
-                    self,
-                    "_ddp_model",
-                    torch.nn.parallel.DistributedDataParallel(
-                        _KerasModuleWrapper(self),
-                        device_ids=[torch.cuda.current_device()]
-                        if torch.cuda.is_available()
-                        else None,
-                    ),
-                )
+        self._setup_ddp()
 
         def one_step_on_data(data):
             """Runs a predict test step on a batch of data."""
@@ -428,7 +399,10 @@ class TorchTrainer(base_trainer.Trainer):
             # Switch the torch Module to training mode. Inform torch layers to
             # do training behavior in case the user did not use `self.training`
             # when implementing a custom layer with torch layers.
-            self.train()
+            if self._in_ddp_context:
+                self._ddp_model.train()
+            else:
+                self.train()
 
             logs = {}
             for begin_step, end_step, data in epoch_iterator:
@@ -447,7 +421,10 @@ class TorchTrainer(base_trainer.Trainer):
             epoch_logs = dict(self._get_metrics_result_or_logs(logs))
 
             # Switch the torch Module back to testing mode.
-            self.eval()
+            if self._in_ddp_context:
+                self._ddp_model.eval()
+            else:
+                self.eval()
 
             # Run validation.
             if validation_data is not None and self._should_eval(
@@ -543,7 +520,10 @@ class TorchTrainer(base_trainer.Trainer):
             )
 
         # Switch the torch Module back to testing mode.
-        self.eval()
+        if self._in_ddp_context:
+            self._ddp_model.eval()
+        else:
+            self.eval()
 
         self.make_test_function()
         self.stop_evaluating = False
@@ -604,7 +584,10 @@ class TorchTrainer(base_trainer.Trainer):
             return outputs
 
         # Switch the torch Module back to testing mode.
-        self.eval()
+        if self._in_ddp_context:
+            self._ddp_model.eval()
+        else:
+            self.eval()
 
         self.make_predict_function()
         self.stop_predicting = False

@@ -264,9 +264,10 @@ class PyDatasetAdapter(DataAdapter):
         return batch
 
     def _infinite_generator(self):
-        for i in itertools.count():
-            if i % self._num_processes == self._process_id:
-                yield self._standardize_batch(self.py_dataset[i])
+        for i in itertools.count(
+            start=self._process_id, step=self._num_processes
+        ):
+            yield self._standardize_batch(self.py_dataset[i])
 
     def _finite_generator(self):
         indices = range(self.py_dataset.num_batches)
@@ -274,12 +275,7 @@ class PyDatasetAdapter(DataAdapter):
             indices = list(indices)
             random.shuffle(indices)
 
-        if self._num_processes > 1:
-            indices = [
-                i
-                for i in indices
-                if i % self._num_processes == self._process_id
-            ]
+        indices = indices[self._process_id :: self._num_processes]
 
         for i in indices:
             yield self._standardize_batch(self.py_dataset[i])

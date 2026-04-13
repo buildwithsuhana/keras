@@ -6,6 +6,7 @@ import os
 import ml_dtypes
 import numpy as np
 import torch
+from torch.distributed.tensor import DTensor
 
 from keras.src import tree
 from keras.src.backend.common import KerasVariable
@@ -274,21 +275,18 @@ def convert_to_tensor(x, dtype=None, sparse=None, ragged=None):
             dtype = to_torch_dtype(dtype)
             x = torch.as_tensor(x, dtype=dtype, device=get_device())
 
-    from keras.src.distribution import distribution_lib as dist_lib
+    dist = global_state.get_global_attribute("distribution")
+    if dist is None:
+        return x
 
-    dist = dist_lib.distribution()
-    if (
-        dist is not None
-        and isinstance(dist, dist_lib.ModelParallel)
-        and is_tensor(x)
-    ):
-        from torch.distributed.tensor import DTensor
+    if is_tensor(x) and not isinstance(x, DTensor):
+        from keras.src.distribution import distribution_lib as dist_lib
 
-        if not isinstance(x, DTensor):
+        if isinstance(dist, dist_lib.ModelParallel):
             from keras.src.distribution import TensorLayout
 
             layout = TensorLayout([None] * x.ndim, dist.device_mesh)
-            x = dist_lib.distribute_tensor(x, layout)
+            x = torch_dist_lib.distribute_tensor(x, layout)
     return x
 
 

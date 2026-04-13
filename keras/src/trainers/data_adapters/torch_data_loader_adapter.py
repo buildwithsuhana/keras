@@ -49,11 +49,14 @@ class TorchDataLoaderAdapter(DataAdapter):
                         rank = process_id // processes_per_replica
 
             if num_replicas is not None and rank is not None:
+                shuffle = isinstance(
+                    dataloader.sampler, torch.utils.data.RandomSampler
+                )
                 sampler = torch.utils.data.distributed.DistributedSampler(
                     dataloader.dataset,
                     num_replicas=num_replicas,
                     rank=rank,
-                    shuffle=True,
+                    shuffle=shuffle,
                 )
                 dataloader = torch.utils.data.DataLoader(
                     dataloader.dataset,

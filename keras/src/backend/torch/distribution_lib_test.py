@@ -101,7 +101,8 @@ class TorchDeviceMeshMappingTest(TorchDistributedTestCase):
 
         mesh = distribution_lib.DeviceMesh((world_size,), ["data"])
         layout = distribution_lib.TensorLayout(["data", None], mesh)
-        _, placements = backend_dlib._to_backend_layout(layout)
+        backend_layout = backend_dlib._to_backend_layout(layout)
+        placements = backend_layout.placements
         self.assertLen(placements, 1)
         self.assertIsInstance(placements[0], Shard)
         self.assertEqual(placements[0].dim, 0)
@@ -305,3 +306,289 @@ class TorchMetricAggregationTest(TorchDistributedTestCase):
 
     def test_sync_metrics(self):
         self.run_distributed(TorchMetricAggregationTest._sync_metrics_test)
+
+
+class TorchCheckpointTest(TorchDistributedTestCase):
+    @staticmethod
+    def _checkpoint_test(self, rank, world_size):
+        import tempfile
+
+        mesh = distribution_lib.DeviceMesh((1, world_size), ["batch", "model"])
+        layout_map = distribution_lib.LayoutMap(mesh)
+        layout_map[".*dense.*kernel"] = distribution_lib.TensorLayout(
+            [None, "model"]
+        )
+        dist = distribution_lib.ModelParallel(
+            layout_map=layout_map, batch_dim_name="batch"
+        )
+
+        with dist.scope():
+            model = models.Sequential(
+                [
+                    layers.Input(shape=(8,)),
+                    layers.Dense(world_size * 4, name="dense_1"),
+                ]
+            )
+            # Set some predictable weights
+            weights = [
+                np.ones((8, world_size * 4)),
+                np.zeros((world_size * 4,)),
+            ]
+            model.set_weights(weights)
+
+            with tempfile.NamedTemporaryFile(suffix=".weights.h5") as f:
+                model.save_weights(f.name)
+
+                # Create a new model and load weights
+                model2 = models.Sequential(
+                    [
+                        layers.Input(shape=(8,)),
+                        layers.Dense(world_size * 4, name="dense_1"),
+                    ]
+                )
+                model2.load_weights(f.name)
+
+                for w1, w2 in zip(model.get_weights(), model2.get_weights()):
+                    self.assertAllClose(w1, w2)
+
+    def test_checkpoint(self):
+        self.run_distributed(TorchCheckpointTest._checkpoint_test)
+
+
+class TorchUnbindTest(TorchDistributedTestCase):
+    @staticmethod
+    def _unbind_test(self, rank, world_size):
+        from torch.distributed.tensor import DTensor
+        from torch.distributed.tensor import Replicate
+
+        mesh = distribution_lib.DeviceMesh((world_size,), ["model"])
+        layout = distribution_lib.TensorLayout(["model", None], mesh)
+        dist = distribution_lib.ModelParallel(
+            device_mesh=mesh, layout_map=distribution_lib.LayoutMap(mesh)
+        )
+
+        with dist.scope():
+            tensor = torch.randn(world_size * 2, 4)
+            dtensor = backend_dlib.distribute_tensor(tensor, layout)
+
+            # Test unbind along sharded dimension
+            unbound = dtensor.unbind(0)
+            self.assertEqual(len(unbound), world_size * 2)
+            for t in unbound:
+                self.assertIsInstance(t, DTensor)
+                # Should be replicated now
+                self.assertTrue(
+                    all(isinstance(p, Replicate) for p in t.placements)
+                )
+
+    def test_unbind(self):
+        self.run_distributed(TorchUnbindTest._unbind_test)
+
+
+class TorchVariableDistributionTest(TorchDistributedTestCase):
+    @staticmethod
+    def _non_mp_variable_test(self, rank, world_size):
+        v = backend.Variable(torch.ones(2, 2))
+        self.assertFalse(hasattr(v.value, "device_mesh"))
+        self.assertNotEqual(v.value.device.type, "cuda")
+
+    def test_non_mp_variable(self):
+        self.run_distributed(
+            TorchVariableDistributionTest._non_mp_variable_test
+        )
+
+
+class TorchPyDatasetAdapterTest(TorchDistributedTestCase):
+    @staticmethod
+    def _py_dataset_sharding_test(self, rank, world_size):
+        from keras.src.trainers.data_adapters.py_dataset_adapter import (
+            PyDataset,
+        )
+
+        class MyPyDataset(PyDataset):
+            def __init__(self, data, **kwargs):
+                super().__init__(**kwargs)
+                self.data = data
+
+            def __len__(self):
+                return len(self.data)
+
+            def __getitem__(self, idx):
+                return self.data[idx], self.data[idx]
+
+        data = np.arange(world_size * 4).reshape(-1, 1).astype("float32")
+        dataset = MyPyDataset(data)
+
+        mesh = distribution_lib.DeviceMesh((world_size,), ["batch"])
+        dist = distribution_lib.DataParallel(mesh)
+
+        from keras.src.trainers.data_adapters.py_dataset_adapter import (
+            PyDatasetAdapter,
+        )
+
+        adapter = PyDatasetAdapter(dataset, distribution=dist)
+
+        # num_batches reflects the global dataset
+        self.assertEqual(adapter.num_batches, 8)
+
+        batches = list(adapter.get_numpy_iterator())
+        # The sharded iterator should only yield batches for this rank
+        self.assertEqual(len(batches), 4)
+
+        # Verify indices - each worker gets 4 batches out of 8 total
+        # Total data size is world_size * 4 = 8.
+        # Rank 0 gets indices 0, 2, 4, 6
+        # Rank 1 gets indices 1, 3, 5, 7
+        expected_indices = data[rank::world_size]
+        for i, batch in enumerate(batches):
+            self.assertAllClose(batch[0], expected_indices[i])
+
+    def test_py_dataset_sharding(self):
+        self.run_distributed(
+            TorchPyDatasetAdapterTest._py_dataset_sharding_test
+        )
+
+
+class TorchDataLoaderShuffleTest(TorchDistributedTestCase):
+    @staticmethod
+    def _dataloader_shuffle_test(self, rank, world_size):
+        from torch.utils.data import DataLoader
+        from torch.utils.data import TensorDataset
+
+        from keras.src.trainers.data_adapters.torch_data_loader_adapter import (
+            TorchDataLoaderAdapter,
+        )
+
+        dataset = TensorDataset(torch.randn(10, 1))
+        # Test with shuffle=True
+        loader_shuffle = DataLoader(dataset, batch_size=2, shuffle=True)
+        with distribution_lib.DataParallel().scope():
+            adapter = TorchDataLoaderAdapter(loader_shuffle)
+            self.assertTrue(adapter._dataloader.sampler.shuffle)
+
+        # Test with shuffle=False
+        loader_no_shuffle = DataLoader(dataset, batch_size=2, shuffle=False)
+        with distribution_lib.DataParallel().scope():
+            adapter = TorchDataLoaderAdapter(loader_no_shuffle)
+            self.assertFalse(adapter._dataloader.sampler.shuffle)
+
+    def test_dataloader_shuffle(self):
+        self.run_distributed(
+            TorchDataLoaderShuffleTest._dataloader_shuffle_test
+        )
+
+
+class TorchDistributionUtilsTest(TorchDistributedTestCase):
+    @staticmethod
+    def _to_backend_device_test(self, rank, world_size):
+        # Test None input
+        device = backend_dlib._to_backend_device(None)
+        self.assertEqual(device.type, "cpu")
+
+        # Test explicit gpu input
+        device = backend_dlib._to_backend_device("gpu:0")
+        self.assertEqual(device.type, "cuda")
+        self.assertEqual(device.index, 0)
+
+        # Test explicit cpu input
+        device = backend_dlib._to_backend_device("cpu")
+        self.assertEqual(device.type, "cpu")
+
+    def test_to_backend_device(self):
+        self.run_distributed(TorchDistributionUtilsTest._to_backend_device_test)
+
+
+class TorchDistributionTensorTest(TorchDistributedTestCase):
+    @staticmethod
+    def _distribute_data_input_dp_test(self, rank, world_size):
+        # DataParallel distribute_data_input should be a no-op
+        data = torch.randn(2, 4)
+        mesh = distribution_lib.DeviceMesh((world_size,), ["batch"])
+        dist = distribution_lib.DataParallel(mesh)
+
+        with dist.scope():
+            output = backend_dlib.distribute_data_input(data, None, "batch")
+            self.assertIs(output, data)
+
+    @staticmethod
+    def _convert_to_tensor_sharding_test(self, rank, world_size):
+        from torch.distributed.tensor import DTensor
+
+        mesh = distribution_lib.DeviceMesh((world_size,), ["model"])
+        layout_map = distribution_lib.LayoutMap(mesh)
+        dist = distribution_lib.ModelParallel(
+            layout_map=layout_map, batch_dim_name="batch"
+        )
+
+        with dist.scope():
+            t = backend.convert_to_tensor(
+                np.ones((world_size * 2, 4), dtype="float32")
+            )
+            self.assertIsInstance(t, DTensor)
+            self.assertEqual(t.shape, (world_size * 2, 4))
+
+    def test_distribute_data_input_dp(self):
+        self.run_distributed(
+            TorchDistributionTensorTest._distribute_data_input_dp_test
+        )
+
+    def test_convert_to_tensor_sharding(self):
+        self.run_distributed(
+            TorchDistributionTensorTest._convert_to_tensor_sharding_test
+        )
+
+
+class TorchTrainerDistributionTest(TorchDistributedTestCase):
+    @staticmethod
+    def _distribute_inputs_test(self, rank, world_size):
+        from torch.distributed.tensor import DTensor
+
+        from keras.src.backend.torch.trainer import TorchTrainer
+
+        trainer = TorchTrainer()
+        mesh = distribution_lib.DeviceMesh((world_size,), ["batch"])
+        dist = distribution_lib.DataParallel(mesh)
+
+        x = torch.randn(4, 8)
+        with dist.scope():
+            distributed_x = trainer._distribute_inputs(dist, x)
+            self.assertIs(distributed_x, x)
+
+        # Test ModelParallel sharding
+        mesh_mp = distribution_lib.DeviceMesh(
+            (1, world_size), ["batch", "model"]
+        )
+        dist_mp = distribution_lib.ModelParallel(
+            layout_map=distribution_lib.LayoutMap(mesh_mp),
+            batch_dim_name="batch",
+        )
+        with dist_mp.scope():
+            distributed_x_mp = trainer._distribute_inputs(dist_mp, x)
+            self.assertIsInstance(distributed_x_mp, DTensor)
+            self.assertEqual(distributed_x_mp.shape, (4, 8))
+
+    @staticmethod
+    def _setup_ddp_lazy_test(self, rank, world_size):
+        # Must use a real model with weights for DDP
+        model = models.Sequential([layers.Input(shape=(8,)), layers.Dense(2)])
+        model.build()
+
+        mesh = distribution_lib.DeviceMesh((world_size,), ["batch"])
+        dist = distribution_lib.DataParallel(mesh)
+
+        with dist.scope():
+            # _setup_ddp should be lazy and idempotent
+            model._setup_ddp()
+            self.assertTrue(hasattr(model, "_ddp_model"))
+            model_ptr = model._ddp_model
+
+            model._setup_ddp()
+            self.assertIs(model._ddp_model, model_ptr)
+
+    def test_distribute_inputs(self):
+        self.run_distributed(
+            TorchTrainerDistributionTest._distribute_inputs_test
+        )
+
+    def test_setup_ddp_lazy(self):
+        self.run_distributed(TorchTrainerDistributionTest._setup_ddp_lazy_test)
