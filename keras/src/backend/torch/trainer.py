@@ -66,7 +66,7 @@ class TorchTrainer(base_trainer.Trainer):
                     if torch.cuda.is_available()
                     else None,
                 )
-                object.__setattr__(self, "_ddp_model", ddp_model)
+                self._ddp_model = ddp_model
                 self._in_ddp_context = True
 
     def compile(self, *args, **kwargs):
@@ -214,9 +214,31 @@ class TorchTrainer(base_trainer.Trainer):
                     v = variable.value
                     if hasattr(v, "device_mesh"):
                         v = v.to_local()
-                    torch.distributed.all_reduce(
-                        v, op=torch.distributed.ReduceOp.SUM
-                    )
+                    aggregation = getattr(variable, "aggregation", "sum")
+                    if aggregation == "sum":
+                        torch.distributed.all_reduce(
+                            v, op=torch.distributed.ReduceOp.SUM
+                        )
+                    elif aggregation == "mean":
+                        if hasattr(torch.distributed.ReduceOp, "AVG"):
+                            torch.distributed.all_reduce(
+                                v, op=torch.distributed.ReduceOp.AVG
+                            )
+                        else:
+                            torch.distributed.all_reduce(
+                                v, op=torch.distributed.ReduceOp.SUM
+                            )
+                            v.div_(torch.distributed.get_world_size())
+                    elif aggregation == "max":
+                        torch.distributed.all_reduce(
+                            v, op=torch.distributed.ReduceOp.MAX
+                        )
+                    elif aggregation == "min":
+                        torch.distributed.all_reduce(
+                            v, op=torch.distributed.ReduceOp.MIN
+                        )
+                    elif aggregation == "only_first_replica":
+                        torch.distributed.broadcast(v, src=0)
                     variable.assign(v)
 
     def make_train_function(self, force=False):
