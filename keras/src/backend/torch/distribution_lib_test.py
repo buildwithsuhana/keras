@@ -42,12 +42,20 @@ class TorchDistributedTestCase(testing.TestCase):
             dist.destroy_process_group()
 
     def run_distributed(self, test_fn, world_size=None):
-        mp.spawn(
-            TorchDistributedTestCase._worker_wrapper,
-            args=(world_size or self.world_size, test_fn, self.__class__),
-            nprocs=world_size or self.world_size,
-            join=True,
-        )
+        previous_device = os.environ.get("KERAS_TORCH_DEVICE")
+        os.environ["KERAS_TORCH_DEVICE"] = "cpu"
+        try:
+            mp.spawn(
+                TorchDistributedTestCase._worker_wrapper,
+                args=(world_size or self.world_size, test_fn, self.__class__),
+                nprocs=world_size or self.world_size,
+                join=True,
+            )
+        finally:
+            if previous_device is None:
+                del os.environ["KERAS_TORCH_DEVICE"]
+            else:
+                os.environ["KERAS_TORCH_DEVICE"] = previous_device
 
 
 class TorchDeviceDiscoveryTest(TorchDistributedTestCase):

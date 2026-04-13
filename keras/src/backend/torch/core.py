@@ -139,8 +139,8 @@ class Variable(KerasVariable):
                 ).to(get_device())
 
     def _direct_assign(self, value):
+        value = convert_to_tensor(value, dtype=self._dtype).detach()
         if self._layout is not None:
-            value = convert_to_tensor(value, dtype=self._dtype).detach()
             value = torch_dist_lib.distribute_tensor(value, self._layout)
         with torch.no_grad():
             self.value.copy_(value)
