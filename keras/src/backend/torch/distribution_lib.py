@@ -37,6 +37,21 @@ def shift_shard_dims_after_remove(placements, remove_dim=0):
     return tuple(new_placements)
 
 
+_UNBIND_REGISTERED = False
+
+
+def _register_unbind_strategy():
+    global _UNBIND_REGISTERED
+    if _UNBIND_REGISTERED:
+        return
+
+    # Use the function call version of the decorator to register
+    register_op_strategy(
+        torch.ops.aten.unbind.int, schema_info=RuntimeSchemaInfo(1)
+    )(_unbind_op_strategy)
+    _UNBIND_REGISTERED = True
+
+
 def list_devices(device_type=None):
     """List available devices."""
     device_type = device_type or "gpu"
@@ -162,6 +177,8 @@ def distribute_tensor(tensor, layout):
     if not isinstance(dist, dist_lib.ModelParallel):
         return tensor
 
+    _register_unbind_strategy()
+
     from keras.src.distribution import TensorLayout
 
     if isinstance(layout, TensorLayout):
@@ -208,6 +225,8 @@ def distribute_data_input(tensor, layout, batch_dim_name):
     if not isinstance(dist, dist_lib.ModelParallel):
         return tensor
 
+    _register_unbind_strategy()
+
     if isinstance(tensor, DTensor):
         return tensor
     from keras.src.distribution import TensorLayout
@@ -227,7 +246,6 @@ def distribute_data_input(tensor, layout, batch_dim_name):
     )
 
 
-@register_op_strategy(torch.ops.aten.unbind.int, schema_info=RuntimeSchemaInfo(1))
 def _unbind_op_strategy(op_schema: OpSchema):
     """Registered sharding strategy for `torch.ops.aten.unbind.int`."""
     input_strategy = op_schema.args_schema[0]
