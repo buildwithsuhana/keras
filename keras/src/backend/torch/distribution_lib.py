@@ -6,8 +6,6 @@ from torch.distributed.tensor import DTensor
 from torch.distributed.tensor import Replicate
 from torch.distributed.tensor import Shard
 
-# --- Device Discovery (Section 3.1) ---
-
 
 def get_device_count(device_type=None):
     """Returns total device count across all hosts."""
@@ -23,9 +21,6 @@ def list_devices(device_type=None):
     device_type = device_type or "gpu"
     count = get_device_count(device_type)
     return [f"{device_type.lower()}:{i}" for i in range(count)]
-
-
-# --- Process Management (Section 3.2) ---
 
 
 def initialize(job_addresses=None, num_processes=None, process_id=None):
@@ -45,11 +40,10 @@ def process_id():
     return torch.distributed.get_rank()
 
 
-# --- Device and Mesh Mapping (Section 3.3) ---
-
-
 def _to_backend_device(device_name):
     """Returns the local device for the current process."""
+    if device_name is not None and "cpu" in device_name.lower():
+        return torch.device("cpu")
     local_rank = int(os.environ.get("LOCAL_RANK", 0))
     if torch.cuda.is_available():
         return torch.device(f"cuda:{local_rank}")
@@ -83,7 +77,6 @@ def _to_backend_layout(tensor_layout):
     torch_mesh = _to_backend_mesh(keras_mesh)
 
     placements = []
-    # PyTorch placements must match the DeviceMesh dimensions.
     for mesh_dim_name in keras_mesh.axis_names:
         shard_dim = None
         if tensor_layout.axes is not None:
@@ -99,9 +92,6 @@ def _to_backend_layout(tensor_layout):
     return DTensorLayout(torch_mesh, tuple(placements))
 
 
-# --- Tensor Distribution (Section 3.4) ---
-
-
 def distribute_tensor(tensor, layout):
     """Scatters or replicates a tensor according to the layout."""
     if layout is None:
@@ -113,7 +103,6 @@ def distribute_tensor(tensor, layout):
     if not isinstance(dist, dist_lib.ModelParallel):
         return tensor
 
-    # Ensure advanced operator strategies are registered.
     _register_unbind_strategy()
 
     from keras.src.distribution import TensorLayout
@@ -158,11 +147,15 @@ def distribute_data_input(tensor, layout, batch_dim_name):
     if isinstance(tensor, DTensor):
         return tensor
 
-    # Ensure it's a torch tensor on the correct device.
     if not isinstance(tensor, torch.Tensor):
+        from keras.src.backend.common import global_state
         from keras.src.backend.torch import core as torch_core
-
-        tensor = torch_core.convert_to_tensor(tensor)
+        dist = global_state.get_global_attribute("distribution")
+        global_state.set_global_attribute("distribution", None)
+        try:
+            tensor = torch_core.convert_to_tensor(tensor)
+        finally:
+            global_state.set_global_attribute("distribution", dist)
 
     if tensor.device.type == "meta":
         return tensor
@@ -170,9 +163,6 @@ def distribute_data_input(tensor, layout, batch_dim_name):
     return DTensor.from_local(
         tensor, device_mesh=layout.device_mesh, placements=layout.placements
     )
-
-
-# --- DTensor Operator Sharding Strategies ---
 
 
 _UNBIND_REGISTERED = False
@@ -216,7 +206,6 @@ def _register_unbind_strategy():
             )
 
             if is_sharded:
-                # Suggest replication if sharded along unbind dim.
                 rep_spec = DTensorSpec(
                     mesh=mesh,
                     placements=tuple(Replicate() for _ in arg_spec.placements),
@@ -233,7 +222,6 @@ def _register_unbind_strategy():
                     )
                 )
             else:
-                # Forward sharding, adjusting for removed dimension.
                 out_placements = []
                 for p in arg_spec.placements:
                     if isinstance(p, Shard) and p.dim > dim:

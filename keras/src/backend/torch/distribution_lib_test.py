@@ -187,9 +187,7 @@ class TorchVariableDistributionAwarenessTest(TorchDistributedTestCase):
 
         mesh = distribution_lib.DeviceMesh((world_size,), ["model"])
         layout_map = distribution_lib.LayoutMap(mesh)
-        layout_map[".*kernel"] = distribution_lib.TensorLayout(
-            [None, "model"]
-        )
+        layout_map[".*kernel"] = distribution_lib.TensorLayout([None, "model"])
         dist = distribution_lib.ModelParallel(
             layout_map=layout_map, batch_dim_name="model"
         )
@@ -552,11 +550,17 @@ class TorchDistributionUtilsTest(TorchDistributedTestCase):
     @staticmethod
     def _to_backend_device_test(self, rank, world_size):
         device = backend_dlib._to_backend_device(None)
-        self.assertEqual(device.type, "cpu")
+        if torch.cuda.is_available():
+            self.assertEqual(device.type, "cuda")
+        else:
+            self.assertEqual(device.type, "cpu")
 
         device = backend_dlib._to_backend_device("gpu:0")
-        self.assertEqual(device.type, "cuda")
-        self.assertEqual(device.index, 0)
+        if torch.cuda.is_available():
+            self.assertEqual(device.type, "cuda")
+            self.assertEqual(device.index, 0)
+        else:
+            self.assertEqual(device.type, "cpu")
 
         device = backend_dlib._to_backend_device("cpu")
         self.assertEqual(device.type, "cpu")

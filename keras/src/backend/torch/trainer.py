@@ -78,7 +78,6 @@ class TorchTrainer(base_trainer.Trainer):
                 self._in_ddp_context = True
 
     def _distribute_inputs(self, dist, data, replicate=False):
-        from keras.src.backend.torch import distribution_lib as torch_dist_lib
         from keras.src.distribution import distribution_lib
 
         def _distribute_if_tensor(t):
@@ -236,14 +235,12 @@ class TorchTrainer(base_trainer.Trainer):
             from torch.distributed.tensor import DTensor
 
             for metric in self.metrics:
+                reduce_op = torch.distributed.ReduceOp.SUM
                 for variable in metric.variables:
                     v = variable.value
                     if isinstance(v, DTensor):
                         v = v.to_local()
-                    torch.distributed.all_reduce(
-                        v, op=torch.distributed.ReduceOp.SUM
-                    )
-                    # No need to assign back as all_reduce is in-place.
+                    torch.distributed.all_reduce(v, op=reduce_op)
 
     def make_train_function(self, force=False):
         if self.train_function is not None and not force:
