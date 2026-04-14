@@ -23,10 +23,6 @@ class _KerasModuleWrapper(torch.nn.Module):
     """Wraps a Keras model so DDP sees standard torch.nn.Parameters."""
 
     def __init__(self, keras_model):
-        super().__init__()
-        # Use object.__setattr__ to avoid PyTorch registering keras_model as a
-        # child module, which would cause infinite recursion during
-        # train()/eval() calls.
         object.__setattr__(self, "_keras_model", keras_model)
         for i, v in enumerate(keras_model.trainable_weights):
             self.register_parameter(f"p{i}", v.value)
@@ -72,8 +68,6 @@ class TorchTrainer(base_trainer.Trainer):
                     if torch.cuda.is_available()
                     else None,
                 )
-                # Use object.__setattr__ to avoid PyTorch registering ddp_model
-                # as a child module, which would cause infinite recursion.
                 object.__setattr__(self, "_ddp_model", ddp_model)
                 self._in_ddp_context = True
 

@@ -765,6 +765,8 @@ class ModelParallel(Distribution):
             per_process_batch_size = global_batch_size // num_model_replicas
             distributed_dataset = dataset.rebatch(per_process_batch_size)
             processes_per_replica = self._num_process // num_model_replicas
+            # Each process belongs to a replica group. Determine which replica
+            # this process group belongs to.
             data_shard_id = self._process_id // processes_per_replica
             distributed_dataset = distributed_dataset.shard(
                 num_shards=num_model_replicas,
