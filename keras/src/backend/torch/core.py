@@ -696,7 +696,7 @@ def slice(inputs, start_indices, shape):
         python_slice(start_index, start_index + length)
         for start_index, length in zip(start_indices, shape)
     ]
-    return inputs[slices]
+    return inputs[tuple(slices)]
 
 
 def slice_update(inputs, start_indices, updates):

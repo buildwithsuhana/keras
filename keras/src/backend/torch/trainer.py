@@ -109,20 +109,9 @@ class TorchTrainer(base_trainer.Trainer):
         dist = dist_lib.distribution()
 
         if dist is not None:
-            if isinstance(dist, dist_lib.ModelParallel):
-                data_layout = dist.get_data_layout(x.shape)
-                x = torch_dist_lib.distribute_data_input(
-                    x, data_layout, dist.batch_dim_name
-                )
-                if y is not None:
-                    y_layout = dist.get_data_layout(y.shape)
-                    y = torch_dist_lib.distribute_data_input(
-                        y, y_layout, dist.batch_dim_name
-                    )
-            else:
-                x = self._distribute_inputs(dist, x)
-                if y is not None:
-                    y = self._distribute_inputs(dist, y)
+            x = self._distribute_inputs(dist, x)
+            if y is not None:
+                y = self._distribute_inputs(dist, y)
 
         # Call torch.nn.Module.zero_grad() to clear the leftover gradients
         # for the weights from the previous train step.
