@@ -128,24 +128,27 @@ class Variable(KerasVariable):
                 distribute_tensor,
             )
 
+            if isinstance(value, torch.nn.Parameter):
+                value = value.data
             value = convert_to_tensor(value, dtype=self._dtype)
             value = distribute_tensor(value, self._layout)
-            device = value.device if hasattr(value, "device") else get_device()
-            self._value = torch.nn.Parameter(
-                value.to(device), requires_grad=self.trainable
-            )
+            self._value = torch.nn.Parameter(value, requires_grad=self.trainable)
         else:
-            # Current behavior — plain Parameter
-            param_value = convert_to_tensor(value, dtype=self._dtype)
-            device = (
-                param_value.device
-                if hasattr(param_value, "device")
-                else get_device()
-            )
-            self._value = torch.nn.Parameter(
-                param_value.to(device),
-                requires_grad=self.trainable,
-            )
+            if isinstance(value, torch.nn.Parameter):
+                self._value = value
+                if self._value.requires_grad != self.trainable:
+                    self._value.requires_grad = self.trainable
+            else:
+                param_value = convert_to_tensor(value, dtype=self._dtype)
+                device = (
+                    param_value.device
+                    if hasattr(param_value, "device")
+                    else get_device()
+                )
+                self._value = torch.nn.Parameter(
+                    param_value.to(device),
+                    requires_grad=self.trainable,
+                )
 
     def _direct_assign(self, value):
         value = convert_to_tensor(value, dtype=self._dtype).detach()

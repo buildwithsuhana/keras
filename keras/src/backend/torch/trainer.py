@@ -37,7 +37,6 @@ class _KerasModuleWrapper(torch.nn.Module):
 class TorchTrainer(base_trainer.Trainer):
     def __init__(self):
         super().__init__()
-        self.optimizer = None
         self.train_function = None
         self.test_function = None
         self.predict_function = None
