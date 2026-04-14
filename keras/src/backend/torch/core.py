@@ -130,13 +130,12 @@ class Variable(KerasVariable):
         if self._layout is not None:
             from torch.distributed.tensor import DTensor
 
+            from keras.src.backend.torch.distribution_lib import (
+                distribute_tensor,
+            )
+
             value = convert_to_tensor(value, dtype=self._dtype)
-            if not isinstance(value, DTensor):
-                value = DTensor.from_local(
-                    value,
-                    device_mesh=self._layout.device_mesh,
-                    placements=self._layout.placements,
-                )
+            value = distribute_tensor(value, self._layout)
             self._value = torch.nn.Parameter(
                 value, requires_grad=self.trainable
             )

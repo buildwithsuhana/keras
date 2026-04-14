@@ -91,13 +91,33 @@ def process_id():
 
 
 def _to_backend_device(device_name):
-    from keras.src.backend.torch import core as torch_core
+    if device_name is None:
+        from keras.src.backend.torch import core as torch_core
 
-    device = torch_core.get_device()
-    if "cuda" in str(device):
-        local_rank = int(os.environ.get("LOCAL_RANK", 0))
-        return torch.device(f"cuda:{local_rank}")
-    return torch.device(device)
+        device = torch_core.get_device()
+        if "cuda" in str(device):
+            local_rank = int(os.environ.get("LOCAL_RANK", 0))
+            return torch.device(f"cuda:{local_rank}")
+        return torch.device(device)
+
+    if isinstance(device_name, torch.device):
+        return device_name
+
+    device_name = device_name.lower()
+    if "gpu" in device_name or "cuda" in device_name:
+        if ":" in device_name:
+            index = int(device_name.split(":")[-1])
+            # Map global index to local rank for distributed training
+            if torch.distributed.is_initialized():
+                from keras.src.backend.torch import core as torch_core
+
+                device = torch_core.get_device()
+                if "cuda" in str(device):
+                    local_rank = int(os.environ.get("LOCAL_RANK", 0))
+                    return torch.device(f"cuda:{local_rank}")
+            return torch.device(f"cuda:{index}")
+        return torch.device("cuda")
+    return torch.device("cpu")
 
 
 def _to_backend_mesh(keras_mesh):
@@ -223,7 +243,7 @@ def distribute_data_input(tensor, layout, batch_dim_name):
 
     tensor = torch_core.convert_to_tensor(tensor)
     if isinstance(tensor, DTensor):
-        return tensor
+        tensor = tensor.to_local()
 
     return DTensor.from_local(
         tensor, device_mesh=torch_mesh, placements=placements

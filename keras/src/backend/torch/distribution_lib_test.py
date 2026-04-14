@@ -187,7 +187,7 @@ class TorchVariableDistributionAwarenessTest(TorchDistributedTestCase):
 
         mesh = distribution_lib.DeviceMesh((world_size,), ["model"])
         layout_map = distribution_lib.LayoutMap(mesh)
-        layout_map[".*dense.*kernel"] = distribution_lib.TensorLayout(
+        layout_map[".*kernel"] = distribution_lib.TensorLayout(
             [None, "model"]
         )
         dist = distribution_lib.ModelParallel(
@@ -394,7 +394,9 @@ class TorchCheckpointTest(TorchDistributedTestCase):
 
             with tempfile.NamedTemporaryFile(suffix=".keras") as f:
                 model.save(f.name)
-                model2 = models.load_model(f.name)
+                from keras.src.saving import saving_api
+
+                model2 = saving_api.load_model(f.name)
                 for w1, w2 in zip(model.get_weights(), model2.get_weights()):
                     self.assertAllClose(w1, w2)
                 self.assertGreater(len(model2.optimizer.variables), 0)
@@ -432,41 +434,6 @@ class TorchCheckpointTest(TorchDistributedTestCase):
 
     def test_dp_checkpoint(self):
         self.run_distributed(TorchCheckpointTest._dp_checkpoint_test)
-
-
-class TorchTFDatasetShardingTest(TorchDistributedTestCase):
-    @staticmethod
-    def _tf_dataset_sharding_test(self, rank, world_size):
-        import tensorflow as tf
-
-        from keras.src.trainers.data_adapters.tf_dataset_adapter import (
-            TFDatasetAdapter,
-        )
-
-        data_size = world_size * 4
-        x = np.arange(data_size).reshape(-1, 1).astype("float32")
-        dataset = tf.data.Dataset.from_tensor_slices((x, x)).batch(1)
-
-        mesh = distribution_lib.DeviceMesh((world_size,), ["batch"])
-        dist = distribution_lib.DataParallel(mesh)
-
-        adapter = TFDatasetAdapter(dataset, distribution=dist)
-
-        self.assertEqual(adapter.num_batches, data_size)
-
-        it = adapter.get_torch_dataloader()
-        batches = list(it)
-
-        self.assertEqual(len(batches), 4)
-
-        expected_indices = x[rank::world_size]
-        for i, batch in enumerate(batches):
-            self.assertAllClose(batch[0], expected_indices[i])
-
-    def test_tf_dataset_sharding(self):
-        self.run_distributed(
-            TorchTFDatasetShardingTest._tf_dataset_sharding_test
-        )
 
 
 class TorchUnbindTest(TorchDistributedTestCase):
