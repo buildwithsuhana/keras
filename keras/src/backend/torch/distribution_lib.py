@@ -55,76 +55,42 @@ def _register_unbind_strategy():
 
 
 def list_devices(device_type=None):
-    """List available devices."""
     device_type = device_type or "gpu"
     if torch.distributed.is_initialized():
         count = torch.distributed.get_world_size()
     elif "WORLD_SIZE" in os.environ:
         count = int(os.environ["WORLD_SIZE"])
     else:
-        if device_type.lower() == "gpu":
-            count = torch.cuda.device_count() or 1
-        else:
-            count = 1
+        count = torch.cuda.device_count() or 1
     return [f"{device_type.lower()}:{i}" for i in range(count)]
 
 
 def get_device_count(device_type=None):
-    """Get the total number of available devices."""
     if torch.distributed.is_initialized():
         return torch.distributed.get_world_size()
     elif "WORLD_SIZE" in os.environ:
         return int(os.environ["WORLD_SIZE"])
     else:
-        if device_type and device_type.lower() == "gpu":
-            return torch.cuda.device_count() or 1
-        else:
-            return 1
+        return torch.cuda.device_count() or 1
 
 
 def initialize(job_addresses=None, num_processes=None, process_id=None):
-    """Initialize the distributed process group."""
     local_rank = int(os.environ.get("LOCAL_RANK", 0))
-    if torch.cuda.is_available():
-        torch.cuda.set_device(local_rank)
-
-    if not torch.distributed.is_initialized():
-        if "MASTER_ADDR" not in os.environ:
-            os.environ["MASTER_ADDR"] = "localhost"
-        if "MASTER_PORT" not in os.environ:
-            os.environ["MASTER_PORT"] = "29500"
-        backend = os.environ.get("TORCH_DISTRIBUTED_BACKEND") or (
-            "nccl" if torch.cuda.is_available() else "gloo"
-        )
-        torch.distributed.init_process_group(backend=backend)
+    torch.cuda.set_device(local_rank)
+    torch.distributed.init_process_group(backend="nccl")
 
 
 def num_processes():
-    """Get the number of processes in the distributed group."""
-    if torch.distributed.is_initialized():
-        return torch.distributed.get_world_size()
-    return 1
+    return torch.distributed.get_world_size()
 
 
 def process_id():
-    """Get the rank of the current process."""
-    if torch.distributed.is_initialized():
-        return torch.distributed.get_rank()
-    return 0
+    return torch.distributed.get_rank()
 
 
 def _to_backend_device(device_name):
-    """Map a Keras device name to a Torch device."""
-    if device_name is not None:
-        device_name = device_name.lower()
-        if "gpu" in device_name:
-            device_name = device_name.replace("gpu", "cuda")
-        return torch.device(device_name)
-
     local_rank = int(os.environ.get("LOCAL_RANK", 0))
-    if torch.cuda.is_available():
-        return torch.device(f"cuda:{local_rank}")
-    return torch.device("cpu")
+    return torch.device(f"cuda:{local_rank}")
 
 
 def _to_backend_mesh(keras_mesh):

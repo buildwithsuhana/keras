@@ -124,19 +124,23 @@ class Variable(KerasVariable):
         self._initialize_layout()
 
         if self._layout is not None:
-            value = convert_to_tensor(value, dtype=self._dtype).detach()
-            self._value = torch_dist_lib.distribute_variable(
-                value, self._layout, trainable=self.trainable
+            from torch.distributed.tensor import DTensor
+
+            value = convert_to_tensor(value, dtype=self._dtype)
+            value = DTensor.from_local(
+                value,
+                device_mesh=self._layout.device_mesh,
+                placements=self._layout.placements,
+            )
+            self._value = torch.nn.Parameter(
+                value, requires_grad=self.trainable
             )
         else:
-            if isinstance(value, torch.nn.Parameter):
-                # Reuse same parameter
-                self._value = value
-            else:
-                self._value = torch.nn.Parameter(
-                    convert_to_tensor(value, dtype=self._dtype),
-                    requires_grad=self.trainable,
-                ).to(get_device())
+            # Current behavior — plain Parameter
+            self._value = torch.nn.Parameter(
+                convert_to_tensor(value, dtype=self._dtype),
+                requires_grad=self.trainable,
+            ).to(get_device())
 
     def _direct_assign(self, value):
         value = convert_to_tensor(value, dtype=self._dtype).detach()

@@ -9,6 +9,7 @@ from keras.src import callbacks as callbacks_module
 from keras.src import optimizers as optimizers_module
 from keras.src import tree
 from keras.src.backend import config
+from keras.src.backend.torch import distribution_lib as torch_dist_lib
 from keras.src.trainers import trainer as base_trainer
 from keras.src.trainers.data_adapters import array_slicing
 from keras.src.trainers.data_adapters import data_adapter_utils
@@ -27,7 +28,7 @@ class _KerasModuleWrapper(torch.nn.Module):
         # train()/eval() calls.
         object.__setattr__(self, "_keras_model", keras_model)
         for i, v in enumerate(keras_model.trainable_weights):
-            self.register_parameter(f"p{i}", v.value)
+            self.register_parameter(f"p{i}", torch.nn.Parameter(v.value))
         for i, v in enumerate(keras_model.non_trainable_weights):
             self.register_buffer(f"b{i}", v.value)
 
@@ -107,9 +108,20 @@ class TorchTrainer(base_trainer.Trainer):
         dist = dist_lib.distribution()
 
         if dist is not None:
-            x = self._distribute_inputs(dist, x)
-            if y is not None:
-                y = self._distribute_inputs(dist, y)
+            if isinstance(dist, dist_lib.ModelParallel):
+                data_layout = dist.get_data_layout(x.shape)
+                x = torch_dist_lib.distribute_data_input(
+                    x, data_layout, dist.batch_dim_name
+                )
+                if y is not None:
+                    y_layout = dist.get_data_layout(y.shape)
+                    y = torch_dist_lib.distribute_data_input(
+                        y, y_layout, dist.batch_dim_name
+                    )
+            else:
+                x = self._distribute_inputs(dist, x)
+                if y is not None:
+                    y = self._distribute_inputs(dist, y)
 
         # Call torch.nn.Module.zero_grad() to clear the leftover gradients
         # for the weights from the previous train step.
@@ -214,33 +226,9 @@ class TorchTrainer(base_trainer.Trainer):
             for metric in self.metrics:
                 for variable in metric.variables:
                     v = variable.value
-                    if hasattr(v, "device_mesh"):
-                        v = v.to_local()
-                    aggregation = getattr(variable, "aggregation", "sum")
-                    if aggregation == "sum":
-                        torch.distributed.all_reduce(
-                            v, op=torch.distributed.ReduceOp.SUM
-                        )
-                    elif aggregation == "mean":
-                        if hasattr(torch.distributed.ReduceOp, "AVG"):
-                            torch.distributed.all_reduce(
-                                v, op=torch.distributed.ReduceOp.AVG
-                            )
-                        else:
-                            torch.distributed.all_reduce(
-                                v, op=torch.distributed.ReduceOp.SUM
-                            )
-                            v.div_(torch.distributed.get_world_size())
-                    elif aggregation == "max":
-                        torch.distributed.all_reduce(
-                            v, op=torch.distributed.ReduceOp.MAX
-                        )
-                    elif aggregation == "min":
-                        torch.distributed.all_reduce(
-                            v, op=torch.distributed.ReduceOp.MIN
-                        )
-                    elif aggregation == "only_first_replica":
-                        torch.distributed.broadcast(v, src=0)
+                    torch.distributed.all_reduce(
+                        v, op=torch.distributed.ReduceOp.SUM
+                    )
                     variable.assign(v)
 
     def make_train_function(self, force=False):
