@@ -175,7 +175,7 @@ def distribute_tensor(tensor, layout):
     if not isinstance(dist, dist_lib.ModelParallel):
         return tensor
 
-    _register_unbind_strategy()
+    # _register_unbind_strategy()
 
     from keras.src.distribution import TensorLayout
 
@@ -223,7 +223,7 @@ def distribute_data_input(tensor, layout, batch_dim_name):
     if not isinstance(dist, dist_lib.ModelParallel):
         return tensor
 
-    _register_unbind_strategy()
+    # _register_unbind_strategy()
 
     if isinstance(tensor, DTensor):
         return tensor
