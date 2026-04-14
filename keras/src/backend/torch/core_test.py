@@ -8,7 +8,9 @@ from keras.src import testing
 from keras.src.backend.torch import core
 
 
-@pytest.mark.skipif(backend.backend() != "torch", reason="Requires Torch backend")
+@pytest.mark.skipif(
+    backend.backend() != "torch", reason="Requires Torch backend"
+)
 class CoreTest(testing.TestCase):
     def test_convert_to_tensor(self):
         # Test basic conversion (use float32 to avoid MPS float64 issues)

@@ -180,7 +180,7 @@ class TorchVariableDistributionAwarenessTest(TorchDistributedTestCase):
             [None, "model"]
         )
         dist = distribution_lib.ModelParallel(
-            layout_map=layout_map, batch_dim_name="batch"
+            layout_map=layout_map, batch_dim_name="model"
         )
         with dist.scope():
             layer = layers.Dense(world_size * 4)
@@ -327,7 +327,7 @@ class TorchCheckpointTest(TorchDistributedTestCase):
             [None, "model"]
         )
         dist = distribution_lib.ModelParallel(
-            layout_map=layout_map, batch_dim_name="batch"
+            layout_map=layout_map, batch_dim_name="model"
         )
 
         with dist.scope():
@@ -525,7 +525,7 @@ class TorchDistributionTensorTest(TorchDistributedTestCase):
         mesh = distribution_lib.DeviceMesh((world_size,), ["model"])
         layout_map = distribution_lib.LayoutMap(mesh)
         dist = distribution_lib.ModelParallel(
-            layout_map=layout_map, batch_dim_name="batch"
+            layout_map=layout_map, batch_dim_name="model"
         )
 
         with dist.scope():

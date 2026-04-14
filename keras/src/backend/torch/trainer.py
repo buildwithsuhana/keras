@@ -38,6 +38,7 @@ class _KerasModuleWrapper(torch.nn.Module):
 class TorchTrainer(base_trainer.Trainer):
     def __init__(self):
         super().__init__()
+        self.optimizer = None
         self.train_function = None
         self.test_function = None
         self.predict_function = None
@@ -73,10 +74,6 @@ class TorchTrainer(base_trainer.Trainer):
                 # as a child module, which would cause infinite recursion.
                 object.__setattr__(self, "_ddp_model", ddp_model)
                 self._in_ddp_context = True
-
-    def compile(self, *args, **kwargs):
-        super().compile(*args, **kwargs)
-        self._setup_ddp()
 
     def _distribute_inputs(self, dist, data, replicate=False):
         from keras.src.backend.torch import distribution_lib as torch_dist_lib
