@@ -1,3 +1,4 @@
+import contextlib
 import warnings
 
 import numpy as np
@@ -28,7 +29,7 @@ class _KerasModuleWrapper(torch.nn.Module):
         # train()/eval() calls.
         object.__setattr__(self, "_keras_model", keras_model)
         for i, v in enumerate(keras_model.trainable_weights):
-            self.register_parameter(f"p{i}", torch.nn.Parameter(v.value))
+            self.register_parameter(f"p{i}", v.value)
         for i, v in enumerate(keras_model.non_trainable_weights):
             self.register_buffer(f"b{i}", v.value)
 
@@ -151,7 +152,27 @@ class TorchTrainer(base_trainer.Trainer):
         if self.trainable_weights:
             # Call torch.Tensor.backward() on the loss to compute gradients
             # for the weights.
-            loss.backward()
+            if dist is not None and isinstance(dist, dist_lib.DataParallel):
+                is_update_step = True
+                if (
+                    self.optimizer is not None
+                    and self.optimizer.gradient_accumulation_steps
+                ):
+                    is_update_step = (
+                        (self.optimizer._iterations.value + 1)
+                        % self.optimizer.gradient_accumulation_steps
+                        == 0
+                    )
+
+                if not is_update_step:
+                    context = self._ddp_model.no_sync()
+                else:
+                    context = contextlib.nullcontext()
+            else:
+                context = contextlib.nullcontext()
+
+            with context:
+                loss.backward()
 
             trainable_weights = self.trainable_weights[:]
             gradients = [v.value.grad for v in trainable_weights]
@@ -223,13 +244,17 @@ class TorchTrainer(base_trainer.Trainer):
 
         dist_obj = dist_lib.distribution()
         if dist_obj is not None and torch.distributed.is_initialized():
+            from torch.distributed.tensor import DTensor
+
             for metric in self.metrics:
                 for variable in metric.variables:
                     v = variable.value
+                    if isinstance(v, DTensor):
+                        v = v.to_local()
                     torch.distributed.all_reduce(
                         v, op=torch.distributed.ReduceOp.SUM
                     )
-                    variable.assign(v)
+                    # No need to assign back as all_reduce is in-place.
 
     def make_train_function(self, force=False):
         if self.train_function is not None and not force:

@@ -76,8 +76,10 @@ def get_device_count(device_type=None):
 
 def initialize(job_addresses=None, num_processes=None, process_id=None):
     local_rank = int(os.environ.get("LOCAL_RANK", 0))
-    torch.cuda.set_device(local_rank)
-    torch.distributed.init_process_group(backend="nccl")
+    if torch.cuda.is_available():
+        torch.cuda.set_device(local_rank)
+    backend = "nccl" if torch.cuda.is_available() else "gloo"
+    torch.distributed.init_process_group(backend=backend)  
 
 
 def num_processes():
@@ -89,14 +91,22 @@ def process_id():
 
 
 def _to_backend_device(device_name):
-    local_rank = int(os.environ.get("LOCAL_RANK", 0))
-    return torch.device(f"cuda:{local_rank}")
+    from keras.src.backend.torch import core as torch_core
+
+    device = torch_core.get_device()
+    if "cuda" in str(device):
+        local_rank = int(os.environ.get("LOCAL_RANK", 0))
+        return torch.device(f"cuda:{local_rank}")
+    return torch.device(device)
 
 
 def _to_backend_mesh(keras_mesh):
     """Map a Keras `DeviceMesh` to a Torch `DeviceMesh`."""
+    from keras.src.backend.torch import core as torch_core
+
+    device = torch_core.get_device()
     return init_device_mesh(
-        "cuda" if torch.cuda.is_available() else "cpu",
+        "cuda" if "cuda" in str(device) else "cpu",
         mesh_shape=tuple(keras_mesh.shape),
         mesh_dim_names=tuple(keras_mesh.axis_names),
     )
@@ -207,6 +217,12 @@ def distribute_data_input(tensor, layout, batch_dim_name):
     elif isinstance(layout, (list, tuple)):
         torch_mesh, placements = layout
     else:
+        return tensor
+
+    from keras.src.backend.torch import core as torch_core
+
+    tensor = torch_core.convert_to_tensor(tensor)
+    if isinstance(tensor, DTensor):
         return tensor
 
     return DTensor.from_local(

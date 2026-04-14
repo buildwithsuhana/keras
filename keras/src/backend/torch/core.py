@@ -111,6 +111,10 @@ class Variable(KerasVariable):
     def _initialize_layout(self):
         distribution = global_state.get_global_attribute("distribution")
         if self._layout is None and distribution is not None:
+            from keras.src.distribution.distribution_lib import ModelParallel
+
+            if not isinstance(distribution, ModelParallel):
+                return
             tensor_layout = distribution.get_variable_layout(self)
             from keras.src.distribution import TensorLayout
 
@@ -127,11 +131,12 @@ class Variable(KerasVariable):
             from torch.distributed.tensor import DTensor
 
             value = convert_to_tensor(value, dtype=self._dtype)
-            value = DTensor.from_local(
-                value,
-                device_mesh=self._layout.device_mesh,
-                placements=self._layout.placements,
-            )
+            if not isinstance(value, DTensor):
+                value = DTensor.from_local(
+                    value,
+                    device_mesh=self._layout.device_mesh,
+                    placements=self._layout.placements,
+                )
             self._value = torch.nn.Parameter(
                 value, requires_grad=self.trainable
             )
