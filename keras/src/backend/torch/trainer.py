@@ -23,6 +23,7 @@ class _KerasModuleWrapper(torch.nn.Module):
     """Wraps a Keras model so DDP sees standard torch.nn.Parameters."""
 
     def __init__(self, keras_model):
+        super().__init__()
         object.__setattr__(self, "_keras_model", keras_model)
         for i, v in enumerate(keras_model.trainable_weights):
             self.register_parameter(f"p{i}", v.value)
