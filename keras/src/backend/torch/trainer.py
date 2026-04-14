@@ -147,10 +147,8 @@ class TorchTrainer(base_trainer.Trainer):
                     and self.optimizer.gradient_accumulation_steps
                 ):
                     is_update_step = (
-                        (self.optimizer._iterations.value + 1)
-                        % self.optimizer.gradient_accumulation_steps
-                        == 0
-                    )
+                        self.optimizer._iterations.value + 1
+                    ) % self.optimizer.gradient_accumulation_steps == 0
 
                 if not is_update_step:
                     context = self._ddp_model.no_sync()

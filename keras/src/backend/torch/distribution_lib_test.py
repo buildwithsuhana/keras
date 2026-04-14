@@ -410,7 +410,6 @@ class TorchCheckpointTest(TorchDistributedTestCase):
             model = models.Sequential(
                 [layers.Input(shape=(8,)), layers.Dense(4)]
             )
-            weights = [np.ones((8, 4)) * rank, np.zeros((4,))]
             model.set_weights([np.ones((8, 4)), np.zeros((4,))])
 
             with tempfile.NamedTemporaryFile(suffix=".weights.h5") as f:

@@ -150,6 +150,7 @@ def distribute_data_input(tensor, layout, batch_dim_name):
     if not isinstance(tensor, torch.Tensor):
         from keras.src.backend.common import global_state
         from keras.src.backend.torch import core as torch_core
+
         dist = global_state.get_global_attribute("distribution")
         global_state.set_global_attribute("distribution", None)
         try:
