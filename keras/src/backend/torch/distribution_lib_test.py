@@ -1,4 +1,5 @@
 import os
+import socket
 
 import numpy as np
 import pytest
@@ -13,6 +14,12 @@ from keras.src.backend.torch import distribution_lib as backend_dlib
 from keras.src.distribution import distribution_lib
 
 
+def find_free_port():
+    with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as s:
+        s.bind(("", 0))
+        return s.getsockname()[1]
+
+
 @pytest.mark.skipif(
     backend.backend() != "torch", reason="Only for Torch backend"
 )
@@ -22,13 +29,13 @@ class TorchDistributedTestCase(testing.TestCase):
         self.world_size = 2
 
     @staticmethod
-    def _worker_wrapper(rank, world_size, test_fn, cls):
+    def _worker_wrapper(rank, world_size, port, test_fn, cls):
         import torch.distributed as dist
 
         os.environ.update(
             {
                 "MASTER_ADDR": "localhost",
-                "MASTER_PORT": os.environ.get("MASTER_PORT", "29500"),
+                "MASTER_PORT": str(port),
                 "RANK": str(rank),
                 "WORLD_SIZE": str(world_size),
                 "LOCAL_RANK": str(rank),
@@ -36,19 +43,23 @@ class TorchDistributedTestCase(testing.TestCase):
                 "PYTORCH_ENABLE_MPS_FALLBACK": "1",
             }
         )
-        dist.init_process_group("gloo", rank=rank, world_size=world_size)
-        test_fn(cls("setUp"), rank, world_size)
-        if dist.is_initialized():
-            dist.destroy_process_group()
+        try:
+            dist.init_process_group("gloo", rank=rank, world_size=world_size)
+            test_fn(cls("setUp"), rank, world_size)
+        finally:
+            if dist.is_initialized():
+                dist.destroy_process_group()
 
     def run_distributed(self, test_fn, world_size=None):
         previous_device = os.environ.get("KERAS_TORCH_DEVICE")
         os.environ["KERAS_TORCH_DEVICE"] = "cpu"
+        world_size = world_size or self.world_size
+        port = find_free_port()
         try:
             mp.spawn(
                 TorchDistributedTestCase._worker_wrapper,
-                args=(world_size or self.world_size, test_fn, self.__class__),
-                nprocs=world_size or self.world_size,
+                args=(world_size, port, test_fn, self.__class__),
+                nprocs=world_size,
                 join=True,
             )
         finally:
@@ -337,7 +348,6 @@ class TorchCheckpointTest(TorchDistributedTestCase):
                     layers.Dense(world_size * 4, name="dense_1"),
                 ]
             )
-            # Set some predictable weights
             weights = [
                 np.ones((8, world_size * 4)),
                 np.zeros((world_size * 4,)),
@@ -347,7 +357,6 @@ class TorchCheckpointTest(TorchDistributedTestCase):
             with tempfile.NamedTemporaryFile(suffix=".weights.h5") as f:
                 model.save_weights(f.name)
 
-                # Create a new model and load weights
                 model2 = models.Sequential(
                     [
                         layers.Input(shape=(8,)),
@@ -359,8 +368,105 @@ class TorchCheckpointTest(TorchDistributedTestCase):
                 for w1, w2 in zip(model.get_weights(), model2.get_weights()):
                     self.assertAllClose(w1, w2)
 
+    @staticmethod
+    def _full_model_checkpoint_test(self, rank, world_size):
+        import tempfile
+
+        mesh = distribution_lib.DeviceMesh((1, world_size), ["batch", "model"])
+        layout_map = distribution_lib.LayoutMap(mesh)
+        layout_map[".*dense.*kernel"] = distribution_lib.TensorLayout(
+            [None, "model"]
+        )
+        dist = distribution_lib.ModelParallel(
+            layout_map=layout_map, batch_dim_name="model"
+        )
+
+        with dist.scope():
+            model = models.Sequential(
+                [
+                    layers.Input(shape=(8,)),
+                    layers.Dense(world_size * 4, name="dense_1"),
+                    layers.Dense(2, name="dense_2"),
+                ]
+            )
+            model.compile(optimizer="adam", loss="mse")
+            model.train_on_batch(np.random.randn(2, 8), np.random.randn(2, 2))
+
+            with tempfile.NamedTemporaryFile(suffix=".keras") as f:
+                model.save(f.name)
+                model2 = models.load_model(f.name)
+                for w1, w2 in zip(model.get_weights(), model2.get_weights()):
+                    self.assertAllClose(w1, w2)
+                self.assertGreater(len(model2.optimizer.variables), 0)
+
+    @staticmethod
+    def _dp_checkpoint_test(self, rank, world_size):
+        import tempfile
+
+        mesh = distribution_lib.DeviceMesh((world_size,), ["batch"])
+        dist = distribution_lib.DataParallel(mesh)
+
+        with dist.scope():
+            model = models.Sequential(
+                [layers.Input(shape=(8,)), layers.Dense(4)]
+            )
+            weights = [np.ones((8, 4)) * rank, np.zeros((4,))]
+            model.set_weights([np.ones((8, 4)), np.zeros((4,))])
+
+            with tempfile.NamedTemporaryFile(suffix=".weights.h5") as f:
+                model.save_weights(f.name)
+
+                model2 = models.Sequential(
+                    [layers.Input(shape=(8,)), layers.Dense(4)]
+                )
+                model2.load_weights(f.name)
+
+                for w1, w2 in zip(model.get_weights(), model2.get_weights()):
+                    self.assertAllClose(w1, w2)
+
     def test_checkpoint(self):
         self.run_distributed(TorchCheckpointTest._checkpoint_test)
+
+    def test_full_model_checkpoint(self):
+        self.run_distributed(TorchCheckpointTest._full_model_checkpoint_test)
+
+    def test_dp_checkpoint(self):
+        self.run_distributed(TorchCheckpointTest._dp_checkpoint_test)
+
+
+class TorchTFDatasetShardingTest(TorchDistributedTestCase):
+    @staticmethod
+    def _tf_dataset_sharding_test(self, rank, world_size):
+        import tensorflow as tf
+
+        from keras.src.trainers.data_adapters.tf_dataset_adapter import (
+            TFDatasetAdapter,
+        )
+
+        data_size = world_size * 4
+        x = np.arange(data_size).reshape(-1, 1).astype("float32")
+        dataset = tf.data.Dataset.from_tensor_slices((x, x)).batch(1)
+
+        mesh = distribution_lib.DeviceMesh((world_size,), ["batch"])
+        dist = distribution_lib.DataParallel(mesh)
+
+        adapter = TFDatasetAdapter(dataset, distribution=dist)
+
+        self.assertEqual(adapter.num_batches, data_size)
+
+        it = adapter.get_torch_dataloader()
+        batches = list(it)
+
+        self.assertEqual(len(batches), 4)
+
+        expected_indices = x[rank::world_size]
+        for i, batch in enumerate(batches):
+            self.assertAllClose(batch[0], expected_indices[i])
+
+    def test_tf_dataset_sharding(self):
+        self.run_distributed(
+            TorchTFDatasetShardingTest._tf_dataset_sharding_test
+        )
 
 
 class TorchUnbindTest(TorchDistributedTestCase):
@@ -379,12 +485,10 @@ class TorchUnbindTest(TorchDistributedTestCase):
             tensor = torch.randn(world_size * 2, 4)
             dtensor = backend_dlib.distribute_tensor(tensor, layout)
 
-            # Test unbind along sharded dimension
             unbound = dtensor.unbind(0)
             self.assertEqual(len(unbound), world_size * 2)
             for t in unbound:
                 self.assertIsInstance(t, DTensor)
-                # Should be replicated now
                 self.assertTrue(
                     all(isinstance(p, Replicate) for p in t.placements)
                 )
@@ -436,17 +540,10 @@ class TorchPyDatasetAdapterTest(TorchDistributedTestCase):
 
         adapter = PyDatasetAdapter(dataset, distribution=dist)
 
-        # num_batches reflects the global dataset
         self.assertEqual(adapter.num_batches, 8)
 
         batches = list(adapter.get_numpy_iterator())
-        # The sharded iterator should only yield batches for this rank
         self.assertEqual(len(batches), 4)
-
-        # Verify indices - each worker gets 4 batches out of 8 total
-        # Total data size is world_size * 4 = 8.
-        # Rank 0 gets indices 0, 2, 4, 6
-        # Rank 1 gets indices 1, 3, 5, 7
         expected_indices = data[rank::world_size]
         for i, batch in enumerate(batches):
             self.assertAllClose(batch[0], expected_indices[i])
@@ -468,13 +565,11 @@ class TorchDataLoaderShuffleTest(TorchDistributedTestCase):
         )
 
         dataset = TensorDataset(torch.randn(10, 1))
-        # Test with shuffle=True
         loader_shuffle = DataLoader(dataset, batch_size=2, shuffle=True)
         with distribution_lib.DataParallel().scope():
             adapter = TorchDataLoaderAdapter(loader_shuffle)
             self.assertTrue(adapter._dataloader.sampler.shuffle)
 
-        # Test with shuffle=False
         loader_no_shuffle = DataLoader(dataset, batch_size=2, shuffle=False)
         with distribution_lib.DataParallel().scope():
             adapter = TorchDataLoaderAdapter(loader_no_shuffle)
@@ -489,16 +584,13 @@ class TorchDataLoaderShuffleTest(TorchDistributedTestCase):
 class TorchDistributionUtilsTest(TorchDistributedTestCase):
     @staticmethod
     def _to_backend_device_test(self, rank, world_size):
-        # Test None input
         device = backend_dlib._to_backend_device(None)
         self.assertEqual(device.type, "cpu")
 
-        # Test explicit gpu input
         device = backend_dlib._to_backend_device("gpu:0")
         self.assertEqual(device.type, "cuda")
         self.assertEqual(device.index, 0)
 
-        # Test explicit cpu input
         device = backend_dlib._to_backend_device("cpu")
         self.assertEqual(device.type, "cpu")
 
@@ -509,7 +601,6 @@ class TorchDistributionUtilsTest(TorchDistributedTestCase):
 class TorchDistributionTensorTest(TorchDistributedTestCase):
     @staticmethod
     def _distribute_data_input_dp_test(self, rank, world_size):
-        # DataParallel distribute_data_input should be a no-op
         data = torch.randn(2, 4)
         mesh = distribution_lib.DeviceMesh((world_size,), ["batch"])
         dist = distribution_lib.DataParallel(mesh)
@@ -585,7 +676,6 @@ class TorchTrainerDistributionTest(TorchDistributedTestCase):
         dist = distribution_lib.DataParallel(mesh)
 
         with dist.scope():
-            # _setup_ddp should be lazy and idempotent
             model._setup_ddp()
             self.assertTrue(hasattr(model, "_ddp_model"))
             model_ptr = model._ddp_model
