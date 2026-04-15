@@ -132,7 +132,9 @@ class Variable(KerasVariable):
                 value = value.data
             value = convert_to_tensor(value, dtype=self._dtype)
             value = distribute_tensor(value, self._layout)
-            self._value = torch.nn.Parameter(value, requires_grad=self.trainable)
+            self._value = torch.nn.Parameter(
+                value, requires_grad=self.trainable
+            )
         else:
             if isinstance(value, torch.nn.Parameter):
                 self._value = value
@@ -140,6 +142,8 @@ class Variable(KerasVariable):
                     self._value.requires_grad = self.trainable
             else:
                 param_value = convert_to_tensor(value, dtype=self._dtype)
+                if isinstance(param_value, DTensor):
+                    param_value = param_value.to_local()
                 device = (
                     param_value.device
                     if hasattr(param_value, "device")
@@ -158,8 +162,10 @@ class Variable(KerasVariable):
                 value, requires_grad=self.trainable
             )
         else:
+            if isinstance(value, DTensor):
+                value = value.to_local()
             with torch.no_grad():
-                self.value.copy_(value)
+                self._value.copy_(value)
 
     def _convert_to_tensor(self, value, dtype=None):
         return convert_to_tensor(value, dtype=dtype)

@@ -203,6 +203,37 @@ class TorchVariableDistributionAwarenessTest(TorchDistributedTestCase):
         )
 
 
+class TorchTrainerModeTest(TorchDistributedTestCase):
+    @staticmethod
+    def _on_batch_mode_test(self, rank, world_size):
+        mesh = distribution_lib.DeviceMesh((world_size,), ["batch"])
+        dist = distribution_lib.DataParallel(mesh, auto_shard_dataset=False)
+        with dist.scope():
+            model = models.Sequential(
+                [layers.Input(shape=(8,)), layers.Dense(2)]
+            )
+            model.compile(optimizer="adam", loss="mse")
+
+            # train_on_batch should set train mode
+            model.train_on_batch(np.random.randn(2, 8), np.random.randn(2, 2))
+            self.assertTrue(model._ddp_model.training)
+
+            # test_on_batch should set eval mode
+            model.test_on_batch(np.random.randn(2, 8), np.random.randn(2, 2))
+            self.assertFalse(model._ddp_model.training)
+
+            # train_on_batch should set train mode back
+            model.train_on_batch(np.random.randn(2, 8), np.random.randn(2, 2))
+            self.assertTrue(model._ddp_model.training)
+
+            # predict_on_batch should set eval mode
+            model.predict_on_batch(np.random.randn(2, 8))
+            self.assertFalse(model._ddp_model.training)
+
+    def test_on_batch_mode(self):
+        self.run_distributed(TorchTrainerModeTest._on_batch_mode_test)
+
+
 class TorchTrainerArchitectureTest(TorchDistributedTestCase):
     @staticmethod
     def _e2e_data_parallel_fit_test(self, rank, world_size):
@@ -248,12 +279,30 @@ class TorchTrainerArchitectureTest(TorchDistributedTestCase):
         from keras.src.backend.torch.trainer import _KerasModuleWrapper
 
         model = models.Sequential(
-            [layers.Input(shape=(8,)), layers.Dense(4), layers.Dense(2)]
+            [
+                layers.Input(shape=(8,)),
+                layers.Dense(4),
+                layers.BatchNormalization(),
+                layers.Dense(2),
+            ]
         )
         model.build()
         wrapper = _KerasModuleWrapper(model)
-        self.assertLen(list(wrapper.parameters()), 4)
-        self.assertEqual(wrapper(torch.randn(2, 8)).shape, (2, 2))
+
+        # Check parameters registration (Dense kernels/biases, BN gamma/beta)
+        self.assertLen(list(wrapper.parameters()), 6)
+
+        # Check buffers registration (BN moving mean/variance)
+        self.assertLen(list(wrapper.buffers()), 2)
+
+        # Check forward pass
+        x = torch.randn(2, 8)
+        y = wrapper(x)
+        self.assertEqual(y.shape, (2, 2))
+
+        # Check forward pass with training=True
+        y_train = wrapper(x, training=True)
+        self.assertEqual(y_train.shape, (2, 2))
 
     def test_e2e_data_parallel_fit(self):
         self.run_distributed(
@@ -295,9 +344,123 @@ class TorchDataLoadingTest(TorchDistributedTestCase):
             self.assertEqual(new_dataloader.sampler.num_replicas, world_size)
             self.assertEqual(new_dataloader.sampler.rank, rank)
 
+    @staticmethod
+    def _dataloader_model_parallel_sampler_test(self, rank, world_size):
+        from torch.utils.data import DataLoader
+        from torch.utils.data import TensorDataset
+        from torch.utils.data.distributed import DistributedSampler
+
+        from keras.src.trainers.data_adapters.torch_data_loader_adapter import (
+            TorchDataLoaderAdapter,
+        )
+
+        dataset = TensorDataset(
+            torch.randn(world_size * 4, 8), torch.randn(world_size * 4, 2)
+        )
+        dataloader = DataLoader(dataset, batch_size=2)
+
+        # 1. Test ModelParallel with batch sharding
+        mesh = distribution_lib.DeviceMesh((world_size,), ["batch"])
+        layout_map = distribution_lib.LayoutMap(mesh)
+        dist = distribution_lib.ModelParallel(
+            layout_map=layout_map, batch_dim_name="batch"
+        )
+        with dist.scope():
+            new_dataloader = TorchDataLoaderAdapter(
+                dataloader
+            ).get_torch_dataloader()
+            self.assertIsInstance(new_dataloader.sampler, DistributedSampler)
+            self.assertEqual(new_dataloader.sampler.num_replicas, world_size)
+            self.assertEqual(new_dataloader.sampler.rank, rank)
+
+        # 2. Test ModelParallel without batch sharding (batch dim size 1)
+        mesh2 = distribution_lib.DeviceMesh((1, world_size), ["batch", "model"])
+        layout_map2 = distribution_lib.LayoutMap(mesh2)
+        dist2 = distribution_lib.ModelParallel(
+            layout_map=layout_map2, batch_dim_name="batch"
+        )
+        with dist2.scope():
+            new_dataloader2 = TorchDataLoaderAdapter(
+                dataloader
+            ).get_torch_dataloader()
+            self.assertNotIsInstance(
+                new_dataloader2.sampler, DistributedSampler
+            )
+
+    @staticmethod
+    def _dataloader_model_parallel_complex_sharding_test(
+        self, rank, world_size
+    ):
+        from torch.utils.data import DataLoader
+        from torch.utils.data import TensorDataset
+        from torch.utils.data.distributed import DistributedSampler
+
+        from keras.src.trainers.data_adapters.torch_data_loader_adapter import (
+            TorchDataLoaderAdapter,
+        )
+
+        dataset = TensorDataset(torch.randn(16, 8), torch.randn(16, 2))
+        # Test with shuffle=True to exercise the RandomSampler detection
+        dataloader = DataLoader(dataset, batch_size=2, shuffle=True)
+
+        # 4 processes, mesh (2, 2), batch_dim_name='batch'
+        # num_model_replicas (data parallel degree) = 2
+        # num_process = 4
+        # rank 0, 1 -> data rank 0
+        # rank 2, 3 -> data rank 1
+        mesh = distribution_lib.DeviceMesh((2, 2), ["batch", "model"])
+        layout_map = distribution_lib.LayoutMap(mesh)
+        dist = distribution_lib.ModelParallel(
+            layout_map=layout_map, batch_dim_name="batch"
+        )
+        with dist.scope():
+            new_dataloader = TorchDataLoaderAdapter(
+                dataloader
+            ).get_torch_dataloader()
+            self.assertIsInstance(new_dataloader.sampler, DistributedSampler)
+            self.assertEqual(new_dataloader.sampler.num_replicas, 2)
+            self.assertEqual(new_dataloader.sampler.rank, rank // 2)
+            self.assertTrue(new_dataloader.sampler.shuffle)
+
+    @staticmethod
+    def _dataloader_no_auto_shard_test(self, rank, world_size):
+        from torch.utils.data import DataLoader
+        from torch.utils.data import TensorDataset
+        from torch.utils.data.distributed import DistributedSampler
+
+        from keras.src.trainers.data_adapters.torch_data_loader_adapter import (
+            TorchDataLoaderAdapter,
+        )
+
+        dataset = TensorDataset(
+            torch.randn(world_size * 4, 8), torch.randn(world_size * 4, 2)
+        )
+        dataloader = DataLoader(dataset, batch_size=2)
+        with distribution_lib.DataParallel(auto_shard_dataset=False).scope():
+            new_dataloader = TorchDataLoaderAdapter(
+                dataloader
+            ).get_torch_dataloader()
+            self.assertNotIsInstance(new_dataloader.sampler, DistributedSampler)
+
     def test_dataloader_distributed_sampler(self):
         self.run_distributed(
             TorchDataLoadingTest._dataloader_distributed_sampler_test
+        )
+
+    def test_dataloader_model_parallel_sampler(self):
+        self.run_distributed(
+            TorchDataLoadingTest._dataloader_model_parallel_sampler_test
+        )
+
+    def test_dataloader_no_auto_shard(self):
+        self.run_distributed(
+            TorchDataLoadingTest._dataloader_no_auto_shard_test
+        )
+
+    def test_dataloader_model_parallel_complex_sharding(self):
+        self.run_distributed(
+            TorchDataLoadingTest._dataloader_model_parallel_complex_sharding_test,
+            world_size=4,
         )
 
 
@@ -611,6 +774,7 @@ class TorchTrainerDistributionTest(TorchDistributedTestCase):
     @staticmethod
     def _distribute_inputs_test(self, rank, world_size):
         from torch.distributed.tensor import DTensor
+        from torch.distributed.tensor import Replicate
 
         from keras.src.backend.torch.trainer import TorchTrainer
 
@@ -632,9 +796,21 @@ class TorchTrainerDistributionTest(TorchDistributedTestCase):
             batch_dim_name="batch",
         )
         with dist_mp.scope():
+            # 1. Normal sharded input
             distributed_x_mp = trainer._distribute_inputs(dist_mp, x)
             self.assertIsInstance(distributed_x_mp, DTensor)
             self.assertEqual(distributed_x_mp.shape, (4, 8))
+
+            # 2. Replicated input (e.g. for symbolic build)
+            replicated_x_mp = trainer._distribute_inputs(
+                dist_mp, x, replicate=True
+            )
+            self.assertIsInstance(replicated_x_mp, DTensor)
+            self.assertTrue(
+                all(
+                    isinstance(p, Replicate) for p in replicated_x_mp.placements
+                )
+            )
 
     @staticmethod
     def _setup_ddp_lazy_test(self, rank, world_size):
@@ -648,10 +824,45 @@ class TorchTrainerDistributionTest(TorchDistributedTestCase):
         with dist.scope():
             model._setup_ddp()
             self.assertTrue(hasattr(model, "_ddp_model"))
+            self.assertTrue(model._in_ddp_context)
             model_ptr = model._ddp_model
 
             model._setup_ddp()
             self.assertIs(model._ddp_model, model_ptr)
+            self.assertTrue(model._in_ddp_context)
+
+    @staticmethod
+    def _train_step_distribution_test(self, rank, world_size):
+        x = torch.randn(4, 8)
+        y = torch.randn(4, 2)
+        data = (x, y)
+
+        # 1. Test DataParallel train_step (uses DDP model)
+        mesh_dp = distribution_lib.DeviceMesh((world_size,), ["batch"])
+        dist_dp = distribution_lib.DataParallel(mesh_dp)
+        with dist_dp.scope():
+            model = models.Sequential(
+                [layers.Input(shape=(8,)), layers.Dense(2)]
+            )
+            model.compile(optimizer="adam", loss="mse")
+            model._setup_ddp()
+            # train_step should distribute inputs and use _ddp_model
+            logs = model.train_step(data)
+            self.assertIn("loss", logs)
+
+        mesh_mp = distribution_lib.DeviceMesh((world_size,), ["model"])
+        layout_map = distribution_lib.LayoutMap(mesh_mp)
+        layout_map[".*kernel"] = distribution_lib.TensorLayout([None, "model"])
+        dist_mp = distribution_lib.ModelParallel(
+            layout_map=layout_map, batch_dim_name=None
+        )
+        with dist_mp.scope():
+            model = models.Sequential(
+                [layers.Input(shape=(8,)), layers.Dense(2)]
+            )
+            model.compile(optimizer="adam", loss="mse")
+            logs = model.train_step(data)
+            self.assertIn("loss", logs)
 
     def test_distribute_inputs(self):
         self.run_distributed(
@@ -660,3 +871,8 @@ class TorchTrainerDistributionTest(TorchDistributedTestCase):
 
     def test_setup_ddp_lazy(self):
         self.run_distributed(TorchTrainerDistributionTest._setup_ddp_lazy_test)
+
+    def test_train_step_distribution(self):
+        self.run_distributed(
+            TorchTrainerDistributionTest._train_step_distribution_test
+        )

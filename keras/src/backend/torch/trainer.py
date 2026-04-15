@@ -647,6 +647,11 @@ class TorchTrainer(base_trainer.Trainer):
         self.make_train_function()
         self.reset_metrics()
 
+        if self._in_ddp_context:
+            self._ddp_model.train()
+        else:
+            self.train()
+
         logs = self.train_function([data])
         logs = pythonify_logs(logs)
         if return_dict:
@@ -669,6 +674,11 @@ class TorchTrainer(base_trainer.Trainer):
         self.make_test_function()
         self.reset_metrics()
 
+        if self._in_ddp_context:
+            self._ddp_model.eval()
+        else:
+            self.eval()
+
         logs = self.test_function([data])
         logs = pythonify_logs(logs)
         if return_dict:
@@ -677,6 +687,12 @@ class TorchTrainer(base_trainer.Trainer):
 
     def predict_on_batch(self, x):
         self.make_predict_function()
+
+        if self._in_ddp_context:
+            self._ddp_model.eval()
+        else:
+            self.eval()
+
         batch_outputs = self.predict_function([(x,)])
         batch_outputs = tree.map_structure(
             backend.convert_to_numpy, batch_outputs
