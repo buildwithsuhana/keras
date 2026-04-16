@@ -229,6 +229,46 @@ class TorchTensorDistributionTest(TorchDistributedTestCase):
             TorchTensorDistributionTest._distribute_data_input_test
         )
 
+    def _distribute_data_input_edge_cases_test(self, rank, world_size):
+        from torch.distributed.tensor import DTensor
+
+        mesh = distribution_lib.DeviceMesh((world_size,), ["batch"])
+        layout = distribution_lib.TensorLayout(["batch", None], mesh)
+        dist = distribution_lib.ModelParallel(
+            layout_map=distribution_lib.LayoutMap(mesh),
+            batch_dim_name="batch",
+        )
+        with dist.scope():
+            # 1. DTensor input (should return as is)
+            tensor = torch.randn(world_size * 2, 2)
+            dtensor = backend_dlib.distribute_data_input(
+                tensor, layout, "batch"
+            )
+            self.assertIs(
+                backend_dlib.distribute_data_input(dtensor, layout, "batch"),
+                dtensor,
+            )
+
+            # 2. Numpy input
+            data_np = np.random.randn(2, 2).astype("float32")
+            dtensor_np = backend_dlib.distribute_data_input(
+                data_np, layout, "batch"
+            )
+            self.assertIsInstance(dtensor_np, DTensor)
+            self.assertAllClose(dtensor_np.to_local(), data_np)
+
+            # 3. Meta device tensor
+            meta_tensor = torch.randn(2, 2, device="meta")
+            output = backend_dlib.distribute_data_input(
+                meta_tensor, layout, "batch"
+            )
+            self.assertEqual(output.device.type, "meta")
+
+    def test_distribute_data_input_edge_cases(self):
+        self.run_distributed(
+            TorchTensorDistributionTest._distribute_data_input_edge_cases_test
+        )
+
     def _distribute_tensor_none_cases_test(self, rank, world_size):
         tensor = torch.randn(2, 2)
         # 1. layout is None
@@ -670,6 +710,7 @@ class TorchUnbindTest(TorchDistributedTestCase):
     def _unbind_test(self, rank, world_size):
         from torch.distributed.tensor import DTensor
         from torch.distributed.tensor import Replicate
+        from torch.distributed.tensor import Shard
 
         mesh = distribution_lib.DeviceMesh((world_size,), ["model"])
         layout = distribution_lib.TensorLayout(["model", None], mesh)
@@ -681,6 +722,7 @@ class TorchUnbindTest(TorchDistributedTestCase):
             tensor = torch.randn(world_size * 2, 4)
             dtensor = backend_dlib.distribute_tensor(tensor, layout)
 
+            # 1. Unbind on sharded dimension (0)
             unbound = dtensor.unbind(0)
             self.assertEqual(len(unbound), world_size * 2)
             for t in unbound:
@@ -688,6 +730,24 @@ class TorchUnbindTest(TorchDistributedTestCase):
                 self.assertTrue(
                     all(isinstance(p, Replicate) for p in t.placements)
                 )
+
+            # 2. Unbind on non-sharded dimension (1)
+            unbound = dtensor.unbind(1)
+            self.assertEqual(len(unbound), 4)
+            for t in unbound:
+                self.assertIsInstance(t, DTensor)
+                self.assertTrue(
+                    any(
+                        isinstance(p, Shard) and p.dim == 0
+                        for p in t.placements
+                    )
+                )
+
+            # 3. Unbind with negative dimension (-1)
+            unbound = dtensor.unbind(-1)
+            self.assertEqual(len(unbound), 4)
+            for t in unbound:
+                self.assertIsInstance(t, DTensor)
 
     def test_unbind(self):
         self.run_distributed(TorchUnbindTest._unbind_test)
@@ -724,6 +784,30 @@ class TorchVariableDistributionTest(TorchDistributedTestCase):
     def test_distribute_variable(self):
         self.run_distributed(
             TorchVariableDistributionTest._distribute_variable_test
+        )
+
+    def _variable_dtensor_initialization_test(self, rank, world_size):
+        from torch.distributed.tensor import DTensor
+
+        mesh = distribution_lib.DeviceMesh((world_size,), ["batch"])
+        layout = distribution_lib.TensorLayout(["batch", None], mesh)
+        dist = distribution_lib.ModelParallel(
+            layout_map=distribution_lib.LayoutMap(mesh)
+        )
+        with dist.scope():
+            dtensor = backend_dlib.distribute_tensor(
+                torch.randn(world_size, 2), layout
+            )
+
+        # Initialize Variable with DTensor but NO layout scope
+        v = backend.Variable(dtensor)
+        self.assertNotIsInstance(v.value, DTensor)
+        self.assertIsInstance(v.value, torch.Tensor)
+        self.assertEqual(v.value.shape, (1, 2))
+
+    def test_variable_dtensor_initialization(self):
+        self.run_distributed(
+            TorchVariableDistributionTest._variable_dtensor_initialization_test
         )
 
 
@@ -801,6 +885,8 @@ class TorchDataLoaderShuffleTest(TorchDistributedTestCase):
 class TorchDistributionUtilsTest(TorchDistributedTestCase):
     @staticmethod
     def _to_backend_device_test(self, rank, world_size):
+        from unittest.mock import patch
+
         device = backend_dlib._to_backend_device(None)
         if torch.cuda.is_available():
             self.assertEqual(device.type, "cuda")
@@ -813,6 +899,13 @@ class TorchDistributionUtilsTest(TorchDistributedTestCase):
             self.assertEqual(device.index, 0)
         else:
             self.assertEqual(device.type, "cpu")
+
+        # Mock CUDA available
+        with patch("torch.cuda.is_available", return_value=True):
+            with patch.dict(os.environ, {"LOCAL_RANK": "2"}):
+                device = backend_dlib._to_backend_device("gpu")
+                self.assertEqual(device.type, "cuda")
+                self.assertEqual(device.index, 2)
 
         device = backend_dlib._to_backend_device("cpu")
         self.assertEqual(device.type, "cpu")
@@ -966,3 +1059,43 @@ class TorchTrainerDistributionTest(TorchDistributedTestCase):
         self.run_distributed(
             TorchTrainerDistributionTest._train_step_distribution_test
         )
+
+
+class TorchTrainerPredictTest(TorchDistributedTestCase):
+    @staticmethod
+    def _predict_mode_test(self, rank, world_size):
+        mesh = distribution_lib.DeviceMesh((world_size,), ["batch"])
+        dist = distribution_lib.DataParallel(mesh, auto_shard_dataset=False)
+        with dist.scope():
+            # Use a layer that records the training mode during call
+            class ModeRecordingLayer(layers.Layer):
+                def __init__(self, **kwargs):
+                    super().__init__(**kwargs)
+                    self.recorded_mode = None
+
+                def call(self, x, training=None):
+                    self.recorded_mode = training
+                    return x
+
+            recorder = ModeRecordingLayer()
+            model = models.Sequential(
+                [layers.Input(shape=(8,)), recorder, layers.Dense(2)]
+            )
+            model.compile(optimizer="adam", loss="mse")
+
+            x = np.random.randn(4, 8).astype("float32")
+
+            # predict() should set eval mode (training=False)
+            model.predict(x, batch_size=2)
+            self.assertFalse(recorder.recorded_mode)
+
+            # predict_on_batch should set eval mode
+            model.predict_on_batch(x[:2])
+            self.assertFalse(recorder.recorded_mode)
+
+            # train_on_batch should set train mode
+            model.train_on_batch(x[:2], np.random.randn(2, 2).astype("float32"))
+            self.assertTrue(recorder.recorded_mode)
+
+    def test_predict_mode(self):
+        self.run_distributed(TorchTrainerPredictTest._predict_mode_test)
