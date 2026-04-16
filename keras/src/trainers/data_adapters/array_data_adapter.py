@@ -277,7 +277,7 @@ class ArrayDataAdapter(DataAdapter):
                 )
 
             def __len__(self):
-                return len(tree.flatten(self.array)[0])
+                return len(tree.flatten(self.array)[0].array)
 
         class RandomBatchSampler(torch.utils.data.Sampler):
             def __init__(self, sampler):
