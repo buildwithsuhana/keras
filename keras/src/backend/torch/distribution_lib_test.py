@@ -229,19 +229,24 @@ class TorchTensorDistributionTest(TorchDistributedTestCase):
             TorchTensorDistributionTest._distribute_data_input_test
         )
 
-    def test_distribute_tensor_none_cases(self):
+    def _distribute_tensor_none_cases_test(self, rank, world_size):
         tensor = torch.randn(2, 2)
         # 1. layout is None
         self.assertIs(backend_dlib.distribute_tensor(tensor, None), tensor)
 
         # 2. distribution is not ModelParallel (e.g. DataParallel)
-        mesh = distribution_lib.DeviceMesh((self.world_size,), ["batch"])
+        mesh = distribution_lib.DeviceMesh((world_size,), ["batch"])
         dist = distribution_lib.DataParallel(mesh)
         layout = distribution_lib.TensorLayout(["batch", None], mesh)
         with dist.scope():
             self.assertIs(
                 backend_dlib.distribute_tensor(tensor, layout), tensor
             )
+
+    def test_distribute_tensor_none_cases(self):
+        self.run_distributed(
+            TorchTensorDistributionTest._distribute_tensor_none_cases_test
+        )
 
 
 class TorchVariableDistributionAwarenessTest(TorchDistributedTestCase):
