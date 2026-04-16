@@ -342,6 +342,37 @@ class TorchTrainerModeTest(TorchDistributedTestCase):
     def test_on_batch_mode(self):
         self.run_distributed(TorchTrainerModeTest._on_batch_mode_test)
 
+    def test_train_on_batch_class_weight(self):
+        model = models.Sequential([layers.Dense(2)])
+        model.compile(optimizer="adam", loss="mse")
+        x = np.random.randn(4, 8).astype("float32")
+        y = np.array([0, 1, 0, 1]).reshape(-1, 1).astype("float32")
+        class_weight = {0: 1.0, 1: 2.0}
+        logs = model.train_on_batch(
+            x, y, class_weight=class_weight, return_dict=True
+        )
+        self.assertIn("loss", logs)
+
+    def test_cached_eval_iterator(self):
+        from keras.src.backend.torch.trainer import TorchEpochIterator
+
+        model = models.Sequential([layers.Dense(2)])
+        model.compile(optimizer="adam", loss="mse")
+        x = np.random.randn(4, 8).astype("float32")
+        y = np.random.randn(4, 2).astype("float32")
+
+        # Manually create and set the iterator to test the cached path
+        iterator = TorchEpochIterator(x=x, y=y, batch_size=2)
+        model._eval_epoch_iterator = iterator
+
+        # Call evaluate with cached iterator
+        logs = model.evaluate(
+            x, y, _use_cached_eval_dataset=True, return_dict=True
+        )
+        self.assertIn("loss", logs)
+        # Ensure it was actually used (iterator was reset and consumed)
+        self.assertIs(model._eval_epoch_iterator, iterator)
+
 
 class TorchTrainerArchitectureTest(TorchDistributedTestCase):
     @staticmethod
@@ -428,6 +459,25 @@ class TorchTrainerArchitectureTest(TorchDistributedTestCase):
             TorchTrainerArchitectureTest._keras_module_wrapper_test,
             world_size=1,
         )
+
+    def test_should_torch_compile_warning(self):
+        from unittest.mock import patch
+
+        model = models.Sequential([layers.Dense(2)])
+        model.compile(jit_compile=True)
+        # Mock torch version < 2.1.0
+        with patch("torch.__version__", "2.0.0"):
+            with pytest.warns(
+                UserWarning, match="Please upgrade to torch>=2.1.0"
+            ):
+                model._should_torch_compile()
+                self.assertFalse(model.jit_compile)
+
+    def test_steps_per_execution_error(self):
+        model = models.Sequential([layers.Dense(2)])
+        model.compile(steps_per_execution=2)
+        with pytest.raises(ValueError, match="`steps_per_execution` must be 1"):
+            model.make_train_function()
 
 
 class TorchDataLoadingTest(TorchDistributedTestCase):
@@ -564,6 +614,74 @@ class TorchDataLoadingTest(TorchDistributedTestCase):
     def test_dataloader_no_auto_shard(self):
         self.run_distributed(
             TorchDataLoadingTest._dataloader_no_auto_shard_test
+        )
+
+    def _dataloader_adapter_various_test(self, rank, world_size):
+        from torch.utils.data import DataLoader
+        from torch.utils.data import TensorDataset
+
+        from keras.src.trainers.data_adapters.torch_data_loader_adapter import (
+            TorchDataLoaderAdapter,
+        )
+
+        dataset = TensorDataset(torch.randn(11, 8), torch.randn(11, 2))
+        dataloader = DataLoader(dataset, batch_size=2)
+
+        # 1. ModelParallel with num_model_replicas >= num_process (1 >= 1)
+        mesh = distribution_lib.DeviceMesh((world_size,), ["batch"])
+        dist = distribution_lib.ModelParallel(
+            layout_map=distribution_lib.LayoutMap(mesh), batch_dim_name="batch"
+        )
+        with dist.scope():
+            adapter = TorchDataLoaderAdapter(dataloader)
+            self.assertEqual(adapter.batch_size, 2)
+            self.assertEqual(adapter.num_batches, 6)
+            self.assertTrue(adapter.has_partial_batch)
+            self.assertEqual(adapter.partial_batch_size, 1)
+
+            # Test iterators
+            it = adapter.get_numpy_iterator()
+            batch = next(it)
+            self.assertIsInstance(batch[0], np.ndarray)
+
+            it_jax = adapter.get_jax_iterator()
+            batch_jax = next(it_jax)
+            self.assertIsInstance(batch_jax[0], np.ndarray)
+
+    def test_dataloader_adapter_various(self):
+        self.run_distributed(
+            TorchDataLoadingTest._dataloader_adapter_various_test,
+            world_size=1,
+        )
+
+    def _dataloader_adapter_multi_replica_test(self, rank, world_size):
+        from torch.utils.data import DataLoader
+        from torch.utils.data import TensorDataset
+        from torch.utils.data.distributed import DistributedSampler
+
+        from keras.src.trainers.data_adapters.torch_data_loader_adapter import (
+            TorchDataLoaderAdapter,
+        )
+
+        dataset = TensorDataset(torch.randn(10, 8), torch.randn(10, 2))
+        dataloader = DataLoader(dataset, batch_size=2)
+
+        # mesh size 4, world size 4. batch dim size 2 => 2 processes per replica
+        mesh = distribution_lib.DeviceMesh((2, 2), ["batch", "model"])
+        dist = distribution_lib.ModelParallel(
+            layout_map=distribution_lib.LayoutMap(mesh), batch_dim_name="batch"
+        )
+        with dist.scope():
+            adapter = TorchDataLoaderAdapter(dataloader)
+            new_loader = adapter.get_torch_dataloader()
+            self.assertIsInstance(new_loader.sampler, DistributedSampler)
+            self.assertEqual(new_loader.sampler.num_replicas, 2)
+            self.assertEqual(new_loader.sampler.rank, rank // 2)
+
+    def test_dataloader_adapter_multi_replica(self):
+        self.run_distributed(
+            TorchDataLoadingTest._dataloader_adapter_multi_replica_test,
+            world_size=4,
         )
 
     def test_dataloader_model_parallel_complex_sharding(self):
@@ -775,11 +893,20 @@ class TorchVariableDistributionTest(TorchDistributedTestCase):
             layout_map=distribution_lib.LayoutMap(mesh)
         )
         with dist.scope():
+            # 1. Using TensorLayout
             v = backend_dlib.distribute_variable(
                 torch.randn(world_size, 2), layout
             )
             self.assertIsInstance(v, torch.nn.Parameter)
             self.assertIsInstance(v.data, DTensor)
+
+            # 2. Using backend-specific layout
+            backend_layout = backend_dlib._to_backend_layout(layout)
+            v2 = backend_dlib.distribute_variable(
+                torch.randn(world_size, 2), backend_layout
+            )
+            self.assertIsInstance(v2, torch.nn.Parameter)
+            self.assertIsInstance(v2.data, DTensor)
 
     def test_distribute_variable(self):
         self.run_distributed(
@@ -808,6 +935,35 @@ class TorchVariableDistributionTest(TorchDistributedTestCase):
     def test_variable_dtensor_initialization(self):
         self.run_distributed(
             TorchVariableDistributionTest._variable_dtensor_initialization_test
+        )
+
+    def _variable_extra_coverage_test(self, rank, world_size):
+        from torch.distributed.tensor import DTensor
+
+        # 1. _initialize with torch.nn.Parameter
+        param = torch.nn.Parameter(torch.randn(2, 2))
+        v = backend.Variable(param)
+        self.assertIs(v.value, param)
+
+        # 2. _direct_assign with DTensor when self._layout is NOT None
+        mesh = distribution_lib.DeviceMesh((world_size,), ["batch"])
+        layout = distribution_lib.TensorLayout(["batch", None], mesh)
+        dist = distribution_lib.ModelParallel(
+            layout_map=distribution_lib.LayoutMap(mesh)
+        )
+        with dist.scope():
+            v2 = backend.Variable(torch.randn(world_size, 2), layout=layout)
+            self.assertIsInstance(v2.value, DTensor)
+
+            new_value = torch.randn(world_size, 2)
+            new_dtensor = backend_dlib.distribute_tensor(new_value, layout)
+            v2.assign(new_dtensor)
+            self.assertIsInstance(v2.value, DTensor)
+            self.assertAllClose(v2.value.to_local(), new_dtensor.to_local())
+
+    def test_variable_extra_coverage(self):
+        self.run_distributed(
+            TorchVariableDistributionTest._variable_extra_coverage_test
         )
 
 
