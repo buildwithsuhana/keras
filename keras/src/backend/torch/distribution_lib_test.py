@@ -72,9 +72,17 @@ class TorchDistributedTestCase(testing.TestCase):
 class TorchDeviceDiscoveryTest(TorchDistributedTestCase):
     @staticmethod
     def _list_devices_test(self, rank, world_size):
+        # Test default (None -> gpu)
         devices = distribution_lib.list_devices()
         self.assertLen(devices, world_size)
-        self.assertTrue(all(f":{i}" in devices[i] for i in range(world_size)))
+        for i in range(world_size):
+            self.assertEqual(devices[i], f"gpu:{i}")
+
+        # Test explicit device type
+        devices = distribution_lib.list_devices("cpu")
+        self.assertLen(devices, world_size)
+        for i in range(world_size):
+            self.assertEqual(devices[i], f"cpu:{i}")
 
     @staticmethod
     def _get_device_count_test(self, rank, world_size):
@@ -85,6 +93,20 @@ class TorchDeviceDiscoveryTest(TorchDistributedTestCase):
 
     def test_get_device_count(self):
         self.run_distributed(TorchDeviceDiscoveryTest._get_device_count_test)
+
+    def test_get_device_count_fallback(self):
+        from unittest.mock import patch
+
+        # Case 1: is_initialized is False, WORLD_SIZE in environ
+        with patch.dict(os.environ, {"WORLD_SIZE": "4"}):
+            self.assertEqual(backend_dlib.get_device_count(), 4)
+
+        # Case 2: is_initialized is False, WORLD_SIZE NOT in environ
+        with patch.dict(os.environ, {}):
+            if "WORLD_SIZE" in os.environ:
+                del os.environ["WORLD_SIZE"]
+            expected = torch.cuda.device_count() or 1
+            self.assertEqual(backend_dlib.get_device_count(), expected)
 
 
 class TorchProcessManagementTest(TorchDistributedTestCase):
@@ -101,6 +123,24 @@ class TorchProcessManagementTest(TorchDistributedTestCase):
 
     def test_process_id(self):
         self.run_distributed(TorchProcessManagementTest._process_id_test)
+
+    def test_initialize(self):
+        from unittest.mock import patch
+
+        # Case 1: CUDA not available
+        with patch("torch.distributed.init_process_group") as mock_init:
+            with patch("torch.cuda.is_available", return_value=False):
+                backend_dlib.initialize()
+                mock_init.assert_called_once_with(backend="gloo")
+
+        # Case 2: CUDA available
+        with patch("torch.distributed.init_process_group") as mock_init:
+            with patch("torch.cuda.is_available", return_value=True):
+                with patch("torch.cuda.set_device") as mock_set_device:
+                    with patch.dict(os.environ, {"LOCAL_RANK": "1"}):
+                        backend_dlib.initialize()
+                        mock_set_device.assert_called_once_with(1)
+                        mock_init.assert_called_once_with(backend="nccl")
 
 
 class TorchDeviceMeshMappingTest(TorchDistributedTestCase):
@@ -151,6 +191,16 @@ class TorchTensorDistributionTest(TorchDistributedTestCase):
             self.assertEqual(tensor.shape, (world_size * 2, 4))
             self.assertEqual(tensor.to_local().shape, (2, 4))
 
+            # Test redistribution (DTensor -> DTensor with new layout)
+            from torch.distributed.tensor import Replicate
+
+            new_layout = distribution_lib.TensorLayout([None, None], mesh)
+            redistributed = backend_dlib.distribute_tensor(tensor, new_layout)
+            self.assertIsInstance(redistributed, DTensor)
+            self.assertTrue(
+                all(isinstance(p, Replicate) for p in redistributed.placements)
+            )
+
     @staticmethod
     def _distribute_data_input_test(self, rank, world_size):
         from torch.distributed.tensor import DTensor
@@ -178,6 +228,20 @@ class TorchTensorDistributionTest(TorchDistributedTestCase):
         self.run_distributed(
             TorchTensorDistributionTest._distribute_data_input_test
         )
+
+    def test_distribute_tensor_none_cases(self):
+        tensor = torch.randn(2, 2)
+        # 1. layout is None
+        self.assertIs(backend_dlib.distribute_tensor(tensor, None), tensor)
+
+        # 2. distribution is not ModelParallel (e.g. DataParallel)
+        mesh = distribution_lib.DeviceMesh((self.world_size,), ["batch"])
+        dist = distribution_lib.DataParallel(mesh)
+        layout = distribution_lib.TensorLayout(["batch", None], mesh)
+        with dist.scope():
+            self.assertIs(
+                backend_dlib.distribute_tensor(tensor, layout), tensor
+            )
 
 
 class TorchVariableDistributionAwarenessTest(TorchDistributedTestCase):
@@ -634,6 +698,27 @@ class TorchVariableDistributionTest(TorchDistributedTestCase):
     def test_non_mp_variable(self):
         self.run_distributed(
             TorchVariableDistributionTest._non_mp_variable_test
+        )
+
+    def _distribute_variable_test(self, rank, world_size):
+        from torch.distributed.tensor import DTensor
+
+        mesh = distribution_lib.DeviceMesh((world_size,), ["batch"])
+        layout = distribution_lib.TensorLayout(["batch", None], mesh)
+
+        dist = distribution_lib.ModelParallel(
+            layout_map=distribution_lib.LayoutMap(mesh)
+        )
+        with dist.scope():
+            v = backend_dlib.distribute_variable(
+                torch.randn(world_size, 2), layout
+            )
+            self.assertIsInstance(v, torch.nn.Parameter)
+            self.assertIsInstance(v.data, DTensor)
+
+    def test_distribute_variable(self):
+        self.run_distributed(
+            TorchVariableDistributionTest._distribute_variable_test
         )
 
 
