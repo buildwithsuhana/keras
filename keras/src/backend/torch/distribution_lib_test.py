@@ -684,9 +684,111 @@ class TorchDataLoadingTest(TorchDistributedTestCase):
             world_size=4,
         )
 
+    def test_dataloader_adapter_tf(self):
+        from torch.utils.data import DataLoader
+        from torch.utils.data import TensorDataset
+
+        from keras.src.trainers.data_adapters.torch_data_loader_adapter import (
+            TorchDataLoaderAdapter,
+        )
+
+        dataset = TensorDataset(torch.randn(4, 8), torch.randn(4, 2))
+        dataloader = DataLoader(dataset, batch_size=2)
+        adapter = TorchDataLoaderAdapter(dataloader)
+        # Cover get_tf_dataset
+        ds = adapter.get_tf_dataset()
+        self.assertIsNotNone(ds)
+
+    def test_array_data_adapter_extra(self):
+        from keras.src.trainers.data_adapters.array_data_adapter import (
+            ArrayDataAdapter,
+        )
+
+        x = np.random.randn(10, 8)
+        y = np.random.randn(10, 2)
+
+        # 1. Test shuffle="batch"
+        adapter = ArrayDataAdapter(x, y, batch_size=2, shuffle="batch")
+        it = adapter.get_numpy_iterator()
+        next(it)
+
+        # 2. Test shuffle=True (full shuffle)
+        adapter = ArrayDataAdapter(x, y, batch_size=2, shuffle=True)
+        it = adapter.get_numpy_iterator()
+        next(it)
+
+        # 3. Test class_weight error with nested y
+        with self.assertRaisesRegex(
+            ValueError, "`class_weight` is only supported"
+        ):
+            ArrayDataAdapter(x, [y, y], class_weight={0: 1.0})
+
+        # 4. Test sample_weight replication
+        adapter = ArrayDataAdapter(x, [y, y], sample_weight=np.ones((10, 1)))
+        self.assertLen(adapter._inputs[2], 2)
+
+    def test_array_data_adapter_torch_sharding(self):
+        from keras.src.trainers.data_adapters.array_data_adapter import (
+            ArrayDataAdapter,
+        )
+
+        x = np.random.randn(10, 8)
+        y = np.random.randn(10, 2)
+
+        # Test shuffle="batch" in torch dataloader
+        adapter = ArrayDataAdapter(x, y, batch_size=2, shuffle="batch")
+        loader = adapter.get_torch_dataloader()
+        self.assertIsNotNone(loader)
+        next(iter(loader))
+
+        # Test shuffle=True in torch dataloader
+        adapter = ArrayDataAdapter(x, y, batch_size=2, shuffle=True)
+        loader = adapter.get_torch_dataloader()
+        next(iter(loader))
+
     def test_dataloader_model_parallel_complex_sharding(self):
         self.run_distributed(
             TorchDataLoadingTest._dataloader_model_parallel_complex_sharding_test,
+            world_size=4,
+        )
+
+    def _dataloader_adapter_coverage_extra_test(self, rank, world_size):
+        from torch.utils.data import DataLoader
+        from torch.utils.data import TensorDataset
+        from torch.utils.data.distributed import DistributedSampler
+
+        from keras.src.trainers.data_adapters.torch_data_loader_adapter import (
+            TorchDataLoaderAdapter,
+        )
+
+        dataset = TensorDataset(torch.randn(10, 1))
+
+        # 1. ModelParallel with num_model_replicas < num_process
+        mesh = distribution_lib.DeviceMesh((2, 2), ["batch", "model"])
+        dist = distribution_lib.ModelParallel(
+            layout_map=distribution_lib.LayoutMap(mesh), batch_dim_name="batch"
+        )
+        with dist.scope():
+            # Test with various DataLoader args to cover more lines
+            dataloader = DataLoader(
+                dataset,
+                batch_size=2,
+                shuffle=True,
+                num_workers=0,
+                drop_last=True,
+            )
+            adapter = TorchDataLoaderAdapter(dataloader)
+            new_loader = adapter.get_torch_dataloader()
+            self.assertIsInstance(new_loader.sampler, DistributedSampler)
+            self.assertEqual(new_loader.sampler.num_replicas, 2)
+            self.assertEqual(new_loader.sampler.rank, rank // 2)
+            self.assertTrue(new_loader.sampler.shuffle)
+            self.assertEqual(new_loader.batch_size, 2)
+            self.assertTrue(new_loader.drop_last)
+
+    def test_dataloader_adapter_coverage_extra(self):
+        self.run_distributed(
+            TorchDataLoadingTest._dataloader_adapter_coverage_extra_test,
             world_size=4,
         )
 
@@ -1255,3 +1357,88 @@ class TorchTrainerPredictTest(TorchDistributedTestCase):
 
     def test_predict_mode(self):
         self.run_distributed(TorchTrainerPredictTest._predict_mode_test)
+
+
+class TorchDistributionExtraCoverageTest(TorchDistributedTestCase):
+    def test_get_device_count_initialized(self):
+        from unittest.mock import patch
+
+        with patch("torch.distributed.is_initialized", return_value=True):
+            with patch("torch.distributed.get_world_size", return_value=8):
+                self.assertEqual(backend_dlib.get_device_count(), 8)
+
+    def test_to_backend_layout_none(self):
+        self.assertIsNone(backend_dlib._to_backend_layout(None))
+
+    @staticmethod
+    def _to_backend_layout_replicate_test(self, rank, world_size):
+        mesh = distribution_lib.DeviceMesh((world_size,), ["model"])
+        # Layout doesn't use "model" axis => Replicate
+        layout = distribution_lib.TensorLayout([None, None], mesh)
+        backend_layout = backend_dlib._to_backend_layout(layout)
+        from torch.distributed.tensor import Replicate
+
+        self.assertIsInstance(backend_layout.placements[0], Replicate)
+
+    def test_to_backend_layout_replicate(self):
+        self.run_distributed(
+            TorchDistributionExtraCoverageTest._to_backend_layout_replicate_test
+        )
+
+    def test_register_unbind_twice(self):
+        # Should return early
+        backend_dlib._register_unbind_strategy()
+        backend_dlib._register_unbind_strategy()
+
+    def test_distribute_data_input_none_layout(self):
+        tensor = torch.randn(2, 2)
+        self.assertIs(
+            backend_dlib.distribute_data_input(tensor, None, "batch"), tensor
+        )
+
+    @staticmethod
+    def _distribute_data_input_not_model_parallel_test(self, rank, world_size):
+        tensor = torch.randn(2, 2)
+        mesh = distribution_lib.DeviceMesh((world_size,), ["batch"])
+        dist = distribution_lib.DataParallel(mesh)
+        layout = distribution_lib.TensorLayout(["batch", None], mesh)
+        with dist.scope():
+            self.assertIs(
+                backend_dlib.distribute_data_input(tensor, layout, "batch"),
+                tensor,
+            )
+
+    def test_distribute_data_input_not_model_parallel(self):
+        self.run_distributed(
+            TorchDistributionExtraCoverageTest._distribute_data_input_not_model_parallel_test
+        )
+
+    def test_fit_validation_split(self):
+        model = models.Sequential([layers.Dense(2)])
+        model.compile(optimizer="adam", loss="mse")
+        x = np.random.randn(10, 8).astype("float32")
+        y = np.random.randn(10, 2).astype("float32")
+        model.fit(x, y, validation_split=0.2, epochs=1)
+
+    def test_predict_multiple_batches(self):
+        model = models.Sequential([layers.Dense(2)])
+        model.compile(optimizer="adam", loss="mse")
+        x = np.random.randn(10, 8).astype("float32")
+        # batch_size=2, num_samples=10 => 5 batches
+        res = model.predict(x, batch_size=2)
+        self.assertEqual(res.shape, (10, 2))
+
+    def test_array_data_adapter_sample_weight_errors(self):
+        from keras.src.trainers.data_adapters.array_data_adapter import (
+            ArrayDataAdapter,
+        )
+
+        x = np.random.randn(10, 8)
+        y = np.random.randn(10, 2)
+        # sample_weight and class_weight together
+        with self.assertRaisesRegex(
+            ValueError, "cannot `class_weight` and `sample_weight`"
+        ):
+            ArrayDataAdapter(
+                x, y, sample_weight=np.ones(10), class_weight={0: 1.0}
+            )
