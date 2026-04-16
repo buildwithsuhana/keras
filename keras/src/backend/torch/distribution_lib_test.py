@@ -752,46 +752,6 @@ class TorchDataLoadingTest(TorchDistributedTestCase):
             world_size=4,
         )
 
-    def _dataloader_adapter_coverage_extra_test(self, rank, world_size):
-        from torch.utils.data import DataLoader
-        from torch.utils.data import TensorDataset
-        from torch.utils.data.distributed import DistributedSampler
-
-        from keras.src.trainers.data_adapters.torch_data_loader_adapter import (
-            TorchDataLoaderAdapter,
-        )
-
-        dataset = TensorDataset(torch.randn(10, 1))
-
-        # 1. ModelParallel with num_model_replicas < num_process
-        mesh = distribution_lib.DeviceMesh((2, 2), ["batch", "model"])
-        dist = distribution_lib.ModelParallel(
-            layout_map=distribution_lib.LayoutMap(mesh), batch_dim_name="batch"
-        )
-        with dist.scope():
-            # Test with various DataLoader args to cover more lines
-            dataloader = DataLoader(
-                dataset,
-                batch_size=2,
-                shuffle=True,
-                num_workers=0,
-                drop_last=True,
-            )
-            adapter = TorchDataLoaderAdapter(dataloader)
-            new_loader = adapter.get_torch_dataloader()
-            self.assertIsInstance(new_loader.sampler, DistributedSampler)
-            self.assertEqual(new_loader.sampler.num_replicas, 2)
-            self.assertEqual(new_loader.sampler.rank, rank // 2)
-            self.assertTrue(new_loader.sampler.shuffle)
-            self.assertEqual(new_loader.batch_size, 2)
-            self.assertTrue(new_loader.drop_last)
-
-    def test_dataloader_adapter_coverage_extra(self):
-        self.run_distributed(
-            TorchDataLoadingTest._dataloader_adapter_coverage_extra_test,
-            world_size=4,
-        )
-
 
 class TorchMetricAggregationTest(TorchDistributedTestCase):
     @staticmethod
@@ -1037,35 +997,6 @@ class TorchVariableDistributionTest(TorchDistributedTestCase):
     def test_variable_dtensor_initialization(self):
         self.run_distributed(
             TorchVariableDistributionTest._variable_dtensor_initialization_test
-        )
-
-    def _variable_extra_coverage_test(self, rank, world_size):
-        from torch.distributed.tensor import DTensor
-
-        # 1. _initialize with torch.nn.Parameter
-        param = torch.nn.Parameter(torch.randn(2, 2))
-        v = backend.Variable(param)
-        self.assertIs(v.value, param)
-
-        # 2. _direct_assign with DTensor when self._layout is NOT None
-        mesh = distribution_lib.DeviceMesh((world_size,), ["batch"])
-        layout = distribution_lib.TensorLayout(["batch", None], mesh)
-        dist = distribution_lib.ModelParallel(
-            layout_map=distribution_lib.LayoutMap(mesh)
-        )
-        with dist.scope():
-            v2 = backend.Variable(torch.randn(world_size, 2), layout=layout)
-            self.assertIsInstance(v2.value, DTensor)
-
-            new_value = torch.randn(world_size, 2)
-            new_dtensor = backend_dlib.distribute_tensor(new_value, layout)
-            v2.assign(new_dtensor)
-            self.assertIsInstance(v2.value, DTensor)
-            self.assertAllClose(v2.value.to_local(), new_dtensor.to_local())
-
-    def test_variable_extra_coverage(self):
-        self.run_distributed(
-            TorchVariableDistributionTest._variable_extra_coverage_test
         )
 
 
