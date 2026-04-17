@@ -60,6 +60,18 @@ def get_device_count(device_type=None):
     return distribution_lib.get_device_count(device_type=device_type)
 
 
+@keras_export("keras.distribution.num_processes")
+def num_processes():
+    """Returns the number of processes for the current distribution setting."""
+    return getattr(distribution_lib, "num_processes", lambda: 1)()
+
+
+@keras_export("keras.distribution.process_id")
+def process_id():
+    """Returns the current process ID for the distribution setting."""
+    return getattr(distribution_lib, "process_id", lambda: 0)()
+
+
 @keras_export("keras.distribution.initialize")
 def initialize(job_addresses=None, num_processes=None, process_id=None):
     """Initialize the distribution system for multi-host/process setting.
@@ -450,8 +462,8 @@ class DataParallel(Distribution):
             self._initialize_mesh_from_list_devices(auto_shard_dataset)
 
         # Those following attributes might get convert to public methods.
-        self._num_process = distribution_lib.num_processes()
-        self._process_id = distribution_lib.process_id()
+        self._num_process = num_processes()
+        self._process_id = process_id()
         self._is_multi_process = self._num_process > 1
 
     def _initialize_with_device_mesh(self, device_mesh, auto_shard_dataset):
@@ -658,8 +670,8 @@ class ModelParallel(Distribution):
         self._layout_map = layout_map
 
         # Those following attributes might get convert to public methods.
-        self._num_process = distribution_lib.num_processes()
-        self._process_id = distribution_lib.process_id()
+        self._num_process = num_processes()
+        self._process_id = process_id()
         self._is_multi_process = self._num_process > 1
 
         mesh_batch_dim_index = self.device_mesh.axis_names.index(

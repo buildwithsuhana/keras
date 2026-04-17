@@ -321,8 +321,8 @@ class TestArrayDataAdapter(testing.TestCase):
     @patch("torch.distributed.is_available")
     @patch("torch.distributed.get_world_size")
     @patch("torch.distributed.get_rank")
-    @patch("keras.src.backend.distribution_lib.num_processes", create=True)
-    @patch("keras.src.backend.distribution_lib.process_id", create=True)
+    @patch("keras.src.distribution.distribution_lib.num_processes")
+    @patch("keras.src.distribution.distribution_lib.process_id")
     @patch("keras.src.distribution.distribution_lib.distribution")
     def test_dataparallel_sharding(self, *args):
         mock_distribution = args[0]
@@ -358,8 +358,8 @@ class TestArrayDataAdapter(testing.TestCase):
 
     @patch("torch.distributed.get_world_size")
     @patch("torch.distributed.get_rank")
-    @patch("keras.src.backend.distribution_lib.num_processes", create=True)
-    @patch("keras.src.backend.distribution_lib.process_id", create=True)
+    @patch("keras.src.distribution.distribution_lib.num_processes")
+    @patch("keras.src.distribution.distribution_lib.process_id")
     @patch("keras.src.distribution.distribution_lib.distribution")
     def test_modelparallel_sharding(self, *args):
         mock_distribution = args[0]
@@ -407,8 +407,8 @@ class TestArrayDataAdapter(testing.TestCase):
 
     @patch("torch.distributed.get_world_size")
     @patch("torch.distributed.get_rank")
-    @patch("keras.src.backend.distribution_lib.num_processes", create=True)
-    @patch("keras.src.backend.distribution_lib.process_id", create=True)
+    @patch("keras.src.distribution.distribution_lib.num_processes")
+    @patch("keras.src.distribution.distribution_lib.process_id")
     @patch("keras.src.distribution.distribution_lib.distribution")
     def test_modelparallel_sharding_large_mesh(self, *args):
         mock_distribution = args[0]

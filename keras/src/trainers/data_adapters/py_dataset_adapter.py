@@ -205,7 +205,6 @@ class PyDatasetAdapter(DataAdapter):
         shuffle=False,
         distribution=None,
     ):
-        from keras.src.backend import distribution_lib as backend_dist_lib
         from keras.src.distribution import distribution_lib
 
         self.py_dataset = x
@@ -218,13 +217,9 @@ class PyDatasetAdapter(DataAdapter):
         dist = distribution or distribution_lib.distribution()
         self._num_processes = 1
         self._process_id = 0
-        if dist is not None and backend_dist_lib is not None:
-            num_processes_fn = getattr(
-                backend_dist_lib, "num_processes", lambda: 1
-            )
-            process_id_fn = getattr(backend_dist_lib, "process_id", lambda: 0)
-            self._num_processes = num_processes_fn()
-            self._process_id = process_id_fn()
+        if dist is not None:
+            self._num_processes = distribution_lib.num_processes()
+            self._process_id = distribution_lib.process_id()
 
         workers = self.py_dataset.workers
         use_multiprocessing = self.py_dataset.use_multiprocessing
