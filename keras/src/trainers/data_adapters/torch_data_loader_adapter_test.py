@@ -177,10 +177,14 @@ class TestTorchDataLoaderAdapter(testing.TestCase):
     @patch("torch.distributed.is_available")
     @patch("torch.distributed.get_world_size")
     @patch("torch.distributed.get_rank")
+    @patch("keras.src.backend.distribution_lib.num_processes", create=True)
+    @patch("keras.src.backend.distribution_lib.process_id", create=True)
     @patch("keras.src.distribution.distribution_lib.distribution")
     def test_dataparallel_sharding(
         self,
         mock_distribution,
+        mock_process_id,
+        mock_num_processes,
         mock_get_rank,
         mock_get_world_size,
         mock_is_available,
@@ -188,6 +192,8 @@ class TestTorchDataLoaderAdapter(testing.TestCase):
         mock_is_available.return_value = True
         mock_get_world_size.return_value = 4
         mock_get_rank.return_value = 1
+        mock_num_processes.return_value = 4
+        mock_process_id.return_value = 1
 
         dist = dist_lib.DataParallel(
             devices=["cpu:0", "cpu:1", "cpu:2", "cpu:3"]
@@ -213,10 +219,14 @@ class TestTorchDataLoaderAdapter(testing.TestCase):
     @patch("torch.distributed.is_available")
     @patch("torch.distributed.get_world_size")
     @patch("torch.distributed.get_rank")
+    @patch("keras.src.backend.distribution_lib.num_processes", create=True)
+    @patch("keras.src.backend.distribution_lib.process_id", create=True)
     @patch("keras.src.distribution.distribution_lib.distribution")
     def test_modelparallel_sharding(
         self,
         mock_distribution,
+        mock_process_id,
+        mock_num_processes,
         mock_get_rank,
         mock_get_world_size,
         mock_is_available,
@@ -224,6 +234,8 @@ class TestTorchDataLoaderAdapter(testing.TestCase):
         mock_is_available.return_value = True
         mock_get_world_size.return_value = 8
         mock_get_rank.return_value = 5
+        mock_num_processes.return_value = 8
+        mock_process_id.return_value = 5
 
         device_mesh = dist_lib.DeviceMesh(
             shape=(2, 4), axis_names=("data", "model"), devices=["cpu:0"] * 8
@@ -261,10 +273,14 @@ class TestTorchDataLoaderAdapter(testing.TestCase):
     @patch("torch.distributed.is_available")
     @patch("torch.distributed.get_world_size")
     @patch("torch.distributed.get_rank")
+    @patch("keras.src.backend.distribution_lib.num_processes", create=True)
+    @patch("keras.src.backend.distribution_lib.process_id", create=True)
     @patch("keras.src.distribution.distribution_lib.distribution")
     def test_modelparallel_sharding_large_mesh(
         self,
         mock_distribution,
+        mock_process_id,
+        mock_num_processes,
         mock_get_rank,
         mock_get_world_size,
         mock_is_available,
@@ -272,6 +288,8 @@ class TestTorchDataLoaderAdapter(testing.TestCase):
         mock_is_available.return_value = True
         mock_get_world_size.return_value = 4
         mock_get_rank.return_value = 2
+        mock_num_processes.return_value = 4
+        mock_process_id.return_value = 2
 
         device_mesh = dist_lib.DeviceMesh(
             shape=(8, 2), axis_names=("data", "model"), devices=["cpu:0"] * 16
