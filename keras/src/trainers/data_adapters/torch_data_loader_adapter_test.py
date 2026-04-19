@@ -177,18 +177,17 @@ class TestTorchDataLoaderAdapter(testing.TestCase):
     @patch("torch.distributed.is_available")
     @patch("torch.distributed.get_world_size")
     @patch("torch.distributed.get_rank")
-    @patch("keras.src.distribution.distribution_lib.num_processes")
-    @patch("keras.src.distribution.distribution_lib.process_id")
+    @patch("keras.src.backend.distribution_lib.num_processes", create=True)
+    @patch("keras.src.backend.distribution_lib.process_id", create=True)
     @patch("keras.src.distribution.distribution_lib.distribution")
-    def test_dataparallel_sharding(
-        self,
-        mock_distribution,
-        mock_process_id,
-        mock_num_processes,
-        mock_get_rank,
-        mock_get_world_size,
-        mock_is_available,
-    ):
+    def test_dataparallel_sharding(self, *args):
+        mock_distribution = args[0]
+        mock_process_id = args[1]
+        mock_num_processes = args[2]
+        mock_get_rank = args[3]
+        mock_get_world_size = args[4]
+        mock_is_available = args[5]
+
         mock_is_available.return_value = True
         mock_get_world_size.return_value = 4
         mock_get_rank.return_value = 1
@@ -219,18 +218,17 @@ class TestTorchDataLoaderAdapter(testing.TestCase):
     @patch("torch.distributed.is_available")
     @patch("torch.distributed.get_world_size")
     @patch("torch.distributed.get_rank")
-    @patch("keras.src.distribution.distribution_lib.num_processes")
-    @patch("keras.src.distribution.distribution_lib.process_id")
+    @patch("keras.src.backend.distribution_lib.num_processes", create=True)
+    @patch("keras.src.backend.distribution_lib.process_id", create=True)
     @patch("keras.src.distribution.distribution_lib.distribution")
-    def test_modelparallel_sharding(
-        self,
-        mock_distribution,
-        mock_process_id,
-        mock_num_processes,
-        mock_get_rank,
-        mock_get_world_size,
-        mock_is_available,
-    ):
+    def test_modelparallel_sharding(self, *args):
+        mock_distribution = args[0]
+        mock_process_id = args[1]
+        mock_num_processes = args[2]
+        mock_get_rank = args[3]
+        mock_get_world_size = args[4]
+        mock_is_available = args[5]
+
         mock_is_available.return_value = True
         mock_get_world_size.return_value = 8
         mock_get_rank.return_value = 5
@@ -273,18 +271,17 @@ class TestTorchDataLoaderAdapter(testing.TestCase):
     @patch("torch.distributed.is_available")
     @patch("torch.distributed.get_world_size")
     @patch("torch.distributed.get_rank")
-    @patch("keras.src.distribution.distribution_lib.num_processes")
-    @patch("keras.src.distribution.distribution_lib.process_id")
+    @patch("keras.src.backend.distribution_lib.num_processes", create=True)
+    @patch("keras.src.backend.distribution_lib.process_id", create=True)
     @patch("keras.src.distribution.distribution_lib.distribution")
-    def test_modelparallel_sharding_large_mesh(
-        self,
-        mock_distribution,
-        mock_process_id,
-        mock_num_processes,
-        mock_get_rank,
-        mock_get_world_size,
-        mock_is_available,
-    ):
+    def test_modelparallel_sharding_large_mesh(self, *args):
+        mock_distribution = args[0]
+        mock_process_id = args[1]
+        mock_num_processes = args[2]
+        mock_get_rank = args[3]
+        mock_get_world_size = args[4]
+        mock_is_available = args[5]
+
         mock_is_available.return_value = True
         mock_get_world_size.return_value = 4
         mock_get_rank.return_value = 2
