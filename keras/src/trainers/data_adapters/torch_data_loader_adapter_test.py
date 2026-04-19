@@ -177,22 +177,20 @@ class TestTorchDataLoaderAdapter(testing.TestCase):
     @patch("torch.distributed.is_available")
     @patch("torch.distributed.get_world_size")
     @patch("torch.distributed.get_rank")
-    @patch("keras.src.backend.distribution_lib.num_processes", create=True)
-    @patch("keras.src.backend.distribution_lib.process_id", create=True)
+    @patch("keras.src.distribution.distribution_lib.distribution_lib")
     @patch("keras.src.distribution.distribution_lib.distribution")
     def test_dataparallel_sharding(self, *args):
         mock_distribution = args[0]
-        mock_process_id = args[1]
-        mock_num_processes = args[2]
-        mock_get_rank = args[3]
-        mock_get_world_size = args[4]
-        mock_is_available = args[5]
+        mock_backend_dist_lib = args[1]
+        mock_get_rank = args[2]
+        mock_get_world_size = args[3]
+        mock_is_available = args[4]
 
         mock_is_available.return_value = True
         mock_get_world_size.return_value = 4
         mock_get_rank.return_value = 1
-        mock_num_processes.return_value = 4
-        mock_process_id.return_value = 1
+        mock_backend_dist_lib.num_processes.return_value = 4
+        mock_backend_dist_lib.process_id.return_value = 1
 
         dist = dist_lib.DataParallel(
             devices=["cpu:0", "cpu:1", "cpu:2", "cpu:3"]
@@ -218,22 +216,20 @@ class TestTorchDataLoaderAdapter(testing.TestCase):
     @patch("torch.distributed.is_available")
     @patch("torch.distributed.get_world_size")
     @patch("torch.distributed.get_rank")
-    @patch("keras.src.backend.distribution_lib.num_processes", create=True)
-    @patch("keras.src.backend.distribution_lib.process_id", create=True)
+    @patch("keras.src.distribution.distribution_lib.distribution_lib")
     @patch("keras.src.distribution.distribution_lib.distribution")
     def test_modelparallel_sharding(self, *args):
         mock_distribution = args[0]
-        mock_process_id = args[1]
-        mock_num_processes = args[2]
-        mock_get_rank = args[3]
-        mock_get_world_size = args[4]
-        mock_is_available = args[5]
+        mock_backend_dist_lib = args[1]
+        mock_get_rank = args[2]
+        mock_get_world_size = args[3]
+        mock_is_available = args[4]
 
         mock_is_available.return_value = True
         mock_get_world_size.return_value = 8
         mock_get_rank.return_value = 5
-        mock_num_processes.return_value = 8
-        mock_process_id.return_value = 5
+        mock_backend_dist_lib.num_processes.return_value = 8
+        mock_backend_dist_lib.process_id.return_value = 5
 
         device_mesh = dist_lib.DeviceMesh(
             shape=(2, 4), axis_names=("data", "model"), devices=["cpu:0"] * 8
@@ -271,22 +267,20 @@ class TestTorchDataLoaderAdapter(testing.TestCase):
     @patch("torch.distributed.is_available")
     @patch("torch.distributed.get_world_size")
     @patch("torch.distributed.get_rank")
-    @patch("keras.src.backend.distribution_lib.num_processes", create=True)
-    @patch("keras.src.backend.distribution_lib.process_id", create=True)
+    @patch("keras.src.distribution.distribution_lib.distribution_lib")
     @patch("keras.src.distribution.distribution_lib.distribution")
     def test_modelparallel_sharding_large_mesh(self, *args):
         mock_distribution = args[0]
-        mock_process_id = args[1]
-        mock_num_processes = args[2]
-        mock_get_rank = args[3]
-        mock_get_world_size = args[4]
-        mock_is_available = args[5]
+        mock_backend_dist_lib = args[1]
+        mock_get_rank = args[2]
+        mock_get_world_size = args[3]
+        mock_is_available = args[4]
 
         mock_is_available.return_value = True
         mock_get_world_size.return_value = 4
         mock_get_rank.return_value = 2
-        mock_num_processes.return_value = 4
-        mock_process_id.return_value = 2
+        mock_backend_dist_lib.num_processes.return_value = 4
+        mock_backend_dist_lib.process_id.return_value = 2
 
         device_mesh = dist_lib.DeviceMesh(
             shape=(8, 2), axis_names=("data", "model"), devices=["cpu:0"] * 16
