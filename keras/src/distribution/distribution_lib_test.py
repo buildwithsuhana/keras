@@ -14,8 +14,8 @@ from keras.src.distribution import distribution_lib
 
 
 @pytest.mark.skipif(
-    backend.backend() != "jax",
-    reason="Only JAX has the backend to mock at the moment",
+    backend.backend() not in ("jax", "torch"),
+    reason="Only JAX and Torch have the backend to mock at the moment",
 )
 @mock.patch.object(
     backend_dlib,
@@ -165,8 +165,8 @@ class DistributionTest(testing.TestCase):
 
 
 @pytest.mark.skipif(
-    backend.backend() != "jax",
-    reason="Only JAX has the proper backend distribution lib",
+    backend.backend() not in ("jax", "torch"),
+    reason="Only JAX and Torch have the proper backend distribution lib",
 )
 class DataParallelDistributionTest(testing.TestCase):
     def setUp(self):
@@ -268,8 +268,8 @@ class DataParallelDistributionTest(testing.TestCase):
 
 
 @pytest.mark.skipif(
-    backend.backend() != "jax",
-    reason="Only JAX has the proper backend distribution lib",
+    backend.backend() not in ("jax", "torch"),
+    reason="Only JAX and Torch have the proper backend distribution lib",
 )
 class ModelParallelDistributionTest(testing.TestCase):
     def setUp(self):

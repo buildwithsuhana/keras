@@ -33,11 +33,15 @@ def initialize(job_addresses=None, num_processes=None, process_id=None):
 
 
 def num_processes():
-    return torch.distributed.get_world_size()
+    if torch.distributed.is_initialized():
+        return torch.distributed.get_world_size()
+    return 1
 
 
 def process_id():
-    return torch.distributed.get_rank()
+    if torch.distributed.is_initialized():
+        return torch.distributed.get_rank()
+    return 0
 
 
 def _to_backend_device(device_name):
