@@ -28,7 +28,6 @@ class CoreTest(testing.TestCase):
         self.assertAllClose(result, [[1, 10, 20], [4, 30, 40]])
 
     def test_variable_with_mock_distribution(self):
-        # lines 114-120, 127-135, 170-171
         from keras.src.distribution import TensorLayout
 
         mock_dist = MagicMock()
