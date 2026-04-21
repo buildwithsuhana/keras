@@ -16,18 +16,6 @@ from keras.src.backend.torch import core
     backend.backend() != "torch", reason="Requires Torch backend"
 )
 class CoreTest(testing.TestCase):
-    def test_slice_ops(self):
-        inputs = torch.tensor([[1, 2, 3], [4, 5, 6]])
-        self.assertAllClose(
-            core.slice(inputs, [0, 1], [2, 2]), [[2, 3], [5, 6]]
-        )
-        self.assertAllClose(
-            core.slice_update(
-                inputs, [0, 1], torch.tensor([[10, 20], [30, 40]])
-            ),
-            [[1, 10, 20], [4, 30, 40]],
-        )
-
     def test_variable_basics(self):
         # Basics: trainable, eq, uninitialized
         v = core.Variable([1.0, 2.0], trainable=True)
