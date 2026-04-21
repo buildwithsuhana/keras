@@ -133,13 +133,18 @@ class Variable(KerasVariable):
             value = convert_to_tensor(value, dtype=self._dtype)
             value = distribute_tensor(value, self._layout)
             self._value = torch.nn.Parameter(
-                value, requires_grad=self.trainable
+                value,
+                requires_grad=self.trainable
+                and (torch.is_floating_point(value) or torch.is_complex(value)),
             )
         else:
             if isinstance(value, torch.nn.Parameter):
                 self._value = value
                 if self._value.requires_grad != self.trainable:
-                    self._value.requires_grad = self.trainable
+                    self._value.requires_grad = self.trainable and (
+                        torch.is_floating_point(self._value)
+                        or torch.is_complex(self._value)
+                    )
             else:
                 param_value = convert_to_tensor(value, dtype=self._dtype)
                 if isinstance(param_value, DTensor):
@@ -149,9 +154,14 @@ class Variable(KerasVariable):
                     if hasattr(param_value, "device")
                     else get_device()
                 )
+                param_value = param_value.to(device)
                 self._value = torch.nn.Parameter(
-                    param_value.to(device),
-                    requires_grad=self.trainable,
+                    param_value,
+                    requires_grad=self.trainable
+                    and (
+                        torch.is_floating_point(param_value)
+                        or torch.is_complex(param_value)
+                    ),
                 )
 
     def _direct_assign(self, value):

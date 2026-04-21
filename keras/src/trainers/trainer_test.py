@@ -1029,6 +1029,10 @@ class TestTrainer(testing.TestCase):
             steps_per_execution=[3, 101], mode=["eager", "non_jit", "jit"]
         )
     )
+    @pytest.mark.skipif(
+        backend.backend() == "torch" and bool(os.environ.get("CI")),
+        reason="Torch Inductor C++ compilation fails in CI (missing cc1plus)",
+    )
     @pytest.mark.requires_trainable_backend
     @pytest.mark.skipif(
         backend.backend() == "torch",
@@ -1164,6 +1168,10 @@ class TestTrainer(testing.TestCase):
             steps_per_execution=[1, 50], mode=["eager", "non_jit", "jit"]
         )
     )
+    @pytest.mark.skipif(
+        backend.backend() == "torch" and bool(os.environ.get("CI")),
+        reason="Torch Inductor C++ compilation fails in CI (missing cc1plus)",
+    )
     def test_predict_preserve_order(self, steps_per_execution, mode):
         if steps_per_execution > 1 and backend.backend() == "torch":
             self.skipTest("`steps_per_execution` not implemented for torch yet")
@@ -1213,6 +1221,10 @@ class TestTrainer(testing.TestCase):
         named_product(
             steps_per_execution=[1, 50], mode=["eager", "non_jit", "jit"]
         )
+    )
+    @pytest.mark.skipif(
+        backend.backend() == "torch" and bool(os.environ.get("CI")),
+        reason="Torch Inductor C++ compilation fails in CI (missing cc1plus)",
     )
     def test_predict_generator(self, steps_per_execution, mode):
         if steps_per_execution > 1 and backend.backend() == "torch":
@@ -1341,6 +1353,10 @@ class TestTrainer(testing.TestCase):
             mode=["eager", "non_jit", "jit"],
         )
     )
+    @pytest.mark.skipif(
+        backend.backend() == "torch" and bool(os.environ.get("CI")),
+        reason="Torch Inductor C++ compilation fails in CI (missing cc1plus)",
+    )
     @pytest.mark.requires_trainable_backend
     @pytest.mark.skipif(
         backend.backend() == "torch",
@@ -1465,6 +1481,10 @@ class TestTrainer(testing.TestCase):
             ],
             mode=["eager", "non_jit", "jit"],
         )
+    )
+    @pytest.mark.skipif(
+        backend.backend() == "torch" and bool(os.environ.get("CI")),
+        reason="Torch Inductor C++ compilation fails in CI (missing cc1plus)",
     )
     @pytest.mark.requires_trainable_backend
     def test_steps_per_epoch(self, steps_per_epoch_test, mode):
@@ -1616,6 +1636,10 @@ class TestTrainer(testing.TestCase):
             ],
             mode=["eager", "non_jit", "jit"],
         )
+    )
+    @pytest.mark.skipif(
+        backend.backend() == "torch" and bool(os.environ.get("CI")),
+        reason="Torch Inductor C++ compilation fails in CI (missing cc1plus)",
     )
     @pytest.mark.requires_trainable_backend
     @pytest.mark.skipif(
