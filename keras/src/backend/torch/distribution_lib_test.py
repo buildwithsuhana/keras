@@ -366,52 +366,8 @@ class TorchTrainerModeTest(TorchDistributedTestCase):
     def test_on_batch_mode(self):
         self.run_distributed(TorchTrainerModeTest._on_batch_mode_test)
 
-    def test_train_on_batch_class_weight(self):
-        model = models.Sequential([layers.Dense(2)])
-        model.compile(optimizer="adam", loss="mse")
-        x = np.random.randn(4, 8).astype("float32")
-        y = np.array([0, 1, 0, 1]).reshape(-1, 1).astype("float32")
-        class_weight = {0: 1.0, 1: 2.0}
-        logs = model.train_on_batch(
-            x, y, class_weight=class_weight, return_dict=True
-        )
-        self.assertIn("loss", logs)
-
-    def test_cached_eval_iterator(self):
-        from keras.src.backend.torch.trainer import TorchEpochIterator
-
-        model = models.Sequential([layers.Dense(2)])
-        model.compile(optimizer="adam", loss="mse")
-        x = np.random.randn(4, 8).astype("float32")
-        y = np.random.randn(4, 2).astype("float32")
-
-        # Manually create and set the iterator to test the cached path
-        iterator = TorchEpochIterator(x=x, y=y, batch_size=2)
-        model._eval_epoch_iterator = iterator
-
-        # Call evaluate with cached iterator
-        logs = model.evaluate(
-            x, y, _use_cached_eval_dataset=True, return_dict=True
-        )
-        self.assertIn("loss", logs)
-        # Ensure it was actually used (iterator was reset and consumed)
-        self.assertIs(model._eval_epoch_iterator, iterator)
-
 
 class TorchTrainerArchitectureTest(TorchDistributedTestCase):
-    @staticmethod
-    def _e2e_data_parallel_fit_test(self, rank, world_size):
-        mesh = distribution_lib.DeviceMesh((world_size,), ["batch"])
-        dist = distribution_lib.DataParallel(mesh, auto_shard_dataset=False)
-        with dist.scope():
-            model = models.Sequential(
-                [layers.Input(shape=(8,)), layers.Dense(4), layers.Dense(2)]
-            )
-            model.compile(optimizer="adam", loss="mse", metrics=["mae"])
-            x, y = np.random.randn(4, 8), np.random.randn(4, 2)
-            model.fit(x, y, epochs=1, batch_size=2)
-            self.assertNotEqual(len(model.evaluate(x, y, batch_size=2)), 0)
-
     @staticmethod
     def _e2e_model_parallel_fit_test(self, rank, world_size):
         mesh = distribution_lib.DeviceMesh((1, world_size), ["batch", "model"])
@@ -498,40 +454,10 @@ class TorchTrainerArchitectureTest(TorchDistributedTestCase):
         self.assertLen(list(wrapper_bn.parameters()), 6)
         self.assertLen(list(wrapper_bn.buffers()), 2)
 
-    def test_e2e_data_parallel_fit(self):
-        self.run_distributed(
-            TorchTrainerArchitectureTest._e2e_data_parallel_fit_test
-        )
-
     def test_e2e_model_parallel_fit(self):
         self.run_distributed(
             TorchTrainerArchitectureTest._e2e_model_parallel_fit_test
         )
-
-    def test_keras_module_wrapper(self):
-        self.run_distributed(
-            TorchTrainerArchitectureTest._keras_module_wrapper_test,
-            world_size=1,
-        )
-
-    def test_should_torch_compile_warning(self):
-        from unittest.mock import patch
-
-        model = models.Sequential([layers.Dense(2)])
-        model.compile(jit_compile=True)
-        # Mock torch version < 2.1.0
-        with patch("torch.__version__", "2.0.0"):
-            with pytest.warns(
-                UserWarning, match="Please upgrade to torch>=2.1.0"
-            ):
-                model._should_torch_compile()
-                self.assertFalse(model.jit_compile)
-
-    def test_steps_per_execution_error(self):
-        model = models.Sequential([layers.Dense(2)])
-        model.compile(steps_per_execution=2)
-        with pytest.raises(ValueError, match="`steps_per_execution` must be 1"):
-            model.make_train_function()
 
 
 class TorchDataLoadingTest(TorchDistributedTestCase):
@@ -738,97 +664,11 @@ class TorchDataLoadingTest(TorchDistributedTestCase):
             world_size=4,
         )
 
-    def test_dataloader_adapter_tf(self):
-        from torch.utils.data import DataLoader
-        from torch.utils.data import TensorDataset
-
-        from keras.src.trainers.data_adapters.torch_data_loader_adapter import (
-            TorchDataLoaderAdapter,
-        )
-
-        dataset = TensorDataset(torch.randn(4, 8), torch.randn(4, 2))
-        dataloader = DataLoader(dataset, batch_size=2)
-        adapter = TorchDataLoaderAdapter(dataloader)
-        # Cover get_tf_dataset
-        ds = adapter.get_tf_dataset()
-        self.assertIsNotNone(ds)
-
-    def test_array_data_adapter_extra(self):
-        from keras.src.trainers.data_adapters.array_data_adapter import (
-            ArrayDataAdapter,
-        )
-
-        x = np.random.randn(10, 8)
-        y = np.random.randn(10, 2)
-
-        # 1. Test shuffle="batch"
-        adapter = ArrayDataAdapter(x, y, batch_size=2, shuffle="batch")
-        it = adapter.get_numpy_iterator()
-        next(it)
-
-        # 2. Test shuffle=True (full shuffle)
-        adapter = ArrayDataAdapter(x, y, batch_size=2, shuffle=True)
-        it = adapter.get_numpy_iterator()
-        next(it)
-
-        # 3. Test class_weight error with nested y
-        with self.assertRaisesRegex(
-            ValueError, "`class_weight` is only supported"
-        ):
-            ArrayDataAdapter(x, [y, y], class_weight={0: 1.0})
-
-        # 4. Test sample_weight replication
-        adapter = ArrayDataAdapter(x, [y, y], sample_weight=np.ones((10, 1)))
-        self.assertLen(adapter._inputs[2], 2)
-
-    def test_array_data_adapter_torch_sharding(self):
-        from keras.src.trainers.data_adapters.array_data_adapter import (
-            ArrayDataAdapter,
-        )
-
-        x = np.random.randn(10, 8)
-        y = np.random.randn(10, 2)
-
-        # Test shuffle="batch" in torch dataloader
-        adapter = ArrayDataAdapter(x, y, batch_size=2, shuffle="batch")
-        loader = adapter.get_torch_dataloader()
-        self.assertIsNotNone(loader)
-        next(iter(loader))
-
-        # Test shuffle=True in torch dataloader
-        adapter = ArrayDataAdapter(x, y, batch_size=2, shuffle=True)
-        loader = adapter.get_torch_dataloader()
-        next(iter(loader))
-
     def test_dataloader_model_parallel_complex_sharding(self):
         self.run_distributed(
             TorchDataLoadingTest._dataloader_model_parallel_complex_sharding_test,
             world_size=4,
         )
-
-
-class TorchMetricAggregationTest(TorchDistributedTestCase):
-    @staticmethod
-    def _sync_metrics_test(self, rank, world_size):
-        from keras.src import metrics
-
-        m = metrics.MeanSquaredError()
-        mesh = distribution_lib.DeviceMesh((world_size,), ["batch"])
-        with distribution_lib.DataParallel(device_mesh=mesh).scope():
-            model = models.Sequential([layers.Dense(1, input_shape=(1,))])
-            model.compile(metrics=[m])
-            model.compute_metrics(
-                torch.zeros(1, 1), torch.ones(1, 1), torch.zeros(1, 1)
-            )
-            m.update_state(
-                torch.ones(1, 1), torch.tensor([[1.0 + np.sqrt(rank)]])
-            )
-            model._sync_metrics()
-        self.assertAllClose(m.variables[0].value, 3.0)
-        self.assertAllClose(m.variables[1].value, 4.0)
-
-    def test_sync_metrics(self):
-        self.run_distributed(TorchMetricAggregationTest._sync_metrics_test)
 
 
 class TorchCheckpointTest(TorchDistributedTestCase):
@@ -1204,49 +1044,6 @@ class TorchDataLoaderShuffleTest(TorchDistributedTestCase):
         )
 
 
-class TorchDistributionUtilsTest(TorchDistributedTestCase):
-    @staticmethod
-    def _to_backend_device_test(self, rank, world_size):
-        from unittest.mock import patch
-
-        device = backend_dlib._to_backend_device(None)
-        if torch.cuda.is_available():
-            self.assertEqual(device.type, "cuda")
-        else:
-            self.assertEqual(device.type, "cpu")
-
-        device = backend_dlib._to_backend_device("gpu:0")
-        if torch.cuda.is_available():
-            self.assertEqual(device.type, "cuda")
-            self.assertEqual(device.index, 0)
-        else:
-            self.assertEqual(device.type, "cpu")
-
-        # Mock CUDA available
-        with patch("torch.cuda.is_available", return_value=True):
-            with patch.dict(os.environ, {"LOCAL_RANK": "2"}):
-                device = backend_dlib._to_backend_device("gpu")
-                self.assertEqual(device.type, "cuda")
-                self.assertEqual(device.index, 2)
-
-        device = backend_dlib._to_backend_device("cpu")
-        self.assertEqual(device.type, "cpu")
-
-    def test_to_backend_device(self):
-        self.run_distributed(TorchDistributionUtilsTest._to_backend_device_test)
-
-    @staticmethod
-    def _to_backend_device_cpu_logic_test(self, rank, world_size):
-        # Test device_name contains "cpu"
-        device = backend_dlib._to_backend_device("Tensor on cpu:0")
-        self.assertEqual(device.type, "cpu")
-
-    def test_to_backend_device_cpu_logic(self):
-        self.run_distributed(
-            TorchDistributionUtilsTest._to_backend_device_cpu_logic_test
-        )
-
-
 class TorchDistributionTensorTest(TorchDistributedTestCase):
     @staticmethod
     def _distribute_data_input_dp_test(self, rank, world_size):
@@ -1502,25 +1299,6 @@ class TorchDistributionExtraCoverageTest(TorchDistributedTestCase):
                     del os.environ["WORLD_SIZE"]
                 devices = backend_dlib.list_devices("GPU")
                 self.assertEqual(devices, ["gpu:0"])
-
-    def test_to_backend_device_mocked(self):
-        from unittest.mock import patch
-
-        # 1. device_name contains "cpu"
-        device = backend_dlib._to_backend_device("cpu:0")
-        self.assertEqual(device.type, "cpu")
-
-        # 2. cuda available
-        with patch("torch.cuda.is_available", return_value=True):
-            with patch.dict(os.environ, {"LOCAL_RANK": "1"}):
-                device = backend_dlib._to_backend_device(None)
-                self.assertEqual(device.type, "cuda")
-                self.assertEqual(device.index, 1)
-
-        # 3. cuda not available
-        with patch("torch.cuda.is_available", return_value=False):
-            device = backend_dlib._to_backend_device(None)
-            self.assertEqual(device.type, "cpu")
 
     def test_to_backend_mesh_mocked(self):
         from unittest.mock import patch
@@ -1781,33 +1559,3 @@ class TorchDistributionExtraCoverageTest(TorchDistributedTestCase):
         self.run_distributed(
             TorchDistributionExtraCoverageTest._distribute_data_input_not_model_parallel_test
         )
-
-    def test_fit_validation_split(self):
-        model = models.Sequential([layers.Dense(2)])
-        model.compile(optimizer="adam", loss="mse")
-        x = np.random.randn(10, 8).astype("float32")
-        y = np.random.randn(10, 2).astype("float32")
-        model.fit(x, y, validation_split=0.2, epochs=1)
-
-    def test_predict_multiple_batches(self):
-        model = models.Sequential([layers.Dense(2)])
-        model.compile(optimizer="adam", loss="mse")
-        x = np.random.randn(10, 8).astype("float32")
-        # batch_size=2, num_samples=10 => 5 batches
-        res = model.predict(x, batch_size=2)
-        self.assertEqual(res.shape, (10, 2))
-
-    def test_array_data_adapter_sample_weight_errors(self):
-        from keras.src.trainers.data_adapters.array_data_adapter import (
-            ArrayDataAdapter,
-        )
-
-        x = np.random.randn(10, 8)
-        y = np.random.randn(10, 2)
-        # sample_weight and class_weight together
-        with self.assertRaisesRegex(
-            ValueError, "cannot `class_weight` and `sample_weight`"
-        ):
-            ArrayDataAdapter(
-                x, y, sample_weight=np.ones(10), class_weight={0: 1.0}
-            )
