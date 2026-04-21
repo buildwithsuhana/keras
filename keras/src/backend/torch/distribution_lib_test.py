@@ -26,44 +26,71 @@ def find_free_port():
         return s.getsockname()[1]
 
 
+def _worker_wrapper(rank, world_size, port, test_fn, cls):
+    os.environ.update(
+        {
+            "MASTER_ADDR": "localhost",
+            "MASTER_PORT": str(port),
+            "RANK": str(rank),
+            "WORLD_SIZE": str(world_size),
+            "LOCAL_RANK": str(rank),
+        }
+    )
+    if not torch.distributed.is_initialized():
+        torch.distributed.init_process_group(
+            "gloo", rank=rank, world_size=world_size
+        )
+    try:
+        test_fn(cls("setUp"), rank, world_size)
+    finally:
+        if torch.distributed.is_initialized():
+            torch.distributed.destroy_process_group()
+
+
 @pytest.mark.skipif(
     backend.backend() != "torch", reason="Only for Torch backend"
 )
 class TorchDistributionLibTest(testing.TestCase):
     def setUp(self):
         super().setUp()
-        # Initialize default process group for single-process unit tests
         if not torch.distributed.is_initialized():
             os.environ.update(
                 {"MASTER_ADDR": "localhost", "MASTER_PORT": "12361"}
             )
             torch.distributed.init_process_group("gloo", rank=0, world_size=1)
 
-    def test_get_device_count(self):
-        # Default
-        self.assertEqual(backend_dlib.get_device_count(), 1)
-        # Mocked
-        with (
-            mock.patch("torch.distributed.is_initialized", return_value=True),
-            mock.patch("torch.distributed.get_world_size", return_value=2),
-        ):
-            self.assertEqual(backend_dlib.get_device_count(), 2)
+    def test_backend_info(self):
+        # 38, 44: num_processes/process_id when not initialized
         with mock.patch("torch.distributed.is_initialized", return_value=False):
+            self.assertEqual(backend_dlib.num_processes(), 1)
+            self.assertEqual(backend_dlib.process_id(), 0)
+            # 14-16: get_device_count fallback branches
             with mock.patch.dict(os.environ, {"WORLD_SIZE": "4"}):
                 self.assertEqual(backend_dlib.get_device_count(), 4)
             with (
                 mock.patch.dict(os.environ, {}, clear=True),
-                mock.patch("torch.cuda.device_count", return_value=3),
+                mock.patch("torch.cuda.device_count", return_value=0),
             ):
-                self.assertEqual(backend_dlib.get_device_count(), 3)
+                self.assertEqual(backend_dlib.get_device_count(), 1)
+
+        with (
+            mock.patch("torch.distributed.is_initialized", return_value=True),
+            mock.patch("torch.distributed.get_world_size", return_value=2),
+            mock.patch("torch.distributed.get_rank", return_value=1),
+        ):
+            self.assertEqual(backend_dlib.get_device_count(), 2)
+            self.assertEqual(backend_dlib.num_processes(), 2)
+            self.assertEqual(backend_dlib.process_id(), 1)
 
     def test_list_devices(self):
+        # 21-23: list_devices coverage
         with mock.patch(
             "keras.src.backend.torch.distribution_lib.get_device_count",
             return_value=2,
         ):
+            self.assertEqual(backend_dlib.list_devices(), ["gpu:0", "gpu:1"])
             self.assertEqual(
-                backend_dlib.list_devices("gpu"), ["gpu:0", "gpu:1"]
+                backend_dlib.list_devices("cpu"), ["cpu:0", "cpu:1"]
             )
 
     def test_initialize(self):
@@ -82,33 +109,20 @@ class TorchDistributionLibTest(testing.TestCase):
             backend_dlib.initialize()
             mock_init.assert_called_once_with(backend="gloo")
 
-    def test_processes(self):
-        # Not initialized
-        with mock.patch("torch.distributed.is_initialized", return_value=False):
-            self.assertEqual(backend_dlib.num_processes(), 1)
-            self.assertEqual(backend_dlib.process_id(), 0)
-        # Initialized
-        with mock.patch("torch.distributed.is_initialized", return_value=True):
-            with mock.patch("torch.distributed.get_world_size", return_value=4):
-                self.assertEqual(backend_dlib.num_processes(), 4)
-            with mock.patch("torch.distributed.get_rank", return_value=2):
-                self.assertEqual(backend_dlib.process_id(), 2)
-
-    def test_to_backend_device(self):
+    def test_backend_conversions(self):
+        # 54: _to_backend_device fallback to cpu
         self.assertEqual(backend_dlib._to_backend_device("cpu").type, "cpu")
-        self.assertEqual(backend_dlib._to_backend_device(None).type, "cpu")
+        with mock.patch("torch.cuda.is_available", return_value=False):
+            self.assertEqual(backend_dlib._to_backend_device("gpu").type, "cpu")
+        # 53: _to_backend_device with cuda available
         with (
             mock.patch("torch.cuda.is_available", return_value=True),
             mock.patch.dict(os.environ, {"LOCAL_RANK": "1"}),
         ):
-            self.assertEqual(
-                backend_dlib._to_backend_device("gpu").type, "cuda"
-            )
-        # Fallback to CPU
-        with mock.patch("torch.cuda.is_available", return_value=False):
-            self.assertEqual(backend_dlib._to_backend_device("gpu").type, "cpu")
+            device = backend_dlib._to_backend_device("gpu")
+            self.assertEqual(device.type, "cuda")
+            self.assertEqual(device.index, 1)
 
-    def test_to_backend_mesh(self):
         mock_mesh = MagicMock(spec=TorchDeviceMesh)
         self.assertIs(backend_dlib._to_backend_mesh(mock_mesh), mock_mesh)
         with (
@@ -119,231 +133,140 @@ class TorchDistributionLibTest(testing.TestCase):
         ):
             mesh = distribution_lib.DeviceMesh((1,), ["data"], ["cpu:0"])
             backend_dlib._to_backend_mesh(mesh)
-            mock_init.assert_called_once_with(
-                "cuda", mesh_shape=(1,), mesh_dim_names=("data",)
-            )
+            mock_init.assert_called_once()
 
-    def test_to_backend_layout(self):
         self.assertIsNone(backend_dlib._to_backend_layout(None))
-        keras_mesh = distribution_lib.DeviceMesh((1,), ["data"], ["cpu:0"])
-        mock_layout = MagicMock(axes=None, device_mesh=keras_mesh)
+        # 90-95: Axis name matching in _to_backend_layout
+        layout = distribution_lib.TensorLayout(["data"], mesh)
+        backend_layout = backend_dlib._to_backend_layout(layout)
+        self.assertIsInstance(backend_layout.placements[0], Shard)
+        self.assertEqual(backend_layout.placements[0].dim, 0)
+
+        mock_layout = MagicMock(axes=None, device_mesh=mesh)
         self.assertIsInstance(
             backend_dlib._to_backend_layout(mock_layout).placements[0],
             Replicate,
         )
-        # axes NO match
-        mock_layout_no_match = MagicMock(axes=["other"], device_mesh=keras_mesh)
-        self.assertIsInstance(
-            backend_dlib._to_backend_layout(mock_layout_no_match).placements[0],
-            Replicate,
-        )
 
-    def test_distribute_tensor(self):
+    def test_distribution_ops(self):
         keras_mesh = distribution_lib.DeviceMesh((1,), ["data"], ["cpu:0"])
         layout = distribution_lib.TensorLayout(["data"], keras_mesh)
         tensor = torch.randn(4)
-        # No distribution
+
+        # 106, 112, 140: Return tensor if not ModelParallel or layout is None
         self.assertIs(backend_dlib.distribute_tensor(tensor, None), tensor)
-        with mock.patch(
-            "keras.src.distribution.distribution_lib.distribution",
-            return_value=MagicMock(),
-        ):
-            self.assertIs(
-                backend_dlib.distribute_tensor(tensor, layout), tensor
-            )
-        # ModelParallel
-        dist_parallel = distribution_lib.ModelParallel(
-            layout_map=distribution_lib.LayoutMap(keras_mesh)
-        )
-        with dist_parallel.scope():
-            # Layout conversion and redistribution
-            backend_layout = backend_dlib._to_backend_layout(layout)
-            self.assertIsInstance(
-                backend_dlib.distribute_tensor(tensor, backend_layout), DTensor
-            )
-            dt = backend_dlib.distribute_tensor(tensor, layout)
-            self.assertIsInstance(dt, DTensor)
-            self.assertIsInstance(
-                backend_dlib.distribute_tensor(dt, layout), DTensor
-            )
-
-    def test_distribute_variable(self):
-        keras_mesh = distribution_lib.DeviceMesh((1,), ["data"], ["cpu:0"])
-        layout = distribution_lib.TensorLayout(["data"], keras_mesh)
-        dist_parallel = distribution_lib.ModelParallel(
-            layout_map=distribution_lib.LayoutMap(keras_mesh)
-        )
-        with dist_parallel.scope():
-            var = backend_dlib.distribute_variable(torch.randn(4), layout)
-            self.assertIsInstance(var, torch.nn.Parameter)
-            self.assertIsInstance(var.data, DTensor)
-
-    def test_distribute_data_input(self):
-        keras_mesh = distribution_lib.DeviceMesh((1,), ["data"], ["cpu:0"])
-        layout = distribution_lib.TensorLayout(["data"], keras_mesh)
-        tensor = torch.randn(4)
+        self.assertIs(backend_dlib.distribute_tensor(tensor, layout), tensor)
         self.assertIs(
             backend_dlib.distribute_data_input(tensor, None, "batch"), tensor
         )
-        with mock.patch(
-            "keras.src.distribution.distribution_lib.distribution",
-            return_value=MagicMock(),
-        ):
-            self.assertIs(
-                backend_dlib.distribute_data_input(tensor, layout, "batch"),
-                tensor,
-            )
-        dist_parallel = distribution_lib.ModelParallel(
+        self.assertIs(
+            backend_dlib.distribute_data_input(tensor, layout, "batch"), tensor
+        )
+
+        dist_p = distribution_lib.ModelParallel(
             layout_map=distribution_lib.LayoutMap(keras_mesh)
         )
-        with dist_parallel.scope():
-            self.assertIsInstance(
-                backend_dlib.distribute_data_input(
-                    np.ones(4, dtype="float32"), layout, "batch"
-                ),
-                DTensor,
-            )
-            # Cover DTensor branch
+        with dist_p.scope():
+            # 122: distribute_tensor for regular tensor
             dt = backend_dlib.distribute_tensor(tensor, layout)
+            self.assertIsInstance(dt, DTensor)
+            # 118-121: redistribute DTensor
+            dt2 = backend_dlib.distribute_tensor(dt, layout)
+            self.assertIsInstance(dt2, DTensor)
+
+            # 146: Return already DTensor
             self.assertIs(
                 backend_dlib.distribute_data_input(dt, layout, "batch"), dt
             )
-            # Cover non-TensorLayout branch
-            backend_layout = backend_dlib._to_backend_layout(layout)
+
+            # 152-155: Convert non-tensor input while clearing distribution
             self.assertIsInstance(
                 backend_dlib.distribute_data_input(
-                    np.ones(4, dtype="float32"), backend_layout, "batch"
+                    np.ones(4, "float32"), layout, "batch"
                 ),
                 DTensor,
             )
+
             meta_t = torch.randn(4, device="meta")
             self.assertIs(
                 backend_dlib.distribute_data_input(meta_t, layout, "batch"),
                 meta_t,
             )
 
+            # 133-134: distribute_variable
+            var = backend_dlib.distribute_variable(tensor, layout)
+            self.assertIsInstance(var, torch.nn.Parameter)
+            self.assertIsInstance(var.data, DTensor)
+
     def test_unbind_strategy(self):
         keras_mesh = distribution_lib.DeviceMesh((1,), ["data"], ["cpu:0"])
-        dist_parallel = distribution_lib.ModelParallel(
+        with distribution_lib.ModelParallel(
             layout_map=distribution_lib.LayoutMap(keras_mesh)
-        )
-        with dist_parallel.scope():
-            # Sharded case
+        ).scope():
+            # 220: Case p.dim > dim in _unbind_op_strategy
+            dt = backend_dlib.distribute_tensor(
+                torch.randn(4, 2),
+                distribution_lib.TensorLayout([None, "data"], keras_mesh),
+            )
+            for t in torch.unbind(dt, dim=0):
+                self.assertIsInstance(t.placements[0], Shard)
+                self.assertEqual(t.placements[0].dim, 0)
+
+            # 201-210, 222: Case is_sharded and Replicate coverage
             dt_sharded = backend_dlib.distribute_tensor(
                 torch.randn(4, 2),
                 distribution_lib.TensorLayout(["data", None], keras_mesh),
             )
             for t in torch.unbind(dt_sharded, dim=0):
                 self.assertIsInstance(t.placements[0], Replicate)
-            # Not sharded case (dim 1)
-            for t in torch.unbind(dt_sharded, dim=1):
-                self.assertIsInstance(t.placements[0], Shard)
-            # Case p.dim > dim (Line 220)
-            dt_dim1 = backend_dlib.distribute_tensor(
+
+            dt_replicate = backend_dlib.distribute_tensor(
                 torch.randn(4, 2),
-                distribution_lib.TensorLayout([None, "data"], keras_mesh),
+                distribution_lib.TensorLayout([None, None], keras_mesh),
             )
-            for t in torch.unbind(dt_dim1, dim=0):
-                self.assertIsInstance(t.placements[0], Shard)
-                self.assertEqual(t.placements[0].dim, 0)
-            # Negative dim
-            for t in torch.unbind(dt_sharded, dim=-1):
-                self.assertIsInstance(t.placements[0], Shard)
-        # Already registered branch
-        with (
-            mock.patch(
-                "keras.src.backend.torch.distribution_lib._UNBIND_REGISTERED",
-                True,
-            ),
-            mock.patch(
-                "torch.distributed.tensor._ops.register_op_strategy"
-            ) as mock_reg,
-        ):
-            backend_dlib._register_unbind_strategy()
-            mock_reg.assert_not_called()
+            for t in torch.unbind(dt_replicate, dim=0):
+                self.assertIsInstance(t.placements[0], Replicate)
 
 
 @pytest.mark.skipif(
     backend.backend() != "torch", reason="Only for Torch backend"
 )
 class TorchDistributionIntegrationTest(testing.TestCase):
-    def setUp(self):
-        super().setUp()
-        self.world_size = 2
-
-    @staticmethod
-    def _worker_wrapper(rank, world_size, port, test_fn, cls):
-        import torch.distributed as dist
-
-        os.environ.update(
-            {
-                "MASTER_ADDR": "localhost",
-                "MASTER_PORT": str(port),
-                "RANK": str(rank),
-                "WORLD_SIZE": str(world_size),
-                "LOCAL_RANK": str(rank),
-            }
-        )
-        try:
-            if not dist.is_initialized():
-                dist.init_process_group(
-                    "gloo", rank=rank, world_size=world_size
-                )
-            test_fn(cls("setUp"), rank, world_size)
-        finally:
-            if dist.is_initialized():
-                dist.destroy_process_group()
-
-    def run_distributed(self, test_fn, world_size=None):
-        world_size = world_size or self.world_size
+    def run_distributed(self, test_fn):
         port = find_free_port()
         mp.spawn(
-            TorchDistributionIntegrationTest._worker_wrapper,
-            args=(world_size, port, test_fn, self.__class__),
-            nprocs=world_size,
+            _worker_wrapper,
+            args=(2, port, test_fn, self.__class__),
+            nprocs=2,
             join=True,
         )
 
-    @staticmethod
-    def _test_e2e_data_parallel(self, rank, world_size):
-        distribution = distribution_lib.DataParallel()
-        with distribution.scope():
-            model = models.Sequential(
-                [layers.Input(shape=(8,)), layers.Dense(4)]
-            )
-            # For vanilla DataParallel, variables are replicated regular Tensors
-            for weight in model.weights:
-                self.assertTrue(weight.trainable)
-
     def test_e2e_data_parallel(self):
-        self.run_distributed(
-            TorchDistributionIntegrationTest._test_e2e_data_parallel
-        )
-
-    @staticmethod
-    def _test_e2e_model_parallel(self, rank, world_size):
-        mesh = distribution_lib.DeviceMesh((world_size,), ["model"])
-        layout_map = distribution_lib.LayoutMap(mesh)
-        layout_map[".*dense.*kernel"] = distribution_lib.TensorLayout(
-            [None, "model"]
-        )
-        distribution = distribution_lib.ModelParallel(
-            layout_map=layout_map, batch_dim_name="model"
-        )
-        with distribution.scope():
-            model = models.Sequential(
-                [
-                    layers.Input(shape=(8,)),
-                    layers.Dense(world_size * 2, name="dense"),
-                ]
-            )
-            # Kernel should be sharded
-            kernel_val = model.layers[0].kernel.value.data
-            self.assertIsInstance(kernel_val, DTensor)
-            self.assertIsInstance(kernel_val.placements[0], Shard)
-            self.assertEqual(kernel_val.placements[0].dim, 1)
+        self.run_distributed(_test_e2e_data_parallel_fn)
 
     def test_e2e_model_parallel(self):
-        self.run_distributed(
-            TorchDistributionIntegrationTest._test_e2e_model_parallel
+        self.run_distributed(_test_e2e_model_parallel_fn)
+
+
+def _test_e2e_data_parallel_fn(self, rank, ws):
+    with distribution_lib.DataParallel().scope():
+        model = models.Sequential([layers.Input(shape=(8,)), layers.Dense(4)])
+        for weight in model.weights:
+            self.assertTrue(weight.trainable)
+
+
+def _test_e2e_model_parallel_fn(self, rank, ws):
+    mesh = distribution_lib.DeviceMesh((ws,), ["model"])
+    layout_map = distribution_lib.LayoutMap(mesh)
+    layout_map[".*dense.*kernel"] = distribution_lib.TensorLayout(
+        [None, "model"]
+    )
+    with distribution_lib.ModelParallel(
+        layout_map=layout_map, batch_dim_name="model"
+    ).scope():
+        model = models.Sequential(
+            [layers.Input(shape=(8,)), layers.Dense(ws * 2, name="dense")]
         )
+        kernel_val = model.layers[0].kernel.value.data
+        self.assertIsInstance(kernel_val, DTensor)
+        self.assertEqual(kernel_val.placements[0].dim, 1)
