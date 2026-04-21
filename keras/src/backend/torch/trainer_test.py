@@ -74,6 +74,9 @@ class TorchDistributedTestCase(testing.TestCase):
                 os.environ["KERAS_TORCH_DEVICE"] = previous_device
 
 
+@pytest.mark.skipif(
+    backend.backend() != "torch", reason="Only for Torch backend"
+)
 class TorchTrainerTest(TorchDistributedTestCase):
     @staticmethod
     def _test_ddp_fit(self, rank, world_size):
@@ -230,6 +233,9 @@ class TorchTrainerTest(TorchDistributedTestCase):
         )
 
 
+@pytest.mark.skipif(
+    backend.backend() != "torch", reason="Only for Torch backend"
+)
 class TorchTrainerExtraCoverageTest(testing.TestCase):
     def test_keras_module_wrapper(self):
         from keras.src.backend.torch.trainer import _KerasModuleWrapper
