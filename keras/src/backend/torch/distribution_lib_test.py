@@ -445,9 +445,11 @@ class TorchTrainerArchitectureTest(TorchDistributedTestCase):
         # Test with model having both trainable and non-trainable weights
         inputs = layers.Input(shape=(8,))
         x = layers.Dense(4, name="dense_trainable")(inputs)  # trainable
-        non_trainable_dense = layers.Dense(4, name="dense_non_trainable")(x)
-        non_trainable_dense.trainable = False  # Make non-trainable
-        outputs = layers.Dense(2, name="dense_output")(non_trainable_dense)
+        non_trainable_layer = layers.Dense(
+            4, name="dense_non_trainable", trainable=False
+        )
+        x = non_trainable_layer(x)
+        outputs = layers.Dense(2, name="dense_output")(x)
         model = models.Model(inputs, outputs)
         model.build(input_shape=(None, 8))
 
@@ -475,7 +477,7 @@ class TorchTrainerArchitectureTest(TorchDistributedTestCase):
         self.assertEqual(y.shape, (2, 2))
 
         # Check forward with **kwargs (training=False)
-        y_kwargs = wrapper(training=False)
+        y_kwargs = wrapper(x, training=False)
         self.assertEqual(y_kwargs.shape, (2, 2))
 
         # Check forward with training=True arg
