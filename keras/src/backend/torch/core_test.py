@@ -2,10 +2,15 @@ import ml_dtypes
 import numpy as np
 import pytest
 import torch
+from torch.distributed.tensor import DTensor
 
 from keras.src import backend
+from keras.src import distribution
 from keras.src import testing
 from keras.src.backend.torch import core
+from keras.src.backend.torch.distribution_lib_test import (
+    TorchDistributedTestCase,
+)
 
 
 @pytest.mark.skipif(
@@ -83,3 +88,59 @@ class CoreTest(testing.TestCase):
         output_spec = core.compute_output_spec(fn, x)
         self.assertIsInstance(output_spec, KerasTensor)
         self.assertEqual(output_spec.shape, (2, 2))
+
+
+@pytest.mark.skipif(
+    backend.backend() != "torch", reason="Requires Torch backend"
+)
+class TorchCoreDistributedTest(TorchDistributedTestCase):
+    """Distributed tests for core.py coverage."""
+
+    @staticmethod
+    def _test_variable_initialize_layout_and_distribute(self, rank, world_size):
+        from keras.src.backend.torch.core import Variable
+
+        mesh = distribution.DeviceMesh((world_size,), ["model"])
+        layout_map = distribution.LayoutMap(mesh)
+        layout_map[".*"] = distribution.TensorLayout(["model", None], mesh)
+        dist = distribution.ModelParallel(
+            layout_map=layout_map, batch_dim_name=None
+        )
+
+        with dist.scope():
+            # layout=None → triggers _initialize_layout → get_variable_layout
+            v = Variable(np.ones((world_size, 2)), dtype="float32")
+            self.assertIsInstance(v.value, torch.nn.Parameter)
+            value = v.value.data
+            self.assertIsInstance(value, DTensor)
+            self.assertEqual(tuple(value.shape), (world_size, 2))
+
+    @staticmethod
+    def _test_convert_to_tensor_model_parallel_fallback(self, rank, world_size):
+        """Test convert_to_tensor non-DTensor tensor → replicated layout."""
+        t = torch.ones((4, 4), device=core.get_device(), dtype=torch.float32)
+        mesh = distribution.DeviceMesh((world_size,), ["batch"])
+        dist = distribution.ModelParallel(
+            layout_map=distribution.LayoutMap(mesh), batch_dim_name="batch"
+        )
+
+        with dist.scope():
+            converted = core.convert_to_tensor(t)
+            self.assertIsInstance(converted, DTensor)
+            self.assertEqual(tuple(converted.shape), t.shape)
+            self.assertTrue(
+                all(
+                    isinstance(p, torch.distributed.tensor.Replicate)
+                    for p in converted.placements
+                )
+            )
+
+    def test_variable_initialize_layout_and_distribute(self):
+        self.run_distributed(
+            TorchCoreDistributedTest._test_variable_initialize_layout_and_distribute
+        )
+
+    def test_convert_to_tensor_model_parallel_fallback(self):
+        self.run_distributed(
+            TorchCoreDistributedTest._test_convert_to_tensor_model_parallel_fallback
+        )

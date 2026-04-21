@@ -1,5 +1,7 @@
 import os
 import socket
+from unittest.mock import MagicMock
+from unittest.mock import patch
 
 import numpy as np
 import pytest
@@ -110,15 +112,17 @@ class TorchDeviceDiscoveryTest(TorchDistributedTestCase):
         from unittest.mock import patch
 
         # Case 1: is_initialized is False, WORLD_SIZE in environ
-        with patch.dict(os.environ, {"WORLD_SIZE": "4"}):
-            self.assertEqual(backend_dlib.get_device_count(), 4)
+        with patch("torch.distributed.is_initialized", return_value=False):
+            with patch.dict(os.environ, {"WORLD_SIZE": "4"}):
+                self.assertEqual(backend_dlib.get_device_count(), 4)
 
         # Case 2: is_initialized is False, WORLD_SIZE NOT in environ
-        with patch.dict(os.environ, {}):
-            if "WORLD_SIZE" in os.environ:
-                del os.environ["WORLD_SIZE"]
-            expected = torch.cuda.device_count() or 1
-            self.assertEqual(backend_dlib.get_device_count(), expected)
+        with patch("torch.distributed.is_initialized", return_value=False):
+            with patch.dict(os.environ, {}):
+                if "WORLD_SIZE" in os.environ:
+                    del os.environ["WORLD_SIZE"]
+                expected = torch.cuda.device_count() or 1
+                self.assertEqual(backend_dlib.get_device_count(), expected)
 
 
 class TorchProcessManagementTest(TorchDistributedTestCase):
@@ -133,8 +137,16 @@ class TorchProcessManagementTest(TorchDistributedTestCase):
     def test_num_processes(self):
         self.run_distributed(TorchProcessManagementTest._num_processes_test)
 
+    def test_num_processes_fallback(self):
+        with patch("torch.distributed.is_initialized", return_value=False):
+            self.assertEqual(backend_dlib.num_processes(), 1)
+
     def test_process_id(self):
         self.run_distributed(TorchProcessManagementTest._process_id_test)
+
+    def test_process_id_fallback(self):
+        with patch("torch.distributed.is_initialized", return_value=False):
+            self.assertEqual(backend_dlib.process_id(), 0)
 
     def test_initialize(self):
         from unittest.mock import patch
@@ -430,7 +442,48 @@ class TorchTrainerArchitectureTest(TorchDistributedTestCase):
     def _keras_module_wrapper_test(self, rank, world_size):
         from keras.src.backend.torch.trainer import _KerasModuleWrapper
 
-        model = models.Sequential(
+        # Test with model having both trainable and non-trainable weights
+        inputs = layers.Input(shape=(8,))
+        x = layers.Dense(4, name="dense_trainable")(inputs)  # trainable
+        non_trainable_dense = layers.Dense(4, name="dense_non_trainable")(x)
+        non_trainable_dense.trainable = False  # Make non-trainable
+        outputs = layers.Dense(2, name="dense_output")(non_trainable_dense)
+        model = models.Model(inputs, outputs)
+        model.build(input_shape=(None, 8))
+
+        # Verify splits non-empty for loop coverage
+        trainable_weights = model.trainable_weights
+        non_trainable_weights = model.non_trainable_weights
+        self.assertGreater(len(trainable_weights), 0)
+        self.assertGreater(len(non_trainable_weights), 0)
+
+        wrapper = _KerasModuleWrapper(model)
+
+        # Check parameters from trainable_weights (register_parameter)
+        trainable_params = list(wrapper.parameters())
+        self.assertGreater(len(trainable_params), 0)
+        self.assertTrue(all(p.requires_grad for p in trainable_params))
+
+        # Check buffers from non_trainable_weights (register_buffer)
+        buffers = list(wrapper.buffers())
+        self.assertGreater(len(buffers), 0)
+        self.assertFalse(any(p.requires_grad for p in buffers))
+
+        # Check forward with *args only
+        x = torch.randn(2, 8)
+        y = wrapper(x)
+        self.assertEqual(y.shape, (2, 2))
+
+        # Check forward with **kwargs (training=False)
+        y_kwargs = wrapper(training=False)
+        self.assertEqual(y_kwargs.shape, (2, 2))
+
+        # Check forward with training=True arg
+        y_train = wrapper(x, training=True)
+        self.assertEqual(y_train.shape, (2, 2))
+
+        # Original BN test for buffers like moving stats
+        model_bn = models.Sequential(
             [
                 layers.Input(shape=(8,)),
                 layers.Dense(4),
@@ -438,23 +491,10 @@ class TorchTrainerArchitectureTest(TorchDistributedTestCase):
                 layers.Dense(2),
             ]
         )
-        model.build()
-        wrapper = _KerasModuleWrapper(model)
-
-        # Check parameters registration (Dense kernels/biases, BN gamma/beta)
-        self.assertLen(list(wrapper.parameters()), 6)
-
-        # Check buffers registration (BN moving mean/variance)
-        self.assertLen(list(wrapper.buffers()), 2)
-
-        # Check forward pass
-        x = torch.randn(2, 8)
-        y = wrapper(x)
-        self.assertEqual(y.shape, (2, 2))
-
-        # Check forward pass with training=True
-        y_train = wrapper(x, training=True)
-        self.assertEqual(y_train.shape, (2, 2))
+        model_bn.build(input_shape=(None, 8))
+        wrapper_bn = _KerasModuleWrapper(model_bn)
+        self.assertLen(list(wrapper_bn.parameters()), 6)
+        self.assertLen(list(wrapper_bn.buffers()), 2)
 
     def test_e2e_data_parallel_fit(self):
         self.run_distributed(
@@ -1427,6 +1467,272 @@ class TorchDistributionExtraCoverageTest(TorchDistributedTestCase):
         with patch("torch.distributed.is_initialized", return_value=True):
             with patch("torch.distributed.get_world_size", return_value=8):
                 self.assertEqual(backend_dlib.get_device_count(), 8)
+
+    def test_list_devices_mocked(self):
+        from unittest.mock import patch
+
+        # Case 1: device_type is None (defaults to "gpu")
+        with patch("torch.cuda.device_count", return_value=2):
+            with patch.dict(os.environ, {}):
+                if "WORLD_SIZE" in os.environ:
+                    del os.environ["WORLD_SIZE"]
+                devices = backend_dlib.list_devices(None)
+                self.assertEqual(devices, ["gpu:0", "gpu:1"])
+
+        # Case 2: device_type is "cpu"
+        with patch("torch.cuda.device_count", return_value=2):
+            with patch.dict(os.environ, {}):
+                if "WORLD_SIZE" in os.environ:
+                    del os.environ["WORLD_SIZE"]
+                devices = backend_dlib.list_devices("cpu")
+                self.assertEqual(devices, ["cpu:0", "cpu:1"])
+
+        # Case 3: is_initialized is True
+        with patch("torch.distributed.is_initialized", return_value=True):
+            with patch("torch.distributed.get_world_size", return_value=4):
+                devices = backend_dlib.list_devices("gpu")
+                self.assertEqual(devices, ["gpu:0", "gpu:1", "gpu:2", "gpu:3"])
+
+        # Case 4: device_type is "GPU" (test .lower())
+        with patch("torch.cuda.device_count", return_value=1):
+            with patch.dict(os.environ, {}):
+                if "WORLD_SIZE" in os.environ:
+                    del os.environ["WORLD_SIZE"]
+                devices = backend_dlib.list_devices("GPU")
+                self.assertEqual(devices, ["gpu:0"])
+
+    def test_to_backend_device_mocked(self):
+        from unittest.mock import patch
+
+        # 1. device_name contains "cpu"
+        device = backend_dlib._to_backend_device("cpu:0")
+        self.assertEqual(device.type, "cpu")
+
+        # 2. cuda available
+        with patch("torch.cuda.is_available", return_value=True):
+            with patch.dict(os.environ, {"LOCAL_RANK": "1"}):
+                device = backend_dlib._to_backend_device(None)
+                self.assertEqual(device.type, "cuda")
+                self.assertEqual(device.index, 1)
+
+        # 3. cuda not available
+        with patch("torch.cuda.is_available", return_value=False):
+            device = backend_dlib._to_backend_device(None)
+            self.assertEqual(device.type, "cpu")
+
+    def test_to_backend_mesh_mocked(self):
+        from unittest.mock import patch
+
+        mesh = MagicMock(spec=distribution_lib.DeviceMesh)
+        mesh.shape = (2,)
+        mesh.axis_names = ["data"]
+
+        with patch(
+            "keras.src.backend.torch.distribution_lib.init_device_mesh"
+        ) as mock_init:
+            backend_dlib._to_backend_mesh(mesh)
+            mock_init.assert_called_once()
+
+        # Test with DeviceMesh input (now supported via pass-through)
+        from torch.distributed.device_mesh import DeviceMesh as TorchDeviceMesh
+
+        mock_torch_mesh = MagicMock(spec=TorchDeviceMesh)
+        self.assertIs(
+            backend_dlib._to_backend_mesh(mock_torch_mesh), mock_torch_mesh
+        )
+
+    def test_to_backend_layout_mocked(self):
+        from unittest.mock import patch
+
+        with patch(
+            "keras.src.backend.torch.distribution_lib.list_devices",
+            return_value=["gpu:0", "gpu:1"],
+        ):
+            mesh = distribution_lib.DeviceMesh((2,), ["data"])
+        layout = distribution_lib.TensorLayout(["data", None], mesh)
+
+        # Mock _to_backend_mesh
+        mock_torch_mesh = MagicMock()
+        mock_torch_mesh.axis_names = ("data",)
+        with patch(
+            "keras.src.backend.torch.distribution_lib._to_backend_mesh",
+            return_value=mock_torch_mesh,
+        ):
+            backend_layout = backend_dlib._to_backend_layout(layout)
+            self.assertEqual(backend_layout.device_mesh, mock_torch_mesh)
+            from torch.distributed.tensor import Replicate
+            from torch.distributed.tensor import Shard
+
+            self.assertIsInstance(backend_layout.placements[0], Shard)
+            # axes is empty case for axis_names loop
+            layout_no_axes = distribution_lib.TensorLayout([], mesh)
+            backend_layout_no_axes = backend_dlib._to_backend_layout(
+                layout_no_axes
+            )
+            self.assertIsInstance(
+                backend_layout_no_axes.placements[0], Replicate
+            )
+
+    def test_distribute_tensor_mocked(self):
+        from unittest.mock import MagicMock
+        from unittest.mock import patch
+
+        tensor = torch.randn(4)
+        # 1. layout is None
+        self.assertIs(backend_dlib.distribute_tensor(tensor, None), tensor)
+
+        # 2. Not ModelParallel
+        with patch(
+            "keras.src.distribution.distribution_lib.distribution",
+            return_value=MagicMock(),
+        ):
+            self.assertIs(
+                backend_dlib.distribute_tensor(tensor, MagicMock()), tensor
+            )
+
+        # 3. Already DTensor (redistribute)
+        mock_dist = MagicMock(spec=distribution_lib.ModelParallel)
+        mock_dtensor = MagicMock(spec=backend_dlib.DTensor)
+        mock_layout = MagicMock()
+        with patch(
+            "keras.src.distribution.distribution_lib.distribution",
+            return_value=mock_dist,
+        ):
+            backend_dlib.distribute_tensor(mock_dtensor, mock_layout)
+            mock_dtensor.redistribute.assert_called_once()
+
+    def test_distribute_variable_mocked(self):
+        from unittest.mock import MagicMock
+        from unittest.mock import patch
+
+        with patch(
+            "keras.src.backend.torch.distribution_lib.distribute_tensor"
+        ) as mock_dist_tensor:
+            mock_dist_tensor.return_value = torch.randn(4)
+            res = backend_dlib.distribute_variable(torch.randn(4), MagicMock())
+            self.assertIsInstance(res, torch.nn.Parameter)
+
+    def test_distribute_data_input_mocked(self):
+        from unittest.mock import MagicMock
+        from unittest.mock import patch
+
+        # 1. Not ModelParallel
+        tensor = torch.randn(4)
+        self.assertIs(
+            backend_dlib.distribute_data_input(tensor, None, "batch"), tensor
+        )
+
+        # 2. Already DTensor
+        mock_dist = MagicMock(spec=distribution_lib.ModelParallel)
+        mock_dtensor = MagicMock(spec=backend_dlib.DTensor)
+        with patch(
+            "keras.src.distribution.distribution_lib.distribution",
+            return_value=mock_dist,
+        ):
+            self.assertIs(
+                backend_dlib.distribute_data_input(
+                    mock_dtensor, MagicMock(), "batch"
+                ),
+                mock_dtensor,
+            )
+
+        # 3. Meta device
+        meta_tensor = torch.randn(4, device="meta")
+        with patch(
+            "keras.src.distribution.distribution_lib.distribution",
+            return_value=mock_dist,
+        ):
+            self.assertIs(
+                backend_dlib.distribute_data_input(
+                    meta_tensor, MagicMock(), "batch"
+                ),
+                meta_tensor,
+            )
+
+        # 4. Numpy input
+        with patch(
+            "keras.src.distribution.distribution_lib.distribution",
+            return_value=mock_dist,
+        ):
+            with patch(
+                "keras.src.backend.torch.core.convert_to_tensor"
+            ) as mock_conv:
+                mock_conv.return_value = torch.randn(4)
+                with patch(
+                    "keras.src.backend.torch.distribution_lib.DTensor.from_local"
+                ) as mock_from_local:
+                    backend_dlib.distribute_data_input(
+                        np.ones(4), MagicMock(), "batch"
+                    )
+                    mock_from_local.assert_called_once()
+
+    def test_unbind_op_strategy_mocked(self):
+        from unittest.mock import MagicMock
+
+        from torch.distributed.tensor import Shard
+        from torch.distributed.tensor._dtensor_spec import DTensorSpec
+
+        # Mock DTensorLayout __init__
+        mesh = MagicMock()
+        placements = (Shard(0),)
+        layout = backend_dlib.DTensorLayout(mesh, placements)
+        self.assertEqual(layout.device_mesh, mesh)
+        self.assertEqual(layout.placements, placements)
+
+        # Mock _unbind_op_strategy
+        # 1. Sharded case
+        mock_arg_strategy = MagicMock()
+        mock_arg_strategy.output_spec = DTensorSpec(
+            mesh=mesh, placements=placements
+        )
+        mock_input_strategy = MagicMock()
+        mock_input_strategy.strategies = [mock_arg_strategy]
+        mock_input_strategy.shape = torch.Size([4, 4])
+        mock_input_strategy.ndim = 2
+        mock_input_strategy.mesh = mesh
+
+        op_schema = MagicMock()
+        op_schema.args_schema = (mock_input_strategy, 0)
+        strategy = backend_dlib._unbind_op_strategy(op_schema)
+        self.assertLen(strategy.strategies, 1)
+
+        # 2. Not sharded case (on sharded dim) - Shard(1), dim=0
+        mock_arg_strategy2 = MagicMock()
+        mock_arg_strategy2.output_spec = DTensorSpec(
+            mesh=mesh, placements=(Shard(1),)
+        )
+        mock_input_strategy2 = MagicMock()
+        mock_input_strategy2.strategies = [mock_arg_strategy2]
+        mock_input_strategy2.shape = torch.Size([4, 4])
+        mock_input_strategy2.ndim = 2
+        mock_input_strategy2.mesh = mesh
+
+        op_schema2 = MagicMock()
+        op_schema2.args_schema = (mock_input_strategy2, 0)
+        strategy2 = backend_dlib._unbind_op_strategy(op_schema2)
+        self.assertLen(strategy2.strategies, 1)
+
+        # 3. Negative dim case
+        op_schema3 = MagicMock()
+        op_schema3.args_schema = (mock_input_strategy2, -1)
+        strategy3 = backend_dlib._unbind_op_strategy(op_schema3)
+        self.assertLen(strategy3.strategies, 1)
+
+        # 4. Not sharded case - Shard(0), dim=1 (placement.dim < dim)
+        mock_arg_strategy4 = MagicMock()
+        mock_arg_strategy4.output_spec = DTensorSpec(
+            mesh=mesh, placements=(Shard(0),)
+        )
+        mock_input_strategy4 = MagicMock()
+        mock_input_strategy4.strategies = [mock_arg_strategy4]
+        mock_input_strategy4.shape = torch.Size([4, 4])
+        mock_input_strategy4.ndim = 2
+        mock_input_strategy4.mesh = mesh
+
+        op_schema4 = MagicMock()
+        op_schema4.args_schema = (mock_input_strategy4, 1)
+        strategy4 = backend_dlib._unbind_op_strategy(op_schema4)
+        self.assertLen(strategy4.strategies, 1)
 
     def test_to_backend_layout_none(self):
         self.assertIsNone(backend_dlib._to_backend_layout(None))
