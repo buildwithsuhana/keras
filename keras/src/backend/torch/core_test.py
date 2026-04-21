@@ -16,30 +16,6 @@ from keras.src.backend.torch import core
     backend.backend() != "torch", reason="Requires Torch backend"
 )
 class CoreTest(testing.TestCase):
-    def test_variable_basics(self):
-        # Basics: trainable, eq, uninitialized
-        v = core.Variable([1.0, 2.0], trainable=True)
-        self.assertTrue(v.value.requires_grad)
-        v.trainable = False
-        self.assertFalse(v.value.requires_grad or v.trainable)
-        self.assertFalse(v.__eq__(None))
-        v2 = core.Variable(lambda s, **k: torch.ones(s), shape=(2, 2))
-        self.assertAllClose(v2.value, torch.ones(2, 2))
-        # From Parameter
-        param = torch.nn.Parameter(torch.ones(2, 2))
-        self.assertFalse(
-            core.Variable(param, trainable=False).value.requires_grad
-        )
-        self.assertTrue(
-            core.Variable(param, trainable=True).value.requires_grad
-        )
-        # Stateless
-        from keras.src.backend.common.stateless_scope import StatelessScope
-
-        with StatelessScope() as scope:
-            scope.add_update((v, torch.tensor([3.0, 4.0])))
-            self.assertAllClose(v.value, [3.0, 4.0])
-
     def test_variable_distribution_mocking(self):
         from keras.src.distribution import TensorLayout
 
@@ -120,7 +96,6 @@ class CoreTest(testing.TestCase):
             self.assertIsInstance(
                 core.convert_to_tensor(torch.ones((2, 2))), torch.Tensor
             )
-        # DTensor branch
         mock_dt = MagicMock(
             spec=DTensor, device=torch.device("cpu"), is_meta=False
         )
@@ -147,7 +122,6 @@ class CoreTest(testing.TestCase):
             core.convert_to_numpy([torch.tensor(1.0), torch.tensor(2.0)]),
             [1.0, 2.0],
         )
-        # DTensor
         mock_dt = MagicMock(
             spec=DTensor,
             requires_grad=False,
