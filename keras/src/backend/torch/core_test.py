@@ -94,6 +94,70 @@ class CoreTest(testing.TestCase):
             v._direct_assign(mock_dtensor)
             mock_dtensor.to_local.assert_called()
 
+    def test_variable_initialize_without_layout_with_parameter(self):
+        # Lines 142-144
+        param = torch.nn.Parameter(torch.ones(2, 2))
+        v = core.Variable(param, trainable=False)
+        self.assertFalse(v.value.requires_grad)
+
+        v2 = core.Variable(param, trainable=True)
+        self.assertTrue(v2.value.requires_grad)
+
+    def test_variable_value_stateless_scope(self):
+        # Lines 219-223
+        v = core.Variable([1.0, 2.0])
+        from keras.src.backend.common.stateless_scope import StatelessScope
+
+        with StatelessScope() as scope:
+            scope.add_update((v, torch.tensor([3.0, 4.0])))
+            self.assertAllClose(v.value, [3.0, 4.0])
+
+    def test_variable_uninitialized(self):
+        # Line 229
+        def initializer(shape, dtype=None):
+            return torch.ones(shape, dtype=core.to_torch_dtype(dtype))
+
+        v = core.Variable(initializer=initializer, shape=(2, 2))
+        # Accessing .value should trigger initialization
+        self.assertAllClose(v.value, torch.ones(2, 2))
+
+    def test_variable_trainable_setter(self):
+        # Lines 242-244
+        v = core.Variable([1.0, 2.0], trainable=True)
+        self.assertTrue(v.value.requires_grad)
+        v.trainable = False
+        self.assertFalse(v.value.requires_grad)
+        self.assertFalse(v.trainable)
+
+    def test_variable_eq_exception(self):
+        # Lines 247-250
+        v = core.Variable([1.0])
+        self.assertFalse(v.__eq__(None))
+
+    def test_convert_to_tensor_errors(self):
+        # Lines 255, 257
+        with self.assertRaisesRegex(
+            ValueError, "not supported with torch backend"
+        ):
+            core.convert_to_tensor([1], sparse=True)
+        with self.assertRaisesRegex(
+            ValueError, "not supported with torch backend"
+        ):
+            core.convert_to_tensor([1], ragged=True)
+
+    def test_convert_to_tensor_variable(self):
+        # Line 260
+        v = core.Variable([1.0, 2.0])
+        res = core.convert_to_tensor(v)
+        self.assertAllClose(res, [1.0, 2.0])
+
+    def test_convert_to_tensor_device_and_meta(self):
+        # Lines 262-267
+        # Test meta tensor to device
+        meta_x = torch.empty(2, 2, device="meta")
+        res = core.convert_to_tensor(meta_x)
+        self.assertEqual(str(res.device.type), core.get_device())
+
     def test_convert_to_tensor_with_model_parallel_mock(self):
         # lines 314-322
         from keras.src.distribution.distribution_lib import ModelParallel
@@ -116,15 +180,22 @@ class CoreTest(testing.TestCase):
         ):
             with patch(
                 "keras.src.backend.torch.distribution_lib.distribute_tensor",
-                return_value=torch.randn(
-                    2, 2, device=core.get_device(), dtype=torch.float32
-                ),
+                return_value=torch.randn(2, 2),
             ):
-                t = torch.ones(
-                    (2, 2), device=core.get_device(), dtype=torch.float32
-                )
+                t = torch.ones((2, 2))
                 res = core.convert_to_tensor(t)
                 self.assertIsInstance(res, torch.Tensor)
+
+    def test_convert_to_numpy_extras(self):
+        # Line 342, 346
+        import ml_dtypes
+
+        t = torch.tensor([1.0, 2.0], dtype=torch.bfloat16)
+        res = core.convert_to_numpy(t)
+        self.assertEqual(res.dtype, ml_dtypes.bfloat16)
+
+        res_list = core.convert_to_numpy([torch.tensor(1.0), torch.tensor(2.0)])
+        self.assertAllClose(res_list, [1.0, 2.0])
 
     def test_convert_to_numpy_dtensor_mock(self):
         # line 331
