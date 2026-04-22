@@ -1,5 +1,6 @@
 import math
 import time
+from unittest.mock import patch
 
 import jax
 import numpy as np
@@ -453,3 +454,59 @@ class PyDatasetAdapterTest(testing.TestCase):
         for index, _ in enumerate(NoLenDataset()):
             if index >= 10:
                 break
+
+    @parameterized.named_parameters(
+        ("dataparallel", "dp", 4, 1, 4, 1),
+        ("modelparallel", "mp", 8, 5, 8, 5),
+    )
+    @patch("keras.src.backend.torch.distribution_lib.num_processes")
+    @patch("keras.src.backend.torch.distribution_lib.process_id")
+    @patch("keras.src.distribution.distribution_lib.distribution")
+    def test_sharding(
+        self,
+        dist_type,
+        world_size,
+        rank,
+        expected_num_processes,
+        expected_process_id,
+        mock_distribution,
+        mock_process_id,
+        mock_num_processes,
+    ):
+        from keras.src.distribution import distribution_lib as dist_lib
+
+        mock_num_processes.return_value = world_size
+        mock_process_id.return_value = rank
+
+        if dist_type == "dp":
+            dist = dist_lib.DataParallel(devices=["cpu:0"] * world_size)
+        else:
+            device_mesh = dist_lib.DeviceMesh(
+                shape=(world_size,),
+                axis_names=("data",),
+                devices=["cpu:0"] * world_size,
+            )
+            dist = dist_lib.ModelParallel(
+                device_mesh=device_mesh,
+                layout_map=dist_lib.LayoutMap(device_mesh),
+                batch_dim_name="data",
+            )
+        dist.auto_shard_dataset = True
+        mock_distribution.return_value = dist
+
+        x = np.random.random((16, 4)).astype("float32")
+        y = np.random.random((16, 2)).astype("float32")
+        py_dataset = ExamplePyDataset(x, y, batch_size=2)
+        adapter = py_dataset_adapter.PyDatasetAdapter(py_dataset, shuffle=False)
+
+        self.assertEqual(adapter._num_processes, expected_num_processes)
+        self.assertEqual(adapter._process_id, expected_process_id)
+
+        # Verify that the generator only yields its shard
+        it = adapter._get_iterator()
+        batches = list(it)
+        # 16 samples / 2 batch_size = 8 batches total
+        # with 4 processes, each gets 2 batches
+        # with 8 processes, each gets 1 batch
+        expected_num_batches = 8 // expected_num_processes
+        self.assertEqual(len(batches), expected_num_batches)

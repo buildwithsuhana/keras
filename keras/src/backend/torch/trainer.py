@@ -233,6 +233,7 @@ class TorchTrainer(base_trainer.Trainer):
                     if isinstance(v, DTensor):
                         v = v.to_local()
                     torch.distributed.all_reduce(v, op=reduce_op)
+                    variable.assign(v)
 
     def make_train_function(self, force=False):
         if self.train_function is not None and not force:

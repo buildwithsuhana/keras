@@ -1,4 +1,5 @@
 import contextlib
+import os
 from unittest import mock
 
 import numpy as np
@@ -186,3 +187,63 @@ class TorchTrainerTest(testing.TestCase):
                     model._sync_metrics()
             for var in [v for m in model.metrics for v in m.variables]:
                 self.assertAllClose(var.value, torch.tensor(2.0))
+
+    def test_model_parallel_training(self):
+        if not torch.distributed.is_initialized():
+            torch.distributed.init_process_group(
+                "gloo", init_method="tcp://127.0.0.1:0", rank=0, world_size=1
+            )
+            self.addCleanup(torch.distributed.destroy_process_group)
+
+        mesh = distribution_lib.DeviceMesh((1,), ["data"], ["cpu"])
+        layout_map = distribution_lib.LayoutMap(mesh)
+        layout_map[".*kernel"] = distribution_lib.TensorLayout(
+            [None, "data"], mesh
+        )
+        distribution = distribution_lib.ModelParallel(
+            layout_map=layout_map, batch_dim_name="data"
+        )
+
+        with distribution.scope():
+            model = models.Sequential(
+                [layers.Dense(8, input_shape=(4,)), layers.Dense(1)]
+            )
+            model.compile(optimizer="adam", loss="mse")
+            inputs, targets = np.ones((16, 4), "f"), np.ones((16, 1), "f")
+            model.fit(inputs, targets, epochs=1, batch_size=4, verbose=0)
+            model.evaluate(inputs, targets, verbose=0)
+            model.predict(inputs, verbose=0)
+
+    def test_distributed_checkpointing(self):
+        if not torch.distributed.is_initialized():
+            torch.distributed.init_process_group(
+                "gloo", init_method="tcp://127.0.0.1:0", rank=0, world_size=1
+            )
+            self.addCleanup(torch.distributed.destroy_process_group)
+
+        model = models.Sequential(
+            [layers.Dense(8, input_shape=(4,)), layers.Dense(1)]
+        )
+        model.compile(optimizer="adam", loss="mse")
+        inputs, targets = np.ones((16, 4), "f"), np.ones((16, 1), "f")
+
+        distribution = distribution_lib.DataParallel(devices=["cpu:0"])
+        distribution.auto_shard_dataset = False
+
+        with distribution.scope():
+            model.fit(inputs, targets, epochs=1, batch_size=4, verbose=0)
+            temp_filepath = os.path.join(
+                self.get_temp_dir(), "model.weights.h5"
+            )
+            model.save_weights(temp_filepath)
+
+            new_model = models.Sequential(
+                [layers.Dense(8, input_shape=(4,)), layers.Dense(1)]
+            )
+            new_model.compile(optimizer="adam", loss="mse")
+            new_model.load_weights(temp_filepath)
+
+            for ref_w, new_w in zip(
+                model.get_weights(), new_model.get_weights()
+            ):
+                self.assertAllClose(ref_w, new_w)

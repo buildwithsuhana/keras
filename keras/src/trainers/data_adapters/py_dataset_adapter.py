@@ -220,7 +220,7 @@ class PyDatasetAdapter(DataAdapter):
         dist = distribution or distribution_lib.distribution()
         self._num_processes = 1
         self._process_id = 0
-        if dist is not None:
+        if dist is not None and getattr(dist, "auto_shard_dataset", True):
             self._num_processes = backend_distribution_lib.num_processes()
             self._process_id = backend_distribution_lib.process_id()
 

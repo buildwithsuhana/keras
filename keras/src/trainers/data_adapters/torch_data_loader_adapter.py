@@ -49,30 +49,8 @@ class TorchDataLoaderAdapter(DataAdapter):
                         rank = process_id // processes_per_replica
 
             if num_replicas is not None and rank is not None:
-                shuffle = isinstance(
-                    dataloader.sampler, torch.utils.data.RandomSampler
-                )
-                sampler = torch.utils.data.distributed.DistributedSampler(
-                    dataloader.dataset,
-                    num_replicas=num_replicas,
-                    rank=rank,
-                    shuffle=shuffle,
-                )
-                dataloader = torch.utils.data.DataLoader(
-                    dataloader.dataset,
-                    batch_size=dataloader.batch_size,
-                    sampler=sampler,
-                    num_workers=dataloader.num_workers,
-                    collate_fn=dataloader.collate_fn,
-                    pin_memory=dataloader.pin_memory,
-                    drop_last=dataloader.drop_last,
-                    timeout=dataloader.timeout,
-                    worker_init_fn=dataloader.worker_init_fn,
-                    multiprocessing_context=dataloader.multiprocessing_context,
-                    generator=dataloader.generator,
-                    prefetch_factor=dataloader.prefetch_factor,
-                    persistent_workers=dataloader.persistent_workers,
-                    pin_memory_device=dataloader.pin_memory_device,
+                dataloader = data_adapter_utils._add_distributed_sampler(
+                    dataloader, num_replicas, rank
                 )
 
         self._dataloader = dataloader
