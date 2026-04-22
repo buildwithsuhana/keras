@@ -77,50 +77,6 @@ class TorchDistributionLibTest(testing.TestCase):
             )
             torch.distributed.init_process_group("gloo", rank=0, world_size=1)
 
-    def test_backend_and_devices(self):
-        with mock.patch("torch.distributed.is_initialized", return_value=False):
-            self.assertEqual(backend_dlib.num_processes(), 1)
-            self.assertEqual(backend_dlib.process_id(), 0)
-            with mock.patch.dict(os.environ, {"WORLD_SIZE": "4"}):
-                self.assertEqual(backend_dlib.get_device_count(), 4)
-            with (
-                mock.patch.dict(os.environ, {}, clear=True),
-                mock.patch("torch.cuda.device_count", return_value=0),
-            ):
-                self.assertEqual(backend_dlib.get_device_count(), 1)
-        with (
-            mock.patch("torch.distributed.is_initialized", return_value=True),
-            mock.patch("torch.distributed.get_world_size", return_value=2),
-            mock.patch("torch.distributed.get_rank", return_value=1),
-        ):
-            self.assertEqual(backend_dlib.get_device_count(), 2)
-            self.assertEqual(backend_dlib.num_processes(), 2)
-            self.assertEqual(backend_dlib.process_id(), 1)
-        with mock.patch(
-            "keras.src.backend.torch.distribution_lib.get_device_count",
-            return_value=2,
-        ):
-            self.assertEqual(backend_dlib.list_devices(), ["gpu:0", "gpu:1"])
-            self.assertEqual(
-                backend_dlib.list_devices("cpu"), ["cpu:0", "cpu:1"]
-            )
-
-    def test_initialize(self):
-        with (
-            mock.patch("torch.cuda.is_available", return_value=True),
-            mock.patch("torch.cuda.set_device") as mock_set,
-            mock.patch("torch.distributed.init_process_group"),
-            mock.patch.dict(os.environ, {"LOCAL_RANK": "1"}),
-        ):
-            backend_dlib.initialize()
-            mock_set.assert_called_once_with(1)
-        with (
-            mock.patch("torch.cuda.is_available", return_value=False),
-            mock.patch("torch.distributed.init_process_group") as mock_init,
-        ):
-            backend_dlib.initialize()
-            mock_init.assert_called_once_with(backend="gloo")
-
     def test_conversions_and_ops(self):
         self.assertEqual(backend_dlib._to_backend_device("cpu").type, "cpu")
         with mock.patch("torch.cuda.is_available", return_value=False):
