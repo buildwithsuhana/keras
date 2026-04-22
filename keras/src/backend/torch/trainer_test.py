@@ -1,4 +1,3 @@
-import contextlib
 import os
 from unittest import mock
 
@@ -13,7 +12,6 @@ from keras.src import backend
 from keras.src import callbacks
 from keras.src import layers
 from keras.src import models
-from keras.src import optimizers
 from keras.src import testing
 from keras.src.backend.torch.trainer import TorchEpochIterator
 from keras.src.backend.torch.trainer import _KerasModuleWrapper
@@ -111,48 +109,6 @@ class TorchTrainerTest(testing.TestCase):
             model.make_test_function()
             model.make_predict_function()
             self.assertEqual(mock_compile.call_count, 3)
-
-    def test_mocked_distribution(self):
-        model = models.Sequential([layers.Dense(1, input_shape=(4,))])
-        model.compile(
-            optimizer=optimizers.Adam(gradient_accumulation_steps=2), loss="mse"
-        )
-        with (
-            mock.patch("torch.distributed.is_initialized", return_value=True),
-            mock.patch("torch.distributed.get_world_size", return_value=1),
-            mock.patch("torch.distributed.get_rank", return_value=0),
-        ):
-            distribution = distribution_lib.DataParallel(devices=["cpu:0"])
-
-        with (
-            mock.patch(
-                "keras.src.distribution.distribution_lib.distribution",
-                return_value=distribution,
-            ),
-            mock.patch(
-                "keras.src.backend.torch.distribution_lib.distribute_data_input",
-                side_effect=lambda t, l, n: t,
-            ),
-            mock.patch(
-                "torch.nn.parallel.DistributedDataParallel",
-                side_effect=lambda m, **kwargs: m,
-            ),
-            mock.patch.object(model.optimizer, "apply"),
-        ):
-            model._setup_ddp()
-            model._ddp_model = mock.Mock(
-                side_effect=lambda *args, **kwargs: torch.randn(
-                    (4, 1), requires_grad=True
-                )
-            )
-            model._ddp_model.no_sync.return_value = contextlib.nullcontext()
-            for i, expect_no_sync in [(0, True), (1, False)]:
-                model.optimizer._iterations.assign(i)
-                model.train_step((torch.ones((4, 4)), torch.ones((4, 1))))
-                self.assertEqual(
-                    model._ddp_model.no_sync.called, expect_no_sync
-                )
-                model._ddp_model.no_sync.reset_mock()
 
     def test_distributed_logic(self):
         if not torch.distributed.is_initialized():

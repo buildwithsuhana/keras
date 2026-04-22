@@ -251,6 +251,9 @@ class Variable(KerasVariable):
 
 
 def convert_to_tensor(x, dtype=None, sparse=None, ragged=None):
+    from keras.src.distribution import TensorLayout
+    from keras.src.distribution import distribution_lib as dist_lib
+
     if sparse:
         raise ValueError("`sparse=True` is not supported with torch backend")
     if ragged:
@@ -311,22 +314,20 @@ def convert_to_tensor(x, dtype=None, sparse=None, ragged=None):
     if dist is None:
         return x
 
-    if is_tensor(x) and not isinstance(x, DTensor):
-        from keras.src.distribution import distribution_lib as dist_lib
+    if not (is_tensor(x) and not isinstance(x, DTensor)):
+        return x
 
-        if isinstance(dist, dist_lib.ModelParallel):
-            from keras.src.distribution import TensorLayout
+    if not isinstance(dist, dist_lib.ModelParallel):
+        return x
 
-            layout = TensorLayout([None] * x.ndim, dist.device_mesh)
-            x = torch_dist_lib.distribute_tensor(x, layout)
+    layout = TensorLayout([None] * x.ndim, dist.device_mesh)
+    x = torch_dist_lib.distribute_tensor(x, layout)
     return x
 
 
 def convert_to_numpy(x):
     def transform(x):
         if is_tensor(x):
-            from torch.distributed.tensor import DTensor
-
             if isinstance(x, DTensor):
                 x = x.full_tensor()
             if x.requires_grad:

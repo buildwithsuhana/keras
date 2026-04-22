@@ -473,6 +473,10 @@ class PyDatasetAdapterTest(testing.TestCase):
         mock_process_id,
         mock_num_processes,
     ):
+        if backend.backend() not in ("torch", "jax"):
+            pytest.skip(
+                "Distribution support is only available for torch and jax."
+            )
         from keras.src.distribution import distribution_lib as dist_lib
 
         mock_num_processes.return_value = world_size
@@ -502,11 +506,7 @@ class PyDatasetAdapterTest(testing.TestCase):
         self.assertEqual(adapter._num_processes, expected_num_processes)
         self.assertEqual(adapter._process_id, expected_process_id)
 
-        # Verify that the generator only yields its shard
         it = adapter._get_iterator()
         batches = list(it)
-        # 16 samples / 2 batch_size = 8 batches total
-        # with 4 processes, each gets 2 batches
-        # with 8 processes, each gets 1 batch
         expected_num_batches = 8 // expected_num_processes
         self.assertEqual(len(batches), expected_num_batches)

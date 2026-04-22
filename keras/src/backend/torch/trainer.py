@@ -4,6 +4,7 @@ import warnings
 import numpy as np
 import torch
 from packaging.version import parse
+from torch.distributed.tensor import DTensor
 
 from keras.src import backend
 from keras.src import callbacks as callbacks_module
@@ -68,7 +69,8 @@ class TorchTrainer(base_trainer.Trainer):
                     if torch.cuda.is_available()
                     else None,
                 )
-                object.__setattr__(self, "_ddp_model", ddp_model)
+                # Use normal setattr to preserve Keras attribute tracking
+                self._ddp_model = ddp_model
                 self._in_ddp_context = True
 
     def _distribute_inputs(self, dist, data, replicate=False):
@@ -110,6 +112,7 @@ class TorchTrainer(base_trainer.Trainer):
         # for the weights from the previous train step.
         self.zero_grad()
 
+        self._setup_ddp()
         if dist is not None and isinstance(dist, dist_lib.DataParallel):
             y_pred = self._ddp_model(x, training=True)
         else:
@@ -224,15 +227,29 @@ class TorchTrainer(base_trainer.Trainer):
 
         dist_obj = dist_lib.distribution()
         if dist_obj is not None and torch.distributed.is_initialized():
-            from torch.distributed.tensor import DTensor
-
+            aggregation_to_op = {
+                "sum": torch.distributed.ReduceOp.SUM,
+                "mean": torch.distributed.ReduceOp.SUM,
+                "max": torch.distributed.ReduceOp.MAX,
+                "min": torch.distributed.ReduceOp.MIN,
+            }
             for metric in self.metrics:
-                reduce_op = torch.distributed.ReduceOp.SUM
                 for variable in metric.variables:
+                    if variable.aggregation in (None, "none"):
+                        continue
+                    is_dtensor = isinstance(variable.value, DTensor)
                     v = variable.value
-                    if isinstance(v, DTensor):
+                    if is_dtensor:
                         v = v.to_local()
-                    torch.distributed.all_reduce(v, op=reduce_op)
+                    if variable.aggregation == "only_first_replica":
+                        torch.distributed.broadcast(v, src=0)
+                    else:
+                        reduce_op = aggregation_to_op.get(
+                            variable.aggregation, torch.distributed.ReduceOp.SUM
+                        )
+                        torch.distributed.all_reduce(v, op=reduce_op)
+                        if variable.aggregation == "mean":
+                            v = v / torch.distributed.get_world_size()
                     variable.assign(v)
 
     def make_train_function(self, force=False):

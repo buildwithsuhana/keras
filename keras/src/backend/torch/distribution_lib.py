@@ -46,8 +46,19 @@ def process_id():
 
 def _to_backend_device(device_name):
     """Returns the local device for the current process."""
-    if device_name is not None and "cpu" in device_name.lower():
-        return torch.device("cpu")
+    if device_name is not None:
+        device_name_lower = device_name.lower()
+        if "cpu" in device_name_lower:
+            return torch.device("cpu")
+        if "gpu" in device_name_lower or "cuda" in device_name_lower:
+            if ":" in device_name_lower:
+                device_idx = int(device_name_lower.split(":")[1])
+                return torch.device(f"cuda:{device_idx}")
+            local_rank = int(os.environ.get("LOCAL_RANK", 0))
+            return torch.device(
+                f"cuda:{local_rank}" if torch.cuda.is_available() else "cpu"
+            )
+
     local_rank = int(os.environ.get("LOCAL_RANK", 0))
     if torch.cuda.is_available():
         return torch.device(f"cuda:{local_rank}")
@@ -178,8 +189,6 @@ _UNBIND_REGISTERED = False
 
 
 def _unbind_op_strategy(op_schema):
-    from torch.distributed.tensor import Replicate
-    from torch.distributed.tensor import Shard
     from torch.distributed.tensor._dtensor_spec import DTensorSpec
     from torch.distributed.tensor._op_schema import OpSpec
     from torch.distributed.tensor._op_schema import OpStrategy
