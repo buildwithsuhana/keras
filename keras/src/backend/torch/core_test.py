@@ -1,132 +1,94 @@
-from unittest.mock import MagicMock
-from unittest.mock import patch
-
+import ml_dtypes
 import numpy as np
 import pytest
 import torch
 from torch.distributed.tensor import DTensor
+from torch.distributed.tensor import Replicate
 
+import keras
 from keras.src import backend
 from keras.src import testing
-from keras.src.backend.common import global_state
 from keras.src.backend.torch import core
 
 
 @pytest.mark.skipif(
-    backend.backend() != "torch", reason="Requires Torch backend"
+    backend.backend() != "torch", reason="Torch specific tests."
 )
-class CoreTest(testing.TestCase):
-    def test_variable_distribution_mocking(self):
-        from keras.src.distribution import TensorLayout
-
-        mock_dist = MagicMock()
-        mock_layout = MagicMock(spec=TensorLayout, backend_layout="mock_layout")
-        mock_dist.get_variable_layout.return_value = mock_layout
-        orig_get = global_state.get_global_attribute
-
-        def side_effect(attr, *a, **k):
-            if attr == "distribution":
-                return mock_dist
-            return orig_get(attr, *a, **k)
-
-        with (
-            patch(
-                "keras.src.backend.common.global_state.get_global_attribute",
-                side_effect=side_effect,
-            ),
-            patch(
-                "keras.src.backend.torch.distribution_lib.distribute_tensor",
-                return_value=torch.randn(2, 2),
-            ),
-        ):
-            v = core.Variable(np.ones((2, 2), "float32"), dtype="float32")
-            self.assertEqual(v._layout, "mock_layout")
-            mock_dist.get_variable_layout.return_value = "other_layout"
-            self.assertEqual(
-                core.Variable(
-                    np.ones((2, 2), "float32"), dtype="float32"
-                )._layout,
-                "other_layout",
+class TorchCoreTest(testing.TestCase):
+    def setUp(self):
+        super().setUp()
+        if not torch.distributed.is_initialized():
+            torch.distributed.init_process_group(
+                "gloo", rank=0, world_size=1, init_method="tcp://127.0.0.1:0"
             )
-            v._direct_assign(np.zeros((2, 2), "float32"))
-            self.assertIsInstance(v.value, torch.nn.Parameter)
 
-    def test_variable_dtensor_mock(self):
-        mock_dt = MagicMock(
-            spec=DTensor, shape=torch.Size((2, 2)), dtype=torch.float32
+    def test_distribution_integration(self):
+        mesh = keras.distribution.DeviceMesh((1,), ["data"], ["cpu:0"])
+        layout_map = keras.distribution.LayoutMap(mesh)
+        layout_map[".*"] = (None,)
+        dist = keras.distribution.ModelParallel(
+            layout_map=layout_map, batch_dim_name="data"
         )
-        mock_dt.to_local.return_value = torch.ones((2, 2))
-        mock_dt.detach.return_value = mock_dt
-        with patch(
-            "keras.src.backend.torch.core.convert_to_tensor",
-            return_value=mock_dt,
-        ):
-            v = core.Variable(mock_dt, shape=(2, 2))
-            mock_dt.to_local.assert_called()
-            v._value = MagicMock()
-            v._direct_assign(mock_dt)
-            mock_dt.to_local.assert_called()
+        with dist.scope():
+            v = backend.Variable(np.ones((2, 2), dtype="float32"))
+            self.assertIsInstance(v.value.data, DTensor)
+            v._direct_assign(np.zeros((2, 2), dtype="float32"))
+            self.assertIsInstance(v.value.data, DTensor)
+
+            t = backend.convert_to_tensor(
+                torch.ones((2, 2), dtype=torch.float32)
+            )
+            self.assertIsInstance(t, DTensor)
+            self.assertAllClose(backend.convert_to_tensor(t), t)
+            self.assertIsInstance(backend.convert_to_tensor([t, t]), DTensor)
+
+            def fn(x):
+                self.assertIsInstance(x, DTensor)
+                return x + 1
+
+            spec = backend.compute_output_spec(
+                fn, keras.KerasTensor(shape=(2, 2), dtype="float32")
+            )
+            self.assertEqual(spec.shape, (2, 2))
+
+    def test_variable_with_distributed_tensor(self):
+        mesh = keras.distribution.DeviceMesh((1,), ["data"], ["cpu:0"])
+        dt = torch.distributed.tensor.distribute_tensor(
+            torch.ones(2, 2, dtype=torch.float32),
+            mesh.backend_mesh,
+            [Replicate()],
+        )
+        v = backend.Variable(dt)
+        self.assertNotIsInstance(v.value.data, DTensor)
+        self.assertAllClose(v.value, torch.ones(2, 2))
 
     def test_convert_to_tensor_basics(self):
-        with self.assertRaises(ValueError):
-            core.convert_to_tensor([1], sparse=True)
-        with self.assertRaises(ValueError):
-            core.convert_to_tensor([1], ragged=True)
+        for arg in [{"sparse": True}, {"ragged": True}]:
+            with self.assertRaises(ValueError):
+                backend.convert_to_tensor([1], **arg)
         self.assertAllClose(
-            core.convert_to_tensor(core.Variable([1.0, 2.0])), [1.0, 2.0]
+            backend.convert_to_tensor(backend.Variable([1.0, 2.0])), [1.0, 2.0]
         )
-        res = core.convert_to_tensor(torch.empty(2, 2, device="meta"))
-        self.assertEqual(str(res.device.type), core.get_device())
-
-    def test_convert_to_tensor_distribution(self):
-        mock_dist = MagicMock(device_mesh=MagicMock(axis_names=[]))
-        orig_get = global_state.get_global_attribute
-        with (
-            patch(
-                "keras.src.backend.common.global_state.get_global_attribute",
-                side_effect=lambda a, *args, **k: mock_dist
-                if a == "distribution"
-                else orig_get(a, *args, **k),
-            ),
-            patch(
-                "keras.src.backend.torch.distribution_lib.distribute_tensor",
-                return_value=torch.randn(2, 2),
-            ),
-        ):
-            self.assertIsInstance(
-                core.convert_to_tensor(torch.ones((2, 2))), torch.Tensor
-            )
-        mock_dt = MagicMock(
-            spec=DTensor, device=torch.device("cpu"), is_meta=False
+        t = backend.convert_to_tensor(
+            torch.empty(2, 2, device="meta", dtype=torch.float32)
         )
-        mock_dt.to.return_value = mock_dt
-        with (
-            patch(
-                "keras.src.backend.common.global_state.get_global_attribute",
-                return_value=mock_dist,
-            ),
-            patch("keras.src.backend.torch.core.is_tensor", return_value=True),
-        ):
-            self.assertIs(core.convert_to_tensor(mock_dt), mock_dt)
+        self.assertEqual(str(t.device.type), core.get_device())
 
     def test_convert_to_numpy_basics(self):
-        import ml_dtypes
-
         self.assertEqual(
-            core.convert_to_numpy(
+            backend.convert_to_numpy(
                 torch.tensor([1.0], dtype=torch.bfloat16)
             ).dtype,
             ml_dtypes.bfloat16,
         )
         self.assertAllClose(
-            core.convert_to_numpy([torch.tensor(1.0), torch.tensor(2.0)]),
+            backend.convert_to_numpy([torch.tensor(1.0), torch.tensor(2.0)]),
             [1.0, 2.0],
         )
-        mock_dt = MagicMock(
-            spec=DTensor,
-            requires_grad=False,
-            device=torch.device("cpu"),
-            dtype=torch.float32,
+        mesh = keras.distribution.DeviceMesh((1,), ["data"], ["cpu:0"])
+        dt = torch.distributed.tensor.distribute_tensor(
+            torch.ones(2, 2, dtype=torch.float32),
+            mesh.backend_mesh,
+            [Replicate()],
         )
-        mock_dt.full_tensor.return_value = torch.ones((2, 2), device="cpu")
-        self.assertAllClose(core.convert_to_numpy(mock_dt), np.ones((2, 2)))
+        self.assertAllClose(backend.convert_to_numpy(dt), np.ones((2, 2)))
