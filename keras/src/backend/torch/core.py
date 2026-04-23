@@ -306,6 +306,16 @@ def convert_to_tensor(x, dtype=None, sparse=None, ragged=None):
                 )
             dtype = to_torch_dtype(dtype)
             x = torch.as_tensor(x, dtype=dtype, device=get_device())
+
+    if is_tensor(x) and not isinstance(x, DTensor):
+        from keras.src.distribution import distribution_lib as dist_lib
+
+        dist = dist_lib.distribution()
+        if dist is not None and isinstance(dist, dist_lib.ModelParallel):
+            from keras.src.distribution import TensorLayout
+
+            layout = TensorLayout([None] * x.ndim, dist.device_mesh)
+            x = torch_dist_lib.distribute_tensor(x, layout)
     return x
 
 
