@@ -392,14 +392,6 @@ def compute_output_spec(fn, *args, **kwargs):
                 dtype=TORCH_DTYPES[x.dtype],
                 device=get_device(),
             )
-            from keras.src.distribution import distribution_lib as dist_lib
-
-            dist = dist_lib.distribution()
-            if dist is not None and isinstance(dist, dist_lib.ModelParallel):
-                from keras.src.distribution import TensorLayout
-
-                layout = TensorLayout([None] * len(shape), dist.device_mesh)
-                t = torch_dist_lib.distribute_tensor(t, layout)
             return t
         return x
 
