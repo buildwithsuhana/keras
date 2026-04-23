@@ -38,16 +38,18 @@ class TorchCoreTest(testing.TestCase):
             t = backend.convert_to_tensor(
                 torch.ones((2, 2), dtype=torch.float32)
             )
-            self.assertIsInstance(t, DTensor)
+            self.assertNotIsInstance(t, DTensor)
             self.assertAllClose(backend.convert_to_tensor(t), t)
-            self.assertIsInstance(backend.convert_to_tensor([t, t]), DTensor)
+            stack_result = backend.convert_to_tensor([t, t])
+            self.assertNotIsInstance(stack_result, DTensor)
 
-            def fn(x):
-                self.assertIsInstance(x, DTensor)
-                return x + 1
+            v_tensor = v.value.data
+            result = v_tensor + 1
+            self.assertIsInstance(result, DTensor)
 
             spec = backend.compute_output_spec(
-                fn, keras.KerasTensor(shape=(2, 2), dtype="float32")
+                lambda x: x + 1,
+                keras.KerasTensor(shape=(2, 2), dtype="float32"),
             )
             self.assertEqual(spec.shape, (2, 2))
 

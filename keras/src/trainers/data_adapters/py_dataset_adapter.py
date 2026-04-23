@@ -220,7 +220,7 @@ class PyDatasetAdapter(DataAdapter):
         dist = distribution or distribution_lib.distribution()
         self._num_processes = 1
         self._process_id = 0
-        if dist is not None and getattr(dist, "auto_shard_dataset", True):
+        if dist is not None and getattr(dist, "auto_shard_dataset", False):
             self._num_processes = backend_distribution_lib.num_processes()
             self._process_id = backend_distribution_lib.process_id()
 
@@ -272,12 +272,20 @@ class PyDatasetAdapter(DataAdapter):
             yield self._standardize_batch(self.py_dataset[i])
 
     def _finite_generator(self):
-        indices = range(self.py_dataset.num_batches)
+        indices = list(range(self.py_dataset.num_batches))
         if self.shuffle:
-            indices = list(indices)
             random.shuffle(indices)
 
         indices = indices[self._process_id :: self._num_processes]
+        if self._num_processes > 1:
+            total_batches = self.py_dataset.num_batches
+            batches_per_process = (
+                total_batches + self._num_processes - 1
+            ) // self._num_processes
+            padding_needed = batches_per_process - len(indices)
+            if padding_needed > 0:
+                if indices:
+                    indices = indices + [indices[-1]] * padding_needed
 
         for i in indices:
             yield self._standardize_batch(self.py_dataset[i])
@@ -646,9 +654,8 @@ class OrderedEnqueuer(PyDatasetEnqueuer):
             if self.py_dataset.num_batches is not None:
                 # For finite datasets, `self.indices` is created here so that
                 # shuffling creates different a order each time.
-                indices = range(self.py_dataset.num_batches)
+                indices = list(range(self.py_dataset.num_batches))
                 if self.shuffle:
-                    indices = list(indices)
                     random.shuffle(indices)
 
                 if self._num_processes > 1:
@@ -657,6 +664,14 @@ class OrderedEnqueuer(PyDatasetEnqueuer):
                         for i in indices
                         if i % self._num_processes == self._process_id
                     ]
+                    total_batches = self.py_dataset.num_batches
+                    batches_per_process = (
+                        total_batches + self._num_processes - 1
+                    ) // self._num_processes
+                    padding_needed = batches_per_process - len(indices)
+                    if padding_needed > 0:
+                        if indices:
+                            indices = indices + [indices[-1]] * padding_needed
                 self.indices = iter(indices)
             self._send_py_dataset()  # Share the initial py_dataset
 

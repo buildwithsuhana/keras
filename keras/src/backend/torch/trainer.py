@@ -41,7 +41,6 @@ class TorchTrainer(base_trainer.Trainer):
         self.train_function = None
         self.test_function = None
         self.predict_function = None
-        self._in_ddp_context = False
 
     def _should_torch_compile(self):
         # require torch>=2.1.0 to enable dynamo since it
@@ -57,6 +56,15 @@ class TorchTrainer(base_trainer.Trainer):
 
         return self.jit_compile
 
+    @property
+    def _in_ddp_context(self):
+        if not hasattr(self, "_ddp_model"):
+            return False
+        from keras.src.distribution import distribution_lib as dist_lib
+
+        dist = dist_lib.distribution()
+        return isinstance(dist, dist_lib.DataParallel)
+
     def _setup_ddp(self):
         from keras.src.distribution import distribution_lib as dist_lib
 
@@ -71,7 +79,25 @@ class TorchTrainer(base_trainer.Trainer):
                 )
                 # Use normal setattr to preserve Keras attribute tracking
                 self._ddp_model = ddp_model
-                self._in_ddp_context = True
+
+    def _sync_buffers(self):
+        """Synchronize buffers (BatchNorm stats) across all ranks."""
+        from keras.src.distribution import distribution_lib as dist_lib
+
+        dist = dist_lib.distribution()
+        if (
+            dist is not None
+            and isinstance(dist, dist_lib.DataParallel)
+            and hasattr(self, "_ddp_model")
+            and torch.distributed.is_initialized()
+        ):
+            module = self._ddp_model.module
+            for buffer in module.buffers():
+                if buffer.requires_grad:
+                    continue
+                torch.distributed.all_reduce(buffer)
+                # Average the buffer across all processes
+                buffer.div_(torch.distributed.get_world_size())
 
     def _distribute_inputs(self, dist, data, replicate=False):
         from keras.src.distribution import distribution_lib
@@ -112,7 +138,6 @@ class TorchTrainer(base_trainer.Trainer):
         # for the weights from the previous train step.
         self.zero_grad()
 
-        self._setup_ddp()
         if dist is not None and isinstance(dist, dist_lib.DataParallel):
             y_pred = self._ddp_model(x, training=True)
         else:
@@ -124,6 +149,9 @@ class TorchTrainer(base_trainer.Trainer):
         loss = self._compute_loss(
             x=x, y=y, y_pred=y_pred, sample_weight=sample_weight, training=True
         )
+
+        self._sync_buffers()
+
         self._loss_tracker.update_state(
             loss,
             sample_weight=next(
@@ -250,6 +278,13 @@ class TorchTrainer(base_trainer.Trainer):
                         torch.distributed.all_reduce(v, op=reduce_op)
                         if variable.aggregation == "mean":
                             v = v / torch.distributed.get_world_size()
+
+                    if is_dtensor:
+                        v = DTensor.from_local(
+                            v,
+                            variable.value.device_mesh,
+                            variable.value.placements,
+                        )
                     variable.assign(v)
 
     def make_train_function(self, force=False):

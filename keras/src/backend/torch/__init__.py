@@ -39,6 +39,7 @@ from keras.src.backend.torch.core import scatter
 from keras.src.backend.torch.core import shape
 from keras.src.backend.torch.core import stop_gradient
 from keras.src.backend.torch.core import to_torch_dtype
+from keras.src.backend.torch.core import unstack
 from keras.src.backend.torch.core import vectorized_map
 from keras.src.backend.torch.rnn import cudnn_ok
 from keras.src.backend.torch.rnn import gru

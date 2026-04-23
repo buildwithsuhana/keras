@@ -512,3 +512,46 @@ class PyDatasetAdapterTest(testing.TestCase):
             batches = list(it)
             expected_num_batches = 8 // expected_num_processes
             self.assertEqual(len(batches), expected_num_batches)
+
+    @parameterized.named_parameters(
+        ("uneven_sharding", 3, 0, 3, 0),
+        ("uneven_sharding_rank1", 3, 1, 3, 1),
+        ("uneven_sharding_rank2", 3, 2, 3, 2),
+    )
+    @patch("keras.src.distribution.distribution_lib.distribution")
+    def test_sharding_padding(
+        self,
+        world_size,
+        rank,
+        expected_num_processes,
+        expected_process_id,
+        mock_distribution,
+    ):
+        if backend.backend() not in ("torch", "jax"):
+            pytest.skip(
+                "Distribution support is only available for torch and jax."
+            )
+        from keras.src.backend import distribution_lib as backend_dist_lib
+
+        with (
+            patch.object(
+                backend_dist_lib, "num_processes", return_value=world_size
+            ),
+            patch.object(backend_dist_lib, "process_id", return_value=rank),
+        ):
+            dist = dist_lib.DataParallel(devices=["cpu:0"] * world_size)
+            dist.auto_shard_dataset = True
+            mock_distribution.return_value = dist
+
+            x = np.random.random((20, 4)).astype("float32")
+            y = np.random.random((20, 2)).astype("float32")
+            py_dataset = ExamplePyDataset(x, y, batch_size=2)
+            adapter = py_dataset_adapter.PyDatasetAdapter(
+                py_dataset, shuffle=False
+            )
+
+            it = adapter._get_iterator()
+            batches = list(it)
+            self.assertEqual(len(batches), 4)
+            if rank == 1:
+                self.assertAllClose(batches[2][1], batches[3][1])

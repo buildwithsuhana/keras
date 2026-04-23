@@ -251,9 +251,6 @@ class Variable(KerasVariable):
 
 
 def convert_to_tensor(x, dtype=None, sparse=None, ragged=None):
-    from keras.src.distribution import TensorLayout
-    from keras.src.distribution import distribution_lib as dist_lib
-
     if sparse:
         raise ValueError("`sparse=True` is not supported with torch backend")
     if ragged:
@@ -309,19 +306,6 @@ def convert_to_tensor(x, dtype=None, sparse=None, ragged=None):
                 )
             dtype = to_torch_dtype(dtype)
             x = torch.as_tensor(x, dtype=dtype, device=get_device())
-
-    dist = global_state.get_global_attribute("distribution")
-    if dist is None:
-        return x
-
-    if not (is_tensor(x) and not isinstance(x, DTensor)):
-        return x
-
-    if not isinstance(dist, dist_lib.ModelParallel):
-        return x
-
-    layout = TensorLayout([None] * x.ndim, dist.device_mesh)
-    x = torch_dist_lib.distribute_tensor(x, layout)
     return x
 
 
@@ -783,6 +767,19 @@ def stop_gradient(variable):
 
 
 def unstack(x, num=None, axis=0):
+    if isinstance(x, DTensor):
+        from torch.distributed.tensor import Replicate
+        from torch.distributed.tensor import Shard
+
+        ndim = x.dim()
+        axis = axis if axis >= 0 else axis + ndim
+        if any(isinstance(p, Shard) and p.dim == axis for p in x.placements):
+            # Redistribute to Replicate on the sharded axis
+            new_placements = [
+                Replicate() if (isinstance(p, Shard) and p.dim == axis) else p
+                for p in x.placements
+            ]
+            x = x.redistribute(placements=new_placements)
     return x.unbind(axis)
 
 

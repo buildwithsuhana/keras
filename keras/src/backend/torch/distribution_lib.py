@@ -122,8 +122,6 @@ def distribute_tensor(tensor, layout):
     if not isinstance(dist, dist_lib.ModelParallel):
         return tensor
 
-    _register_unbind_strategy()
-
     from keras.src.distribution import TensorLayout
 
     if isinstance(layout, TensorLayout):
@@ -156,8 +154,6 @@ def distribute_data_input(tensor, layout, batch_dim_name):
     if not isinstance(dist, dist_lib.ModelParallel):
         return tensor
 
-    _register_unbind_strategy()
-
     from keras.src.distribution import TensorLayout
 
     if isinstance(layout, TensorLayout):
@@ -183,72 +179,3 @@ def distribute_data_input(tensor, layout, batch_dim_name):
     return DTensor.from_local(
         tensor, device_mesh=layout.device_mesh, placements=layout.placements
     )
-
-
-_UNBIND_REGISTERED = False
-
-
-def _unbind_op_strategy(op_schema):
-    from torch.distributed.tensor._dtensor_spec import DTensorSpec
-    from torch.distributed.tensor._op_schema import OpSpec
-    from torch.distributed.tensor._op_schema import OpStrategy
-
-    input_strategy = op_schema.args_schema[0]
-    dim = op_schema.args_schema[1] if len(op_schema.args_schema) > 1 else 0
-    dim = dim if dim >= 0 else dim + input_strategy.ndim
-
-    mesh = input_strategy.mesh
-    new_strategy = OpStrategy([])
-
-    for arg_strategy in input_strategy.strategies:
-        arg_spec = arg_strategy.output_spec
-        is_sharded = any(
-            isinstance(p, Shard) and p.dim == dim for p in arg_spec.placements
-        )
-
-        if is_sharded:
-            rep_spec = DTensorSpec(
-                mesh=mesh,
-                placements=tuple(Replicate() for _ in arg_spec.placements),
-                tensor_meta=arg_spec.tensor_meta,
-            )
-            out_spec = DTensorSpec(
-                mesh=mesh,
-                placements=tuple(Replicate() for _ in arg_spec.placements),
-            )
-            new_strategy.strategies.append(
-                OpSpec(
-                    output_specs=(out_spec,) * input_strategy.shape[dim],
-                    input_specs=(rep_spec,),
-                )
-            )
-        else:
-            out_placements = []
-            for p in arg_spec.placements:
-                if isinstance(p, Shard) and p.dim > dim:
-                    out_placements.append(Shard(p.dim - 1))
-                else:
-                    out_placements.append(p)
-            out_spec = DTensorSpec(mesh=mesh, placements=tuple(out_placements))
-            new_strategy.strategies.append(
-                OpSpec(
-                    output_specs=(out_spec,) * input_strategy.shape[dim],
-                    input_specs=(arg_spec,),
-                )
-            )
-    return new_strategy
-
-
-def _register_unbind_strategy():
-    """Registers sharding propagation for `unbind` (used by MHA heads)."""
-    global _UNBIND_REGISTERED
-    if _UNBIND_REGISTERED:
-        return
-
-    from torch.distributed.tensor._op_schema import RuntimeSchemaInfo
-    from torch.distributed.tensor._ops import register_op_strategy
-
-    register_op_strategy(
-        torch.ops.aten.unbind.int, schema_info=RuntimeSchemaInfo(1)
-    )(_unbind_op_strategy)
-    _UNBIND_REGISTERED = True

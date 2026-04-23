@@ -11,6 +11,7 @@ from torch.distributed.tensor import Shard
 from keras.src import backend
 from keras.src import layers
 from keras.src import models
+from keras.src import ops
 from keras.src import testing
 from keras.src.backend.torch import distribution_lib as backend_dlib
 from keras.src.distribution import distribution_lib as dist_lib
@@ -97,7 +98,7 @@ class TorchDistributionLibTest(testing.TestCase):
             dt = backend_dlib.distribute_tensor(
                 torch.randn(4, 2), dist_lib.TensorLayout(["data", None], mesh)
             )
-            for st in torch.unbind(dt, 0):
+            for st in ops.unstack(dt, 0):
                 self.assertIsInstance(st.placements[0], Replicate)
 
     def test_e2e_building(self):
