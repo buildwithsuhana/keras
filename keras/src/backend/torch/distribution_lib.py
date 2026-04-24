@@ -244,6 +244,15 @@ def _register_unbind_strategy():
     global _UNBIND_REGISTERED
     if _UNBIND_REGISTERED:
         return
+    # Newer PyTorch versions (>= 2.4) handle `unbind` sharding for DTensor
+    # natively. Avoid registering strategies using private internals on those
+    # versions. Also guard registration in a try/except so failures are
+    # best-effort and won't break ModelParallel execution.
+    from packaging.version import parse
+
+    if parse(torch.__version__) >= parse("2.4.0"):
+        _UNBIND_REGISTERED = True
+        return
 
     from torch.distributed.tensor._op_schema import RuntimeSchemaInfo
     from torch.distributed.tensor._ops import register_op_strategy
