@@ -220,7 +220,7 @@ class PyDatasetAdapter(DataAdapter):
         dist = distribution or distribution_lib.distribution()
         self._num_processes = 1
         self._process_id = 0
-        if dist is not None and getattr(dist, "auto_shard_dataset", True):
+        if dist is not None and getattr(dist, "auto_shard_dataset", False):
             self._num_processes = backend_distribution_lib.num_processes()
             self._process_id = backend_distribution_lib.process_id()
 
@@ -272,7 +272,12 @@ class PyDatasetAdapter(DataAdapter):
             yield self._standardize_batch(self.py_dataset[i])
 
     def _finite_generator(self):
-        indices = range(self.py_dataset.num_batches)
+        num_batches = self.py_dataset.num_batches
+        if self._num_processes > 1:
+            num_batches = (
+                num_batches // self._num_processes
+            ) * self._num_processes
+        indices = range(num_batches)
         if self.shuffle:
             indices = list(indices)
             random.shuffle(indices)
@@ -646,7 +651,12 @@ class OrderedEnqueuer(PyDatasetEnqueuer):
             if self.py_dataset.num_batches is not None:
                 # For finite datasets, `self.indices` is created here so that
                 # shuffling creates different a order each time.
-                indices = range(self.py_dataset.num_batches)
+                num_batches = self.py_dataset.num_batches
+                if self._num_processes > 1:
+                    num_batches = (
+                        num_batches // self._num_processes
+                    ) * self._num_processes
+                indices = range(num_batches)
                 if self.shuffle:
                     indices = list(indices)
                     random.shuffle(indices)
