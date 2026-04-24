@@ -7,16 +7,15 @@ from torch.distributed.tensor import Replicate
 from torch.distributed.tensor import Shard
 
 
-def _apply_dtensor_patches():
-    """Apply monkeypatches for DTensor iteration and unbinding."""
-    if not hasattr(DTensor, "_keras_patched"):
-        DTensor.__iter__ = lambda self: iter(self.to_local())
+def _setup_dtensor_ops():
+    """Setup custom operations for DTensor unbinding support."""
+    if not hasattr(DTensor, "_keras_ops_setup"):
         DTensor.unbind = lambda self, dim=0: self.to_local().unbind(dim)
         _orig_unbind = torch.unbind
         torch.unbind = lambda input, dim=0: (
             input.unbind(dim) if isinstance(input, DTensor) else _orig_unbind(input, dim)
         )
-        DTensor._keras_patched = True
+        DTensor._keras_ops_setup = True
 
 
 def get_device_count(device_type=None):
@@ -135,8 +134,8 @@ def distribute_tensor(tensor, layout):
     if not isinstance(dist, dist_lib.ModelParallel):
         return tensor
 
-    # Apply DTensor patches for unbinding/iteration support
-    _apply_dtensor_patches()
+    # Setup DTensor operations for unbinding/iteration support
+    _setup_dtensor_ops()
 
     from keras.src.distribution import TensorLayout
 
@@ -179,8 +178,8 @@ def distribute_data_input(tensor, layout, batch_dim_name):
     if not isinstance(dist, dist_lib.ModelParallel):
         return tensor
 
-    # Apply DTensor patches for unbinding/iteration support
-    _apply_dtensor_patches()
+    # Setup DTensor operations for unbinding/iteration support
+    _setup_dtensor_ops()
 
     from keras.src.distribution import TensorLayout
 
