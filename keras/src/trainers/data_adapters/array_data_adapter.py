@@ -261,8 +261,6 @@ class ArrayDataAdapter(DataAdapter):
         from keras.src.backend.torch.core import convert_to_tensor
         from keras.src.distribution import distribution_lib as dist_lib
 
-        num_samples = self._num_samples
-
         class ArrayDataset(torch.utils.data.Dataset):
             def __init__(self, array):
                 self.array = array
@@ -279,7 +277,7 @@ class ArrayDataAdapter(DataAdapter):
                 )
 
             def __len__(self):
-                return num_samples
+                return len(tree.flatten(self.array)[0].array)
 
         class RandomBatchSampler(torch.utils.data.Sampler):
             def __init__(self, sampler):

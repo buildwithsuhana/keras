@@ -34,19 +34,6 @@ class _KerasModuleWrapper(torch.nn.Module):
     def forward(self, *args, **kwargs):
         return self._keras_model(*args, **kwargs)
 
-    def sync_buffers(self):
-        """Syncs buffers (e.g. BatchNorm stats) across ranks."""
-        if (
-            torch.distributed.is_available()
-            and torch.distributed.is_initialized()
-        ):
-            world_size = torch.distributed.get_world_size()
-            if world_size > 1:
-                for buffer in self.buffers():
-                    torch.distributed.all_reduce(
-                        buffer, op=torch.distributed.ReduceOp.AVG
-                    )
-
 
 class TorchTrainer(base_trainer.Trainer):
     def __init__(self):
@@ -84,9 +71,7 @@ class TorchTrainer(base_trainer.Trainer):
                 )
                 # Use normal setattr to preserve Keras attribute tracking
                 self._ddp_model = ddp_model
-            self._in_ddp_context = True
-        else:
-            self._in_ddp_context = False
+                self._in_ddp_context = True
 
     def _distribute_inputs(self, dist, data, replicate=False):
         from keras.src.distribution import distribution_lib
@@ -127,9 +112,9 @@ class TorchTrainer(base_trainer.Trainer):
         # for the weights from the previous train step.
         self.zero_grad()
 
+        self._setup_ddp()
         if dist is not None and isinstance(dist, dist_lib.DataParallel):
             y_pred = self._ddp_model(x, training=True)
-            self._ddp_model.module.sync_buffers()
         else:
             if self._call_has_training_arg:
                 y_pred = self(x, training=True)
