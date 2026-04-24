@@ -77,9 +77,6 @@ def initialize(job_addresses=None, num_processes=None, process_id=None):
         backend = "nccl" if torch.cuda.is_available() else "gloo"
         torch.distributed.init_process_group(backend=backend)
 
-    # Apply DTensor patches for unbinding/iteration support
-    _apply_dtensor_patches()
-
 
 def num_processes():
     if torch.distributed.is_initialized():
@@ -171,6 +168,9 @@ def distribute_tensor(tensor, layout):
     if not isinstance(dist, dist_lib.ModelParallel):
         return tensor
 
+    # Apply DTensor patches for unbinding/iteration support
+    _apply_dtensor_patches()
+
     from keras.src.distribution import TensorLayout
 
     if isinstance(layout, TensorLayout):
@@ -211,6 +211,9 @@ def distribute_data_input(tensor, layout, batch_dim_name):
     dist = dist_lib.distribution()
     if not isinstance(dist, dist_lib.ModelParallel):
         return tensor
+
+    # Apply DTensor patches for unbinding/iteration support
+    _apply_dtensor_patches()
 
     from keras.src.distribution import TensorLayout
 
