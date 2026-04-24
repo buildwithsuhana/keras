@@ -220,7 +220,9 @@ class PyDatasetAdapter(DataAdapter):
         dist = distribution or distribution_lib.distribution()
         self._num_processes = 1
         self._process_id = 0
-        if dist is not None and getattr(dist, "auto_shard_dataset", True):
+        # Default to False so that distributions without an explicit
+        # `auto_shard_dataset` attribute do NOT trigger sharding.
+        if dist is not None and getattr(dist, "auto_shard_dataset", False):
             self._num_processes = backend_distribution_lib.num_processes()
             self._process_id = backend_distribution_lib.process_id()
 
@@ -272,14 +274,27 @@ class PyDatasetAdapter(DataAdapter):
             yield self._standardize_batch(self.py_dataset[i])
 
     def _finite_generator(self):
-        indices = range(self.py_dataset.num_batches)
+        indices = list(range(self.py_dataset.num_batches))
         if self.shuffle:
-            indices = list(indices)
             random.shuffle(indices)
 
-        indices = indices[self._process_id :: self._num_processes]
+        # Ensure each process yields the same number of batches. If the
+        # total number of batches isn't divisible by the number of processes,
+        # some ranks would otherwise have fewer batches which can cause
+        # rendezvous/all_reduce deadlocks. Best-effort: repeat the last
+        # batch on ranks that would otherwise be short so all ranks run the
+        # same number of steps.
+        per_rank = []
+        max_len = (len(indices) + self._num_processes - 1) // self._num_processes
+        for k in range(max_len):
+            idx = k * self._num_processes + self._process_id
+            if idx < len(indices):
+                per_rank.append(indices[idx])
+            else:
+                # repeat the last valid index to pad
+                per_rank.append(indices[-1])
 
-        for i in indices:
+        for i in per_rank:
             yield self._standardize_batch(self.py_dataset[i])
 
     def _infinite_enqueuer_generator(self):

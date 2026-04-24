@@ -277,7 +277,24 @@ class ArrayDataAdapter(DataAdapter):
                 )
 
             def __len__(self):
-                return len(tree.flatten(self.array)[0].array)
+                # The first leaf may be an internal wrapper exposing `.array`,
+                # or may be a plain tensor/ndarray. Handle both safely.
+                first = tree.flatten(self.array)[0]
+                if hasattr(first, "array"):
+                    try:
+                        return len(first.array)
+                    except Exception:
+                        pass
+                if hasattr(first, "shape"):
+                    try:
+                        return int(first.shape[0])
+                    except Exception:
+                        pass
+                # Fallback: coerce to list and measure length
+                try:
+                    return len(list(first))
+                except Exception:
+                    raise TypeError("Unable to determine length of ArrayDataset")
 
         class RandomBatchSampler(torch.utils.data.Sampler):
             def __init__(self, sampler):

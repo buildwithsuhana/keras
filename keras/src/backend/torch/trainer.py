@@ -61,6 +61,9 @@ class TorchTrainer(base_trainer.Trainer):
         from keras.src.distribution import distribution_lib as dist_lib
 
         dist = dist_lib.distribution()
+        # If distribution scope entered, create DDP wrapper once. If no
+        # distribution is active but a DDP wrapper exists, tear it down and
+        # clear the ddp context flag.
         if dist is not None and isinstance(dist, dist_lib.DataParallel):
             if not hasattr(self, "_ddp_model"):
                 ddp_model = torch.nn.parallel.DistributedDataParallel(
@@ -72,6 +75,13 @@ class TorchTrainer(base_trainer.Trainer):
                 # Use normal setattr to preserve Keras attribute tracking
                 self._ddp_model = ddp_model
                 self._in_ddp_context = True
+        else:
+            if hasattr(self, "_ddp_model"):
+                try:
+                    delattr(self, "_ddp_model")
+                except Exception:
+                    pass
+            self._in_ddp_context = False
 
     def _distribute_inputs(self, dist, data, replicate=False):
         from keras.src.distribution import distribution_lib
@@ -111,8 +121,6 @@ class TorchTrainer(base_trainer.Trainer):
         # Call torch.nn.Module.zero_grad() to clear the leftover gradients
         # for the weights from the previous train step.
         self.zero_grad()
-
-        self._setup_ddp()
         if dist is not None and isinstance(dist, dist_lib.DataParallel):
             y_pred = self._ddp_model(x, training=True)
         else:
@@ -120,6 +128,25 @@ class TorchTrainer(base_trainer.Trainer):
                 y_pred = self(x, training=True)
             else:
                 y_pred = self(x)
+
+        # If using DDP, ensure non-parameter buffers (e.g. BatchNorm running
+        # stats) are synced across ranks after the forward pass. DDP only
+        # synchronizes gradients for parameters.
+        if dist is not None and isinstance(dist, dist_lib.DataParallel):
+            try:
+                # The wrapper stores buffers on the wrapped module
+                module = getattr(self._ddp_model, "module", None)
+                if module is not None:
+                    for _name, buf in module.named_buffers():
+                        if buf is None:
+                            continue
+                        if not buf.requires_grad:
+                            if torch.distributed.is_initialized():
+                                torch.distributed.all_reduce(buf, op=torch.distributed.ReduceOp.SUM)
+                                buf.div_(torch.distributed.get_world_size())
+            except Exception:
+                # Best-effort: failure to sync buffers shouldn't crash training
+                pass
 
         loss = self._compute_loss(
             x=x, y=y, y_pred=y_pred, sample_weight=sample_weight, training=True
@@ -191,6 +218,21 @@ class TorchTrainer(base_trainer.Trainer):
                 y_pred = self(x, training=False)
             else:
                 y_pred = self(x)
+        # Sync non-parameter buffers (e.g. BatchNorm running stats) after
+        # forward in DDP.
+        if dist is not None and isinstance(dist, dist_lib.DataParallel):
+            try:
+                module = getattr(self._ddp_model, "module", None)
+                if module is not None:
+                    for _name, buf in module.named_buffers():
+                        if buf is None:
+                            continue
+                        if not buf.requires_grad:
+                            if torch.distributed.is_initialized():
+                                torch.distributed.all_reduce(buf, op=torch.distributed.ReduceOp.SUM)
+                                buf.div_(torch.distributed.get_world_size())
+            except Exception:
+                pass
 
         loss = self._compute_loss(
             x=x, y=y, y_pred=y_pred, sample_weight=sample_weight, training=False
@@ -220,6 +262,19 @@ class TorchTrainer(base_trainer.Trainer):
                 y_pred = self(x, training=False)
             else:
                 y_pred = self(x)
+        if dist is not None and isinstance(dist, dist_lib.DataParallel):
+            try:
+                module = getattr(self._ddp_model, "module", None)
+                if module is not None:
+                    for _name, buf in module.named_buffers():
+                        if buf is None:
+                            continue
+                        if not buf.requires_grad:
+                            if torch.distributed.is_initialized():
+                                torch.distributed.all_reduce(buf, op=torch.distributed.ReduceOp.SUM)
+                                buf.div_(torch.distributed.get_world_size())
+            except Exception:
+                pass
         return y_pred
 
     def _sync_metrics(self):
