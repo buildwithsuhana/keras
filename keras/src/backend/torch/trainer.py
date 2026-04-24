@@ -4,13 +4,13 @@ import warnings
 import numpy as np
 import torch
 from packaging.version import parse
-from torch.distributed.tensor import DTensor
 
 from keras.src import backend
 from keras.src import callbacks as callbacks_module
 from keras.src import optimizers as optimizers_module
 from keras.src import tree
 from keras.src.backend import config
+from keras.src.backend.torch import core as torch_core
 from keras.src.backend.torch import distribution_lib as torch_dist_lib
 from keras.src.trainers import trainer as base_trainer
 from keras.src.trainers.data_adapters import array_slicing
@@ -26,10 +26,12 @@ class _KerasModuleWrapper(torch.nn.Module):
     def __init__(self, keras_model):
         super().__init__()
         object.__setattr__(self, "_keras_model", keras_model)
+        self._buffer_aggregations = {}
         for i, v in enumerate(keras_model.trainable_weights):
             self.register_parameter(f"p{i}", v.value)
         for i, v in enumerate(keras_model.non_trainable_weights):
             self.register_buffer(f"b{i}", v.value)
+            self._buffer_aggregations[f"b{i}"] = v.aggregation
 
     def forward(self, *args, **kwargs):
         return self._keras_model(*args, **kwargs)
@@ -138,15 +140,26 @@ class TorchTrainer(base_trainer.Trainer):
         if dist is not None and isinstance(dist, dist_lib.DataParallel):
             module = getattr(self._ddp_model, "module", None)
             if module is not None:
-                for _name, buf in module.named_buffers():
+                aggregation_to_op = {
+                    "sum": torch.distributed.ReduceOp.SUM,
+                    "mean": torch.distributed.ReduceOp.SUM,
+                    "max": torch.distributed.ReduceOp.MAX,
+                    "min": torch.distributed.ReduceOp.MIN,
+                }
+                for name, buf in module.named_buffers():
                     if buf is None:
                         continue
                     if not buf.requires_grad:
                         if torch.distributed.is_initialized():
-                            torch.distributed.all_reduce(
-                                buf, op=torch.distributed.ReduceOp.SUM
-                            )
-                            buf.div_(torch.distributed.get_world_size())
+                            aggregation = module._buffer_aggregations.get(name)
+                            if aggregation in (None, "none"):
+                                aggregation = "mean"
+                            if aggregation not in aggregation_to_op:
+                                continue
+                            reduce_op = aggregation_to_op[aggregation]
+                            torch.distributed.all_reduce(buf, op=reduce_op)
+                            if aggregation == "mean":
+                                buf.div_(torch.distributed.get_world_size())
 
     def _get_ddp_sync_context(self, dist, dist_lib):
         if dist is not None and isinstance(dist, dist_lib.DataParallel):
@@ -267,11 +280,14 @@ class TorchTrainer(base_trainer.Trainer):
                 "max": torch.distributed.ReduceOp.MAX,
                 "min": torch.distributed.ReduceOp.MIN,
             }
+            DTensor = torch_core._get_dtensor()
             for metric in self.metrics:
                 for variable in metric.variables:
                     if variable.aggregation in (None, "none"):
                         continue
-                    is_dtensor = isinstance(variable.value, DTensor)
+                    is_dtensor = DTensor is not None and isinstance(
+                        variable.value, DTensor
+                    )
                     v = variable.value
                     if is_dtensor:
                         v = v.to_local()

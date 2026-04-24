@@ -18,6 +18,9 @@ from keras.src.distribution.distribution_lib import distribution as distribution
 from keras.src.distribution.distribution_lib import (
     get_device_count as get_device_count,
 )
+from keras.src.distribution.distribution_lib import (
+    get_num_replicas_and_rank as get_num_replicas_and_rank,
+)
 from keras.src.distribution.distribution_lib import initialize as initialize
 from keras.src.distribution.distribution_lib import list_devices as list_devices
 from keras.src.distribution.distribution_lib import (

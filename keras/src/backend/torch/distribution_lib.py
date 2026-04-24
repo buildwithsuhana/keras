@@ -2,9 +2,12 @@ import os
 
 import torch
 from torch.distributed.device_mesh import init_device_mesh
-from torch.distributed.tensor import DTensor
-from torch.distributed.tensor import Replicate
-from torch.distributed.tensor import Shard
+
+
+def _get_dtensor():
+    from torch.distributed.tensor import DTensor
+
+    return DTensor
 
 
 def get_device_count(device_type=None):
@@ -96,6 +99,9 @@ def _to_backend_layout(tensor_layout):
     keras_mesh = tensor_layout.device_mesh
     torch_mesh = _to_backend_mesh(keras_mesh)
 
+    from torch.distributed.tensor import Replicate
+    from torch.distributed.tensor import Shard
+
     placements = []
     for mesh_dim_name in keras_mesh.axis_names:
         shard_dim = None
@@ -123,14 +129,15 @@ def distribute_tensor(tensor, layout):
     if not isinstance(dist, dist_lib.ModelParallel):
         return tensor
 
-    _setup_dtensor_ops()
+    _register_distributed_strategies()
 
     from keras.src.distribution import TensorLayout
 
     if isinstance(layout, TensorLayout):
         layout = _to_backend_layout(layout)
 
-    if isinstance(tensor, DTensor):
+    DTensor = _get_dtensor()
+    if DTensor is not None and isinstance(tensor, DTensor):
         return tensor.redistribute(
             device_mesh=layout.device_mesh, placements=layout.placements
         )
@@ -157,14 +164,15 @@ def distribute_data_input(tensor, layout, batch_dim_name):
     if not isinstance(dist, dist_lib.ModelParallel):
         return tensor
 
-    _setup_dtensor_ops()
+    _register_distributed_strategies()
 
     from keras.src.distribution import TensorLayout
 
     if isinstance(layout, TensorLayout):
         layout = _to_backend_layout(layout)
 
-    if isinstance(tensor, DTensor):
+    DTensor = _get_dtensor()
+    if DTensor is not None and isinstance(tensor, DTensor):
         return tensor
 
     if not isinstance(tensor, torch.Tensor):
@@ -186,37 +194,110 @@ def distribute_data_input(tensor, layout, batch_dim_name):
     )
 
 
-def _setup_dtensor_ops():
-    """Setup custom operations for DTensor unbinding and dropout support."""
-    if hasattr(DTensor, "_keras_ops_setup"):
+_STRATEGIES_REGISTERED = False
+
+
+def _unbind_op_strategy(op_schema):
+    from torch.distributed.tensor import Replicate
+    from torch.distributed.tensor import Shard
+    from torch.distributed.tensor._dtensor_spec import DTensorSpec
+    from torch.distributed.tensor._op_schema import OpSpec
+    from torch.distributed.tensor._op_schema import OpStrategy
+
+    input_strategy = op_schema.args_schema[0]
+    mesh = input_strategy.mesh
+    new_strategy = OpStrategy([])
+
+    for arg_strategy in input_strategy.strategies:
+        arg_spec = arg_strategy.output_spec
+        dim = op_schema.args_schema[1] if len(op_schema.args_schema) > 1 else 0
+        dim = dim if dim >= 0 else dim + arg_spec.ndim
+
+        is_sharded_on_dim = any(
+            isinstance(p, Shard) and p.dim == dim for p in arg_spec.placements
+        )
+        if is_sharded_on_dim:
+            rep_placements = tuple(Replicate() for _ in arg_spec.placements)
+            rep_spec = DTensorSpec(
+                mesh=mesh,
+                placements=rep_placements,
+                tensor_meta=arg_spec.tensor_meta,
+            )
+            out_spec = DTensorSpec(mesh=mesh, placements=rep_placements)
+            new_strategy.strategies.append(
+                OpSpec(
+                    output_specs=(out_spec,) * arg_spec.shape[dim],
+                    input_specs=(rep_spec,),
+                )
+            )
+        else:
+            out_placements = [
+                Shard(p.dim - 1) if isinstance(p, Shard) and p.dim > dim else p
+                for p in arg_spec.placements
+            ]
+            out_spec = DTensorSpec(mesh=mesh, placements=tuple(out_placements))
+            new_strategy.strategies.append(
+                OpSpec(
+                    output_specs=(out_spec,) * arg_spec.shape[dim],
+                    input_specs=(arg_spec,),
+                )
+            )
+    return new_strategy
+
+
+def _bernoulli_op_strategy(op_schema):
+    from torch.distributed.tensor import Partial
+    from torch.distributed.tensor import Replicate
+    from torch.distributed.tensor._dtensor_spec import DTensorSpec
+    from torch.distributed.tensor._op_schema import OpSpec
+    from torch.distributed.tensor._op_schema import OpStrategy
+
+    input_strategy = op_schema.args_schema[0]
+    mesh = input_strategy.mesh
+    new_strategy = OpStrategy([])
+
+    for arg_strategy in input_strategy.strategies:
+        arg_spec = arg_strategy.output_spec
+        if any(isinstance(p, Partial) for p in arg_spec.placements):
+            rep_placements = tuple(Replicate() for _ in arg_spec.placements)
+            rep_spec = DTensorSpec(
+                mesh=mesh,
+                placements=rep_placements,
+                tensor_meta=arg_spec.tensor_meta,
+            )
+            new_strategy.strategies.append(
+                OpSpec(output_specs=rep_spec, input_specs=(rep_spec,))
+            )
+        else:
+            new_strategy.strategies.append(
+                OpSpec(output_specs=arg_spec, input_specs=(arg_spec,))
+            )
+    return new_strategy
+
+
+def _register_distributed_strategies():
+    """Register sharding propagation for ops (unbind, bernoulli).
+
+    No-ops if already registered or if the PyTorch internal API is unavailable.
+    """
+    global _STRATEGIES_REGISTERED
+    if _STRATEGIES_REGISTERED:
         return
+    from torch.distributed.tensor._op_schema import RuntimeSchemaInfo
+    from torch.distributed.tensor._ops import register_op_strategy
 
-    dtensor_unbind = DTensor.unbind
-    torch_unbind = torch.unbind
-    torch_dropout = torch.nn.functional.dropout
+    register_op_strategy(
+        torch.ops.aten.unbind.int, schema_info=RuntimeSchemaInfo(1)
+    )(_unbind_op_strategy)
 
-    def unbind(tensor, dim=0):
-        if not isinstance(tensor, DTensor):
-            return torch_unbind(tensor, dim)
-        try:
-            result = dtensor_unbind(tensor, dim)
-            return result
-        except:
-            return tensor.to_local().unbind(dim)
+    # dropout (bernoulli)
+    if hasattr(torch.ops.aten.bernoulli_, "float"):
+        register_op_strategy(
+            torch.ops.aten.bernoulli_.float, schema_info=RuntimeSchemaInfo(1)
+        )(_bernoulli_op_strategy)
+    if hasattr(torch.ops.aten.bernoulli, "p"):
+        register_op_strategy(
+            torch.ops.aten.bernoulli.p, schema_info=RuntimeSchemaInfo(1)
+        )(_bernoulli_op_strategy)
 
-    def dropout(input_tensor, p=0.5, training=True, inplace=False):
-        if not isinstance(input_tensor, DTensor):
-            return torch_dropout(input_tensor, p, training, inplace)
-        try:
-            result = torch_dropout(input_tensor, p, training, inplace)
-            return result
-        except:
-            local_output = torch_dropout(
-                input_tensor.to_local(), p, training, inplace
-            )
-            return DTensor.from_local(
-                local_output, input_tensor.device_mesh, input_tensor.placements
-            )
-
-    DTensor.unbind, torch.unbind = unbind, unbind
-    torch.nn.functional.dropout, DTensor._keras_ops_setup = dropout, True
+    _STRATEGIES_REGISTERED = True

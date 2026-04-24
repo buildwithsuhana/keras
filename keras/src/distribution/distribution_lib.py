@@ -775,6 +775,42 @@ class ModelParallel(Distribution):
             return distributed_dataset.prefetch(tf.data.AUTOTUNE)
 
 
+@keras_export("keras.distribution.get_num_replicas_and_rank")
+def get_num_replicas_and_rank(dist):
+    """Retrieve the number of replicas and the rank for the given distribution.
+
+    Args:
+        dist: a `Distribution` instance.
+
+    Returns:
+        A tuple of `(num_replicas, rank)`.
+    """
+    if dist is None:
+        return None, None
+
+    num_replicas = None
+    rank = None
+    if isinstance(dist, DataParallel):
+        num_replicas = distribution_lib.num_processes()
+        rank = distribution_lib.process_id()
+    elif isinstance(dist, ModelParallel):
+        mesh_batch_dim_index = dist.device_mesh.axis_names.index(
+            dist.batch_dim_name
+        )
+        num_model_replicas = dist.device_mesh.shape[mesh_batch_dim_index]
+        if num_model_replicas > 0:
+            num_process = distribution_lib.num_processes()
+            process_id = distribution_lib.process_id()
+            if num_model_replicas >= num_process:
+                num_replicas = num_process
+                rank = process_id
+            else:
+                num_replicas = num_model_replicas
+                processes_per_replica = num_process // num_model_replicas
+                rank = process_id // processes_per_replica
+    return num_replicas, rank
+
+
 @keras_export("keras.distribution.LayoutMap")
 class LayoutMap(collections.abc.MutableMapping):
     """A dict-like object that maps string to `TensorLayout` instances.

@@ -100,7 +100,7 @@ class TorchDistributionLibTest(testing.TestCase):
             )
             for st in torch.unbind(dt, 0):
                 self.assertIsInstance(st, torch.Tensor)
-                self.assertNotIsInstance(st, DTensor)
+                self.assertIsInstance(st, DTensor)
 
     def test_e2e_building(self):
         mesh = dist_lib.DeviceMesh((1,), ["data"], ["cpu:0"])

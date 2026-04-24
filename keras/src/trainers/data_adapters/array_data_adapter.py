@@ -294,31 +294,7 @@ class ArrayDataAdapter(DataAdapter):
         dist = dist_lib.distribution()
         sampler = None
         if dist is not None and dist.auto_shard_dataset:
-            num_replicas = None
-            rank = None
-            if isinstance(dist, dist_lib.DataParallel):
-                num_replicas = torch.distributed.get_world_size()
-                rank = torch.distributed.get_rank()
-            elif isinstance(dist, dist_lib.ModelParallel):
-                mesh_batch_dim_index = dist.device_mesh.axis_names.index(
-                    dist.batch_dim_name
-                )
-                num_model_replicas = dist.device_mesh.shape[
-                    mesh_batch_dim_index
-                ]
-                if num_model_replicas > 1:
-                    num_process = torch.distributed.get_world_size()
-                    process_id = torch.distributed.get_rank()
-                    if num_model_replicas >= num_process:
-                        num_replicas = num_process
-                        rank = process_id
-                    else:
-                        num_replicas = num_model_replicas
-                        processes_per_replica = (
-                            num_process // num_model_replicas
-                        )
-                        rank = process_id // processes_per_replica
-
+            num_replicas, rank = dist_lib.get_num_replicas_and_rank(dist)
             if num_replicas is not None and rank is not None:
                 sampler = torch.utils.data.distributed.DistributedSampler(
                     range(self._num_samples),

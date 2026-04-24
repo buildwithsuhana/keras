@@ -6,7 +6,6 @@ import os
 import ml_dtypes
 import numpy as np
 import torch
-from torch.distributed.tensor import DTensor
 
 from keras.src import tree
 from keras.src.backend.common import KerasVariable
@@ -21,6 +20,15 @@ from keras.src.backend.common.stateless_scope import in_stateless_scope
 from keras.src.backend.common.symbolic_scope import SymbolicScope
 from keras.src.backend.config import floatx
 from keras.src.backend.torch import distribution_lib as torch_dist_lib
+from keras.src.distribution import TensorLayout
+from keras.src.distribution import distribution_lib as dist_lib
+
+
+def _get_dtensor():
+    from torch.distributed.tensor import DTensor
+
+    return DTensor
+
 
 SUPPORTS_SPARSE_TENSORS = False
 SUPPORTS_RAGGED_TENSORS = False
@@ -112,7 +120,6 @@ class Variable(KerasVariable):
         distribution = global_state.get_global_attribute("distribution")
         if self._layout is None and distribution is not None:
             tensor_layout = distribution.get_variable_layout(self)
-            from keras.src.distribution import TensorLayout
 
             if isinstance(tensor_layout, TensorLayout):
                 self._layout = tensor_layout.backend_layout
@@ -147,7 +154,8 @@ class Variable(KerasVariable):
                     )
             else:
                 param_value = convert_to_tensor(value, dtype=self._dtype)
-                if isinstance(param_value, DTensor):
+                DTensor = _get_dtensor()
+                if DTensor is not None and isinstance(param_value, DTensor):
                     param_value = param_value.to_local()
                 device = (
                     param_value.device
@@ -172,7 +180,8 @@ class Variable(KerasVariable):
                 value, requires_grad=self.trainable
             )
         else:
-            if isinstance(value, DTensor):
+            DTensor = _get_dtensor()
+            if DTensor is not None and isinstance(value, DTensor):
                 value = value.to_local()
             with torch.no_grad():
                 self._value.copy_(value)
@@ -251,9 +260,6 @@ class Variable(KerasVariable):
 
 
 def convert_to_tensor(x, dtype=None, sparse=None, ragged=None):
-    from keras.src.distribution import TensorLayout
-    from keras.src.distribution import distribution_lib as dist_lib
-
     if sparse:
         raise ValueError("`sparse=True` is not supported with torch backend")
     if ragged:
@@ -311,27 +317,29 @@ def convert_to_tensor(x, dtype=None, sparse=None, ragged=None):
             x = torch.as_tensor(x, dtype=dtype, device=get_device())
 
     dist = global_state.get_global_attribute("distribution")
-    if dist is None:
-        return x
-    if not isinstance(dist, dist_lib.ModelParallel):
-        return x
-    if isinstance(x, DTensor):
-        return x
+    if dist is not None:
+        if not isinstance(dist, dist_lib.ModelParallel):
+            return x
 
-    is_parameter = isinstance(x, torch.nn.Parameter)
-    is_leaf_tensor = is_tensor(x) and getattr(x, "is_leaf", False)
-    if not (is_parameter or is_leaf_tensor):
-        return x
+        DTensor = _get_dtensor()
+        if DTensor is not None and isinstance(x, DTensor):
+            return x
 
-    layout = TensorLayout([None] * x.ndim, dist.device_mesh)
-    x = torch_dist_lib.distribute_tensor(x, layout)
+        is_parameter = isinstance(x, torch.nn.Parameter)
+        is_leaf_tensor = is_tensor(x) and getattr(x, "is_leaf", False)
+        if not (is_parameter or is_leaf_tensor):
+            return x
+
+        layout = TensorLayout([None] * x.ndim, dist.device_mesh)
+        x = torch_dist_lib.distribute_tensor(x, layout)
     return x
 
 
 def convert_to_numpy(x):
     def transform(x):
         if is_tensor(x):
-            if isinstance(x, DTensor):
+            DTensor = _get_dtensor()
+            if DTensor is not None and isinstance(x, DTensor):
                 x = x.full_tensor()
             if x.requires_grad:
                 x = x.detach()
@@ -401,12 +409,9 @@ def compute_output_spec(fn, *args, **kwargs):
                 dtype=TORCH_DTYPES[x.dtype],
                 device=get_device(),
             )
-            from keras.src.distribution import distribution_lib as dist_lib
 
             dist = dist_lib.distribution()
             if dist is not None and isinstance(dist, dist_lib.ModelParallel):
-                from keras.src.distribution import TensorLayout
-
                 layout = TensorLayout([None] * len(shape), dist.device_mesh)
                 t = torch_dist_lib.distribute_tensor(t, layout)
             return t
