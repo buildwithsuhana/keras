@@ -289,3 +289,17 @@ def _register_unbind_strategy():
         )
 
     _UNBIND_REGISTERED = True
+
+
+# Eagerly attempt to register the `unbind` sharding strategy at import time
+# so that DTensor sharding propagation will find the strategy during model
+# construction. If registration fails, print a traceback to STDERR and
+# re-raise to make the failure visible for debugging.
+try:
+    _register_unbind_strategy()
+except Exception:
+    import sys, traceback
+
+    print("Failed to register unbind sharding strategy during import:", file=sys.stderr)
+    traceback.print_exc()
+    raise
