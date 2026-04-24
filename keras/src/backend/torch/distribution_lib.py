@@ -8,14 +8,42 @@ from torch.distributed.tensor import Shard
 
 
 def _setup_dtensor_ops():
-    """Setup custom operations for DTensor unbinding support."""
-    if not hasattr(DTensor, "_keras_ops_setup"):
-        DTensor.unbind = lambda self, dim=0: self.to_local().unbind(dim)
-        _orig_unbind = torch.unbind
-        torch.unbind = lambda input, dim=0: (
-            input.unbind(dim) if isinstance(input, DTensor) else _orig_unbind(input, dim)
-        )
-        DTensor._keras_ops_setup = True
+    """Setup custom operations for DTensor unbinding and dropout support."""
+    if hasattr(DTensor, "_keras_ops_setup"):
+        return
+    dtensor_unbind = DTensor.unbind
+    torch_unbind = torch.unbind
+    torch_dropout = torch.nn.functional.dropout
+
+    def unbind(tensor, dim=0):
+        if not isinstance(tensor, DTensor):
+            return torch_unbind(tensor, dim)
+        try:
+            result = dtensor_unbind(tensor, dim)
+            print("[Keras DTensor Fix] Native DTensor unbind used")
+            return result
+        except:
+            print("[Keras DTensor Fix] Fallback unbind used")
+            return tensor.to_local().unbind(dim)
+
+    def dropout(input_tensor, p=0.5, training=True, inplace=False):
+        if not isinstance(input_tensor, DTensor):
+            return torch_dropout(input_tensor, p, training, inplace)
+        try:
+            result = torch_dropout(input_tensor, p, training, inplace)
+            print("[Keras DTensor Fix] Native DTensor dropout used")
+            return result
+        except:
+            print("[Keras DTensor Fix] Fallback dropout used")
+            local_output = torch_dropout(
+                input_tensor.to_local(), p, training, inplace
+            )
+            return DTensor.from_local(
+                local_output, input_tensor.device_mesh, input_tensor.placements
+            )
+
+    DTensor.unbind, torch.unbind = unbind, unbind
+    torch.nn.functional.dropout, DTensor._keras_ops_setup = dropout, True
 
 
 def get_device_count(device_type=None):
