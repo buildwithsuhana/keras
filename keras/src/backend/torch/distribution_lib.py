@@ -128,9 +128,18 @@ def distribute_tensor(tensor, layout):
         layout = _to_backend_layout(layout)
 
     if isinstance(tensor, DTensor):
-        return tensor.redistribute(
-            device_mesh=layout.device_mesh, placements=layout.placements
-        )
+        try:
+            return tensor.redistribute(
+                device_mesh=layout.device_mesh, placements=layout.placements
+            )
+        except NotImplementedError as e:
+            # Add contextual information to help debugging sharding propagation
+            msg = (
+                "DTensor.redistribute failed: operator may lack sharding strategy. "
+                f"device_mesh={getattr(layout.device_mesh, 'shape', None)}, "
+                f"placements={layout.placements}, tensor_shape={tuple(tensor.shape)}"
+            )
+            raise NotImplementedError(msg) from e
 
     return torch.distributed.tensor.distribute_tensor(
         tensor, device_mesh=layout.device_mesh, placements=layout.placements
@@ -176,6 +185,16 @@ def distribute_data_input(tensor, layout, batch_dim_name):
     if tensor.device.type == "meta":
         return tensor
 
-    return DTensor.from_local(
-        tensor, device_mesh=layout.device_mesh, placements=layout.placements
-    )
+    try:
+        dt = DTensor.from_local(
+            tensor, device_mesh=layout.device_mesh, placements=layout.placements
+        )
+    except Exception as e:
+        msg = (
+            "DTensor.from_local failed while wrapping input data. "
+            f"device_mesh={getattr(layout.device_mesh, 'shape', None)}, "
+            f"placements={layout.placements}, tensor_shape={tuple(tensor.shape)}: {e}"
+        )
+        raise RuntimeError(msg) from e
+
+    return dt
