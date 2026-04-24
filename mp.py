@@ -1,21 +1,26 @@
 import sys
 import os
-
-# Add local Keras code to path BEFORE any imports so keras-hub uses local fixed version
-sys.path.insert(0, '/Users/suhanaaa/keras')
-
-# Import and configure keras backend FIRST before any other imports
-os.environ["KERAS_BACKEND"] = "torch"
-
-# Force import of torch backend and distribution lib early to apply patches
-import keras_hub
 import numpy as np
 import torch
 import torch.distributed as dist
 
+# Import and configure keras backend FIRST before any other imports
+os.environ["KERAS_BACKEND"] = "torch"
+
 
 def _test_fn(rank, world_size):
     try:
+        # CRITICAL: Add local Keras code to path in EACH spawned process
+        # torch.multiprocessing.spawn() uses fresh Python interpreter for each child,
+        # so sys.path modifications in parent won't be inherited
+        import numpy as np
+        sys.path.insert(0, '/Users/suhanaaa/keras')
+        
+        # Now import keras (local fixed version) and keras-hub (preinstalled)
+        import keras
+        import keras_hub
+        import keras.distribution
+        
         # Ensure patches are applied in this process
         import keras.src.backend.torch.distribution_lib  # noqa: trigger patches
 
