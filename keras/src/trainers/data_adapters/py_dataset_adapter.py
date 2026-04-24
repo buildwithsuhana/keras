@@ -304,7 +304,9 @@ class PyDatasetAdapter(DataAdapter):
 
     def _finite_enqueuer_generator(self):
         self.enqueuer.start()
-        num_batches = self.py_dataset.num_batches
+        num_batches = (
+            self.py_dataset.num_batches + self._num_processes - 1
+        ) // self._num_processes
         for i, batch in enumerate(self.enqueuer.get()):
             yield self._standardize_batch(batch)
             if i >= num_batches - 1:
@@ -667,11 +669,18 @@ class OrderedEnqueuer(PyDatasetEnqueuer):
                     random.shuffle(indices)
 
                 if self._num_processes > 1:
-                    indices = [
-                        i
-                        for i in indices
-                        if i % self._num_processes == self._process_id
-                    ]
+                    sharded_indices = []
+                    max_len = (
+                        len(indices) + self._num_processes - 1
+                    ) // self._num_processes
+                    for k in range(max_len):
+                        idx = k * self._num_processes + self._process_id
+                        if idx < len(indices):
+                            sharded_indices.append(indices[idx])
+                        else:
+                            # repeat the last valid index to pad
+                            sharded_indices.append(indices[-1])
+                    indices = sharded_indices
                 self.indices = iter(indices)
             self._send_py_dataset()  # Share the initial py_dataset
 
