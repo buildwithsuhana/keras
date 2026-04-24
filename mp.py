@@ -1,4 +1,8 @@
+import sys
 import os
+
+# Add local Keras code to path BEFORE any imports so keras-hub uses local fixed version
+sys.path.insert(0, '/Users/suhanaaa/keras')
 
 # Import and configure keras backend FIRST before any other imports
 os.environ["KERAS_BACKEND"] = "torch"

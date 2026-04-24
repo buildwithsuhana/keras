@@ -618,6 +618,14 @@ def compute_fans(shape):
     Returns:
         A tuple of integer scalars: `(fan_in, fan_out)`.
     """
+    # Detect and convert DTensor to local tensor before any iteration
+    # to avoid triggering unbind operations in distributed context
+    from keras.src.backend import config
+    if config.backend() == "torch":
+        from torch.distributed.tensor import DTensor
+        if isinstance(shape, DTensor):
+            shape = shape.to_local()
+    
     shape = tuple(shape)
     if len(shape) < 1:  # Just to avoid errors for constants.
         fan_in = fan_out = 1
@@ -630,8 +638,8 @@ def compute_fans(shape):
         # Assuming convolution kernels (2D, 3D, or more).
         # kernel shape: (..., input_depth, depth)
         receptive_field_size = 1
-        for dim in shape[:-2]:
-            receptive_field_size *= dim
+        for i in range(len(shape) - 2):
+            receptive_field_size *= shape[i]
         fan_in = shape[-2] * receptive_field_size
         fan_out = shape[-1] * receptive_field_size
     return int(fan_in), int(fan_out)

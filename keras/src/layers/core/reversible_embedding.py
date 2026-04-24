@@ -148,19 +148,15 @@ class ReversibleEmbedding(layers.Embedding):
         return None
 
     def compute_output_shape(self, input_shape, reverse=False):
-        output_shape = list(input_shape)
+        # Use tuple slicing instead of list() to avoid triggering __iter__ on DTensor
         if reverse:
-            output_shape[-1] = self.input_dim
+            return input_shape[:-1] + (self.input_dim,)
         else:
-            output_shape += [self.output_dim]
-        return output_shape
+            return input_shape[:-1] + (self.output_dim,)
 
     def compute_output_spec(self, inputs, reverse=False):
-        output_shape = list(inputs.shape)
-        if reverse:
-            output_shape[-1] = self.input_dim
-        else:
-            output_shape += [self.output_dim]
+        # Delegate to compute_output_shape to avoid calling list() on shape
+        output_shape = self.compute_output_shape(inputs.shape, reverse=reverse)
         return KerasTensor(output_shape, dtype=self.compute_dtype)
 
     def get_config(self):

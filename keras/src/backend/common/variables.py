@@ -589,6 +589,13 @@ def standardize_dtype(dtype):
 
 
 def standardize_shape(shape):
+    # Detect and convert DTensor to local tensor before any iteration
+    # to avoid triggering unbind operations in distributed context
+    if config.backend() == "torch":
+        from torch.distributed.tensor import DTensor
+        if isinstance(shape, DTensor):
+            shape = shape.to_local()
+    
     if not isinstance(shape, tuple):
         if shape is None:
             raise ValueError("Undefined shapes are not supported.")

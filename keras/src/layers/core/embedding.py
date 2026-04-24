@@ -175,7 +175,8 @@ class Embedding(Layer):
         return ops.not_equal(inputs, 0)
 
     def compute_output_shape(self, input_shape):
-        return (*input_shape, self.output_dim)
+        # Use tuple concat instead of unpacking to avoid triggering __iter__ on DTensor
+        return tuple(input_shape) + (self.output_dim,)
 
     def compute_output_spec(self, inputs):
         output_shape = self.compute_output_shape(inputs.shape)
