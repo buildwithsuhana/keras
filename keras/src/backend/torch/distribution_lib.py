@@ -257,7 +257,35 @@ def _register_unbind_strategy():
     from torch.distributed.tensor._op_schema import RuntimeSchemaInfo
     from torch.distributed.tensor._ops import register_op_strategy
 
-    register_op_strategy(
-        torch.ops.aten.unbind.int, schema_info=RuntimeSchemaInfo(1)
-    )(_unbind_op_strategy)
+    # Try to register the unbind strategy for multiple possible aten
+    # overloads across PyTorch versions. Some builds expose
+    # `torch.ops.aten.unbind.int`, others `unbind.default` or
+    # just `unbind`.
+    candidates = [
+        ("unbind.int", getattr(torch.ops.aten, "unbind.int", None)),
+        ("unbind.default", getattr(torch.ops.aten, "unbind.default", None)),
+        ("unbind", getattr(torch.ops.aten, "unbind", None)),
+    ]
+
+    registered = False
+    for name, op in candidates:
+        if op is None:
+            continue
+        try:
+            register_op_strategy(op, schema_info=RuntimeSchemaInfo(1))(
+                _unbind_op_strategy
+            )
+            registered = True
+            break
+        except Exception:
+            # Try next candidate
+            continue
+
+    if not registered:
+        raise RuntimeError(
+            "Failed to register unbind sharding strategy: no suitable "
+            "aten.unbind op found to register. Please report this PyTorch "
+            "build/ABI so we can add support."
+        )
+
     _UNBIND_REGISTERED = True
