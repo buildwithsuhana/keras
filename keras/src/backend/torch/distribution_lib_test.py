@@ -95,7 +95,7 @@ class TorchDistributionLibTest(testing.TestCase):
             layout_map=dist_lib.LayoutMap(mesh)
         ).scope():
             dt = backend_dlib.distribute_tensor(
-                torch.randn(4, 2), dist_lib.TensorLayout(["data", None], mesh)
+                torch.randn(4, 2), dist_lib.TensorLayout([None, None], mesh)
             )
             for st in torch.unbind(dt, 0):
                 self.assertIsInstance(st.placements[0], Replicate)

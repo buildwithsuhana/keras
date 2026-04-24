@@ -7,39 +7,6 @@ from torch.distributed.tensor import Replicate
 from torch.distributed.tensor import Shard
 
 
-# Monkeypatch DTensor to handle iteration and unbinding on shape objects
-# This fixes "Operator aten.unbind.int does not have a sharding strategy registered"
-_original_dtensor_iter = None
-_original_dtensor_unbind = None
-
-def _patched_dtensor_iter(self):
-    """Allow iteration over DTensor by converting to local first."""
-    local_tensor = self.to_local()
-    return iter(local_tensor)
-
-def _patched_dtensor_unbind(self, dim=0):
-    """Allow unbind on DTensor by converting to local first."""
-    local_tensor = self.to_local()
-    return local_tensor.unbind(dim)
-
-def _apply_dtensor_patches():
-    """Apply monkeypatches for DTensor iteration and unbinding."""
-    global _original_dtensor_iter, _original_dtensor_unbind
-    if not hasattr(DTensor, '_keras_patched'):
-        # Patch __iter__ to allow iteration without sharding propagation
-        _original_dtensor_iter = DTensor.__iter__
-        DTensor.__iter__ = _patched_dtensor_iter
-        
-        # Patch unbind to convert to local first
-        _original_dtensor_unbind = DTensor.unbind
-        DTensor.unbind = _patched_dtensor_unbind
-        
-        DTensor._keras_patched = True
-
-# Apply patches at module import time
-_apply_dtensor_patches()
-
-
 def get_device_count(device_type=None):
     """Returns total device count across all hosts."""
     if torch.distributed.is_initialized():
