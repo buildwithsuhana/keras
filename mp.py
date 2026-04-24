@@ -16,13 +16,14 @@ def _test_fn(rank, world_size):
         import numpy as np
         sys.path.insert(0, '/Users/suhanaaa/keras')
         
+        # Import patched distribution_lib FIRST before any other keras/keras-hub imports
+        # This applies DTensor iteration patches that are needed later
+        import keras.src.backend.torch.distribution_lib  # noqa: trigger patches
+        
         # Now import keras (local fixed version) and keras-hub (preinstalled)
         import keras
         import keras_hub
         import keras.distribution
-        
-        # Ensure patches are applied in this process
-        import keras.src.backend.torch.distribution_lib  # noqa: trigger patches
 
         os.environ["RANK"] = str(rank)
         os.environ["WORLD_SIZE"] = str(world_size)
