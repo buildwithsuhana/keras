@@ -42,6 +42,7 @@ class TorchTrainer(base_trainer.Trainer):
         self.test_function = None
         self.predict_function = None
         self._in_ddp_context = False
+        self._current_dist = None
 
     def _should_torch_compile(self):
         # require torch>=2.1.0 to enable dynamo since it
@@ -58,9 +59,13 @@ class TorchTrainer(base_trainer.Trainer):
         return self.jit_compile
 
     def _setup_ddp(self):
-        from keras.src.distribution import distribution_lib as dist_lib
+        dist_lib, dist = self._get_distribution()
+        if dist is not self._current_dist:
+            self.train_function = None
+            self.test_function = None
+            self.predict_function = None
+            self._current_dist = dist
 
-        dist = dist_lib.distribution()
         if dist is not None and isinstance(dist, dist_lib.DataParallel):
             if not hasattr(self, "_ddp_model"):
                 ddp_model = torch.nn.parallel.DistributedDataParallel(
@@ -71,7 +76,16 @@ class TorchTrainer(base_trainer.Trainer):
                 )
                 # Use normal setattr to preserve Keras attribute tracking
                 self._ddp_model = ddp_model
-                self._in_ddp_context = True
+            self._in_ddp_context = True
+        else:
+            if hasattr(self, "_ddp_model"):
+                delattr(self, "_ddp_model")
+            self._in_ddp_context = False
+
+    def _get_distribution(self):
+        from keras.src.distribution import distribution_lib as dist_lib
+
+        return dist_lib, dist_lib.distribution()
 
     def _distribute_inputs(self, dist, data, replicate=False):
         from keras.src.distribution import distribution_lib
@@ -96,30 +110,85 @@ class TorchTrainer(base_trainer.Trainer):
 
         return tree.map_structure(_distribute_if_tensor, data)
 
-    def train_step(self, data):
-        x, y, sample_weight = data_adapter_utils.unpack_x_y_sample_weight(data)
-
-        from keras.src.distribution import distribution_lib as dist_lib
-
-        dist = dist_lib.distribution()
-
+    def _apply_distribution(self, dist, x, y=None):
         if dist is not None:
             x = self._distribute_inputs(dist, x)
             if y is not None:
                 y = self._distribute_inputs(dist, y)
+        return x, y
+
+    def _unpack_and_distribute_data(self, data):
+        x, y, sample_weight = data_adapter_utils.unpack_x_y_sample_weight(data)
+        dist_lib, dist = self._get_distribution()
+        x, y = self._apply_distribution(dist, x, y)
+        return dist_lib, dist, x, y, sample_weight
+
+    def _forward(self, dist, x, training=False):
+        from keras.src.distribution import distribution_lib as dist_lib
+
+        if dist is not None and isinstance(dist, dist_lib.DataParallel):
+            return self._ddp_model(x, training=training)
+        if self._call_has_training_arg:
+            return self(x, training=training)
+        return self(x)
+
+    def _sync_ddp_buffers(self, dist):
+        from keras.src.distribution import distribution_lib as dist_lib
+
+        if dist is not None and isinstance(dist, dist_lib.DataParallel):
+            module = getattr(self._ddp_model, "module", None)
+            if module is not None:
+                for _name, buf in module.named_buffers():
+                    if buf is None:
+                        continue
+                    if not buf.requires_grad:
+                        if torch.distributed.is_initialized():
+                            torch.distributed.all_reduce(
+                                buf, op=torch.distributed.ReduceOp.SUM
+                            )
+                            buf.div_(torch.distributed.get_world_size())
+
+    def _get_ddp_sync_context(self, dist, dist_lib):
+        if dist is not None and isinstance(dist, dist_lib.DataParallel):
+            is_update_step = True
+            if (
+                self.optimizer is not None
+                and self.optimizer.gradient_accumulation_steps
+            ):
+                is_update_step = (
+                    self.optimizer._iterations.value + 1
+                ) % self.optimizer.gradient_accumulation_steps == 0
+
+            if not is_update_step:
+                return self._ddp_model.no_sync()
+        return contextlib.nullcontext()
+
+    def _set_train_mode(self, training=True):
+        if training:
+            if self._in_ddp_context:
+                self._ddp_model.train()
+            else:
+                self.train()
+        else:
+            if self._in_ddp_context:
+                self._ddp_model.eval()
+            else:
+                self.eval()
+
+    def train_step(self, data):
+        (
+            dist_lib,
+            dist,
+            x,
+            y,
+            sample_weight,
+        ) = self._unpack_and_distribute_data(data)
 
         # Call torch.nn.Module.zero_grad() to clear the leftover gradients
         # for the weights from the previous train step.
         self.zero_grad()
-
-        self._setup_ddp()
-        if dist is not None and isinstance(dist, dist_lib.DataParallel):
-            y_pred = self._ddp_model(x, training=True)
-        else:
-            if self._call_has_training_arg:
-                y_pred = self(x, training=True)
-            else:
-                y_pred = self(x)
+        y_pred = self._forward(dist, x, training=True)
+        self._sync_ddp_buffers(dist)
 
         loss = self._compute_loss(
             x=x, y=y, y_pred=y_pred, sample_weight=sample_weight, training=True
@@ -137,22 +206,7 @@ class TorchTrainer(base_trainer.Trainer):
         if self.trainable_weights:
             # Call torch.Tensor.backward() on the loss to compute gradients
             # for the weights.
-            if dist is not None and isinstance(dist, dist_lib.DataParallel):
-                is_update_step = True
-                if (
-                    self.optimizer is not None
-                    and self.optimizer.gradient_accumulation_steps
-                ):
-                    is_update_step = (
-                        self.optimizer._iterations.value + 1
-                    ) % self.optimizer.gradient_accumulation_steps == 0
-
-                if not is_update_step:
-                    context = self._ddp_model.no_sync()
-                else:
-                    context = contextlib.nullcontext()
-            else:
-                context = contextlib.nullcontext()
+            context = self._get_ddp_sync_context(dist, dist_lib)
 
             with context:
                 loss.backward()
@@ -170,27 +224,15 @@ class TorchTrainer(base_trainer.Trainer):
 
     def test_step(self, data):
         (
+            dist_lib,
+            dist,
             x,
             y,
             sample_weight,
-        ) = data_adapter_utils.unpack_x_y_sample_weight(data)
+        ) = self._unpack_and_distribute_data(data)
 
-        from keras.src.distribution import distribution_lib as dist_lib
-
-        dist = dist_lib.distribution()
-
-        if dist is not None:
-            x = self._distribute_inputs(dist, x)
-            if y is not None:
-                y = self._distribute_inputs(dist, y)
-
-        if dist is not None and isinstance(dist, dist_lib.DataParallel):
-            y_pred = self._ddp_model(x, training=False)
-        else:
-            if self._call_has_training_arg:
-                y_pred = self(x, training=False)
-            else:
-                y_pred = self(x)
+        y_pred = self._forward(dist, x, training=False)
+        self._sync_ddp_buffers(dist)
 
         loss = self._compute_loss(
             x=x, y=y, y_pred=y_pred, sample_weight=sample_weight, training=False
@@ -204,28 +246,20 @@ class TorchTrainer(base_trainer.Trainer):
         return self.compute_metrics(x, y, y_pred, sample_weight=sample_weight)
 
     def predict_step(self, data):
-        x, _, _ = data_adapter_utils.unpack_x_y_sample_weight(data)
+        (
+            dist_lib,
+            dist,
+            x,
+            _,
+            _,
+        ) = self._unpack_and_distribute_data(data)
 
-        from keras.src.distribution import distribution_lib as dist_lib
-
-        dist = dist_lib.distribution()
-
-        if dist is not None:
-            x = self._distribute_inputs(dist, x)
-
-        if dist is not None and isinstance(dist, dist_lib.DataParallel):
-            y_pred = self._ddp_model(x, training=False)
-        else:
-            if self._call_has_training_arg:
-                y_pred = self(x, training=False)
-            else:
-                y_pred = self(x)
+        y_pred = self._forward(dist, x, training=False)
+        self._sync_ddp_buffers(dist)
         return y_pred
 
     def _sync_metrics(self):
-        from keras.src.distribution import distribution_lib as dist_lib
-
-        dist_obj = dist_lib.distribution()
+        dist_lib, dist_obj = self._get_distribution()
         if dist_obj is not None and torch.distributed.is_initialized():
             aggregation_to_op = {
                 "sum": torch.distributed.ReduceOp.SUM,
@@ -253,6 +287,7 @@ class TorchTrainer(base_trainer.Trainer):
                     variable.assign(v)
 
     def make_train_function(self, force=False):
+        self._setup_ddp()
         if self.train_function is not None and not force:
             return self.train_function
 
@@ -261,8 +296,6 @@ class TorchTrainer(base_trainer.Trainer):
                 "`steps_per_execution` must be 1 with the PyTorch backend. "
                 f"Received: steps_per_execution={self.steps_per_execution}"
             )
-
-        self._setup_ddp()
 
         def one_step_on_data(data):
             """Runs a single training step on a batch of data."""
@@ -321,9 +354,7 @@ class TorchTrainer(base_trainer.Trainer):
             self.predict_function = one_step_on_data
 
     def _symbolic_build(self, data_batch=None, iterator=None):
-        from keras.src.distribution import distribution_lib as dist_lib
-
-        dist = dist_lib.distribution()
+        dist_lib, dist = self._get_distribution()
 
         if data_batch is None and iterator is not None:
             for _, _, data_or_iterator in iterator:
@@ -432,10 +463,7 @@ class TorchTrainer(base_trainer.Trainer):
             # Switch the torch Module to training mode. Inform torch layers to
             # do training behavior in case the user did not use `self.training`
             # when implementing a custom layer with torch layers.
-            if self._in_ddp_context:
-                self._ddp_model.train()
-            else:
-                self.train()
+            self._set_train_mode(True)
 
             logs = {}
             for begin_step, end_step, data in epoch_iterator:
@@ -454,10 +482,7 @@ class TorchTrainer(base_trainer.Trainer):
             epoch_logs = dict(self._get_metrics_result_or_logs(logs))
 
             # Switch the torch Module back to testing mode.
-            if self._in_ddp_context:
-                self._ddp_model.eval()
-            else:
-                self.eval()
+            self._set_train_mode(False)
 
             # Run validation.
             if validation_data is not None and self._should_eval(
@@ -553,10 +578,7 @@ class TorchTrainer(base_trainer.Trainer):
             )
 
         # Switch the torch Module back to testing mode.
-        if self._in_ddp_context:
-            self._ddp_model.eval()
-        else:
-            self.eval()
+        self._set_train_mode(False)
 
         self.make_test_function()
         self.stop_evaluating = False
@@ -617,10 +639,7 @@ class TorchTrainer(base_trainer.Trainer):
             return outputs
 
         # Switch the torch Module back to testing mode.
-        if self._in_ddp_context:
-            self._ddp_model.eval()
-        else:
-            self.eval()
+        self._set_train_mode(False)
 
         self.make_predict_function()
         self.stop_predicting = False
@@ -665,10 +684,7 @@ class TorchTrainer(base_trainer.Trainer):
         self.make_train_function()
         self.reset_metrics()
 
-        if self._in_ddp_context:
-            self._ddp_model.train()
-        else:
-            self.train()
+        self._set_train_mode(True)
 
         logs = self.train_function([data])
         logs = pythonify_logs(logs)
@@ -692,10 +708,7 @@ class TorchTrainer(base_trainer.Trainer):
         self.make_test_function()
         self.reset_metrics()
 
-        if self._in_ddp_context:
-            self._ddp_model.eval()
-        else:
-            self.eval()
+        self._set_train_mode(False)
 
         logs = self.test_function([data])
         logs = pythonify_logs(logs)
@@ -706,10 +719,7 @@ class TorchTrainer(base_trainer.Trainer):
     def predict_on_batch(self, x):
         self.make_predict_function()
 
-        if self._in_ddp_context:
-            self._ddp_model.eval()
-        else:
-            self.eval()
+        self._set_train_mode(False)
 
         batch_outputs = self.predict_function([(x,)])
         batch_outputs = tree.map_structure(

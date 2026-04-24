@@ -313,11 +313,14 @@ def convert_to_tensor(x, dtype=None, sparse=None, ragged=None):
     dist = global_state.get_global_attribute("distribution")
     if dist is None:
         return x
-
-    if not (is_tensor(x) and not isinstance(x, DTensor)):
+    if not isinstance(dist, dist_lib.ModelParallel):
+        return x
+    if isinstance(x, DTensor):
         return x
 
-    if not isinstance(dist, dist_lib.ModelParallel):
+    is_parameter = isinstance(x, torch.nn.Parameter)
+    is_leaf_tensor = is_tensor(x) and getattr(x, "is_leaf", False)
+    if not (is_parameter or is_leaf_tensor):
         return x
 
     layout = TensorLayout([None] * x.ndim, dist.device_mesh)

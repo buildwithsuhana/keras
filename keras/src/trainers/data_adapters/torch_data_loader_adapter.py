@@ -22,7 +22,7 @@ class TorchDataLoaderAdapter(DataAdapter):
             )
 
         dist = dist_lib.distribution()
-        if dist is not None and dist.auto_shard_dataset:
+        if dist is not None and getattr(dist, "auto_shard_dataset", False):
             num_replicas = None
             rank = None
             if isinstance(dist, dist_lib.DataParallel):

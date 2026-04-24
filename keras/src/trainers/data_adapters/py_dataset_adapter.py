@@ -220,7 +220,7 @@ class PyDatasetAdapter(DataAdapter):
         dist = distribution or distribution_lib.distribution()
         self._num_processes = 1
         self._process_id = 0
-        if dist is not None and getattr(dist, "auto_shard_dataset", True):
+        if dist is not None and getattr(dist, "auto_shard_dataset", False):
             self._num_processes = backend_distribution_lib.num_processes()
             self._process_id = backend_distribution_lib.process_id()
 
@@ -266,21 +266,23 @@ class PyDatasetAdapter(DataAdapter):
         return batch
 
     def _infinite_generator(self):
-        for i in itertools.count(
-            start=self._process_id, step=self._num_processes
-        ):
+        for i in itertools.count():
             yield self._standardize_batch(self.py_dataset[i])
 
     def _finite_generator(self):
-        indices = range(self.py_dataset.num_batches)
+        num_batches = self.py_dataset.num_batches
+        indices = list(range(num_batches))
         if self.shuffle:
-            indices = list(indices)
             random.shuffle(indices)
 
-        indices = indices[self._process_id :: self._num_processes]
-
-        for i in indices:
-            yield self._standardize_batch(self.py_dataset[i])
+        num_batches_per_rank = (
+            num_batches + self._num_processes - 1
+        ) // self._num_processes
+        for i in range(num_batches_per_rank):
+            idx = i * self._num_processes + self._process_id
+            if idx >= num_batches:
+                idx = num_batches - 1
+            yield self._standardize_batch(self.py_dataset[indices[idx]])
 
     def _infinite_enqueuer_generator(self):
         self.enqueuer.start()
@@ -289,7 +291,9 @@ class PyDatasetAdapter(DataAdapter):
 
     def _finite_enqueuer_generator(self):
         self.enqueuer.start()
-        num_batches = self.py_dataset.num_batches
+        num_batches = (
+            self.py_dataset.num_batches + self._num_processes - 1
+        ) // self._num_processes
         for i, batch in enumerate(self.enqueuer.get()):
             yield self._standardize_batch(batch)
             if i >= num_batches - 1:
@@ -652,11 +656,17 @@ class OrderedEnqueuer(PyDatasetEnqueuer):
                     random.shuffle(indices)
 
                 if self._num_processes > 1:
-                    indices = [
-                        i
-                        for i in indices
-                        if i % self._num_processes == self._process_id
-                    ]
+                    num_batches = len(indices)
+                    num_batches_per_rank = (
+                        num_batches + self._num_processes - 1
+                    ) // self._num_processes
+                    sharded_indices = []
+                    for i in range(num_batches_per_rank):
+                        idx = i * self._num_processes + self._process_id
+                        if idx >= num_batches:
+                            idx = num_batches - 1
+                        sharded_indices.append(indices[idx])
+                    indices = sharded_indices
                 self.indices = iter(indices)
             self._send_py_dataset()  # Share the initial py_dataset
 

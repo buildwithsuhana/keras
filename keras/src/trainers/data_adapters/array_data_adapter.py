@@ -262,8 +262,9 @@ class ArrayDataAdapter(DataAdapter):
         from keras.src.distribution import distribution_lib as dist_lib
 
         class ArrayDataset(torch.utils.data.Dataset):
-            def __init__(self, array):
+            def __init__(self, array, num_samples):
                 self.array = array
+                self.num_samples = num_samples
 
             def __getitems__(self, indices):
                 def slice_and_convert(sliceable):
@@ -277,7 +278,7 @@ class ArrayDataAdapter(DataAdapter):
                 )
 
             def __len__(self):
-                return len(tree.flatten(self.array)[0].array)
+                return self.num_samples
 
         class RandomBatchSampler(torch.utils.data.Sampler):
             def __init__(self, sampler):
@@ -361,7 +362,7 @@ class ArrayDataAdapter(DataAdapter):
         inputs = array_slicing.convert_to_sliceable(
             self._inputs, target_backend="torch"
         )
-        dataset = ArrayDataset(inputs)
+        dataset = ArrayDataset(inputs, self._num_samples)
         return torch.utils.data.DataLoader(
             dataset, batch_sampler=batch_sampler, collate_fn=no_op_collate
         )
