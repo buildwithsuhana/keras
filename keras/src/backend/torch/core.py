@@ -314,10 +314,22 @@ def convert_to_tensor(x, dtype=None, sparse=None, ragged=None):
     if dist is None:
         return x
 
-    if not (is_tensor(x) and not isinstance(x, DTensor)):
+    # Only distribute when using ModelParallel and when `x` is a leaf
+    # tensor or an explicit parameter. Wrapping *all* intermediate
+    # activations as DTensors causes excessive replication and breaks
+    # the intended DTensor dispatch semantics (sharding should be
+    # declared on leaf/weight tensors only).
+    if not isinstance(dist, dist_lib.ModelParallel):
         return x
 
-    if not isinstance(dist, dist_lib.ModelParallel):
+    # If already a DTensor, nothing to do.
+    if isinstance(x, DTensor):
+        return x
+
+    # Only distribute explicit parameters or leaf tensors (weights).
+    is_parameter = isinstance(x, torch.nn.Parameter)
+    is_leaf_tensor = is_tensor(x) and getattr(x, "is_leaf", False)
+    if not (is_parameter or is_leaf_tensor):
         return x
 
     layout = TensorLayout([None] * x.ndim, dist.device_mesh)
