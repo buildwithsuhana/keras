@@ -24,6 +24,7 @@ class TorchDistributionLibTest(testing.TestCase):
             torch.distributed.init_process_group(
                 "gloo", rank=0, world_size=1, init_method="tcp://127.0.0.1:0"
             )
+        backend_dlib.initialize()
 
     def test_utils_and_init(self):
         with mock.patch("torch.distributed.is_initialized", return_value=False):
@@ -46,6 +47,9 @@ class TorchDistributionLibTest(testing.TestCase):
             mock.patch("torch.cuda.is_available", return_value=True),
             mock.patch("torch.cuda.set_device") as mset,
             mock.patch("torch.distributed.init_process_group") as minit,
+            mock.patch(
+                "torch.distributed.is_initialized", return_value=False
+            ),
         ):
             backend_dlib.initialize()
             mset.assert_called()
@@ -95,10 +99,11 @@ class TorchDistributionLibTest(testing.TestCase):
             layout_map=dist_lib.LayoutMap(mesh)
         ).scope():
             dt = backend_dlib.distribute_tensor(
-                torch.randn(4, 2), dist_lib.TensorLayout([None, None], mesh)
+                torch.randn(4, 2), dist_lib.TensorLayout(["data", None], mesh)
             )
             for st in torch.unbind(dt, 0):
-                self.assertIsInstance(st.placements[0], Replicate)
+                self.assertIsInstance(st, torch.Tensor)
+                self.assertNotIsInstance(st, DTensor)
 
     def test_e2e_building(self):
         mesh = dist_lib.DeviceMesh((1,), ["data"], ["cpu:0"])

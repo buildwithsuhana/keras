@@ -7,6 +7,51 @@ from torch.distributed.tensor import Replicate
 from torch.distributed.tensor import Shard
 
 
+# Monkeypatch DTensor to handle iteration and unbinding on shape objects
+# This fixes "Operator aten.unbind.int does not have a sharding strategy registered"
+_original_dtensor_iter = None
+_original_dtensor_unbind = None
+_original_torch_unbind = None
+
+
+def _patched_dtensor_iter(self):
+    """Allow iteration over DTensor by converting to local first."""
+    local_tensor = self.to_local()
+    return iter(local_tensor)
+
+
+def _patched_dtensor_unbind(self, dim=0):
+    """Allow unbind on DTensor by converting to local first."""
+    local_tensor = self.to_local()
+    return local_tensor.unbind(dim)
+
+
+def _patched_torch_unbind(input, dim=0):
+    """Allow unbind on DTensor by converting to local first."""
+    if isinstance(input, DTensor):
+        return input.unbind(dim)
+    return _original_torch_unbind(input, dim)
+
+
+def _apply_dtensor_patches():
+    """Apply monkeypatches for DTensor iteration and unbinding."""
+    global _original_dtensor_iter, _original_dtensor_unbind, _original_torch_unbind
+    if not hasattr(DTensor, "_keras_patched"):
+        # Patch __iter__ to allow iteration without sharding propagation
+        _original_dtensor_iter = DTensor.__iter__
+        DTensor.__iter__ = _patched_dtensor_iter
+
+        # Patch unbind to convert to local first
+        _original_dtensor_unbind = DTensor.unbind
+        DTensor.unbind = _patched_dtensor_unbind
+
+        # Patch torch.unbind to handle DTensors
+        _original_torch_unbind = torch.unbind
+        torch.unbind = _patched_torch_unbind
+
+        DTensor._keras_patched = True
+
+
 def get_device_count(device_type=None):
     """Returns total device count across all hosts."""
     if torch.distributed.is_initialized():
@@ -25,11 +70,15 @@ def list_devices(device_type=None):
 
 def initialize(job_addresses=None, num_processes=None, process_id=None):
     """Initialize the current process for distributed training."""
-    local_rank = int(os.environ.get("LOCAL_RANK", 0))
-    if torch.cuda.is_available():
-        torch.cuda.set_device(local_rank)
-    backend = "nccl" if torch.cuda.is_available() else "gloo"
-    torch.distributed.init_process_group(backend=backend)
+    if not torch.distributed.is_initialized():
+        local_rank = int(os.environ.get("LOCAL_RANK", 0))
+        if torch.cuda.is_available():
+            torch.cuda.set_device(local_rank)
+        backend = "nccl" if torch.cuda.is_available() else "gloo"
+        torch.distributed.init_process_group(backend=backend)
+
+    # Apply DTensor patches for unbinding/iteration support
+    _apply_dtensor_patches()
 
 
 def num_processes():
