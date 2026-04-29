@@ -198,6 +198,7 @@ _STRATEGIES_REGISTERED = False
 
 
 def _unbind_op_strategy(op_schema):
+    print("DEBUG: Executing _unbind_op_strategy")
     from torch.distributed.tensor import Replicate
     from torch.distributed.tensor import Shard
     from torch.distributed.tensor._dtensor_spec import DTensorSpec
@@ -246,6 +247,7 @@ def _unbind_op_strategy(op_schema):
 
 
 def _bernoulli_op_strategy(op_schema):
+    print("DEBUG: Executing _bernoulli_op_strategy")
     from torch.distributed.tensor import Partial
     from torch.distributed.tensor import Replicate
     from torch.distributed.tensor._dtensor_spec import DTensorSpec
@@ -276,6 +278,7 @@ def _bernoulli_op_strategy(op_schema):
 
 
 def _native_dropout_op_strategy(op_schema):
+    print("DEBUG: Executing _native_dropout_op_strategy")
     from torch.distributed.tensor import Partial
     from torch.distributed.tensor import Replicate
     from torch.distributed.tensor._dtensor_spec import DTensorSpec
@@ -318,25 +321,30 @@ def _register_distributed_strategies():
     global _STRATEGIES_REGISTERED
     if _STRATEGIES_REGISTERED:
         return
+    print("DEBUG: Registering distributed strategies")
     from torch.distributed.tensor._op_schema import RuntimeSchemaInfo
     from torch.distributed.tensor._ops import register_op_strategy
 
+    print("DEBUG: Registering unbind.int strategy")
     register_op_strategy(
         torch.ops.aten.unbind.int, schema_info=RuntimeSchemaInfo(1)
     )(_unbind_op_strategy)
 
     # dropout (bernoulli)
     if hasattr(torch.ops.aten.bernoulli_, "float"):
+        print("DEBUG: Registering bernoulli_.float strategy")
         register_op_strategy(
             torch.ops.aten.bernoulli_.float, schema_info=RuntimeSchemaInfo(1)
         )(_bernoulli_op_strategy)
     if hasattr(torch.ops.aten.bernoulli, "p"):
+        print("DEBUG: Registering bernoulli.p strategy")
         register_op_strategy(
             torch.ops.aten.bernoulli.p, schema_info=RuntimeSchemaInfo(1)
         )(_bernoulli_op_strategy)
 
     # native_dropout
     if hasattr(torch.ops.aten.native_dropout, "default"):
+        print("DEBUG: Registering native_dropout.default strategy")
         register_op_strategy(
             torch.ops.aten.native_dropout.default,
             schema_info=RuntimeSchemaInfo(1),
