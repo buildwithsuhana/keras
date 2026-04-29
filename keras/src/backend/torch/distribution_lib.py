@@ -198,7 +198,6 @@ _STRATEGIES_REGISTERED = False
 
 
 def _unbind_op_strategy(op_schema):
-    print("DEBUG: Executing _unbind_op_strategy")
     from torch.distributed.tensor import Replicate
     from torch.distributed.tensor import Shard
     from torch.distributed.tensor._dtensor_spec import DTensorSpec
