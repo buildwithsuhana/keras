@@ -247,38 +247,21 @@ def _unbind_op_strategy(op_schema):
 
 
 def _bernoulli_op_strategy(op_schema):
-    print("DEBUG: Executing _bernoulli_op_strategy")
-    from torch.distributed.tensor import Partial
-    from torch.distributed.tensor import Replicate
-    from torch.distributed.tensor._dtensor_spec import DTensorSpec
     from torch.distributed.tensor._op_schema import OpSpec
     from torch.distributed.tensor._op_schema import OpStrategy
 
     input_strategy = op_schema.args_schema[0]
-    mesh = input_strategy.mesh
     new_strategy = OpStrategy([])
 
     for arg_strategy in input_strategy.strategies:
         arg_spec = arg_strategy.output_spec
-        if any(isinstance(p, Partial) for p in arg_spec.placements):
-            rep_placements = tuple(Replicate() for _ in arg_spec.placements)
-            rep_spec = DTensorSpec(
-                mesh=mesh,
-                placements=rep_placements,
-                tensor_meta=arg_spec.tensor_meta,
-            )
-            new_strategy.strategies.append(
-                OpSpec(output_specs=rep_spec, input_specs=(rep_spec,))
-            )
-        else:
-            new_strategy.strategies.append(
-                OpSpec(output_specs=arg_spec, input_specs=(arg_spec,))
-            )
+        new_strategy.strategies.append(
+            OpSpec(output_specs=arg_spec, input_specs=(arg_spec,))
+        )
     return new_strategy
 
 
 def _native_dropout_op_strategy(op_schema):
-    print("DEBUG: Executing _native_dropout_op_strategy")
     from torch.distributed.tensor import Partial
     from torch.distributed.tensor import Replicate
     from torch.distributed.tensor._dtensor_spec import DTensorSpec
@@ -296,12 +279,11 @@ def _native_dropout_op_strategy(op_schema):
             rep_spec = DTensorSpec(
                 mesh=mesh,
                 placements=rep_placements,
-                tensor_meta=arg_spec.tensor_meta,
+                tensor_meta=None,
             )
-            # native_dropout returns (output, mask)
             new_strategy.strategies.append(
                 OpSpec(
-                    output_specs=(rep_spec, rep_spec), input_specs=(rep_spec,)
+                    output_specs=(arg_spec, rep_spec), input_specs=(arg_spec,)
                 )
             )
         else:
