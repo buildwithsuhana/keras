@@ -20,8 +20,6 @@ from keras.src.backend.common.stateless_scope import in_stateless_scope
 from keras.src.backend.common.symbolic_scope import SymbolicScope
 from keras.src.backend.config import floatx
 from keras.src.backend.torch import distribution_lib as torch_dist_lib
-from keras.src.distribution import TensorLayout
-from keras.src.distribution import distribution_lib as dist_lib
 
 
 def _get_dtensor():
@@ -120,6 +118,8 @@ class Variable(KerasVariable):
         distribution = global_state.get_global_attribute("distribution")
         if self._layout is None and distribution is not None:
             tensor_layout = distribution.get_variable_layout(self)
+
+            from keras.src.distribution import TensorLayout
 
             if isinstance(tensor_layout, TensorLayout):
                 self._layout = tensor_layout.backend_layout
@@ -318,6 +318,9 @@ def convert_to_tensor(x, dtype=None, sparse=None, ragged=None):
 
     dist = global_state.get_global_attribute("distribution")
     if dist is not None:
+        from keras.src.distribution import TensorLayout
+        from keras.src.distribution import distribution_lib as dist_lib
+
         if not isinstance(dist, dist_lib.ModelParallel):
             return x
 
@@ -409,6 +412,9 @@ def compute_output_spec(fn, *args, **kwargs):
                 dtype=TORCH_DTYPES[x.dtype],
                 device=get_device(),
             )
+
+            from keras.src.distribution import TensorLayout
+            from keras.src.distribution import distribution_lib as dist_lib
 
             dist = dist_lib.distribution()
             if dist is not None and isinstance(dist, dist_lib.ModelParallel):

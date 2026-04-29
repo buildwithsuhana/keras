@@ -102,6 +102,30 @@ class TorchDistributionLibTest(testing.TestCase):
                 self.assertIsInstance(st, torch.Tensor)
                 self.assertIsInstance(st, DTensor)
 
+    def test_dropout_strategy(self):
+        from torch.distributed.tensor import Partial
+        from torch.distributed.tensor import Replicate
+
+        mesh = dist_lib.DeviceMesh((1,), ["data"], ["cpu:0"])
+        with dist_lib.ModelParallel(
+            layout_map=dist_lib.LayoutMap(mesh)
+        ).scope():
+            backend_dlib._register_distributed_strategies()
+            # Create a DTensor with Partial placement
+            torch_mesh = backend_dlib._to_backend_mesh(mesh)
+            dt = DTensor.from_local(torch.randn(4, 2), torch_mesh, [Partial()])
+            self.assertIsInstance(dt.placements[0], Partial)
+
+            # dropout should redistribute to Replicate
+            # native_dropout returns (output, mask)
+            out, mask = torch.ops.aten.native_dropout.default(
+                dt, p=0.5, train=True
+            )
+            self.assertIsInstance(out, DTensor)
+            self.assertIsInstance(out.placements[0], Replicate)
+            self.assertIsInstance(mask, DTensor)
+            self.assertIsInstance(mask.placements[0], Replicate)
+
     def test_e2e_building(self):
         mesh = dist_lib.DeviceMesh((1,), ["data"], ["cpu:0"])
         layout_map = dist_lib.LayoutMap(mesh)
