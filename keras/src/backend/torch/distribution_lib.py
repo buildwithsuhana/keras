@@ -275,20 +275,18 @@ def _native_dropout_op_strategy(op_schema):
         arg_spec = arg_strategy.output_spec
         if any(isinstance(p, Partial) for p in arg_spec.placements):
             rep_placements = tuple(Replicate() for _ in arg_spec.placements)
-            rep_spec = DTensorSpec(
-                mesh=mesh,
-                placements=rep_placements,
-                tensor_meta=None,
-            )
+            out_spec = DTensorSpec(mesh=mesh, placements=arg_spec.placements)
+            rep_spec = DTensorSpec(mesh=mesh, placements=rep_placements)
             new_strategy.strategies.append(
                 OpSpec(
-                    output_specs=(arg_spec, rep_spec), input_specs=(arg_spec,)
+                    output_specs=(out_spec, rep_spec), input_specs=(arg_spec,)
                 )
             )
         else:
+            out_spec = DTensorSpec(mesh=mesh, placements=arg_spec.placements)
             new_strategy.strategies.append(
                 OpSpec(
-                    output_specs=(arg_spec, arg_spec), input_specs=(arg_spec,)
+                    output_specs=(out_spec, out_spec), input_specs=(arg_spec,)
                 )
             )
     return new_strategy
