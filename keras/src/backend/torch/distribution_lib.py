@@ -245,71 +245,6 @@ def _unbind_op_strategy(op_schema):
     return new_strategy
 
 
-def _bernoulli_op_strategy(op_schema):
-    from torch.distributed.tensor import Partial
-    from torch.distributed.tensor import Replicate
-    from torch.distributed.tensor._dtensor_spec import DTensorSpec
-    from torch.distributed.tensor._op_schema import OpSpec
-    from torch.distributed.tensor._op_schema import OpStrategy
-
-    input_strategy = op_schema.args_schema[0]
-    mesh = input_strategy.mesh
-    new_strategy = OpStrategy([])
-
-    for arg_strategy in input_strategy.strategies:
-        arg_spec = arg_strategy.output_spec
-        if any(isinstance(p, Partial) for p in arg_spec.placements):
-            rep_placements = tuple(Replicate() for _ in arg_spec.placements)
-            rep_spec = DTensorSpec(
-                mesh=mesh,
-                placements=rep_placements,
-                tensor_meta=arg_spec.tensor_meta,
-            )
-            new_strategy.strategies.append(
-                OpSpec(output_specs=rep_spec, input_specs=(rep_spec,))
-            )
-        else:
-            new_strategy.strategies.append(
-                OpSpec(output_specs=arg_spec, input_specs=(arg_spec,))
-            )
-    return new_strategy
-
-
-def _native_dropout_op_strategy(op_schema):
-    from torch.distributed.tensor import Partial
-    from torch.distributed.tensor import Replicate
-    from torch.distributed.tensor._dtensor_spec import DTensorSpec
-    from torch.distributed.tensor._op_schema import OpSpec
-    from torch.distributed.tensor._op_schema import OpStrategy
-
-    input_strategy = op_schema.args_schema[0]
-    mesh = input_strategy.mesh
-    new_strategy = OpStrategy([])
-
-    for arg_strategy in input_strategy.strategies:
-        arg_spec = arg_strategy.output_spec
-        if any(isinstance(p, Partial) for p in arg_spec.placements):
-            rep_placements = tuple(Replicate() for _ in arg_spec.placements)
-            rep_spec = DTensorSpec(
-                mesh=mesh,
-                placements=rep_placements,
-                tensor_meta=arg_spec.tensor_meta,
-            )
-            # native_dropout returns (output, mask)
-            new_strategy.strategies.append(
-                OpSpec(
-                    output_specs=(rep_spec, rep_spec), input_specs=(rep_spec,)
-                )
-            )
-        else:
-            new_strategy.strategies.append(
-                OpSpec(
-                    output_specs=(arg_spec, arg_spec), input_specs=(arg_spec,)
-                )
-            )
-    return new_strategy
-
-
 def _register_distributed_strategies():
     """Register sharding propagation for ops.
 
@@ -318,28 +253,16 @@ def _register_distributed_strategies():
     global _STRATEGIES_REGISTERED
     if _STRATEGIES_REGISTERED:
         return
-    from torch.distributed.tensor._op_schema import RuntimeSchemaInfo
-    from torch.distributed.tensor._ops import register_op_strategy
 
-    register_op_strategy(
-        torch.ops.aten.unbind.int, schema_info=RuntimeSchemaInfo(1)
-    )(_unbind_op_strategy)
+    try:
+        from torch.distributed.tensor._op_schema import RuntimeSchemaInfo
+        from torch.distributed.tensor._ops import register_op_strategy
 
-    # dropout (bernoulli)
-    if hasattr(torch.ops.aten.bernoulli_, "float"):
         register_op_strategy(
-            torch.ops.aten.bernoulli_.float, schema_info=RuntimeSchemaInfo(1)
-        )(_bernoulli_op_strategy)
-    if hasattr(torch.ops.aten.bernoulli, "p"):
-        register_op_strategy(
-            torch.ops.aten.bernoulli.p, schema_info=RuntimeSchemaInfo(1)
-        )(_bernoulli_op_strategy)
-
-    # native_dropout
-    if hasattr(torch.ops.aten.native_dropout, "default"):
-        register_op_strategy(
-            torch.ops.aten.native_dropout.default,
-            schema_info=RuntimeSchemaInfo(1),
-        )(_native_dropout_op_strategy)
-
-    _STRATEGIES_REGISTERED = True
+            torch.ops.aten.unbind.int, schema_info=RuntimeSchemaInfo(1)
+        )(_unbind_op_strategy)
+        _STRATEGIES_REGISTERED = True
+    except (ImportError, AttributeError):
+        # PyTorch version does not expose these internal APIs yet;
+        # unbind on sharded DTensors will fall back to PyTorch's default.
+        pass
