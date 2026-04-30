@@ -407,13 +407,14 @@ def compute_output_spec(fn, *args, **kwargs):
                 device=get_device(),
             )
 
-            from keras.src.distribution import TensorLayout
-            from keras.src.distribution import distribution_lib as dist_lib
+            dist = global_state.get_global_attribute("distribution")
+            if dist is not None:
+                from keras.src.distribution import TensorLayout
+                from keras.src.distribution import distribution_lib as dist_lib
 
-            dist = dist_lib.distribution()
-            if dist is not None and isinstance(dist, dist_lib.ModelParallel):
-                layout = TensorLayout([None] * len(shape), dist.device_mesh)
-                t = torch_dist_lib.distribute_tensor(t, layout)
+                if isinstance(dist, dist_lib.ModelParallel):
+                    layout = TensorLayout([None] * len(shape), dist.device_mesh)
+                    t = torch_dist_lib.distribute_tensor(t, layout)
             return t
         return x
 
