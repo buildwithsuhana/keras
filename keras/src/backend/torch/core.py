@@ -21,13 +21,6 @@ from keras.src.backend.common.symbolic_scope import SymbolicScope
 from keras.src.backend.config import floatx
 from keras.src.backend.torch import distribution_lib as torch_dist_lib
 
-
-def _get_dtensor():
-    from torch.distributed.tensor import DTensor
-
-    return DTensor
-
-
 SUPPORTS_SPARSE_TENSORS = False
 SUPPORTS_RAGGED_TENSORS = False
 SUPPORTS_COMPLEX_DTYPES = True
@@ -155,7 +148,7 @@ class Variable(KerasVariable):
                     )
             else:
                 param_value = convert_to_tensor(value, dtype=self._dtype)
-                DTensor = _get_dtensor()
+                DTensor = torch_dist_lib._get_dtensor()
                 if DTensor is not None and isinstance(param_value, DTensor):
                     param_value = param_value.to_local()
                 device = (
@@ -181,7 +174,7 @@ class Variable(KerasVariable):
                 value, requires_grad=self.trainable
             )
         else:
-            DTensor = _get_dtensor()
+            DTensor = torch_dist_lib._get_dtensor()
             if DTensor is not None and isinstance(value, DTensor):
                 value = value.to_local()
             with torch.no_grad():
@@ -325,7 +318,7 @@ def convert_to_tensor(x, dtype=None, sparse=None, ragged=None):
         if not isinstance(dist, dist_lib.ModelParallel):
             return x
 
-        DTensor = _get_dtensor()
+        DTensor = torch_dist_lib._get_dtensor()
         if DTensor is not None and isinstance(x, DTensor):
             return x
 
@@ -342,7 +335,7 @@ def convert_to_tensor(x, dtype=None, sparse=None, ragged=None):
 def convert_to_numpy(x):
     def transform(x):
         if is_tensor(x):
-            DTensor = _get_dtensor()
+            DTensor = torch_dist_lib._get_dtensor()
             if DTensor is not None and isinstance(x, DTensor):
                 x = x.full_tensor()
             if x.requires_grad:

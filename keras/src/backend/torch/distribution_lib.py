@@ -1,7 +1,6 @@
 import os
 
 import torch
-from torch.distributed.device_mesh import init_device_mesh
 
 
 def _get_dtensor():
@@ -72,6 +71,7 @@ def _to_backend_device(device_name):
 def _to_backend_mesh(keras_mesh):
     """Maps a Keras DeviceMesh to a Torch DeviceMesh."""
     from torch.distributed.device_mesh import DeviceMesh as TorchDeviceMesh
+    from torch.distributed.device_mesh import init_device_mesh
 
     if isinstance(keras_mesh, TorchDeviceMesh):
         return keras_mesh

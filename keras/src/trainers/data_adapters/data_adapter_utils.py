@@ -358,6 +358,9 @@ def is_torch_tensor(value):
 def _add_distributed_sampler(dataloader, num_replicas, rank):
     import torch
 
+    if isinstance(dataloader.dataset, torch.utils.data.IterableDataset):
+        return dataloader
+
     sampler = torch.utils.data.distributed.DistributedSampler(
         dataloader.dataset,
         num_replicas=num_replicas,

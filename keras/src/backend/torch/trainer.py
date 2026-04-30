@@ -10,7 +10,6 @@ from keras.src import callbacks as callbacks_module
 from keras.src import optimizers as optimizers_module
 from keras.src import tree
 from keras.src.backend import config
-from keras.src.backend.torch import core as torch_core
 from keras.src.backend.torch import distribution_lib as torch_dist_lib
 from keras.src.trainers import trainer as base_trainer
 from keras.src.trainers.data_adapters import array_slicing
@@ -280,7 +279,7 @@ class TorchTrainer(base_trainer.Trainer):
                 "max": torch.distributed.ReduceOp.MAX,
                 "min": torch.distributed.ReduceOp.MIN,
             }
-            DTensor = torch_core._get_dtensor()
+            DTensor = torch_dist_lib._get_dtensor()
             for metric in self.metrics:
                 for variable in metric.variables:
                     if variable.aggregation in (None, "none"):

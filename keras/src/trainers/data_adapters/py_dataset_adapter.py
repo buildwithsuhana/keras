@@ -266,7 +266,9 @@ class PyDatasetAdapter(DataAdapter):
         return batch
 
     def _infinite_generator(self):
-        for i in itertools.count():
+        for i in itertools.count(
+            start=self._process_id, step=self._num_processes
+        ):
             yield self._standardize_batch(self.py_dataset[i])
 
     def _finite_generator(self):

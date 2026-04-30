@@ -798,7 +798,7 @@ def get_num_replicas_and_rank(dist):
             dist.batch_dim_name
         )
         num_model_replicas = dist.device_mesh.shape[mesh_batch_dim_index]
-        if num_model_replicas > 0:
+        if num_model_replicas > 1:
             num_process = distribution_lib.num_processes()
             process_id = distribution_lib.process_id()
             if num_model_replicas >= num_process:

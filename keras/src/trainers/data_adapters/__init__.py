@@ -81,7 +81,6 @@ def get_data_adapter(
         return TFDatasetAdapter(
             x, class_weight=class_weight, distribution=distribution
         )
-
     elif isinstance(x, py_dataset_adapter.PyDataset):
         if y is not None:
             raise_unsupported_arg("y", "the targets", "PyDataset")
@@ -95,13 +94,6 @@ def get_data_adapter(
             shuffle=shuffle,
             distribution=distribution,
         )
-        # TODO: should we warn or not?
-        # if x.num_batches is None and shuffle:
-        #     warnings.warn(
-        #         "`shuffle=True` was passed, but will be ignored since the "
-        #         "data `x` was provided as a infinite PyDataset. The "
-        #         "PyDataset is expected to already be shuffled."
-        # )
     elif is_torch_dataloader(x):
         if y is not None:
             raise_unsupported_arg("y", "the targets", "torch DataLoader")
@@ -127,7 +119,6 @@ def get_data_adapter(
                 stacklevel=2,
             )
         return TorchDataLoaderAdapter(x)
-
     elif is_grain_dataset(x):
         if y is not None:
             raise_unsupported_arg(
@@ -155,7 +146,6 @@ def get_data_adapter(
                 stacklevel=2,
             )
         return GrainDatasetAdapter(x)
-
     elif isinstance(x, types.GeneratorType):
         if y is not None:
             raise_unsupported_arg("y", "the targets", "PyDataset")
