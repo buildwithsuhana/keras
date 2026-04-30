@@ -197,55 +197,6 @@ def distribute_data_input(tensor, layout, batch_dim_name):
 _STRATEGIES_REGISTERED = False
 
 
-def _unbind_op_strategy(op_schema):
-    print("DEBUG: Using unbind.int strategy")
-    from torch.distributed.tensor import Replicate
-    from torch.distributed.tensor import Shard
-    from torch.distributed.tensor._dtensor_spec import DTensorSpec
-    from torch.distributed.tensor._op_schema import OpSpec
-    from torch.distributed.tensor._op_schema import OpStrategy
-
-    input_strategy = op_schema.args_schema[0]
-    mesh = input_strategy.mesh
-    new_strategy = OpStrategy([])
-
-    for arg_strategy in input_strategy.strategies:
-        arg_spec = arg_strategy.output_spec
-        dim = op_schema.args_schema[1] if len(op_schema.args_schema) > 1 else 0
-        dim = dim if dim >= 0 else dim + arg_spec.ndim
-
-        is_sharded_on_dim = any(
-            isinstance(p, Shard) and p.dim == dim for p in arg_spec.placements
-        )
-        if is_sharded_on_dim:
-            rep_placements = tuple(Replicate() for _ in arg_spec.placements)
-            rep_spec = DTensorSpec(
-                mesh=mesh,
-                placements=rep_placements,
-                tensor_meta=arg_spec.tensor_meta,
-            )
-            out_spec = DTensorSpec(mesh=mesh, placements=rep_placements)
-            new_strategy.strategies.append(
-                OpSpec(
-                    output_specs=(out_spec,) * arg_spec.shape[dim],
-                    input_specs=(rep_spec,),
-                )
-            )
-        else:
-            out_placements = [
-                Shard(p.dim - 1) if isinstance(p, Shard) and p.dim > dim else p
-                for p in arg_spec.placements
-            ]
-            out_spec = DTensorSpec(mesh=mesh, placements=tuple(out_placements))
-            new_strategy.strategies.append(
-                OpSpec(
-                    output_specs=(out_spec,) * arg_spec.shape[dim],
-                    input_specs=(arg_spec,),
-                )
-            )
-    return new_strategy
-
-
 def _bernoulli_op_strategy(op_schema):
     print("DEBUG: Using bernoulli strategy")
     from torch.distributed.tensor._op_schema import OpSpec
@@ -306,11 +257,6 @@ def _register_distributed_strategies():
     print("DEBUG: Registering distributed strategies")
     from torch.distributed.tensor._op_schema import RuntimeSchemaInfo
     from torch.distributed.tensor._ops import register_op_strategy
-
-    print("DEBUG: Registering unbind.int strategy")
-    register_op_strategy(
-        torch.ops.aten.unbind.int, schema_info=RuntimeSchemaInfo(1)
-    )(_unbind_op_strategy)
 
     # dropout (bernoulli)
     if hasattr(torch.ops.aten.bernoulli_, "float"):
