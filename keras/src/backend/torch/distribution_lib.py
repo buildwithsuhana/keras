@@ -198,7 +198,6 @@ _STRATEGIES_REGISTERED = False
 
 
 def _unbind_op_strategy(op_schema):
-    print("DEBUG: Using unbind.int strategy")
     from torch.distributed.tensor import Replicate
     from torch.distributed.tensor import Shard
     from torch.distributed.tensor._dtensor_spec import DTensorSpec
@@ -254,13 +253,16 @@ def _register_distributed_strategies():
     global _STRATEGIES_REGISTERED
     if _STRATEGIES_REGISTERED:
         return
-    print("DEBUG: Registering distributed strategies")
-    from torch.distributed.tensor._op_schema import RuntimeSchemaInfo
-    from torch.distributed.tensor._ops import register_op_strategy
 
-    print("DEBUG: Registering unbind.int strategy")
-    register_op_strategy(
-        torch.ops.aten.unbind.int, schema_info=RuntimeSchemaInfo(1)
-    )(_unbind_op_strategy)
+    try:
+        from torch.distributed.tensor._op_schema import RuntimeSchemaInfo
+        from torch.distributed.tensor._ops import register_op_strategy
 
-    _STRATEGIES_REGISTERED = True
+        register_op_strategy(
+            torch.ops.aten.unbind.int, schema_info=RuntimeSchemaInfo(1)
+        )(_unbind_op_strategy)
+        _STRATEGIES_REGISTERED = True
+    except (ImportError, AttributeError):
+        # PyTorch version does not expose these internal APIs yet;
+        # unbind on sharded DTensors will fall back to PyTorch's default.
+        pass
