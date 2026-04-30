@@ -198,6 +198,7 @@ _STRATEGIES_REGISTERED = False
 
 
 def _unbind_op_strategy(op_schema):
+    print("DEBUG: Using unbind.int strategy")
     from torch.distributed.tensor import Replicate
     from torch.distributed.tensor import Shard
     from torch.distributed.tensor._dtensor_spec import DTensorSpec
@@ -246,6 +247,7 @@ def _unbind_op_strategy(op_schema):
 
 
 def _bernoulli_op_strategy(op_schema):
+    print("DEBUG: Using bernoulli strategy")
     from torch.distributed.tensor._op_schema import OpSpec
     from torch.distributed.tensor._op_schema import OpStrategy
 
@@ -261,6 +263,7 @@ def _bernoulli_op_strategy(op_schema):
 
 
 def _native_dropout_op_strategy(op_schema):
+    print("DEBUG: Using native_dropout strategy")
     from torch.distributed.tensor import Partial
     from torch.distributed.tensor import Replicate
     from torch.distributed.tensor._dtensor_spec import DTensorSpec
