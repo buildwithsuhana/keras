@@ -126,8 +126,8 @@ def get_data_adapter(
                 "is expected to already be shuffled.",
                 stacklevel=2,
             )
-
         return TorchDataLoaderAdapter(x)
+
     elif is_grain_dataset(x):
         if y is not None:
             raise_unsupported_arg(
@@ -154,8 +154,8 @@ def get_data_adapter(
                 "is expected to already be shuffled.",
                 stacklevel=2,
             )
-
         return GrainDatasetAdapter(x)
+
     elif isinstance(x, types.GeneratorType):
         if y is not None:
             raise_unsupported_arg("y", "the targets", "PyDataset")
