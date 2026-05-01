@@ -88,6 +88,13 @@ def get_data_adapter(
             raise_unsupported_arg(
                 "sample_weights", "the sample weights", "PyDataset"
             )
+        if getattr(x, "num_batches", None) is None and shuffle:
+            warnings.warn(
+                "`shuffle=True` was passed, but will be ignored since the "
+                "data `x` was provided as an infinite PyDataset. The "
+                "PyDataset is expected to already be shuffled.",
+                stacklevel=2,
+            )
         return PyDatasetAdapter(
             x,
             class_weight=class_weight,
