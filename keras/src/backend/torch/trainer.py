@@ -152,7 +152,8 @@ class TorchTrainer(base_trainer.Trainer):
                         if torch.distributed.is_initialized():
                             aggregation = module._buffer_aggregations.get(name)
                             if aggregation in (None, "none"):
-                                # Unknown aggregation — broadcast from rank 0.
+                                # Unknown aggregation — broadcast from rank 0
+                                # (safe default).
                                 torch.distributed.broadcast(buf, src=0)
                                 continue
                             if aggregation not in aggregation_to_op:

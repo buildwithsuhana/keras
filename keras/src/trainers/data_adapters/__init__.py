@@ -91,8 +91,8 @@ def get_data_adapter(
             )
         if getattr(x, "num_batches", None) is None and shuffle:
             warnings.warn(
-                "`shuffle=True` was passed, but will be ignored since the "
-                "data `x` was provided as an infinite PyDataset. The "
+                "shuffle=True was passed, but will be ignored since the "
+                "data x was provided as an infinite PyDataset. The "
                 "PyDataset is expected to already be shuffled.",
                 stacklevel=2,
             )
@@ -158,10 +158,10 @@ def get_data_adapter(
 
     elif isinstance(x, types.GeneratorType):
         if y is not None:
-            raise_unsupported_arg("y", "the targets", "PyDataset")
+            raise_unsupported_arg("y", "the targets", "generator")
         if sample_weight is not None:
             raise_unsupported_arg(
-                "sample_weights", "the sample weights", "PyDataset"
+                "sample_weights", "the sample weights", "generator"
             )
         if class_weight is not None:
             raise ValueError(
