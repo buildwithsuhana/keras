@@ -1442,6 +1442,39 @@ def dot_product_attention(
         bias = convert_to_tensor(bias, dtype=compute_dtype)
         mask = bias  # Use `bias` as `mask` for scaled_dot_product_attention.
 
+    import os
+
+    if os.environ.get("KERAS_TORCH_SDPA") == "0":
+        # Manual implementation that supports sharding on CPU
+        if scale is None:
+            scale = 1.0 / (query.shape[-1] ** 0.5)
+
+        # (batch, heads, query_seq, d_key) x (batch, heads, d_key, key_seq)
+        # -> (batch, heads, query_seq, key_seq)
+        # We need to transpose query/key/value to (batch, heads, seq, dim)
+        # Keras Hub input is (batch, seq, heads, dim)
+        q = torch.transpose(query, 1, 2)
+        k = torch.transpose(key, 1, 2)
+        v = torch.transpose(value, 1, 2)
+
+        attn_logits = torch.matmul(q, k.transpose(-1, -2)) * scale
+        if mask is not None:
+            attn_logits += mask
+        if is_causal:
+            # Handle causal mask if needed
+            s_q = q.shape[2]
+            s_k = k.shape[2]
+            causal_mask = torch.ones(
+                (s_q, s_k), device=q.device, dtype=torch.bool
+            ).tril()
+            attn_logits = torch.where(
+                causal_mask, attn_logits, _get_large_negative(q.dtype)
+            )
+
+        attn_weights = torch.nn.functional.softmax(attn_logits, dim=-1)
+        attention_output = torch.matmul(attn_weights, v)
+        return torch.transpose(attention_output, 1, 2)
+
     axis0, axis1 = 1, 2
     query = torch.transpose(query, axis0, axis1)
     key = torch.transpose(key, axis0, axis1)

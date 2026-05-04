@@ -132,7 +132,7 @@ class Variable(KerasVariable):
             if isinstance(value, torch.nn.Parameter):
                 value = value.data
             value = convert_to_tensor(value, dtype=self._dtype)
-            value = distribute_tensor(value, self._layout)
+            value = distribute_tensor(value, self._layout, name=self.path)
             self._value = torch.nn.Parameter(
                 value,
                 requires_grad=self.trainable
@@ -169,7 +169,9 @@ class Variable(KerasVariable):
     def _direct_assign(self, value):
         value = convert_to_tensor(value, dtype=self._dtype).detach()
         if self._layout is not None:
-            value = torch_dist_lib.distribute_tensor(value, self._layout)
+            value = torch_dist_lib.distribute_tensor(
+                value, self._layout, name=self.path
+            )
             self._value = torch.nn.Parameter(
                 value, requires_grad=self.trainable
             )

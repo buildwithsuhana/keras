@@ -474,6 +474,9 @@ class TorchTrainer(base_trainer.Trainer):
         self.make_train_function()
         callbacks.on_train_begin()
         initial_epoch = self._initial_epoch or initial_epoch
+        import os
+
+        print(f"[Rank {os.environ.get('RANK', '0')}] Starting training...")
         for epoch in range(initial_epoch, epochs):
             self.reset_metrics()
             callbacks.on_epoch_begin(epoch)

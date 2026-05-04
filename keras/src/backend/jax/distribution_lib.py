@@ -40,7 +40,7 @@ def get_device_count(device_type=None):
     return jax.device_count(device_type)
 
 
-def distribute_tensor(tensor, layout):
+def distribute_tensor(tensor, layout, name=None):
     """Distribute the tensor based on the layout.
 
     Note that this function can be used both in eager context, or within a
@@ -50,6 +50,7 @@ def distribute_tensor(tensor, layout):
         tensor: `jax.Array` that need to be distributed.
         layout: `TensorLayout` for the created variable, or a
             JAX-supported layout instance (e.g. `jax.sharding.Sharding`).
+        name: Optional name for logging.
 
     Returns:
         Distributed value.

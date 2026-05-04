@@ -47,6 +47,12 @@ def process_id():
     return 0
 
 
+def get_sharding_counts():
+    global _SHARDED_TENSOR_COUNT
+    global _REPLICATED_TENSOR_COUNT
+    return _SHARDED_TENSOR_COUNT, _REPLICATED_TENSOR_COUNT
+
+
 def _to_backend_device(device_name):
     """Returns the local device for the current process."""
     if device_name is not None:
@@ -118,7 +124,11 @@ def _to_backend_layout(tensor_layout):
     return DTensorLayout(torch_mesh, tuple(placements))
 
 
-def distribute_tensor(tensor, layout):
+_SHARDED_TENSOR_COUNT = 0
+_REPLICATED_TENSOR_COUNT = 0
+
+
+def distribute_tensor(tensor, layout, name=None):
     """Scatters or replicates a tensor according to the layout."""
     if layout is None:
         return tensor
@@ -135,6 +145,23 @@ def distribute_tensor(tensor, layout):
 
     if isinstance(layout, TensorLayout):
         layout = _to_backend_layout(layout)
+
+    from torch.distributed.tensor import Shard
+
+    global _SHARDED_TENSOR_COUNT
+    global _REPLICATED_TENSOR_COUNT
+    if any(isinstance(p, Shard) for p in layout.placements):
+        _SHARDED_TENSOR_COUNT += 1
+        if name:
+            print(
+                f"[Rank {os.environ.get('RANK')}] Sharding tensor {name} with layout: {layout.placements}"
+            )
+        else:
+            print(
+                f"[Rank {os.environ.get('RANK')}] Sharding tensor with layout: {layout.placements}"
+            )
+    else:
+        _REPLICATED_TENSOR_COUNT += 1
 
     DTensor = _get_dtensor()
     if DTensor is not None and isinstance(tensor, DTensor):

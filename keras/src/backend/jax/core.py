@@ -81,7 +81,9 @@ class JaxVariable(KerasVariable):
 
     def _direct_assign(self, value):
         if self._layout is not None:
-            value = distribution_lib.distribute_tensor(value, self._layout)
+            value = distribution_lib.distribute_tensor(
+                value, self._layout, name=self.path
+            )
         self._value = value
 
     def _convert_to_tensor(self, value, dtype=None):
