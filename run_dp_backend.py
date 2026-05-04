@@ -39,7 +39,34 @@ def run_training(backend, rank=0):
     with distribution.scope():
         model = keras_hub.models.OPTBackbone.from_preset("opt_125m_en")
         model.load_weights("initial_weights.weights.h5")
-             
+        
+        # Override train_step to force training=False for consistency
+        if backend == "torch":
+            def custom_train_step(self, data):
+                import keras.src.tree as tree
+                (dist_lib, dist, x, y, sample_weight) = self._unpack_and_distribute_data(data)
+                self.zero_grad()
+                y_pred = self._forward(dist, x, training=False)
+                self._sync_ddp_buffers(dist)
+                loss = self._compute_loss(x=x, y=y, y_pred=y_pred, sample_weight=sample_weight, training=False)
+                self._loss_tracker.update_state(loss, sample_weight=next(i for i in tree.flatten(x) if i is not None).shape[0])
+                return self.compute_metrics(x, y, y_pred, sample_weight=sample_weight)
+            model.train_step = custom_train_step.__get__(model, model.__class__)
+        elif backend == "jax":
+            import jax
+            from keras.src.trainers.data_adapters import data_adapter_utils
+            def custom_train_step(self, state, data):
+                (trainable_variables, non_trainable_variables, optimizer_variables, metrics_variables) = state
+                x, y, sample_weight = data_adapter_utils.unpack_x_y_sample_weight(data)
+                grad_fn = jax.value_and_grad(self.compute_loss_and_updates, has_aux=True)
+                (loss, aux), grads = grad_fn(trainable_variables, non_trainable_variables, metrics_variables, x, y, sample_weight, training=False, optimizer_variables=optimizer_variables)
+                (unscaled_loss, y_pred, non_trainable_variables, metrics_variables) = aux
+                (trainable_variables, optimizer_variables) = self.optimizer.stateless_apply(optimizer_variables, grads, trainable_variables)
+                logs, metrics_variables = self._update_metrics_variables(metrics_variables, unscaled_loss, x, y, y_pred, sample_weight)
+                state = (trainable_variables, non_trainable_variables, optimizer_variables, metrics_variables)
+                return logs, state
+            model.train_step = custom_train_step.__get__(model, model.__class__)
+
         for layer in model._flatten_layers():
             for attr in ["dropout", "dropout_rate", "hidden_dropout_rate", "attention_dropout_rate"]:
                 if hasattr(layer, attr):
@@ -51,16 +78,12 @@ def run_training(backend, rank=0):
         x_mask = data["x_mask"][:2]
         y = data["y"][:2]
 
-        if backend == "torch":
-            samples_per_rank = len(y) // world_size
-            start, end = rank * samples_per_rank, (rank + 1) * samples_per_rank
-            x_tokens, x_mask, y = x_tokens[start:end], x_mask[start:end], y[start:end]
-
         x = {"token_ids": x_tokens, "padding_mask": x_mask}
 
         model.compile(
             optimizer=keras.optimizers.Adam(learning_rate=1e-5),
-            loss=keras.losses.SparseCategoricalCrossentropy(from_logits=True)
+            loss=keras.losses.SparseCategoricalCrossentropy(from_logits=True),
+            jit_compile=False
         )
 
         print(f"[{backend} Rank {rank}] Training...")
