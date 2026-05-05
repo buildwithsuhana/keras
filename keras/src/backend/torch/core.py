@@ -268,18 +268,19 @@ def convert_to_tensor(x, dtype=None, sparse=None, ragged=None):
         if dtype is not None:
             x = x.to(to_torch_dtype(dtype))
 
-    if dtype is None and not is_tensor(x):
-        if isinstance(x, bool):
-            x = torch.as_tensor(x, dtype=torch.bool, device=get_device())
-        elif isinstance(x, int):
-            if x < -(2**31) or x >= 2**31:
-                x = torch.as_tensor(x, dtype=torch.int64, device=get_device())
+    if not is_tensor(x):
+        if isinstance(x, (bool, int, float, complex)):
+            if dtype is not None:
+                dt = to_torch_dtype(dtype)
+            elif isinstance(x, bool):
+                dt = torch.bool
+            elif isinstance(x, int):
+                dt = torch.int64 if x < -(2**31) or x >= 2**31 else torch.int32
+            elif isinstance(x, float):
+                dt = to_torch_dtype(floatx())
             else:
-                x = torch.as_tensor(x, dtype=torch.int32, device=get_device())
-        elif isinstance(x, float):
-            x = torch.as_tensor(
-                x, dtype=to_torch_dtype(floatx()), device=get_device()
-            )
+                dt = torch.complex64
+            x = torch.as_tensor(x, dtype=dt, device=get_device())
 
     if not is_tensor(x):
         # Convert to np in case of any array-like that is not list or tuple.

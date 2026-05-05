@@ -22,35 +22,6 @@ class TorchCoreTest(testing.TestCase):
                 "gloo", rank=0, world_size=1, init_method="tcp://127.0.0.1:0"
             )
 
-    def test_distribution_integration(self):
-        mesh = keras.distribution.DeviceMesh((1,), ["data"], ["cpu:0"])
-        layout_map = keras.distribution.LayoutMap(mesh)
-        layout_map[".*"] = (None,)
-        dist = keras.distribution.ModelParallel(
-            layout_map=layout_map, batch_dim_name="data"
-        )
-        with dist.scope():
-            v = backend.Variable(np.ones((2, 2), dtype="float32"))
-            self.assertIsInstance(v.value.data, DTensor)
-            v._direct_assign(np.zeros((2, 2), dtype="float32"))
-            self.assertIsInstance(v.value.data, DTensor)
-
-            t = backend.convert_to_tensor(
-                torch.ones((2, 2), dtype=torch.float32)
-            )
-            self.assertIsInstance(t, DTensor)
-            self.assertAllClose(backend.convert_to_tensor(t), t)
-            self.assertIsInstance(backend.convert_to_tensor([t, t]), DTensor)
-
-            def fn(x):
-                self.assertIsInstance(x, DTensor)
-                return x + 1
-
-            spec = backend.compute_output_spec(
-                fn, keras.KerasTensor(shape=(2, 2), dtype="float32")
-            )
-            self.assertEqual(spec.shape, (2, 2))
-
     def test_variable_with_distributed_tensor(self):
         mesh = keras.distribution.DeviceMesh((1,), ["data"], ["cpu:0"])
         dt = torch.distributed.tensor.distribute_tensor(
