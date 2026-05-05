@@ -191,7 +191,7 @@ class DataParallelDistributionTest(testing.TestCase):
 
         self.assertFalse(distribution._is_multi_process)
         self.assertEqual(distribution._process_id, 0)
-        self.assertEqual(distribution._num_process, 1)
+        self.assertEqual(distribution.num_processes, 1)
 
     def test_create_with_devices(self):
         distribution = distribution_lib.DataParallel(devices=self.devices)
@@ -263,7 +263,7 @@ class DataParallelDistributionTest(testing.TestCase):
         distribution = distribution_lib.DataParallel(
             device_mesh=self.device_mesh
         )
-        distributed_dataset = distribution.distribute_dataset(dataset)
+        distributed_dataset = distribution.distribute_tf_dataset(dataset)
         self.assertIs(dataset, distributed_dataset)
 
 
@@ -355,7 +355,7 @@ class ModelParallelDistributionTest(testing.TestCase):
         distribution = distribution_lib.ModelParallel(
             layout_map=layout_map, batch_dim_name="data"
         )
-        distributed_dataset = distribution.distribute_dataset(dataset)
+        distributed_dataset = distribution.distribute_tf_dataset(dataset)
         self.assertIs(dataset, distributed_dataset)
 
     @mock.patch.object(backend_dlib, "num_processes", return_value=4)
@@ -529,7 +529,7 @@ class DataShardingIntegrationTest(testing.TestCase):
 
         for process_id in range(num_devices):
             distribution._process_id = process_id
-            ds = distribution.distribute_dataset(global_dataset)
+            ds = distribution.distribute_tf_dataset(global_dataset)
             shards.append(list(ds.unbatch().as_numpy_iterator()))
 
         processes_per_replica = num_devices // num_model_replicas

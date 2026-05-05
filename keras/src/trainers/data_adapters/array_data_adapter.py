@@ -292,24 +292,7 @@ class ArrayDataAdapter(DataAdapter):
                 return len(self.sampler)
 
         dist = dist_lib.distribution()
-        sampler = None
-        if dist is not None and dist.auto_shard_dataset:
-            num_replicas, rank = dist_lib.get_num_replicas_and_rank(dist)
-            if num_replicas is not None and rank is not None:
-                sampler = torch.utils.data.distributed.DistributedSampler(
-                    range(self._num_samples),
-                    num_replicas=num_replicas,
-                    rank=rank,
-                    shuffle=self._shuffle is True,
-                )
-
-        if sampler is not None:
-            batch_sampler = torch.utils.data.BatchSampler(
-                sampler,
-                batch_size=self._batch_size,
-                drop_last=False,
-            )
-        elif self._shuffle == "batch":
+        if self._shuffle == "batch":
             batch_sampler = RandomBatchSampler(
                 torch.utils.data.BatchSampler(
                     range(self._num_samples),
@@ -339,9 +322,12 @@ class ArrayDataAdapter(DataAdapter):
             self._inputs, target_backend="torch"
         )
         dataset = ArrayDataset(inputs, self._num_samples)
-        return torch.utils.data.DataLoader(
+        dataloader = torch.utils.data.DataLoader(
             dataset, batch_sampler=batch_sampler, collate_fn=no_op_collate
         )
+        if dist is not None:
+            dataloader = dist.distribute_torch_dataloader(dataloader)
+        return dataloader
 
     def _get_iterator(self, slice_and_convert_fn, inputs):
         global_permutation = None

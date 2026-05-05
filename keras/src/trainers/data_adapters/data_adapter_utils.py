@@ -355,21 +355,70 @@ def is_torch_tensor(value):
     return False
 
 
-def _add_distributed_sampler(dataloader, num_replicas, rank):
+def _add_torch_distributed_sampler(dataloader, num_replicas, rank):
+    import itertools
+
     import torch
 
     if isinstance(dataloader.dataset, torch.utils.data.IterableDataset):
-        return dataloader
+
+        class ShardedIterableDataset(torch.utils.data.IterableDataset):
+            def __init__(self, dataset, num_replicas, rank):
+                self.dataset = dataset
+                self.num_replicas = num_replicas
+                self.rank = rank
+
+            def __iter__(self):
+                return itertools.islice(
+                    self.dataset, self.rank, None, self.num_replicas
+                )
+
+        if hasattr(dataloader.dataset, "__len__"):
+
+            def __len__(self):
+                return (
+                    len(self.dataset) + self.num_replicas - 1
+                ) // self.num_replicas
+
+            ShardedIterableDataset.__len__ = __len__
+
+        dataset = ShardedIterableDataset(dataloader.dataset, num_replicas, rank)
+        return torch.utils.data.DataLoader(
+            dataset,
+            batch_size=dataloader.batch_size,
+            num_workers=dataloader.num_workers,
+            collate_fn=dataloader.collate_fn,
+            pin_memory=dataloader.pin_memory,
+            drop_last=dataloader.drop_last,
+            timeout=dataloader.timeout,
+            worker_init_fn=dataloader.worker_init_fn,
+            multiprocessing_context=dataloader.multiprocessing_context,
+            generator=dataloader.generator,
+            prefetch_factor=dataloader.prefetch_factor,
+            persistent_workers=dataloader.persistent_workers,
+            pin_memory_device=dataloader.pin_memory_device,
+        )
+
+    shuffle = isinstance(dataloader.sampler, torch.utils.data.RandomSampler)
+    if hasattr(dataloader, "batch_sampler") and dataloader.batch_sampler:
+        if hasattr(dataloader.batch_sampler, "sampler"):
+            shuffle = isinstance(
+                dataloader.batch_sampler.sampler, torch.utils.data.RandomSampler
+            )
 
     sampler = torch.utils.data.distributed.DistributedSampler(
         dataloader.dataset,
         num_replicas=num_replicas,
         rank=rank,
-        shuffle=isinstance(dataloader.sampler, torch.utils.data.RandomSampler),
+        shuffle=shuffle,
     )
+    batch_size = dataloader.batch_size
+    if batch_size is None and hasattr(dataloader, "batch_sampler"):
+        batch_size = getattr(dataloader.batch_sampler, "batch_size", None)
+
     return torch.utils.data.DataLoader(
         dataloader.dataset,
-        batch_size=dataloader.batch_size,
+        batch_size=batch_size,
         sampler=sampler,
         num_workers=dataloader.num_workers,
         collate_fn=dataloader.collate_fn,

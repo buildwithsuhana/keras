@@ -236,3 +236,80 @@ class TestTorchDataLoaderAdapter(testing.TestCase):
             new_dataloader.sampler.num_replicas, expected_num_replicas
         )
         self.assertEqual(new_dataloader.sampler.rank, expected_rank)
+
+    @parameterized.named_parameters(
+        ("dataparallel", "dp", 4, 1, (4,), 4, 1),
+        ("modelparallel", "mp", 8, 5, (2, 4), 2, 1),
+    )
+    @patch("torch.distributed.is_available")
+    @patch("torch.distributed.get_world_size")
+    @patch("torch.distributed.get_rank")
+    @patch("keras.src.distribution.distribution_lib.distribution_lib")
+    @patch("keras.src.distribution.distribution_lib.distribution")
+    def test_sharding_iterable_dataset(
+        self,
+        dist_type,
+        world_size,
+        rank,
+        mesh_shape,
+        expected_num_replicas,
+        expected_rank,
+        mock_distribution,
+        mock_backend_dist_lib,
+        mock_get_rank,
+        mock_get_world_size,
+        mock_is_available,
+    ):
+        mock_is_available.return_value = True
+        mock_get_world_size.return_value = world_size
+        mock_get_rank.return_value = rank
+        mock_backend_dist_lib.num_processes.return_value = world_size
+        mock_backend_dist_lib.process_id.return_value = rank
+
+        if dist_type == "dp":
+            dist = dist_lib.DataParallel(devices=["cpu:0"] * world_size)
+        else:
+            device_mesh = dist_lib.DeviceMesh(
+                shape=mesh_shape,
+                axis_names=("data", "model"),
+                devices=["cpu:0"] * np.prod(mesh_shape),
+            )
+            dist = dist_lib.ModelParallel(
+                device_mesh=device_mesh,
+                layout_map=dist_lib.LayoutMap(device_mesh),
+                batch_dim_name="data",
+            )
+        dist.auto_shard_dataset = True
+        mock_distribution.return_value = dist
+
+        class TestIterableDataset(torch.utils.data.IterableDataset):
+            def __iter__(self):
+                for i in range(100):
+                    yield torch.tensor([i])
+
+            def __len__(self):
+                return 100
+
+        dataset = TestIterableDataset()
+        dataloader = torch.utils.data.DataLoader(dataset, batch_size=10)
+
+        adapter = TorchDataLoaderAdapter(dataloader)
+        new_dataloader = adapter.get_torch_dataloader()
+
+        self.assertTrue(
+            "ShardedIterableDataset" in str(type(new_dataloader.dataset))
+        )
+        self.assertEqual(
+            new_dataloader.dataset.num_replicas, expected_num_replicas
+        )
+        self.assertEqual(new_dataloader.dataset.rank, expected_rank)
+
+        items = list(new_dataloader)
+        # 100 items total, 10 items per batch.
+        # Each replica should get 100 / expected_num_replicas items.
+        expected_items = 100 // expected_num_replicas
+        self.assertEqual(sum(len(b) for b in items), expected_items)
+
+        # Check that we are getting the correct items (interleaved sharding)
+        first_item = next(iter(new_dataloader))[0]
+        self.assertEqual(first_item.item(), expected_rank)

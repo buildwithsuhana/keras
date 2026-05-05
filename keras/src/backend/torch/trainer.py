@@ -67,40 +67,39 @@ class TorchTrainer(base_trainer.Trainer):
                 delattr(self, "_ddp_model")
             self._in_ddp_context = False
 
-    def _distribute_inputs(self, dist, data, replicate=False):
+    def _distribute_data(self, data, replicate=False):
         from keras.src.distribution import distribution_lib
 
-        def _distribute_if_tensor(t):
-            if (backend.is_tensor(t) or isinstance(t, np.ndarray)) and hasattr(
-                t, "shape"
-            ):
-                layout = dist.get_data_layout(t.shape)
-                if replicate and isinstance(
-                    dist, distribution_lib.ModelParallel
-                ):
-                    from keras.src.distribution import TensorLayout
-
-                    layout = TensorLayout(
-                        [None] * len(t.shape), dist.device_mesh
-                    )
-                return torch_dist_lib.distribute_data_input(
-                    t, layout, dist.batch_dim_name
-                )
-            return t
-
-        return tree.map_structure(_distribute_if_tensor, data)
-
-    def _apply_distribution(self, dist, x, y=None):
+        dist = distribution_lib.distribution()
         if dist is not None:
-            x = self._distribute_inputs(dist, x)
-            if y is not None:
-                y = self._distribute_inputs(dist, y)
-        return x, y
+
+            def _distribute_if_tensor(t):
+                if (
+                    backend.is_tensor(t) or isinstance(t, np.ndarray)
+                ) and hasattr(t, "shape"):
+                    layout = dist.get_data_layout(t.shape)
+                    if replicate and isinstance(
+                        dist, distribution_lib.ModelParallel
+                    ):
+                        from keras.src.distribution import TensorLayout
+
+                        layout = TensorLayout(
+                            [None] * len(t.shape), dist.device_mesh
+                        )
+                    return torch_dist_lib.distribute_data_input(
+                        t, layout, dist.batch_dim_name
+                    )
+                return t
+
+            return tree.map_structure(_distribute_if_tensor, data)
+        return tree.map_structure(backend.convert_to_tensor, data)
 
     def _unpack_and_distribute_data(self, data):
-        x, y, sample_weight = data_adapter_utils.unpack_x_y_sample_weight(data)
+        from keras.src.distribution import distribution_lib as dist_lib
+
         dist = dist_lib.distribution()
-        x, y = self._apply_distribution(dist, x, y)
+        data = self._distribute_data(data)
+        x, y, sample_weight = data_adapter_utils.unpack_x_y_sample_weight(data)
         return dist_lib, dist, x, y, sample_weight
 
     def _forward(self, dist, x, training=False):

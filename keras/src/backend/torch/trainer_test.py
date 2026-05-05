@@ -14,7 +14,6 @@ from keras.src import layers
 from keras.src import models
 from keras.src import testing
 from keras.src.backend.torch.trainer import TorchEpochIterator
-from keras.src.backend.torch.trainer import _KerasModuleWrapper
 from keras.src.distribution import distribution_lib
 
 
@@ -72,9 +71,8 @@ class TorchTrainerTest(testing.TestCase):
             "keras.src.backend.torch.distribution_lib.distribute_data_input",
             return_value=torch.ones((4, 4)),
         ):
-            model._distribute_inputs(
-                distribution, np.ones((4, 4), "f"), replicate=True
-            )
+            with distribution.scope():
+                model._distribute_data(np.ones((4, 4), "f"), replicate=True)
         small_model = models.Sequential([layers.Dense(1, input_shape=(4,))])
         small_model.compile("adam", "mse")
         small_model.train_on_batch(inputs[:4], targets[:4])
@@ -87,28 +85,6 @@ class TorchTrainerTest(testing.TestCase):
             UserWarning, "does not have any trainable weights"
         ):
             no_weights_model.train_on_batch(inputs[:4], targets[:4])
-
-    def test_module_wrapper_and_compile(self):
-        model = models.Sequential(
-            [layers.BatchNormalization(input_shape=(4,)), layers.Dense(1)]
-        )
-        self.assertEqual(
-            _KerasModuleWrapper(model)(torch.ones((4, 4))).shape, (4, 1)
-        )
-        model.compile(optimizer="adam", loss="mse")
-
-        with (
-            mock.patch(
-                "torch.compile", side_effect=lambda x, **kwargs: x
-            ) as mock_compile,
-            mock.patch.object(
-                model, "_should_torch_compile", return_value=True
-            ),
-        ):
-            model.make_train_function()
-            model.make_test_function()
-            model.make_predict_function()
-            self.assertEqual(mock_compile.call_count, 3)
 
     def test_distributed_logic(self):
         if not torch.distributed.is_initialized():
