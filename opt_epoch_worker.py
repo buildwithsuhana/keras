@@ -29,6 +29,14 @@ def setup_dist():
 def run_test():
     rank, world_size = setup_dist()
     
+    if backend == "torch":
+        import torch
+        device = torch.device(f"cuda:{torch.cuda.current_device()}" if torch.cuda.is_available() else "cpu")
+        print(f"[torch Rank {rank}] Training on device: {device}")
+    else:
+        import jax
+        print(f"[jax Process {rank}] Training on {jax.local_device_count()} local devices")
+    
     # 1. Setup Model Parallel (2 devices)
     mesh = distribution.DeviceMesh(shape=(world_size,), axis_names=("model",))
     layout_map = distribution.LayoutMap(mesh)
@@ -85,9 +93,27 @@ def run_test():
             y_pred = model(dummy_inputs)
             model.compute_loss(dummy_inputs, dummy_y, y_pred)
             model.optimizer.build(model.trainable_variables)
+
+            # --- PROVE SHARDING ---
+            for v in model.weights:
+                if "query/kernel" in v.path:
+                    DTensor = distribution_lib._get_dtensor()
+                    if DTensor is not None and isinstance(v.value, DTensor):
+                        sharding_spec = v.value.placements
+                        print(f"[torch Rank {rank}] Weight {v.path} sharding spec: {sharding_spec}")
+                    else:
+                        print(f"[torch Rank {rank}] Weight {v.path} is NOT a DTensor")
+                    break
         else:
             y_pred = model({"token_ids": dummy_token_ids, "padding_mask": dummy_padding_mask})
             model.compute_loss(None, dummy_targets, y_pred)
+            
+            # --- PROVE JAX SHARDING ---
+            if rank == 0:
+                for v in model.weights:
+                    if "query/kernel" in v.path:
+                        print(f"[jax Process 0] Weight {v.path} sharding: {v.value.sharding}")
+                        break
 
     # 2. Weight Sync
     if backend == "jax":
