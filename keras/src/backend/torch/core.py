@@ -252,6 +252,8 @@ class Variable(KerasVariable):
 
 
 def convert_to_tensor(x, dtype=None, sparse=None, ragged=None):
+    if x is None:
+        return None
     if sparse:
         raise ValueError("`sparse=True` is not supported with torch backend")
     if ragged:

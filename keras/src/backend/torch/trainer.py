@@ -59,12 +59,11 @@ class TorchTrainer(base_trainer.Trainer):
                     if torch.cuda.is_available()
                     else None,
                 )
-                # Use normal setattr to preserve Keras attribute tracking
-                self._ddp_model = ddp_model
+                object.__setattr__(self, "_ddp_model", ddp_model)
             self._in_ddp_context = True
         else:
             if hasattr(self, "_ddp_model"):
-                delattr(self, "_ddp_model")
+                object.__delattr__(self, "_ddp_model")
             self._in_ddp_context = False
 
     def _distribute_data(self, data, replicate=False):
