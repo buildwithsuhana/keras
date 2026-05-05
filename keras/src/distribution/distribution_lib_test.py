@@ -134,6 +134,10 @@ class TensorLayoutTest(testing.TestCase):
             layout.device_mesh = self.mesh
 
 
+@pytest.mark.skipif(
+    backend.backend() not in ("jax", "torch"),
+    reason="Only JAX and Torch have the backend to mock at the moment",
+)
 class DistributionTest(testing.TestCase):
     def setUp(self):
         super().setUp()
@@ -524,7 +528,7 @@ class DataShardingIntegrationTest(testing.TestCase):
 
         # Simulate one process per local device to exercise process-group
         # sharding semantics without backend mocking.
-        distribution._num_process = num_devices
+        distribution._num_processes = num_devices
         distribution._is_multi_process = True
 
         for process_id in range(num_devices):
