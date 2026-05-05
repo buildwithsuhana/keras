@@ -11,29 +11,13 @@ from keras.src import optimizers as optimizers_module
 from keras.src import tree
 from keras.src.backend import config
 from keras.src.backend.torch import distribution_lib as torch_dist_lib
+from keras.src.distribution import distribution_lib as dist_lib
 from keras.src.trainers import trainer as base_trainer
 from keras.src.trainers.data_adapters import array_slicing
 from keras.src.trainers.data_adapters import data_adapter_utils
 from keras.src.trainers.epoch_iterator import EpochIterator
 from keras.src.utils import traceback_utils
 from keras.src.utils.python_utils import pythonify_logs
-
-
-class _KerasModuleWrapper(torch.nn.Module):
-    """Wraps a Keras model so DDP sees standard torch.nn.Parameters."""
-
-    def __init__(self, keras_model):
-        super().__init__()
-        object.__setattr__(self, "_keras_model", keras_model)
-        self._buffer_aggregations = {}
-        for i, v in enumerate(keras_model.trainable_weights):
-            self.register_parameter(f"p{i}", v.value)
-        for i, v in enumerate(keras_model.non_trainable_weights):
-            self.register_buffer(f"b{i}", v.value)
-            self._buffer_aggregations[f"b{i}"] = v.aggregation
-
-    def forward(self, *args, **kwargs):
-        return self._keras_model(*args, **kwargs)
 
 
 class TorchTrainer(base_trainer.Trainer):
@@ -60,7 +44,7 @@ class TorchTrainer(base_trainer.Trainer):
         return self.jit_compile
 
     def _setup_ddp(self):
-        dist_lib, dist = self._get_distribution()
+        dist = dist_lib.distribution()
         if dist is not self._current_dist:
             self.train_function = None
             self.test_function = None
@@ -70,7 +54,7 @@ class TorchTrainer(base_trainer.Trainer):
         if dist is not None and isinstance(dist, dist_lib.DataParallel):
             if not hasattr(self, "_ddp_model"):
                 ddp_model = torch.nn.parallel.DistributedDataParallel(
-                    _KerasModuleWrapper(self),
+                    self,
                     device_ids=[torch.cuda.current_device()]
                     if torch.cuda.is_available()
                     else None,
@@ -82,11 +66,6 @@ class TorchTrainer(base_trainer.Trainer):
             if hasattr(self, "_ddp_model"):
                 delattr(self, "_ddp_model")
             self._in_ddp_context = False
-
-    def _get_distribution(self):
-        from keras.src.distribution import distribution_lib as dist_lib
-
-        return dist_lib, dist_lib.distribution()
 
     def _distribute_inputs(self, dist, data, replicate=False):
         from keras.src.distribution import distribution_lib
@@ -120,7 +99,7 @@ class TorchTrainer(base_trainer.Trainer):
 
     def _unpack_and_distribute_data(self, data):
         x, y, sample_weight = data_adapter_utils.unpack_x_y_sample_weight(data)
-        dist_lib, dist = self._get_distribution()
+        dist = dist_lib.distribution()
         x, y = self._apply_distribution(dist, x, y)
         return dist_lib, dist, x, y, sample_weight
 
@@ -145,7 +124,7 @@ class TorchTrainer(base_trainer.Trainer):
                     "max": torch.distributed.ReduceOp.MAX,
                     "min": torch.distributed.ReduceOp.MIN,
                 }
-                for name, buf in module.named_buffers():
+                for name, buf in module.named_buffers(recurse=False):
                     if buf is None:
                         continue
                     if not buf.requires_grad:
@@ -274,7 +253,7 @@ class TorchTrainer(base_trainer.Trainer):
         return y_pred
 
     def _sync_metrics(self):
-        dist_lib, dist_obj = self._get_distribution()
+        dist_obj = dist_lib.distribution()
         if dist_obj is not None and torch.distributed.is_initialized():
             aggregation_to_op = {
                 "sum": torch.distributed.ReduceOp.SUM,
@@ -371,27 +350,6 @@ class TorchTrainer(base_trainer.Trainer):
             self.predict_function = torch.compile(one_step_on_data)
         else:
             self.predict_function = one_step_on_data
-
-    def _symbolic_build(self, data_batch=None, iterator=None):
-        dist_lib, dist = self._get_distribution()
-
-        if data_batch is None and iterator is not None:
-            for _, _, data_or_iterator in iterator:
-                if isinstance(data_or_iterator, (list, tuple)):
-                    data_batch = data_or_iterator[0]
-                else:
-                    data_batch = next(data_or_iterator)
-                break
-
-        if dist is not None:
-            if data_batch is not None:
-                data_batch = self._distribute_inputs(
-                    dist, data_batch, replicate=True
-                )
-            super()._symbolic_build(data_batch=data_batch)
-            return
-
-        super()._symbolic_build(data_batch=data_batch, iterator=iterator)
 
     @traceback_utils.filter_traceback
     def fit(

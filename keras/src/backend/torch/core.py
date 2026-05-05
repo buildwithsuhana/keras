@@ -401,21 +401,11 @@ def compute_output_spec(fn, *args, **kwargs):
                 for i, e in enumerate(shape):
                     if e is None:
                         shape[i] = fill_value
-            t = torch.ones(
+            return torch.ones(
                 size=shape,
                 dtype=TORCH_DTYPES[x.dtype],
                 device=get_device(),
             )
-
-            dist = global_state.get_global_attribute("distribution")
-            if dist is not None:
-                from keras.src.distribution import TensorLayout
-                from keras.src.distribution import distribution_lib as dist_lib
-
-                if isinstance(dist, dist_lib.ModelParallel):
-                    layout = TensorLayout([None] * len(shape), dist.device_mesh)
-                    t = torch_dist_lib.distribute_tensor(t, layout)
-            return t
         return x
 
     def convert_torch_to_keras_tensor(x):
