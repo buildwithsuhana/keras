@@ -282,7 +282,8 @@ class TorchTrainer(base_trainer.Trainer):
                 "max": torch.distributed.ReduceOp.MAX,
                 "min": torch.distributed.ReduceOp.MIN,
             }
-            DTensor = torch_dist_lib._get_dtensor()
+            from torch.distributed.tensor import DTensor
+
             for metric in self.metrics:
                 for variable in metric.variables:
                     if variable.aggregation in (None, "none"):

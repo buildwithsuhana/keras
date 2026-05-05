@@ -3,12 +3,6 @@ import os
 import torch
 
 
-def _get_dtensor():
-    from torch.distributed.tensor import DTensor
-
-    return DTensor
-
-
 def get_device_count(device_type=None):
     """Returns total device count across all hosts."""
     if torch.distributed.is_initialized():
@@ -136,8 +130,9 @@ def distribute_tensor(tensor, layout):
     if isinstance(layout, TensorLayout):
         layout = _to_backend_layout(layout)
 
-    DTensor = _get_dtensor()
-    if DTensor is not None and isinstance(tensor, DTensor):
+    from torch.distributed.tensor import DTensor
+
+    if isinstance(tensor, DTensor):
         return tensor.redistribute(
             device_mesh=layout.device_mesh, placements=layout.placements
         )
@@ -171,8 +166,9 @@ def distribute_data_input(tensor, layout, batch_dim_name):
     if isinstance(layout, TensorLayout):
         layout = _to_backend_layout(layout)
 
-    DTensor = _get_dtensor()
-    if DTensor is not None and isinstance(tensor, DTensor):
+    from torch.distributed.tensor import DTensor
+
+    if isinstance(tensor, DTensor):
         return tensor
 
     if not isinstance(tensor, torch.Tensor):

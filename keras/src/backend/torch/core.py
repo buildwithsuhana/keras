@@ -104,10 +104,6 @@ def to_torch_dtype(dtype):
 
 
 class Variable(KerasVariable):
-    def __init__(self, *args, layout=None, **kwargs):
-        self._layout = layout
-        super().__init__(*args, **kwargs)
-
     def _initialize_layout(self):
         distribution = global_state.get_global_attribute("distribution")
         if self._layout is None and distribution is not None:
@@ -148,8 +144,9 @@ class Variable(KerasVariable):
                     )
             else:
                 param_value = convert_to_tensor(value, dtype=self._dtype)
-                DTensor = torch_dist_lib._get_dtensor()
-                if DTensor is not None and isinstance(param_value, DTensor):
+                from torch.distributed.tensor import DTensor
+
+                if isinstance(param_value, DTensor):
                     param_value = param_value.to_local()
                 device = (
                     param_value.device
@@ -170,15 +167,13 @@ class Variable(KerasVariable):
         value = convert_to_tensor(value, dtype=self._dtype).detach()
         if self._layout is not None:
             value = torch_dist_lib.distribute_tensor(value, self._layout)
-            self._value = torch.nn.Parameter(
-                value, requires_grad=self.trainable
-            )
         else:
-            DTensor = torch_dist_lib._get_dtensor()
-            if DTensor is not None and isinstance(value, DTensor):
+            from torch.distributed.tensor import DTensor
+
+            if isinstance(value, DTensor):
                 value = value.to_local()
-            with torch.no_grad():
-                self._value.copy_(value)
+        with torch.no_grad():
+            self._value.copy_(value)
 
     def _convert_to_tensor(self, value, dtype=None):
         return convert_to_tensor(value, dtype=dtype)
@@ -244,7 +239,10 @@ class Variable(KerasVariable):
     def trainable(self, value):
         self._trainable = value
         if self._value is not None:
-            self._value.requires_grad = value
+            self._value.requires_grad = value and (
+                torch.is_floating_point(self._value)
+                or torch.is_complex(self._value)
+            )
 
     def __eq__(self, other):
         try:
@@ -318,8 +316,9 @@ def convert_to_tensor(x, dtype=None, sparse=None, ragged=None):
         if not isinstance(dist, dist_lib.ModelParallel):
             return x
 
-        DTensor = torch_dist_lib._get_dtensor()
-        if DTensor is not None and isinstance(x, DTensor):
+        from torch.distributed.tensor import DTensor
+
+        if isinstance(x, DTensor):
             return x
 
         is_parameter = isinstance(x, torch.nn.Parameter)
@@ -335,8 +334,9 @@ def convert_to_tensor(x, dtype=None, sparse=None, ragged=None):
 def convert_to_numpy(x):
     def transform(x):
         if is_tensor(x):
-            DTensor = torch_dist_lib._get_dtensor()
-            if DTensor is not None and isinstance(x, DTensor):
+            from torch.distributed.tensor import DTensor
+
+            if isinstance(x, DTensor):
                 x = x.full_tensor()
             if x.requires_grad:
                 x = x.detach()
