@@ -11,6 +11,7 @@ from keras.src.backend.common.backend_utils import (
 from keras.src.backend.torch.core import cast
 from keras.src.backend.torch.core import convert_to_tensor
 from keras.src.backend.torch.core import get_device
+from keras.src.backend.torch import distribution_lib as torch_dist_lib
 from keras.src.backend.torch.numpy import expand_dims
 from keras.src.backend.torch.numpy import where
 from keras.src.utils.argument_validation import standardize_tuple
@@ -1447,6 +1448,11 @@ def dot_product_attention(
     key = torch.transpose(key, axis0, axis1)
     value = torch.transpose(value, axis0, axis1)
 
+    DTensor = torch_dist_lib._get_dtensor()
+    is_dtensor = DTensor is not None and isinstance(query, DTensor)
+    if is_dtensor and get_device() == "cpu":
+        flash_attention = False
+
     if flash_attention is None:
         flash_attention = _can_use_flash_attention(
             query, key, value, mask, is_causal
@@ -1472,14 +1478,32 @@ def dot_product_attention(
     else:
         if mask is not None:
             mask = mask.contiguous()
-        attention_output = torch.nn.functional.scaled_dot_product_attention(
-            query.contiguous(),
-            key.contiguous(),
-            value.contiguous(),
-            attn_mask=mask,
-            is_causal=is_causal,
-            scale=scale,
-        )
+        if is_dtensor and get_device() == "cpu":
+            # For CPU, DTensor + SDPA requires MATH backend as of torch 2.2/2.3
+            # otherwise it might try to use flash_attention_for_cpu which
+            # doesn't have sharding rules.
+            with torch.nn.attention.sdpa_kernel(
+                backends=[torch.nn.attention.SDPBackend.MATH],
+            ):
+                attention_output = (
+                    torch.nn.functional.scaled_dot_product_attention(
+                        query.contiguous(),
+                        key.contiguous(),
+                        value.contiguous(),
+                        attn_mask=mask,
+                        is_causal=is_causal,
+                        scale=scale,
+                    )
+                )
+        else:
+            attention_output = torch.nn.functional.scaled_dot_product_attention(
+                query.contiguous(),
+                key.contiguous(),
+                value.contiguous(),
+                attn_mask=mask,
+                is_causal=is_causal,
+                scale=scale,
+            )
     return torch.transpose(attention_output, axis1, axis0)
 
 
