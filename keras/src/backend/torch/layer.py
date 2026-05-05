@@ -40,15 +40,6 @@ class TorchLayer(torch.nn.Module):
     def forward(self, *args, **kwargs):
         return Operation.__call__(self, *args, **kwargs)
 
-    def train(self, mode=True):
-        if getattr(self, "_is_setting_train", False):
-            return self
-        object.__setattr__(self, "_is_setting_train", True)
-        try:
-            return super().train(mode)
-        finally:
-            object.__setattr__(self, "_is_setting_train", False)
-
     def _setattr_hook(self, name, value):
         from keras.src.layers import Layer
 
