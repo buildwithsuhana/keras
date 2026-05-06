@@ -399,9 +399,6 @@ def compute_output_spec(fn, *args, **kwargs):
                 for i, e in enumerate(shape):
                     if e is None:
                         shape[i] = fill_value
-
-            from keras.src.backend.common import global_state
-
             device = get_device()
             if global_state.get_global_attribute("distribution") is not None:
                 device = "meta"
