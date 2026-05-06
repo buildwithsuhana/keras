@@ -90,8 +90,12 @@ class TorchTrainer(base_trainer.Trainer):
                     )
                 return t
 
-            return tree.map_structure(_distribute_if_tensor, data)
-        return tree.map_structure(backend.convert_to_tensor, data)
+            return tree.map_structure(
+                _distribute_if_tensor, data, none_is_leaf=False
+            )
+        return tree.map_structure(
+            backend.convert_to_tensor, data, none_is_leaf=False
+        )
 
     def _unpack_and_distribute_data(self, data):
         from keras.src.distribution import distribution_lib as dist_lib
