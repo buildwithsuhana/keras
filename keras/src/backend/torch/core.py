@@ -6,6 +6,7 @@ import os
 import ml_dtypes
 import numpy as np
 import torch
+from torch.distributed.tensor import DTensor
 
 from keras.src import tree
 from keras.src.backend.common import KerasVariable
@@ -144,7 +145,6 @@ class Variable(KerasVariable):
                     )
             else:
                 param_value = convert_to_tensor(value, dtype=self._dtype)
-                from torch.distributed.tensor import DTensor
 
                 if isinstance(param_value, DTensor):
                     param_value = param_value.to_local()
@@ -168,8 +168,6 @@ class Variable(KerasVariable):
         if self._layout is not None:
             value = torch_dist_lib.distribute_tensor(value, self._layout)
         else:
-            from torch.distributed.tensor import DTensor
-
             if isinstance(value, DTensor):
                 value = value.to_local()
         with torch.no_grad():
@@ -253,7 +251,7 @@ class Variable(KerasVariable):
 
 def convert_to_tensor(x, dtype=None, sparse=None, ragged=None):
     if x is None:
-        return None
+        raise ValueError("`convert_to_tensor` received `None`.")
     if sparse:
         raise ValueError("`sparse=True` is not supported with torch backend")
     if ragged:
@@ -318,9 +316,6 @@ def convert_to_tensor(x, dtype=None, sparse=None, ragged=None):
 
         if not isinstance(dist, dist_lib.ModelParallel):
             return x
-
-        from torch.distributed.tensor import DTensor
-
         if isinstance(x, DTensor):
             return x
 
@@ -337,8 +332,6 @@ def convert_to_tensor(x, dtype=None, sparse=None, ragged=None):
 def convert_to_numpy(x):
     def transform(x):
         if is_tensor(x):
-            from torch.distributed.tensor import DTensor
-
             if isinstance(x, DTensor):
                 x = x.full_tensor()
             if x.requires_grad:

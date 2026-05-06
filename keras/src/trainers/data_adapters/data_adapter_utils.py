@@ -1,3 +1,5 @@
+import itertools
+
 import numpy as np
 
 from keras.src import backend
@@ -356,8 +358,6 @@ def is_torch_tensor(value):
 
 
 def _add_torch_distributed_sampler(dataloader, num_replicas, rank):
-    import itertools
-
     import torch
 
     if isinstance(dataloader.dataset, torch.utils.data.IterableDataset):
