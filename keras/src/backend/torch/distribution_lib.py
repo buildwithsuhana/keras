@@ -259,6 +259,6 @@ def _register_distributed_strategies():
         )(_unbind_op_strategy)
         _STRATEGIES_REGISTERED = True
     except (ImportError, AttributeError):
-        # PyTorch version does not expose these internal APIs yet;
+        # PyTorch version does not expose these internal APIs yet
         # unbind on sharded DTensors will fall back to PyTorch's default.
         pass
