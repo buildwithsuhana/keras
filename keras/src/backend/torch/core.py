@@ -269,7 +269,6 @@ def convert_to_tensor(x, dtype=None, sparse=None, ragged=None):
                 x = x.to(device)
         if dtype is not None:
             x = x.to(to_torch_dtype(dtype))
-        return x
 
     if not is_tensor(x):
         if isinstance(x, (bool, int, float, complex)):
@@ -287,15 +286,11 @@ def convert_to_tensor(x, dtype=None, sparse=None, ragged=None):
 
     if not is_tensor(x):
         # Convert to np in case of any array-like that is not list or tuple.
-        # Skip scalar Python values to avoid np.array(float) -> float64, which
-        # causes dtype issues during torch.export (constants are lifted before
-        # the cast to the requested dtype).
-        if isinstance(x, (list, tuple)):
-            if len(x) > 0 and any(isinstance(x1, torch.Tensor) for x1 in x):
-                # Handle list or tuple of torch tensors
-                x = torch.stack([convert_to_tensor(x1) for x1 in x])
-        elif not isinstance(x, (bool, int, float)):
+        if not isinstance(x, (list, tuple)):
             x = np.array(x)
+        elif len(x) > 0 and any(isinstance(x1, torch.Tensor) for x1 in x):
+            # Handle list or tuple of torch tensors
+            x = torch.stack([convert_to_tensor(x1) for x1 in x])
 
         if not is_tensor(x):
             if isinstance(x, np.ndarray):
@@ -303,7 +298,6 @@ def convert_to_tensor(x, dtype=None, sparse=None, ragged=None):
                     # Torch backend does not support uint32.
                     x = x.astype(np.int64)
                 if standardize_dtype(x.dtype) == "bfloat16":
-                    # Torch backend does not support converting bfloat16 ndarray.
                     x = x.astype(np.float32)
                     dtype = "bfloat16"
                 dtype = dtype or x.dtype
@@ -316,9 +310,6 @@ def convert_to_tensor(x, dtype=None, sparse=None, ragged=None):
                 )
             dtype = to_torch_dtype(dtype)
             x = torch.as_tensor(x, dtype=dtype, device=get_device())
-
-    from keras.src.backend.common import global_state
-    from keras.src.backend.torch import distribution_lib as torch_dist_lib
 
     dist = global_state.get_global_attribute("distribution")
     if dist is not None:
