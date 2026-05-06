@@ -267,38 +267,40 @@ def convert_to_tensor(x, dtype=None, sparse=None, ragged=None):
                 x = x.to(device)
         if dtype is not None:
             x = x.to(to_torch_dtype(dtype))
-
-    if not is_tensor(x):
-        if isinstance(x, (bool, int, float, complex)):
-            if dtype is not None:
-                dt = to_torch_dtype(dtype)
-            elif isinstance(x, bool):
-                dt = torch.bool
-            elif isinstance(x, int):
-                dt = torch.int64 if x < -(2**31) or x >= 2**31 else torch.int32
-            elif isinstance(x, float):
-                dt = to_torch_dtype(floatx())
-            else:
-                dt = torch.complex64
-            x = torch.as_tensor(x, dtype=dt, device=get_device())
-
-    if not is_tensor(x):
+    elif isinstance(x, (bool, int, float, complex)):
+        if dtype is not None:
+            dt = to_torch_dtype(dtype)
+        elif isinstance(x, bool):
+            dt = torch.bool
+        elif isinstance(x, int):
+            dt = torch.int64 if x < -(2**31) or x >= 2**31 else torch.int32
+        elif isinstance(x, float):
+            dt = to_torch_dtype(floatx())
+        else:
+            dt = torch.complex64
+        x = torch.as_tensor(x, dtype=dt, device=get_device())
+    else:
         # Convert to np in case of any array-like that is not list or tuple.
-        if not isinstance(x, (list, tuple)):
+        # Skip scalar Python values to avoid np.array(float) -> float64, which
+        # causes dtype issues during torch.export (constants are lifted before
+        # the cast to the requested dtype).
+        if isinstance(x, (list, tuple)):
+            if len(x) > 0 and any(isinstance(x1, torch.Tensor) for x1 in x):
+                # Handle list or tuple of torch tensors
+                x = torch.stack([convert_to_tensor(x1) for x1 in x])
+        elif not isinstance(x, (bool, int, float)):
             x = np.array(x)
-        elif len(x) > 0 and any(isinstance(x1, torch.Tensor) for x1 in x):
-            # Handle list or tuple of torch tensors
-            x = torch.stack([convert_to_tensor(x1) for x1 in x])
 
+        if isinstance(x, np.ndarray):
+            if x.dtype == np.uint32:
+                # Torch backend does not support uint32.
+                x = x.astype(np.int64)
+            if standardize_dtype(x.dtype) == "bfloat16":
+                # Torch backend does not support converting bfloat16 ndarray.
+                x = x.astype(np.float32)
+                dtype = "bfloat16"
+            dtype = dtype or x.dtype
         if not is_tensor(x):
-            if isinstance(x, np.ndarray):
-                if x.dtype == np.uint32:
-                    # Torch backend does not support uint32.
-                    x = x.astype(np.int64)
-                if standardize_dtype(x.dtype) == "bfloat16":
-                    x = x.astype(np.float32)
-                    dtype = "bfloat16"
-                dtype = dtype or x.dtype
             if dtype is None:
                 dtype = result_type(
                     *[
