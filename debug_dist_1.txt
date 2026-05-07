@@ -1,0 +1,6 @@
+REGISTERING STRATEGIES
+Successfully registered aten.unbind.int
+Successfully registered aten.view.default
+Successfully registered aten._unsafe_view.default
+Successfully registered aten.reshape.default
+Successfully registered aten.view_copy.default

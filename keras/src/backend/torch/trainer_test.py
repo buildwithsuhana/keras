@@ -1,3 +1,4 @@
+import contextlib
 import os
 from unittest import mock
 
@@ -9,6 +10,7 @@ from keras.src import backend
 from keras.src import callbacks
 from keras.src import layers
 from keras.src import models
+from keras.src import optimizers
 from keras.src import testing
 from keras.src.backend.torch.trainer import TorchEpochIterator
 from keras.src.distribution import distribution_lib
@@ -142,3 +144,87 @@ class TorchTrainerTest(testing.TestCase):
                 model.get_weights(), new_model.get_weights()
             ):
                 self.assertAllClose(ref_w, new_w)
+
+    def test_metrics_synchronization(self):
+        if not torch.distributed.is_initialized():
+            torch.distributed.init_process_group(
+                "gloo", init_method="tcp://127.0.0.1:0", rank=0, world_size=1
+            )
+            self.addCleanup(torch.distributed.destroy_process_group)
+
+        model = models.Sequential([layers.Dense(1, input_shape=(4,))])
+        model.compile(optimizer="adam", loss="mse", metrics=["mae"])
+
+        mesh = distribution_lib.DeviceMesh((1,), ["data"], ["cpu"])
+        distribution = distribution_lib.DataParallel(device_mesh=mesh)
+
+        with distribution.scope():
+            object.__setattr__(model, "_ddp_model", model)
+            model._in_ddp_context = True
+
+            with mock.patch.object(model, "_setup_ddp"), \
+                 mock.patch("torch.distributed.all_reduce") as mock_all_reduce:
+                model.fit(np.ones((4, 4), "f"), np.ones((4, 1), "f"), epochs=1, verbose=0)
+
+                mock_all_reduce.reset_mock()
+
+                model._sync_metrics()
+                self.assertGreaterEqual(mock_all_reduce.call_count, 2)
+
+                for call in mock_all_reduce.call_args_list:
+                    args, kwargs = call
+                    self.assertEqual(kwargs.get("op"), torch.distributed.ReduceOp.SUM)
+
+    def test_gradient_accumulation_no_sync(self):
+        if not torch.distributed.is_initialized():
+            torch.distributed.init_process_group(
+                "gloo", init_method="tcp://127.0.0.1:0", rank=0, world_size=1
+            )
+            self.addCleanup(torch.distributed.destroy_process_group)
+
+        model = models.Sequential([layers.Dense(1, input_shape=(4,))])
+        optimizer = optimizers.Adam(gradient_accumulation_steps=2)
+        model.compile(optimizer=optimizer, loss="mse")
+
+        mesh = distribution_lib.DeviceMesh((1,), ["data"], ["cpu"])
+        distribution = distribution_lib.DataParallel(device_mesh=mesh)
+
+        with distribution.scope():
+            model.no_sync = mock.MagicMock(return_value=contextlib.nullcontext())
+            object.__setattr__(model, "_ddp_model", model)
+            model._in_ddp_context = True
+
+            with mock.patch.object(model, "_setup_ddp"):
+                model.train_on_batch(np.ones((4, 4), "f"), np.ones((4, 1), "f"))
+                model.no_sync.assert_called_once()
+
+                model.no_sync.reset_mock()
+                model.train_on_batch(np.ones((4, 4), "f"), np.ones((4, 1), "f"))
+                model.no_sync.assert_not_called()
+
+    def test_distributed_checkpointing_rank_logic(self):
+        if not torch.distributed.is_initialized():
+            torch.distributed.init_process_group(
+                "gloo", init_method="tcp://127.0.0.1:0", rank=0, world_size=1
+            )
+            self.addCleanup(torch.distributed.destroy_process_group)
+
+        model = models.Sequential([layers.Dense(1, input_shape=(4,))])
+        model.compile(optimizer="adam", loss="mse")
+        model(torch.ones((1, 4)))
+
+        temp_filepath = os.path.join(self.get_temp_dir(), "model.weights.h5")
+
+        with mock.patch("keras.src.backend.torch.distribution_lib.process_id", return_value=0):
+            model.save_weights(temp_filepath)
+            self.assertTrue(os.path.exists(temp_filepath))
+
+        new_model = models.Sequential([layers.Dense(1, input_shape=(4,))])
+        new_model.compile(optimizer="adam", loss="mse")
+        new_model(torch.ones((1, 4)))
+
+        with mock.patch("keras.src.backend.torch.distribution_lib.process_id", return_value=1):
+            new_model.load_weights(temp_filepath)
+
+        for ref_w, new_w in zip(model.get_weights(), new_model.get_weights()):
+            self.assertAllClose(ref_w, new_w)

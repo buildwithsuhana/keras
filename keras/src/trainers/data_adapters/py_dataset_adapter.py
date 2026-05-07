@@ -279,9 +279,8 @@ class PyDatasetAdapter(DataAdapter):
         ) // self._num_processes
         for i in range(num_batches_per_rank):
             idx = i * self._num_processes + self._process_id
-            if idx >= num_batches:
-                idx = num_batches - 1
-            yield self._standardize_batch(self.py_dataset[indices[idx]])
+            if idx < num_batches:
+                yield self._standardize_batch(self.py_dataset[indices[idx]])
 
     def _infinite_enqueuer_generator(self):
         self.enqueuer.start()
@@ -662,9 +661,8 @@ class OrderedEnqueuer(PyDatasetEnqueuer):
                     sharded_indices = []
                     for i in range(num_batches_per_rank):
                         idx = i * self._num_processes + self._process_id
-                        if idx >= num_batches:
-                            idx = num_batches - 1
-                        sharded_indices.append(indices[idx])
+                        if idx < num_batches:
+                            sharded_indices.append(indices[idx])
                     indices = sharded_indices
                 self.indices = iter(indices)
             self._send_py_dataset()  # Share the initial py_dataset

@@ -53,11 +53,17 @@ class TorchTrainer(base_trainer.Trainer):
 
         if dist is not None and isinstance(dist, dist_lib.DataParallel):
             if not hasattr(self, "_ddp_model"):
+                if torch.cuda.is_available():
+                    device = torch.device(f"cuda:{torch.cuda.current_device()}")
+                    # Move model to the target device before DDP wrapping.
+                    # DDP requires all parameters to be on the same device.
+                    self.to(device)
+                    device_ids = [torch.cuda.current_device()]
+                else:
+                    device_ids = None
                 ddp_model = torch.nn.parallel.DistributedDataParallel(
                     self,
-                    device_ids=[torch.cuda.current_device()]
-                    if torch.cuda.is_available()
-                    else None,
+                    device_ids=device_ids,
                 )
                 object.__setattr__(self, "_ddp_model", ddp_model)
             self._in_ddp_context = True

@@ -411,6 +411,12 @@ class Distribution:
         """Create a distributed tf.data.Dataset."""
         raise NotImplementedError()
 
+    def distribute_dataset(self, dataset):
+        """Create a distributed tf.data.Dataset.
+        Alias for `distribute_tf_dataset`.
+        """
+        return self.distribute_tf_dataset(dataset)
+
     def distribute_torch_dataloader(self, dataloader):
         """Create a distributed torch DataLoader."""
         return dataloader

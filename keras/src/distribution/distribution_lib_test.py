@@ -270,6 +270,10 @@ class DataParallelDistributionTest(testing.TestCase):
         distributed_dataset = distribution.distribute_tf_dataset(dataset)
         self.assertIs(dataset, distributed_dataset)
 
+        # Test alias
+        distributed_dataset_alias = distribution.distribute_dataset(dataset)
+        self.assertIs(dataset, distributed_dataset_alias)
+
 
 @pytest.mark.skipif(
     backend.backend() not in ("jax", "torch"),
