@@ -82,8 +82,8 @@
   "step_1_loss": 1.6268099546432495,
   "step_5_loss": 1.5535573959350586,
   "perplexity": 4.728260594831589,
-  "throughput": 10.51911347906374,
-  "training_time": 1.9013009071350098,
+  "throughput": 10.379015715497006,
+  "training_time": 1.9269649982452393,
   "step_1_updates": {
     "embeddings/token_embedding/embeddings": {
       "mean": -2.577013602511613e-10,

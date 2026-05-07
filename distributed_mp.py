@@ -26,13 +26,17 @@ def get_weights_summary(model):
 def run_backend(backend, world_size=2):
     os.environ["KERAS_BACKEND"] = backend
     if backend == "jax":
-        import jax
+        num_gpus = 0
         try:
-            num_gpus = len(jax.devices("gpu"))
+            import torch
+            num_gpus = torch.cuda.device_count()
         except:
-            num_gpus = 0
+            pass
+        
         if num_gpus < world_size:
             os.environ["XLA_FLAGS"] = f"--xla_force_host_platform_device_count={world_size}"
+            # Force JAX to CPU if we are simulating to avoid using a single GPU if present
+            os.environ["JAX_PLATFORMS"] = "cpu"
         _run_jax(world_size)
     elif backend == "torch":
         import torch
@@ -48,6 +52,11 @@ def _run_jax(world_size):
     if len(devices) > world_size:
         devices = devices[:world_size]
     print(f"Using JAX devices: {devices}")
+    
+    if len(devices) < world_size:
+        raise ValueError(f"Not enough devices found. Expected {world_size}, got {len(devices)}. "
+                         f"Check XLA_FLAGS or GPU availability.")
+
     mesh = keras.distribution.DeviceMesh(shape=(world_size,), axis_names=("model",), devices=devices)
     layout_map = keras.distribution.LayoutMap(mesh)
     
