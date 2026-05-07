@@ -715,7 +715,10 @@ def arange(start, stop=None, step=None, dtype=None):
     dtype = None if dtype is None else backend.standardize_dtype(dtype)
     if any_symbolic_tensors((start, stop, step)):
         return Arange(dtype=dtype).symbolic_call(start, stop, step=step)
-    return backend.numpy.arange(start, stop, step=step, dtype=dtype)
+    return backend.convert_to_tensor(
+        backend.numpy.arange(start, stop, step=step, dtype=dtype),
+        is_op_output=True,
+    )
 
 
 class Arccos(Operation):

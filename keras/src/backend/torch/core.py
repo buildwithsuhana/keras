@@ -249,7 +249,7 @@ class Variable(KerasVariable):
             return False
 
 
-def convert_to_tensor(x, dtype=None, sparse=None, ragged=None):
+def convert_to_tensor(x, dtype=None, sparse=None, ragged=None, is_op_output=False):
     if x is None:
         raise ValueError("`convert_to_tensor` received `None`.")
     if sparse:
@@ -320,14 +320,18 @@ def convert_to_tensor(x, dtype=None, sparse=None, ragged=None):
             return x
         if isinstance(x, DTensor):
             return x
+        if is_op_output:
+            if is_tensor(x):
+                layout = TensorLayout([None] * x.ndim, dist.device_mesh)
+                x = torch_dist_lib.distribute_tensor(x, layout)
+        else:
+            is_parameter = isinstance(x, torch.nn.Parameter)
+            is_leaf_tensor = is_tensor(x) and getattr(x, "is_leaf", False)
+            if not (is_parameter or is_leaf_tensor):
+                return x
 
-        is_parameter = isinstance(x, torch.nn.Parameter)
-        is_leaf_tensor = is_tensor(x) and getattr(x, "is_leaf", False)
-        if not (is_parameter or is_leaf_tensor):
-            return x
-
-        layout = TensorLayout([None] * x.ndim, dist.device_mesh)
-        x = torch_dist_lib.distribute_tensor(x, layout)
+            layout = TensorLayout([None] * x.ndim, dist.device_mesh)
+            x = torch_dist_lib.distribute_tensor(x, layout)
     return x
 
 
