@@ -1,35 +1,26 @@
+
 import os
+
 os.environ["KERAS_BACKEND"] = "torch"
+
 import keras
 import torch
-from keras.src.backend.torch.numpy import arange
-from keras.src.backend.torch.core import convert_to_tensor
+import numpy as np
 
-def test_arange_promotion():
-    print("Testing arange promotion...")
-    # Keras default floatx is usually float32
-    print(f"Current floatx: {keras.backend.floatx()}")
-    
-    # arange with float start
-    x = arange(0.0, 5.0)
-    print(f"arange(0.0, 5.0) dtype: {x.dtype}")
-    
-    # arange with int start
-    y = arange(0, 5)
-    print(f"arange(0, 5) dtype: {y.dtype}")
+print(f"Keras floatx: {keras.config.floatx()}")
 
-def test_convert_to_tensor_promotion():
-    print("\nTesting convert_to_tensor promotion...")
-    
-    # User data (list of floats)
-    x = convert_to_tensor([1.0, 2.0])
-    print(f"convert_to_tensor([1.0, 2.0]) dtype: {x.dtype}")
-    
-    # Op output (torch tensor float64)
-    t64 = torch.tensor([1.0, 2.0], dtype=torch.float64)
-    x = convert_to_tensor(t64)
-    print(f"convert_to_tensor(torch.float64 tensor) dtype: {x.dtype}")
+# Case 1: Python float
+x = keras.ops.arange(0.0, 5.0)
+print(f"arange(0.0, 5.0) dtype: {x.dtype}")
 
-if __name__ == "__main__":
-    test_arange_promotion()
-    test_convert_to_tensor_promotion()
+# Case 2: float64 inputs
+start = torch.tensor(0.0, dtype=torch.float64)
+stop = torch.tensor(5.0, dtype=torch.float64)
+x = keras.ops.arange(start, stop)
+print(f"arange(float64_tensor, float64_tensor) dtype: {x.dtype}")
+
+# Case 3: float64 numpy inputs
+start_np = np.array(0.0, dtype="float64")
+stop_np = np.array(5.0, dtype="float64")
+x = keras.ops.arange(start_np, stop_np)
+print(f"arange(float64_np, float64_np) dtype: {x.dtype}")
