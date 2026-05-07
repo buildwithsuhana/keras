@@ -47,6 +47,7 @@ def _run_jax(world_size):
     devices = keras.distribution.list_devices()
     if len(devices) > world_size:
         devices = devices[:world_size]
+    print(f"Using JAX devices: {devices}")
     mesh = keras.distribution.DeviceMesh(shape=(world_size,), axis_names=("model",), devices=devices)
     layout_map = keras.distribution.LayoutMap(mesh)
     
