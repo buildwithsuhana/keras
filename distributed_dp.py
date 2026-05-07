@@ -10,7 +10,13 @@ os.environ["TF_CPP_MIN_LOG_LEVEL"] = "3"
 def run_backend(backend, world_size=2):
     os.environ["KERAS_BACKEND"] = backend
     if backend == "jax":
-        os.environ["XLA_FLAGS"] = f"--xla_force_host_platform_device_count={world_size}"
+        import jax
+        try:
+            num_gpus = len(jax.devices("gpu"))
+        except:
+            num_gpus = 0
+        if num_gpus < world_size:
+            os.environ["XLA_FLAGS"] = f"--xla_force_host_platform_device_count={world_size}"
         _run_jax(world_size)
     elif backend == "torch":
         import torch
@@ -23,7 +29,9 @@ def _run_jax(world_size):
     import keras_hub
     keras.utils.set_random_seed(42)
     
-    devices = keras.distribution.list_devices()[:world_size]
+    devices = keras.distribution.list_devices()
+    if len(devices) > world_size:
+        devices = devices[:world_size]
     mesh = keras.distribution.DeviceMesh(shape=(world_size,), axis_names=("batch",), devices=devices)
     
     distribution = keras.distribution.DataParallel(device_mesh=mesh, auto_shard_dataset=False)
@@ -64,21 +72,29 @@ def _run_jax(world_size):
 
 def _run_torch(rank, world_size, port):
     import os
+    import torch
     os.environ["RANK"] = str(rank)
     os.environ["WORLD_SIZE"] = str(world_size)
     os.environ["LOCAL_RANK"] = str(rank)
     os.environ["MASTER_ADDR"] = "localhost"
     os.environ["MASTER_PORT"] = port
-    os.environ["KERAS_TORCH_DEVICE"] = "cpu"
+    
+    num_gpus = torch.cuda.device_count()
+    if num_gpus >= world_size:
+        os.environ["KERAS_TORCH_DEVICE"] = f"cuda:{rank}"
+        device_type = "cuda"
+    else:
+        os.environ["KERAS_TORCH_DEVICE"] = "cpu"
+        device_type = "cpu"
+        
     import keras
     import keras_hub
-    import torch
     import sys
     sys.path.insert(0, os.getcwd())
     keras.utils.set_random_seed(42)
     keras.distribution.initialize()
     
-    devices = [f"cpu:{i}" for i in range(world_size)]
+    devices = keras.distribution.list_devices(device_type)[:world_size]
     mesh = keras.distribution.DeviceMesh(shape=(world_size,), axis_names=("batch",), devices=devices)
     
     distribution = keras.distribution.DataParallel(device_mesh=mesh, auto_shard_dataset=False)

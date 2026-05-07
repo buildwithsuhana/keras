@@ -26,7 +26,13 @@ def get_weights_summary(model):
 def run_backend(backend, world_size=2):
     os.environ["KERAS_BACKEND"] = backend
     if backend == "jax":
-        os.environ["XLA_FLAGS"] = f"--xla_force_host_platform_device_count={world_size}"
+        import jax
+        try:
+            num_gpus = len(jax.devices("gpu"))
+        except:
+            num_gpus = 0
+        if num_gpus < world_size:
+            os.environ["XLA_FLAGS"] = f"--xla_force_host_platform_device_count={world_size}"
         _run_jax(world_size)
     elif backend == "torch":
         import torch
@@ -38,7 +44,10 @@ def _run_jax(world_size):
     import keras_hub
     keras.utils.set_random_seed(42)
     
-    mesh = keras.distribution.DeviceMesh(shape=(world_size,), axis_names=("model",), devices=keras.distribution.list_devices()[:world_size])
+    devices = keras.distribution.list_devices()
+    if len(devices) > world_size:
+        devices = devices[:world_size]
+    mesh = keras.distribution.DeviceMesh(shape=(world_size,), axis_names=("model",), devices=devices)
     layout_map = keras.distribution.LayoutMap(mesh)
     
     # Sharding strategy for all layers
@@ -112,15 +121,23 @@ def _run_jax(world_size):
 
 def _run_torch(rank, world_size):
     import os
+    import torch
     os.environ["RANK"] = str(rank)
     os.environ["WORLD_SIZE"] = str(world_size)
     os.environ["LOCAL_RANK"] = str(rank)
     os.environ["MASTER_ADDR"] = "localhost"
     os.environ["MASTER_PORT"] = "29560"
-    os.environ["KERAS_TORCH_DEVICE"] = "cpu"
+    
+    num_gpus = torch.cuda.device_count()
+    if num_gpus >= world_size:
+        os.environ["KERAS_TORCH_DEVICE"] = "cuda"
+        device_type = "cuda"
+    else:
+        os.environ["KERAS_TORCH_DEVICE"] = "cpu"
+        device_type = "cpu"
+    
     import keras
     import keras_hub
-    import torch
     import sys
     sys.path.insert(0, os.getcwd())
     keras.utils.set_random_seed(42)
@@ -128,7 +145,7 @@ def _run_torch(rank, world_size):
     
     print(f"[Rank {rank}] Initialized. World size: {world_size}")
     
-    devices = keras.distribution.list_devices("cpu")[:world_size]
+    devices = keras.distribution.list_devices(device_type)[:world_size]
     print(f"[Rank {rank}] Using devices: {devices}")
     
     mesh = keras.distribution.DeviceMesh(shape=(world_size,), axis_names=("model",), devices=devices)
