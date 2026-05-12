@@ -80,13 +80,13 @@
     }
   },
   "step_1_loss": 1.6268099546432495,
-  "step_5_loss": 1.5535578727722168,
-  "perplexity": 4.728262849442472,
-  "throughput": 34.97684223868922,
-  "training_time": 0.5718069076538086,
+  "step_5_loss": 1.5535575151443481,
+  "perplexity": 4.728261158484209,
+  "throughput": 5.443970399355856,
+  "training_time": 3.6737892627716064,
   "step_1_updates": {
     "embeddings/token_embedding/embeddings": {
-      "mean": -2.5769614220294557e-10,
+      "mean": -2.5770591216556227e-10,
       "samples": [
         0.0,
         0.0,
@@ -96,7 +96,7 @@
       ]
     },
     "embeddings/position_embedding/embeddings": {
-      "mean": -8.919903149440245e-10,
+      "mean": -8.919025518139279e-10,
       "samples": [
         -5.128979682922363e-05,
         -1.4603137969970703e-05,
@@ -106,7 +106,7 @@
       ]
     },
     "transformer_layer_0/feedforward_intermediate_dense/kernel": {
-      "mean": -2.196571244894585e-07,
+      "mean": -2.1965732344142452e-07,
       "samples": [
         -6.854534149169922e-06,
         4.516215994954109e-05,
@@ -116,7 +116,7 @@
       ]
     },
     "transformer_layer_0/feedforward_output_dense/kernel": {
-      "mean": 3.1437661363042935e-08,
+      "mean": 3.1437132008704793e-08,
       "samples": [
         1.2814998626708984e-05,
         6.332993507385254e-06,
@@ -126,17 +126,17 @@
       ]
     },
     "transformer_layer_1/feedforward_intermediate_dense/kernel": {
-      "mean": 2.8740739566046614e-08,
+      "mean": 2.874069515712563e-08,
       "samples": [
         -2.0677223801612854e-05,
         0.0,
-        -3.6783283576369286e-05,
+        -3.678351640701294e-05,
         0.0,
         -3.9944425225257874e-05
       ]
     },
     "transformer_layer_1/feedforward_output_dense/kernel": {
-      "mean": -6.065467061944219e-08,
+      "mean": -6.065450719461296e-08,
       "samples": [
         -2.397364005446434e-05,
         4.582107067108154e-06,
@@ -146,7 +146,7 @@
       ]
     },
     "transformer_layer_2/feedforward_intermediate_dense/kernel": {
-      "mean": 1.9296412290259468e-07,
+      "mean": 1.9296419395686826e-07,
       "samples": [
         0.0,
         0.0,
@@ -156,7 +156,7 @@
       ]
     },
     "transformer_layer_2/feedforward_output_dense/kernel": {
-      "mean": -1.3126671660756983e-07,
+      "mean": -1.312666881858604e-07,
       "samples": [
         0.0,
         0.0,
@@ -166,7 +166,7 @@
       ]
     },
     "transformer_layer_3/feedforward_intermediate_dense/kernel": {
-      "mean": 3.9310414479132305e-08,
+      "mean": 3.9310446453555414e-08,
       "samples": [
         4.0333718061447144e-05,
         0.0,
@@ -176,17 +176,17 @@
       ]
     },
     "transformer_layer_3/feedforward_output_dense/kernel": {
-      "mean": -8.89559359507075e-08,
+      "mean": -8.895590752899807e-08,
       "samples": [
         2.7194619178771973e-06,
         5.7151541113853455e-05,
         3.395788371562958e-05,
-        1.1213589459657669e-05,
+        1.1214055120944977e-05,
         4.001334309577942e-05
       ]
     },
     "transformer_layer_4/feedforward_intermediate_dense/kernel": {
-      "mean": 3.089596987138066e-07,
+      "mean": 3.0895952818355e-07,
       "samples": [
         0.0,
         2.6928260922431946e-05,
@@ -196,7 +196,7 @@
       ]
     },
     "transformer_layer_4/feedforward_output_dense/kernel": {
-      "mean": -1.5005424813807622e-07,
+      "mean": -1.500541486620932e-07,
       "samples": [
         0.0,
         0.0,
@@ -206,7 +206,7 @@
       ]
     },
     "transformer_layer_5/feedforward_intermediate_dense/kernel": {
-      "mean": 7.295020054698398e-08,
+      "mean": 7.295035686638585e-08,
       "samples": [
         -9.447336196899414e-06,
         0.0,
@@ -216,7 +216,7 @@
       ]
     },
     "transformer_layer_5/feedforward_output_dense/kernel": {
-      "mean": -2.2266125654368807e-07,
+      "mean": -2.2266164023676538e-07,
       "samples": [
         4.902482032775879e-06,
         4.273653030395508e-05,
@@ -226,7 +226,7 @@
       ]
     },
     "transformer_layer_6/feedforward_intermediate_dense/kernel": {
-      "mean": -5.120147505977002e-08,
+      "mean": -5.120165269545396e-08,
       "samples": [
         -1.0065734386444092e-05,
         -4.688650369644165e-05,
@@ -236,7 +236,7 @@
       ]
     },
     "transformer_layer_6/feedforward_output_dense/kernel": {
-      "mean": -3.7084015502841794e-07,
+      "mean": -3.7083978554619534e-07,
       "samples": [
         -9.718351066112518e-06,
         -1.0028481483459473e-05,
@@ -246,9 +246,9 @@
       ]
     },
     "transformer_layer_7/feedforward_intermediate_dense/kernel": {
-      "mean": -2.757574577572086e-07,
+      "mean": -2.757573440703709e-07,
       "samples": [
-        -4.192243795841932e-05,
+        -4.192246706224978e-05,
         3.1777191907167435e-05,
         0.0,
         0.0,
@@ -256,7 +256,7 @@
       ]
     },
     "transformer_layer_7/feedforward_output_dense/kernel": {
-      "mean": -3.055104684790422e-07,
+      "mean": -3.055102979487856e-07,
       "samples": [
         3.748573362827301e-05,
         -3.112293779850006e-05,
@@ -266,7 +266,7 @@
       ]
     },
     "transformer_layer_8/feedforward_intermediate_dense/kernel": {
-      "mean": -3.550195515344967e-07,
+      "mean": -3.55019238895693e-07,
       "samples": [
         -4.3878331780433655e-05,
         3.869272768497467e-05,
@@ -276,7 +276,7 @@
       ]
     },
     "transformer_layer_8/feedforward_output_dense/kernel": {
-      "mean": -2.9728204253842705e-07,
+      "mean": -2.972819856950082e-07,
       "samples": [
         -2.209097146987915e-05,
         -1.4744699001312256e-05,
@@ -286,27 +286,27 @@
       ]
     },
     "transformer_layer_9/feedforward_intermediate_dense/kernel": {
-      "mean": 6.488010058092186e-07,
+      "mean": 6.488009489657998e-07,
       "samples": [
         -9.213108569383621e-06,
         0.0,
         3.656744956970215e-05,
-        7.966766133904457e-06,
+        7.96664971858263e-06,
         -4.194676876068115e-05
       ]
     },
     "transformer_layer_9/feedforward_output_dense/kernel": {
-      "mean": 1.0731105248851236e-07,
+      "mean": 1.0731158539556418e-07,
       "samples": [
         8.981674909591675e-06,
         1.4863908290863037e-06,
-        -4.0065497159957886e-06,
+        -4.0084123611450195e-06,
         7.256865501403809e-06,
         -5.908310413360596e-06
       ]
     },
     "transformer_layer_10/feedforward_intermediate_dense/kernel": {
-      "mean": 7.242954893627029e-07,
+      "mean": 7.242956030495407e-07,
       "samples": [
         0.0,
         -1.477077603340149e-05,
@@ -316,7 +316,7 @@
       ]
     },
     "transformer_layer_10/feedforward_output_dense/kernel": {
-      "mean": 6.80781624851079e-07,
+      "mean": 6.807823638155241e-07,
       "samples": [
         0.0,
         0.0,
@@ -336,12 +336,12 @@
       ]
     },
     "transformer_layer_11/feedforward_output_dense/kernel": {
-      "mean": 4.061580227698869e-08,
+      "mean": 4.061600833438206e-08,
       "samples": [
         -1.0654330253601074e-06,
-        -1.3779383152723312e-05,
-        -3.194250166416168e-05,
-        7.928814738988876e-06,
+        -1.3778917491436005e-05,
+        -3.1942036002874374e-05,
+        7.928349077701569e-06,
         3.9229169487953186e-05
       ]
     }

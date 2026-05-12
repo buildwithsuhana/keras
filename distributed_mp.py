@@ -64,11 +64,11 @@ def _run_jax(world_size):
     layout_map[".*token_embedding/embeddings"] = keras.distribution.TensorLayout(("model", None), mesh)
     layout_map[".*position_embedding/embeddings"] = keras.distribution.TensorLayout((None, "model"), mesh)
     
-    # MHA: Q/K/V shard on heads, Attention Output replicated to avoid Torch view errors
+    # MHA: Q/K/V shard on heads, Attention Output sharded on input dim to match
     layout_map[".*self_attention/query/kernel"] = keras.distribution.TensorLayout((None, "model", None), mesh)
     layout_map[".*self_attention/key/kernel"] = keras.distribution.TensorLayout((None, "model", None), mesh)
     layout_map[".*self_attention/value/kernel"] = keras.distribution.TensorLayout((None, "model", None), mesh)
-    layout_map[".*self_attention/attention_output/kernel"] = keras.distribution.TensorLayout((None, None, None), mesh)
+    layout_map[".*self_attention/attention_output/kernel"] = keras.distribution.TensorLayout(("model", None), mesh)
     
     # MLP: Intermediate shard on output dim, Output shard on input dim
     layout_map[".*feedforward_intermediate_dense/kernel"] = keras.distribution.TensorLayout((None, "model"), mesh)
@@ -89,7 +89,7 @@ def _run_jax(world_size):
     distribution = keras.distribution.ModelParallel(layout_map=layout_map, batch_dim_name="model", auto_shard_dataset=False)
     with distribution.scope():
         model = keras_hub.models.OPTBackbone.from_preset("opt_125m_en", dropout=0.0)
-        model.compile(optimizer=keras.optimizers.Adam(learning_rate=1e-5), loss="mse")
+        model.compile(optimizer=keras.optimizers.Adam(learning_rate=1e-5), loss="mse", jit_compile=False)
         
         initial = get_weights_summary(model)
         np.random.seed(42)
@@ -132,6 +132,17 @@ def _run_jax(world_size):
 def _run_torch(rank, world_size):
     import os
     import torch
+    
+    # Monkeypatch DeviceMesh for torch.compile compatibility in Torch 2.9.0
+    from torch.distributed.device_mesh import DeviceMesh as TorchDeviceMesh
+    original_repr = TorchDeviceMesh.__repr__
+    def patched_repr(self):
+        try:
+            return original_repr(self)
+        except AttributeError:
+            return "DeviceMesh(...)"
+    TorchDeviceMesh.__repr__ = patched_repr
+
     os.environ["RANK"] = str(rank)
     os.environ["WORLD_SIZE"] = str(world_size)
     os.environ["LOCAL_RANK"] = str(rank)
@@ -156,20 +167,25 @@ def _run_torch(rank, world_size):
     print(f"[Rank {rank}] Initialized. World size: {world_size}")
     
     devices = keras.distribution.list_devices(device_type)[:world_size]
-    print(f"[Rank {rank}] Using devices: {devices}")
-    
     mesh = keras.distribution.DeviceMesh(shape=(world_size,), axis_names=("model",), devices=devices)
+    
+    # Patch DeviceMesh for torch.compile compatibility in Torch 2.9.0
+    if hasattr(mesh.backend_mesh, "_mesh_dim_names") and not hasattr(mesh.backend_mesh, "mesh_dim_names"):
+        mesh.backend_mesh.mesh_dim_names = mesh.backend_mesh._mesh_dim_names
+    elif not hasattr(mesh.backend_mesh, "mesh_dim_names"):
+        mesh.backend_mesh.mesh_dim_names = mesh.axis_names
+
     layout_map = keras.distribution.LayoutMap(mesh)
     
     # Sharding strategy for all layers
     layout_map[".*token_embedding/embeddings"] = keras.distribution.TensorLayout(("model", None), mesh)
     layout_map[".*position_embedding/embeddings"] = keras.distribution.TensorLayout((None, "model"), mesh)
     
-    # MHA: Q/K/V shard on heads, Attention Output replicated to avoid Torch view errors
+    # MHA: Q/K/V shard on heads, Attention Output sharded on input dim to match
     layout_map[".*self_attention/query/kernel"] = keras.distribution.TensorLayout((None, "model", None), mesh)
     layout_map[".*self_attention/key/kernel"] = keras.distribution.TensorLayout((None, "model", None), mesh)
     layout_map[".*self_attention/value/kernel"] = keras.distribution.TensorLayout((None, "model", None), mesh)
-    layout_map[".*self_attention/attention_output/kernel"] = keras.distribution.TensorLayout((None, None, None), mesh)
+    layout_map[".*self_attention/attention_output/kernel"] = keras.distribution.TensorLayout(("model", None), mesh)
     
     # MLP: Intermediate shard on output dim, Output shard on input dim
     layout_map[".*feedforward_intermediate_dense/kernel"] = keras.distribution.TensorLayout((None, "model"), mesh)
@@ -224,32 +240,30 @@ def _run_torch(rank, world_size):
         x = {k: v[indices] for k, v in x_full.items()}
         y = y_full[indices]
         
-        from torch.nn.attention import sdpa_kernel
-        with sdpa_kernel(torch.nn.attention.SDPBackend.MATH):
-            # Warmup
-            model.fit(x, y, batch_size=2, epochs=1, steps_per_epoch=1, verbose=1 if rank == 0 else 0, shuffle=False)
-            
-            start_time = time.time()
-            history = model.fit(x, y, batch_size=2, epochs=5, steps_per_epoch=1, verbose=1 if rank == 0 else 0, shuffle=False)
-            end_time = time.time()
-            training_time = end_time - start_time
-            
-            after_step_1 = get_weights_summary(model)
+        # Warmup
+        model.fit(x, y, batch_size=2, epochs=1, steps_per_epoch=1, verbose=1 if rank == 0 else 0, shuffle=False)
+        
+        start_time = time.time()
+        history = model.fit(x, y, batch_size=2, epochs=5, steps_per_epoch=1, verbose=1 if rank == 0 else 0, shuffle=False)
+        end_time = time.time()
+        training_time = end_time - start_time
+        
+        after_step_1 = get_weights_summary(model)
 
-            if rank == 0:
-                step_1_loss = float(history.history["loss"][0])
-                step_5_loss = float(history.history["loss"][4])
-                throughput = (4 * 5) / training_time
-                perplexity = float(np.exp(step_5_loss))
+        if rank == 0:
+            step_1_loss = float(history.history["loss"][0])
+            step_5_loss = float(history.history["loss"][4])
+            throughput = (4 * 5) / training_time
+            perplexity = float(np.exp(step_5_loss))
 
-                print(f"\n[Rank {rank}] Verifying gradient sharding:")
-                from torch.distributed.tensor import DTensor
-                grad_sharded_count = 0
-                for v in model.trainable_variables:
-                    if v.value.grad is not None:
-                        if isinstance(v.value.grad, DTensor):
-                            grad_sharded_count += 1
-                print(f"    Total sharded gradients found: {grad_sharded_count}/{len(model.trainable_variables)}")
+            print(f"\n[Rank {rank}] Verifying gradient sharding:")
+            from torch.distributed.tensor import DTensor
+            grad_sharded_count = 0
+            for v in model.trainable_variables:
+                if v.value.grad is not None:
+                    if isinstance(v.value.grad, DTensor):
+                        grad_sharded_count += 1
+            print(f"    Total sharded gradients found: {grad_sharded_count}/{len(model.trainable_variables)}")
 
     if rank == 0:
         results = {
