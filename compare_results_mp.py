@@ -18,15 +18,17 @@ def compare():
         ("Perplexity", "perplexity"),
         ("Throughput (samples/sec)", "throughput"),
         ("Training Time (sec)", "training_time"),
+        ("Compilation Time (sec)", "compilation_time"),
+        ("Peak Memory (MB)", "peak_memory"),
     ]
 
     all_pass = True
     for label, key in metrics:
-        v_jax = jax[key]
-        v_torch = torch[key]
+        v_jax = jax.get(key, 0.0)
+        v_torch = torch.get(key, 0.0)
         diff = abs(v_jax - v_torch)
         print(f"{label:<30} | {v_jax:<20.12f} | {v_torch:<20.12f} | {diff:<15.8e}")
-        if key not in ["throughput", "training_time"] and diff > 1e-5:
+        if key not in ["throughput", "training_time", "compilation_time", "peak_memory"] and diff > 1e-5:
             all_pass = False
 
     print("\nSummary:")

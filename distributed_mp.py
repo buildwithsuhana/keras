@@ -61,8 +61,14 @@ def get_weights_summary(model):
     return summary
 
 def run_backend(backend, world_size=2):
+    # Clean up old results
+    for f in ["results_torch.json", "results_jax.json"]:
+        if os.path.exists(f): os.remove(f)
+    for r in range(world_size):
+        f = f"results_torch_rank_{r}.json"
+        if os.path.exists(f): os.remove(f)
+
     if backend == "jax":
-        # Force JAX to see multiple CPU devices if GPUs aren't enough
         import torch
         num_gpus = torch.cuda.device_count()
         if num_gpus < world_size:
@@ -71,7 +77,6 @@ def run_backend(backend, world_size=2):
         _run_jax(world_size)
     elif backend == "torch":
         import torch
-        # Use 'spawn' for GPU compatibility
         num_gpus = torch.cuda.device_count()
         method = "spawn" if num_gpus >= world_size else "fork"
         print(f"Using Torch start method: {method} ({num_gpus} GPUs found)")
@@ -92,6 +97,7 @@ def run_backend(backend, world_size=2):
             if all_peaks:
                 results["peak_memory"] = sum(all_peaks) # Total system memory
             with open("results_torch.json", "w") as f: json.dump(results, f, indent=2)
+            print(f"Final results written to results_torch.json (System Peak Memory: {results.get('peak_memory'):.2f} MB)")
 
 def _run_jax(world_size):
     import jax
@@ -110,7 +116,7 @@ def _run_jax(world_size):
     mesh = keras.distribution.DeviceMesh(shape=(world_size,), axis_names=("model",), devices=devices)
     layout_map = keras.distribution.LayoutMap(mesh)
     
-    # Sharding strategy
+    # Sharding
     layout_map[".*token_embedding/embeddings"] = keras.distribution.TensorLayout(("model", None), mesh)
     layout_map[".*position_embedding/embeddings"] = keras.distribution.TensorLayout((None, "model"), mesh)
     layout_map[".*self_attention/query/kernel"] = keras.distribution.TensorLayout((None, "model", None), mesh)
@@ -260,8 +266,10 @@ def _run_torch(rank, world_size):
             "step_1_updates": {path: {"mean": float(np.mean(after_step_1[path]["val"] - initial[path]["val"])), "samples": (after_step_1[path]["val"] - initial[path]["val"]).flatten()[:5].tolist()} for path in initial if path in after_step_1},
         })
     
+    # Critical: Write rank-specific file
     with open(f"results_torch_rank_{rank}.json", "w") as f:
         json.dump(rank_results, f, indent=2)
+    print(f"[Rank {rank}] Successfully wrote results_torch_rank_{rank}.json")
     
     if torch.distributed.is_initialized():
         torch.distributed.barrier()
