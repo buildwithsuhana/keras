@@ -17,7 +17,7 @@ def compare():
         ("Step 5 Loss", "step_5_loss"),
         ("Perplexity", "perplexity"),
         ("Throughput (samples/sec)", "throughput"),
-        ("Compilation Time (sec)", "compilation_time"),
+        ("Training Time (sec)", "training_time"),
         ("Peak Memory (MB)", "peak_memory_mb"),
     ]
 
