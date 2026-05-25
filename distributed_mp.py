@@ -1,7 +1,7 @@
 import os
 import sys
 
-# CRITICAL: Set backend BEFORE importing Keras
+# Set backend BEFORE importing Keras
 if len(sys.argv) > 1:
     os.environ["KERAS_BACKEND"] = sys.argv[1]
 
@@ -13,7 +13,7 @@ import threading
 import contextlib
 import gc
 
-# Pre-import libraries in the parent process to enable memory sharing via 'fork'
+# Pre-import libraries
 import torch
 import keras
 import keras_hub
@@ -73,7 +73,6 @@ def run_backend(backend, world_size=2):
             os.environ["JAX_PLATFORMS"] = "cpu"
         _run_jax(world_size)
     elif backend == "torch":
-        # Use 'fork' to share the pre-imported 'keras' and 'torch' memory pages
         ctx = torch.multiprocessing.get_context("fork")
         processes = []
         for rank in range(world_size):
@@ -82,11 +81,29 @@ def run_backend(backend, world_size=2):
             processes.append(p)
         for p in processes:
             p.join()
+            
+        # Collect and merge results from rank files
+        if os.path.exists("results_torch_rank_0.json"):
+            with open("results_torch_rank_0.json", "r") as f:
+                results = json.load(f)
+            
+            # Find global peak memory across all ranks
+            all_peaks = []
+            for r in range(world_size):
+                fname = f"results_torch_rank_{r}.json"
+                if os.path.exists(fname):
+                    with open(fname, "r") as f:
+                        data = json.load(f)
+                        if "rank_peak_memory" in data:
+                            all_peaks.append(data["rank_peak_memory"])
+            
+            if all_peaks:
+                results["peak_memory"] = max(all_peaks)
+                
+            with open("results_torch.json", "w") as f: json.dump(results, f, indent=2)
 
 def _run_jax(world_size):
-    import jax
     keras.utils.set_random_seed(42)
-    
     tracker = MemoryTracker()
     tracker.start()
 
@@ -95,9 +112,6 @@ def _run_jax(world_size):
         devices = devices[:world_size]
     print(f"Using JAX devices: {devices}")
     
-    if len(devices) < world_size:
-        raise ValueError(f"Not enough devices found. Expected {world_size}, got {len(devices)}.")
-
     mesh = keras.distribution.DeviceMesh(shape=(world_size,), axis_names=("model",), devices=devices)
     layout_map = keras.distribution.LayoutMap(mesh)
     
@@ -134,7 +148,6 @@ def _run_jax(world_size):
             x_full["token_ids"][base+2:base+4] = x_full["token_ids"][base:base+2]
             y_full[base+2:base+4] = y_full[base:base+2]
 
-        # Compilation Warmup
         start_comp = time.time()
         model.fit(x_full, y_full, batch_size=4, epochs=1, steps_per_epoch=1, verbose=1, shuffle=False)
         compilation_time = time.time() - start_comp
@@ -183,7 +196,7 @@ def _run_torch(rank, world_size):
     tracker = MemoryTracker()
     tracker.start()
 
-    print(f"[Rank {rank}] Initialized. World size: {world_size} on {device_type}")
+    print(f"[Rank {rank}] Initialized on {device_type}")
     
     devices = keras.distribution.list_devices(device_type)[:world_size]
     mesh = keras.distribution.DeviceMesh(shape=(world_size,), axis_names=("model",), devices=devices)
@@ -234,7 +247,6 @@ def _run_torch(rank, world_size):
         x = {k: v[indices] for k, v in x_full.items()}
         y = y_full[indices]
         
-        # Warmup
         start_comp = time.time()
         model.fit(x, y, batch_size=2, epochs=1, steps_per_epoch=1, verbose=1 if rank == 0 else 0, shuffle=False)
         compilation_time = time.time() - start_comp
@@ -248,13 +260,13 @@ def _run_torch(rank, world_size):
 
     peak_memory = tracker.stop()
     
-    # Collective peak memory (max across ranks)
-    peak_mem_tensor = torch.tensor([peak_memory], device='cpu')
-    torch.distributed.all_reduce(peak_mem_tensor, op=torch.distributed.ReduceOp.MAX)
-    global_peak_memory = peak_mem_tensor.item()
-
+    # Save results to a rank-specific file
+    rank_results = {
+        "rank_peak_memory": peak_memory
+    }
+    
     if rank == 0:
-        results = {
+        rank_results.update({
             "initial_weights": {k: {"mean": v["mean"]} for k, v in initial.items()},
             "step_1_loss": float(history.history["loss"][0]),
             "step_5_loss": float(history.history["loss"][4]),
@@ -262,10 +274,11 @@ def _run_torch(rank, world_size):
             "throughput": (4 * 5) / training_time,
             "training_time": training_time,
             "compilation_time": compilation_time,
-            "peak_memory": global_peak_memory,
             "step_1_updates": {path: {"mean": float(np.mean(after_step_1[path]["val"] - initial[path]["val"])), "samples": (after_step_1[path]["val"] - initial[path]["val"]).flatten()[:5].tolist()} for path in initial if path in after_step_1},
-        }
-        with open("results_torch.json", "w") as f: json.dump(results, f, indent=2)
+        })
+    
+    with open(f"results_torch_rank_{rank}.json", "w") as f:
+        json.dump(rank_results, f, indent=2)
     
     if torch.distributed.is_initialized():
         torch.distributed.barrier()
