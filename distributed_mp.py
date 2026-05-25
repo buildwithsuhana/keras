@@ -10,71 +10,23 @@ import gc
 class MemoryTracker:
     def __init__(self):
         self.peak_cpu = 0
-        self.peak_gpu = 0
         self.running = False
         self.thread = None
 
-    def get_current_mem(self):
-        gc.collect()
-        process = psutil.Process(os.getpid())
-        cpu = process.memory_info().rss
-        gpu = 0
-        try:
-            import torch
-            if torch.cuda.is_available():
-                # Use allocated memory to avoid capturing the reserved pool
-                gpu = torch.cuda.memory_allocated()
-        except:
-            pass
-        return cpu, gpu
-
     def _track(self):
         process = psutil.Process(os.getpid())
-        
-        # Identify if we have torch/jax for GPU tracking
-        has_torch_cuda = False
-        has_jax_gpu = False
-        try:
-            import torch
-            has_torch_cuda = torch.cuda.is_available()
-        except:
-            pass
-        try:
-            import jax
-            has_jax_gpu = any(d.platform == 'gpu' for d in jax.devices())
-        except:
-            pass
-
         while self.running:
             try:
-                # Track CPU RSS
                 mem = process.memory_info().rss
                 if mem > self.peak_cpu:
                     self.peak_cpu = mem
-                
-                # Track GPU VRAM
-                if has_torch_cuda:
-                    import torch
-                    gpu_mem = torch.cuda.memory_allocated()
-                    if gpu_mem > self.peak_gpu:
-                        self.peak_gpu = gpu_mem
-                elif has_jax_gpu:
-                    import jax
-                    total_gpu_mem = 0
-                    for d in jax.local_devices():
-                        if d.platform == 'gpu':
-                            stats = d.memory_stats()
-                            total_gpu_mem += stats['bytes_in_use']
-                    if total_gpu_mem > self.peak_gpu:
-                        self.peak_gpu = total_gpu_mem
             except:
                 break
             time.sleep(0.5)
 
     def start(self):
-        cpu, gpu = self.get_current_mem()
-        self.peak_cpu = cpu
-        self.peak_gpu = gpu
+        gc.collect()
+        self.peak_cpu = psutil.Process(os.getpid()).memory_info().rss
         self.running = True
         self.thread = threading.Thread(target=self._track, daemon=True)
         self.thread.start()
@@ -83,7 +35,7 @@ class MemoryTracker:
         self.running = False
         if self.thread:
             self.thread.join()
-        return self.peak_cpu, self.peak_gpu
+        return self.peak_cpu
 
 def get_layout_map(mesh):
     import keras
@@ -121,10 +73,7 @@ def run_training(rank, world_size, layout_map, backend):
     import keras_hub
     
     tracker = MemoryTracker()
-    
-    # Capture baseline before model creation
-    base_cpu, base_gpu = tracker.get_current_mem()
-    
+    base_cpu = psutil.Process(os.getpid()).memory_info().rss
     tracker.start()
 
     distribution = keras.distribution.ModelParallel(
@@ -180,30 +129,40 @@ def run_training(rank, world_size, layout_map, backend):
         history = model.fit(x, y, batch_size=batch_size, epochs=5, steps_per_epoch=1, verbose=1 if rank == 0 else 0, shuffle=False)
         training_time = time.time() - start_time
         
-        peak_cpu, peak_gpu = tracker.stop()
-        
-        # Calculate delta memory (peak - baseline) for this rank
-        delta_mem = (peak_cpu - base_cpu) + (peak_gpu - base_gpu)
+        peak_cpu = tracker.stop()
 
-        if backend == "torch":
-            import torch
-            device = os.environ.get("KERAS_TORCH_DEVICE", "cpu")
-            
-            # Aggregate Deltas across all ranks
-            d_tensor = torch.tensor([float(delta_mem)], device=device)
-            torch.distributed.all_reduce(d_tensor, op=torch.distributed.ReduceOp.SUM)
-            total_delta = d_tensor.item()
-            
-            # Use Rank 0's baseline as the system baseline
-            b_tensor = torch.tensor([float(base_cpu + base_gpu)], device=device)
-            # We don't sum baselines; we just take Rank 0's to represent the "System Baseline"
-            # (assuming ranks are roughly identical in their framework overhead)
-            
-            # Final Peak = Single Rank Baseline + Sum of All Rank Deltas
-            peak_mem_mb = (base_cpu + base_gpu + total_delta) / (1024 * 1024)
+        # Compare GPU memory specifically
+        has_gpu = False
+        if backend == "jax":
+            import jax
+            total_gpu_peak = 0
+            for d in jax.local_devices():
+                if d.platform == 'gpu':
+                    has_gpu = True
+                    total_gpu_peak += d.memory_stats()['peak_bytes_in_use']
+            peak_mem_mb = total_gpu_peak / (1024 * 1024)
         else:
-            # JAX is single process, so delta is already for the whole mesh
-            peak_mem_mb = (peak_cpu + peak_gpu) / (1024 * 1024)
+            import torch
+            if torch.cuda.is_available():
+                has_gpu = True
+                rank_peak_gpu = torch.cuda.max_memory_allocated()
+                device = os.environ.get("KERAS_TORCH_DEVICE", "cuda")
+                m_tensor = torch.tensor([float(rank_peak_gpu)], device=device)
+                torch.distributed.all_reduce(m_tensor, op=torch.distributed.ReduceOp.SUM)
+                peak_mem_mb = m_tensor.item() / (1024 * 1024)
+            else:
+                peak_mem_mb = 0
+
+        # Fallback to sum of CPU deltas if no GPU was found (for local testing)
+        if not has_gpu:
+            delta_cpu = float(peak_cpu - base_cpu)
+            if backend == "torch":
+                import torch
+                d_tensor = torch.tensor([delta_cpu])
+                torch.distributed.all_reduce(d_tensor, op=torch.distributed.ReduceOp.SUM)
+                peak_mem_mb = d_tensor.item() / (1024 * 1024)
+            else:
+                peak_mem_mb = delta_cpu / (1024 * 1024)
 
         if rank == 0:
             step_1_loss = float(history.history["loss"][0])
