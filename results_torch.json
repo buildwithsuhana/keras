@@ -1,0 +1,349 @@
+{
+  "initial_weights": {
+    "embeddings/token_embedding/embeddings": {
+      "mean": 0.025439251214265823
+    },
+    "embeddings/position_embedding/embeddings": {
+      "mean": -6.503910117316991e-05
+    },
+    "transformer_layer_0/feedforward_intermediate_dense/kernel": {
+      "mean": -0.0031726283486932516
+    },
+    "transformer_layer_0/feedforward_output_dense/kernel": {
+      "mean": -1.2345709365035873e-05
+    },
+    "transformer_layer_1/feedforward_intermediate_dense/kernel": {
+      "mean": -0.00357479858212173
+    },
+    "transformer_layer_1/feedforward_output_dense/kernel": {
+      "mean": 3.457236061876756e-07
+    },
+    "transformer_layer_2/feedforward_intermediate_dense/kernel": {
+      "mean": -0.0031858463771641254
+    },
+    "transformer_layer_2/feedforward_output_dense/kernel": {
+      "mean": 3.278999065514654e-05
+    },
+    "transformer_layer_3/feedforward_intermediate_dense/kernel": {
+      "mean": -0.0018152602715417743
+    },
+    "transformer_layer_3/feedforward_output_dense/kernel": {
+      "mean": -2.4568350909248693e-06
+    },
+    "transformer_layer_4/feedforward_intermediate_dense/kernel": {
+      "mean": -0.003964981995522976
+    },
+    "transformer_layer_4/feedforward_output_dense/kernel": {
+      "mean": -3.6359733712743036e-06
+    },
+    "transformer_layer_5/feedforward_intermediate_dense/kernel": {
+      "mean": -0.004022553563117981
+    },
+    "transformer_layer_5/feedforward_output_dense/kernel": {
+      "mean": -1.2726999557344243e-05
+    },
+    "transformer_layer_6/feedforward_intermediate_dense/kernel": {
+      "mean": -0.004415373783558607
+    },
+    "transformer_layer_6/feedforward_output_dense/kernel": {
+      "mean": -1.7083581042243168e-05
+    },
+    "transformer_layer_7/feedforward_intermediate_dense/kernel": {
+      "mean": -0.004402410704642534
+    },
+    "transformer_layer_7/feedforward_output_dense/kernel": {
+      "mean": -3.4405409678583965e-05
+    },
+    "transformer_layer_8/feedforward_intermediate_dense/kernel": {
+      "mean": -0.004656418226659298
+    },
+    "transformer_layer_8/feedforward_output_dense/kernel": {
+      "mean": -5.922287891735323e-05
+    },
+    "transformer_layer_9/feedforward_intermediate_dense/kernel": {
+      "mean": 0.004729966167360544
+    },
+    "transformer_layer_9/feedforward_output_dense/kernel": {
+      "mean": -4.204715878586285e-05
+    },
+    "transformer_layer_10/feedforward_intermediate_dense/kernel": {
+      "mean": 0.005276868585497141
+    },
+    "transformer_layer_10/feedforward_output_dense/kernel": {
+      "mean": -3.2400002965005115e-05
+    },
+    "transformer_layer_11/feedforward_intermediate_dense/kernel": {
+      "mean": 0.004872085526585579
+    },
+    "transformer_layer_11/feedforward_output_dense/kernel": {
+      "mean": 3.815446689259261e-05
+    }
+  },
+  "step_1_loss": 1.626810073852539,
+  "step_5_loss": 1.5535575151443481,
+  "perplexity": 4.728261158484209,
+  "throughput": 11.832576383562092,
+  "training_time": 1.690248966217041,
+  "step_1_updates": {
+    "embeddings/token_embedding/embeddings": {
+      "mean": -2.5769522626895025e-10,
+      "samples": [
+        0.0,
+        0.0,
+        0.0,
+        0.0,
+        0.0
+      ]
+    },
+    "embeddings/position_embedding/embeddings": {
+      "mean": -8.919395777517991e-10,
+      "samples": [
+        -5.128979682922363e-05,
+        -1.4603137969970703e-05,
+        5.0786882638931274e-05,
+        -1.9505620002746582e-05,
+        4.8063695430755615e-05
+      ]
+    },
+    "transformer_layer_0/feedforward_intermediate_dense/kernel": {
+      "mean": -2.1965726659800566e-07,
+      "samples": [
+        -6.854534149169922e-06,
+        4.516215994954109e-05,
+        4.998873919248581e-05,
+        -3.813300281763077e-05,
+        7.148832082748413e-06
+      ]
+    },
+    "transformer_layer_0/feedforward_output_dense/kernel": {
+      "mean": 3.14368122644737e-08,
+      "samples": [
+        1.2814998626708984e-05,
+        6.332993507385254e-06,
+        8.163973689079285e-06,
+        1.1321157217025757e-05,
+        2.1496787667274475e-05
+      ]
+    },
+    "transformer_layer_1/feedforward_intermediate_dense/kernel": {
+      "mean": 2.8741201418824858e-08,
+      "samples": [
+        -2.0677223801612854e-05,
+        0.0,
+        -3.6783283576369286e-05,
+        0.0,
+        -3.9944425225257874e-05
+      ]
+    },
+    "transformer_layer_1/feedforward_output_dense/kernel": {
+      "mean": -6.065474167371576e-08,
+      "samples": [
+        -2.397364005446434e-05,
+        4.582107067108154e-06,
+        8.203089237213135e-06,
+        1.931237056851387e-05,
+        2.89231538772583e-05
+      ]
+    },
+    "transformer_layer_2/feedforward_intermediate_dense/kernel": {
+      "mean": 1.9296463449336443e-07,
+      "samples": [
+        0.0,
+        0.0,
+        2.265721559524536e-05,
+        8.376315236091614e-06,
+        -2.195313572883606e-05
+      ]
+    },
+    "transformer_layer_2/feedforward_output_dense/kernel": {
+      "mean": -1.3126665976415097e-07,
+      "samples": [
+        0.0,
+        0.0,
+        0.0,
+        0.0,
+        0.0
+      ]
+    },
+    "transformer_layer_3/feedforward_intermediate_dense/kernel": {
+      "mean": 3.931034342485873e-08,
+      "samples": [
+        4.0333718061447144e-05,
+        0.0,
+        -9.81055200099945e-06,
+        0.0,
+        3.9196573197841644e-05
+      ]
+    },
+    "transformer_layer_3/feedforward_output_dense/kernel": {
+      "mean": -8.895597147784429e-08,
+      "samples": [
+        2.7194619178771973e-06,
+        5.7151541113853455e-05,
+        3.395788371562958e-05,
+        1.1214055120944977e-05,
+        4.001334309577942e-05
+      ]
+    },
+    "transformer_layer_4/feedforward_intermediate_dense/kernel": {
+      "mean": 3.0895930080987455e-07,
+      "samples": [
+        0.0,
+        2.6928260922431946e-05,
+        0.0,
+        0.0,
+        4.279334098100662e-05
+      ]
+    },
+    "transformer_layer_4/feedforward_output_dense/kernel": {
+      "mean": -1.5005430498149508e-07,
+      "samples": [
+        0.0,
+        0.0,
+        0.0,
+        0.0,
+        0.0
+      ]
+    },
+    "transformer_layer_5/feedforward_intermediate_dense/kernel": {
+      "mean": 7.295045634236885e-08,
+      "samples": [
+        -9.447336196899414e-06,
+        0.0,
+        -3.633648157119751e-05,
+        0.0,
+        -4.507973790168762e-05
+      ]
+    },
+    "transformer_layer_5/feedforward_output_dense/kernel": {
+      "mean": -2.226609012723202e-07,
+      "samples": [
+        4.902482032775879e-06,
+        4.273653030395508e-05,
+        3.9983540773391724e-05,
+        -1.0999850928783417e-05,
+        -5.641952157020569e-05
+      ]
+    },
+    "transformer_layer_6/feedforward_intermediate_dense/kernel": {
+      "mean": -5.120184809470629e-08,
+      "samples": [
+        -1.0065734386444092e-05,
+        -4.688650369644165e-05,
+        0.0,
+        0.0,
+        4.320591688156128e-05
+      ]
+    },
+    "transformer_layer_6/feedforward_output_dense/kernel": {
+      "mean": -3.7084026871525566e-07,
+      "samples": [
+        -9.718351066112518e-06,
+        -1.0028481483459473e-05,
+        9.98377799987793e-06,
+        9.592622518539429e-06,
+        -8.940696716308594e-06
+      ]
+    },
+    "transformer_layer_7/feedforward_intermediate_dense/kernel": {
+      "mean": -2.7575748617891804e-07,
+      "samples": [
+        -4.192243795841932e-05,
+        3.1777191907167435e-05,
+        0.0,
+        0.0,
+        3.2395124435424805e-05
+      ]
+    },
+    "transformer_layer_7/feedforward_output_dense/kernel": {
+      "mean": -3.055103832139139e-07,
+      "samples": [
+        3.748573362827301e-05,
+        -3.112293779850006e-05,
+        3.4300610423088074e-05,
+        -2.7567148208618164e-07,
+        -4.1740015149116516e-05
+      ]
+    },
+    "transformer_layer_8/feedforward_intermediate_dense/kernel": {
+      "mean": -3.550192673174024e-07,
+      "samples": [
+        -4.3878331780433655e-05,
+        3.869272768497467e-05,
+        -7.148832082748413e-06,
+        -1.4308840036392212e-05,
+        -1.4094635844230652e-05
+      ]
+    },
+    "transformer_layer_8/feedforward_output_dense/kernel": {
+      "mean": -2.972819004298799e-07,
+      "samples": [
+        -2.209097146987915e-05,
+        -1.4744699001312256e-05,
+        3.790995106101036e-05,
+        5.036406219005585e-05,
+        -4.60110604763031e-05
+      ]
+    },
+    "transformer_layer_9/feedforward_intermediate_dense/kernel": {
+      "mean": 6.488009489657998e-07,
+      "samples": [
+        -9.213574230670929e-06,
+        0.0,
+        3.656744956970215e-05,
+        7.96664971858263e-06,
+        -4.194676876068115e-05
+      ]
+    },
+    "transformer_layer_9/feedforward_output_dense/kernel": {
+      "mean": 1.0731108091022179e-07,
+      "samples": [
+        8.981674909591675e-06,
+        1.4863908290863037e-06,
+        -4.0084123611450195e-06,
+        7.256865501403809e-06,
+        -5.908310413360596e-06
+      ]
+    },
+    "transformer_layer_10/feedforward_intermediate_dense/kernel": {
+      "mean": 7.242960009534727e-07,
+      "samples": [
+        0.0,
+        -1.477077603340149e-05,
+        3.34596261382103e-05,
+        2.3249536752700806e-05,
+        3.0353665351867676e-05
+      ]
+    },
+    "transformer_layer_10/feedforward_output_dense/kernel": {
+      "mean": 6.807813406339847e-07,
+      "samples": [
+        0.0,
+        0.0,
+        0.0,
+        0.0,
+        0.0
+      ]
+    },
+    "transformer_layer_11/feedforward_intermediate_dense/kernel": {
+      "mean": 1.210408981933142e-06,
+      "samples": [
+        -1.1572614312171936e-05,
+        0.0,
+        -3.00481915473938e-05,
+        -3.316625952720642e-05,
+        -2.7700327336788177e-05
+      ]
+    },
+    "transformer_layer_11/feedforward_output_dense/kernel": {
+      "mean": 4.061562108859107e-08,
+      "samples": [
+        -1.0654330253601074e-06,
+        -1.3778451830148697e-05,
+        -3.194250166416168e-05,
+        7.928814738988876e-06,
+        3.9229169487953186e-05
+      ]
+    }
+  }
+}
