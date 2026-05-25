@@ -41,6 +41,22 @@ class TorchTrainer(base_trainer.Trainer):
             )
             self.jit_compile = False
 
+        if self.jit_compile:
+            try:
+                from torch.distributed.tensor import DTensor
+            except (ImportError, ModuleNotFoundError):
+                DTensor = None
+
+            if DTensor is not None:
+                for variable in getattr(self, "variables", []):
+                    if isinstance(getattr(variable, "value", None), DTensor):
+                        warnings.warn(
+                            "Disabling torch.compile for models containing DTensor "
+                            "variables because torch.compile does not currently "
+                            "support DTensor-backed operations."
+                        )
+                        return False
+
         return self.jit_compile
 
     def _setup_ddp(self):
