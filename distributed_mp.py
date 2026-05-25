@@ -125,6 +125,12 @@ def run_training(rank, world_size, layout_map, backend):
         # Warmup
         model.fit(x, y, batch_size=batch_size, epochs=1, steps_per_epoch=1, verbose=1 if rank == 0 else 0, shuffle=False)
         
+        # RESET PEAK STATS HERE to ignore initialization spikes
+        if backend == "torch":
+            import torch
+            if torch.cuda.is_available():
+                torch.cuda.reset_peak_memory_stats()
+        
         start_time = time.time()
         history = model.fit(x, y, batch_size=batch_size, epochs=5, steps_per_epoch=1, verbose=1 if rank == 0 else 0, shuffle=False)
         training_time = time.time() - start_time
@@ -139,6 +145,8 @@ def run_training(rank, world_size, layout_map, backend):
             for d in jax.local_devices():
                 if d.platform == 'gpu':
                     has_gpu = True
+                    # JAX stats are cumulative for the process, we use the peak reached.
+                    # Since JAX is single-process, this sum is the total system peak.
                     total_gpu_peak += d.memory_stats()['peak_bytes_in_use']
             peak_mem_mb = total_gpu_peak / (1024 * 1024)
         else:
@@ -146,7 +154,8 @@ def run_training(rank, world_size, layout_map, backend):
             if torch.cuda.is_available():
                 has_gpu = True
                 rank_peak_gpu = torch.cuda.max_memory_allocated()
-                device = os.environ.get("KERAS_TORCH_DEVICE", "cuda")
+                device_idx = int(os.environ.get("LOCAL_RANK", 0))
+                device = torch.device(f"cuda:{device_idx}")
                 m_tensor = torch.tensor([float(rank_peak_gpu)], device=device)
                 torch.distributed.all_reduce(m_tensor, op=torch.distributed.ReduceOp.SUM)
                 peak_mem_mb = m_tensor.item() / (1024 * 1024)
