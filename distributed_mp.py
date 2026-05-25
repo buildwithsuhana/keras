@@ -96,7 +96,7 @@ def run_training(rank, world_size, layout_map, backend):
         model.compile(
             optimizer=keras.optimizers.Adam(learning_rate=1e-5), 
             loss="mse", 
-            jit_compile=True if backend == "jax" else False
+            jit_compile=False
         )
         
         np.random.seed(42)
