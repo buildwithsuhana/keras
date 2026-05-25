@@ -14,6 +14,7 @@ def compare():
     print("-" * 95)
 
     metrics = [
+        ("Compilation Time (sec)", "compilation_time"),
         ("Step 5 Loss", "step_5_loss"),
         ("Perplexity", "perplexity"),
         ("Throughput (samples/sec)", "throughput"),
