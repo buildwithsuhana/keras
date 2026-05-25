@@ -1,12 +1,11 @@
 import os
 import sys
-import platform
 
 # Set backend BEFORE any imports
 if len(sys.argv) > 1:
     os.environ["KERAS_BACKEND"] = sys.argv[1]
 
-# Memory management for JAX
+# Prevent JAX pre-allocation
 os.environ["XLA_PYTHON_CLIENT_PREALLOCATE"] = "false"
 
 def run_backend(backend, world_size=2):
@@ -17,39 +16,31 @@ def run_backend(backend, world_size=2):
     if os.path.exists(f): os.remove(f)
     
     if backend == "jax":
-        # Force JAX to see multiple CPU devices if GPUs aren't enough
-        import torch
-        num_gpus = torch.cuda.device_count() if hasattr(torch.cuda, "device_count") else 0
-        if num_gpus < world_size:
-            os.environ["XLA_FLAGS"] = f"--xla_force_host_platform_device_count={world_size}"
-            if platform.system() == "Darwin":
-                 os.environ["JAX_PLATFORMS"] = "cpu"
+        # JAX worker
         _run_jax(world_size)
     elif backend == "torch":
         import torch
-        num_gpus = torch.cuda.device_count() if hasattr(torch.cuda, "device_count") else 0
-        print(f"Using Torch spawn ({num_gpus} GPUs found)")
+        print(f"Using Torch spawn (Required for GPU safety)")
         torch.multiprocessing.spawn(_run_torch, args=(world_size,), nprocs=world_size, join=True)
         
         # Aggregate results
+        import numpy as np # Import only when needed for aggregation
         if os.path.exists("results_torch_rank_0.json"):
             with open("results_torch_rank_0.json", "r") as f:
                 results = json.load(f)
             all_peaks = []
-            per_device_mem = {}
             for r in range(world_size):
                 fname = f"results_torch_rank_{r}.json"
                 if os.path.exists(fname):
                     with open(fname, "r") as f:
                         data = json.load(f)
                         all_peaks.append(data.get("rank_peak_memory", 0))
-                        per_device_mem[f"Device {r}"] = data.get("device_peak_memory", 0)
             if all_peaks:
                 results["peak_memory"] = sum(all_peaks)
-                results["per_device_memory"] = per_device_mem
             with open("results_torch.json", "w") as f: json.dump(results, f, indent=2)
 
 def _run_jax(world_size):
+    # Imports happen ONLY inside the worker
     import jax
     import keras
     import keras_hub
@@ -58,13 +49,13 @@ def _run_jax(world_size):
     import json
     import psutil
     
+    # Simple Memory Tracker inside worker
     process = psutil.Process(os.getpid())
-    keras.utils.set_random_seed(42)
     
+    keras.utils.set_random_seed(42)
     devices = keras.distribution.list_devices()
     if len(devices) > world_size: devices = devices[:world_size]
-    print(f"Using JAX devices: {devices}")
-
+    
     mesh = keras.distribution.DeviceMesh(shape=(world_size,), axis_names=("model",), devices=devices)
     layout_map = keras.distribution.LayoutMap(mesh)
     layout_map[".*token_embedding/embeddings"] = keras.distribution.TensorLayout(("model", None), mesh)
@@ -72,8 +63,7 @@ def _run_jax(world_size):
     layout_map[".*feedforward_intermediate_dense/kernel"] = keras.distribution.TensorLayout((None, "model"), mesh)
     layout_map[".*feedforward_output_dense/kernel"] = keras.distribution.TensorLayout(("model", None), mesh)
 
-    # Set auto_shard_dataset=False because we provide sharded data or want to avoid tf.data requirement
-    distribution = keras.distribution.ModelParallel(layout_map=layout_map, batch_dim_name="model", auto_shard_dataset=False)
+    distribution = keras.distribution.ModelParallel(layout_map=layout_map, batch_dim_name="model")
     with distribution.scope():
         model = keras_hub.models.OPTBackbone.from_preset("opt_125m_en", dropout=0.0)
         model.compile(optimizer="adam", loss="mse", jit_compile=False)
@@ -81,22 +71,26 @@ def _run_jax(world_size):
         x = {"token_ids": np.ones((world_size * 2, 32), dtype="int32"), "padding_mask": np.ones((world_size * 2, 32), dtype="int32")}
         y = np.ones((world_size * 2, 32, 768), dtype="float32")
 
+        # Compilation
         start_comp = time.time()
         model.fit(x, y, epochs=1, steps_per_epoch=1, verbose=0)
         compilation_time = time.time() - start_comp
         
+        # Training
         start_train = time.time()
         history = model.fit(x, y, epochs=5, steps_per_epoch=1, verbose=0)
         training_time = time.time() - start_train
         
     peak_mem = process.memory_info().rss / (1024 * 1024)
+    
+    # Device VRAM
     per_device_mem = {}
     for i, d in enumerate(devices):
         try:
             stats = d.memory_stats()
             per_device_mem[f"Device {i}"] = stats.get('peak_bytes_in_use', 0) / (1024 * 1024)
         except:
-            per_device_mem[f"Device {i}"] = peak_mem / world_size
+            per_device_mem[f"Device {i}"] = 0
 
     results = {
         "step_1_loss": float(history.history["loss"][0]),
@@ -109,9 +103,9 @@ def _run_jax(world_size):
         "per_device_memory": per_device_mem,
     }
     with open("results_jax.json", "w") as f: json.dump(results, f, indent=2)
-    print(f"JAX results written to results_jax.json")
 
 def _run_torch(rank, world_size):
+    # Imports happen ONLY inside the worker
     import torch
     import keras
     import keras_hub
@@ -133,10 +127,7 @@ def _run_torch(rank, world_size):
     keras.utils.set_random_seed(42)
     keras.distribution.initialize()
     
-    num_gpus = torch.cuda.device_count() if hasattr(torch.cuda, "device_count") else 0
-    device_type = "cuda" if num_gpus >= world_size else "cpu"
-    if platform.system() == "Darwin": device_type = "cpu"
-    
+    device_type = "cuda" if torch.cuda.is_available() else "cpu"
     devices = keras.distribution.list_devices(device_type)[:world_size]
     mesh = keras.distribution.DeviceMesh(shape=(world_size,), axis_names=("model",), devices=devices)
     layout_map = keras.distribution.LayoutMap(mesh)
@@ -145,8 +136,7 @@ def _run_torch(rank, world_size):
     layout_map[".*feedforward_intermediate_dense/kernel"] = keras.distribution.TensorLayout((None, "model"), mesh)
     layout_map[".*feedforward_output_dense/kernel"] = keras.distribution.TensorLayout(("model", None), mesh)
 
-    # Set auto_shard_dataset=False because we provide sharded data
-    distribution = keras.distribution.ModelParallel(layout_map=layout_map, batch_dim_name="model", auto_shard_dataset=False)
+    distribution = keras.distribution.ModelParallel(layout_map=layout_map, batch_dim_name="model")
     with distribution.scope():
         model = keras_hub.models.OPTBackbone.from_preset("opt_125m_en", dropout=0.0)
         gc.collect()
