@@ -1,11 +1,12 @@
 import os
 import sys
+import platform
 
 # CRITICAL: Set backend BEFORE any Keras/Torch imports
 if len(sys.argv) > 1:
     os.environ["KERAS_BACKEND"] = sys.argv[1]
 
-# Prevent JAX from pre-allocating all VRAM to avoid OOM in multi-backend scripts
+# Memory management for JAX
 os.environ["XLA_PYTHON_CLIENT_PREALLOCATE"] = "false"
 os.environ["TF_CPP_MIN_LOG_LEVEL"] = "3"
 
@@ -67,11 +68,11 @@ def get_weights_summary(model):
     return summary
 
 def run_backend(backend, world_size=2):
-    print(f"\n--- Starting {backend.upper()} Run (world_size={world_size}) ---")
+    print(f"\n--- Starting {backend.upper()} Run ---")
     
     # Only clean up this specific backend's results
-    f = f"results_{backend}.json"
-    if os.path.exists(f): os.remove(f)
+    for f in [f"results_{backend}.json"]:
+        if os.path.exists(f): os.remove(f)
     
     if backend == "torch":
         for r in range(world_size):
@@ -83,19 +84,32 @@ def run_backend(backend, world_size=2):
         num_gpus = torch.cuda.device_count() if hasattr(torch.cuda, "device_count") else 0
         if num_gpus < world_size:
             os.environ["XLA_FLAGS"] = f"--xla_force_host_platform_device_count={world_size}"
-            os.environ["JAX_PLATFORMS"] = "cpu"
+            if platform.system() == "Darwin":
+                 os.environ["JAX_PLATFORMS"] = "cpu"
         _run_jax(world_size)
     elif backend == "torch":
         import torch
-        # Always use spawn for consistency and safety on both CPU/GPU
-        print(f"Using Torch start method: spawn")
-        try:
+        num_gpus = torch.cuda.device_count() if hasattr(torch.cuda, "device_count") else 0
+        
+        # Use spawn for GPU, fork for CPU (if not on Mac)
+        method = "spawn"
+        if num_gpus == 0 and platform.system() != "Darwin":
+            method = "fork"
+        
+        print(f"Using Torch start method: {method}")
+        # Note: We use torch.multiprocessing.spawn for spawn, or manual process creation for fork
+        if method == "spawn":
             torch.multiprocessing.spawn(_run_torch, args=(world_size,), nprocs=world_size, join=True)
-        except Exception as e:
-            print(f"Torch Spawn failed: {e}")
-            traceback.print_exc()
-            return
-
+        else:
+            ctx = torch.multiprocessing.get_context(method)
+            processes = []
+            for rank in range(world_size):
+                p = ctx.Process(target=_run_torch, args=(rank, world_size))
+                p.start()
+                processes.append(p)
+            for p in processes:
+                p.join()
+        
         # Aggregate results
         if os.path.exists("results_torch_rank_0.json"):
             with open("results_torch_rank_0.json", "r") as f:
@@ -114,9 +128,6 @@ def run_backend(backend, world_size=2):
             results["per_device_memory"] = per_device_mem
             results["peak_memory"] = total_host_mem # Total Host RSS
             with open("results_torch.json", "w") as f: json.dump(results, f, indent=2)
-            print(f"Final results written to results_torch.json (System Peak Memory: {total_host_mem:.2f} MB)")
-        else:
-            print("Error: results_torch_rank_0.json not found. Torch run failed to produce results.")
 
 def _run_jax(world_size):
     try:
@@ -164,12 +175,10 @@ def _run_jax(world_size):
                 x_full["token_ids"][base+2:base+4] = x_full["token_ids"][base:base+2]
                 y_full[base+2:base+4] = y_full[base:base+2]
 
-            print("JAX: Starting Warmup...")
             start_comp = time.time()
             model.fit(x_full, y_full, batch_size=4, epochs=1, steps_per_epoch=1, verbose=1, shuffle=False)
             compilation_time = time.time() - start_comp
             
-            print("JAX: Starting Training...")
             start_time = time.time()
             history = model.fit(x_full, y_full, batch_size=4, epochs=5, steps_per_epoch=1, verbose=1, shuffle=False)
             end_time = time.time()
@@ -177,8 +186,6 @@ def _run_jax(world_size):
             
             step_1_loss = float(history.history["loss"][0])
             step_5_loss = float(history.history["loss"][4])
-            
-            print("JAX: Collecting final weights...")
             after_step_1 = get_weights_summary(model)
 
         peak_host_memory = tracker.stop()
@@ -186,10 +193,12 @@ def _run_jax(world_size):
         per_device_mem = {}
         for i, d in enumerate(devices):
             try:
+                # Try to get VRAM usage for GPUs
                 stats = d.memory_stats()
                 mem_mb = stats.get('peak_bytes_in_use', 0) / (1024 * 1024)
                 per_device_mem[f"Device {i}"] = mem_mb
             except:
+                # Fallback for CPU
                 per_device_mem[f"Device {i}"] = peak_host_memory / world_size
 
         results = {
@@ -205,9 +214,8 @@ def _run_jax(world_size):
             "step_1_updates": {path: {"mean": float(np.mean(after_step_1[path]["val"] - initial[path]["val"])), "samples": (after_step_1[path]["val"] - initial[path]["val"]).flatten()[:5].tolist()} for path in initial if path in after_step_1},
         }
         with open("results_jax.json", "w") as f: json.dump(results, f, indent=2)
-        print(f"JAX: Results written to results_jax.json (Peak Memory: {peak_host_memory:.2f} MB)")
-    except Exception as e:
-        print(f"JAX Run crashed with error: {e}")
+        print(f"JAX results written to results_jax.json")
+    except Exception:
         traceback.print_exc()
 
 def _run_torch(rank, world_size):
@@ -223,8 +231,13 @@ def _run_torch(rank, world_size):
         os.environ["MASTER_ADDR"] = "localhost"
         os.environ["MASTER_PORT"] = "29560"
         
-        num_gpus = torch.cuda.device_count()
+        num_gpus = torch.cuda.device_count() if hasattr(torch.cuda, "device_count") else 0
         device_type = "cuda" if num_gpus >= world_size else "cpu"
+        
+        # On Mac, force CPU
+        if platform.system() == "Darwin":
+            device_type = "cpu"
+            
         os.environ["KERAS_TORCH_DEVICE"] = device_type
         
         keras.utils.set_random_seed(42)
@@ -318,13 +331,11 @@ def _run_torch(rank, world_size):
         
         with open(f"results_torch_rank_{rank}.json", "w") as f:
             json.dump(rank_results, f, indent=2)
-        print(f"[Rank {rank}] Successfully wrote results_torch_rank_{rank}.json")
         
         if torch.distributed.is_initialized():
             torch.distributed.barrier()
             torch.distributed.destroy_process_group()
-    except Exception as e:
-        print(f"[Rank {rank}] Run crashed with error: {e}")
+    except Exception:
         traceback.print_exc()
 
 if __name__ == "__main__":
