@@ -122,14 +122,11 @@ class Variable(KerasVariable):
         self._initialize_layout()
 
         if self._layout is not None:
-            from keras.src.backend.torch.distribution_lib import (
-                distribute_tensor,
-            )
-
             if isinstance(value, torch.nn.Parameter):
                 value = value.data
             value = convert_to_tensor(value, dtype=self._dtype)
-            value = distribute_tensor(value, self._layout)
+
+            value = torch_dist_lib.distribute_tensor(value, self._layout)
             self._value = torch.nn.Parameter(
                 value,
                 requires_grad=self.trainable
@@ -164,7 +161,8 @@ class Variable(KerasVariable):
                 )
 
     def _direct_assign(self, value):
-        value = convert_to_tensor(value, dtype=self._dtype).detach()
+        value = convert_to_tensor(value, dtype=self._dtype)
+
         if self._layout is not None:
             value = torch_dist_lib.distribute_tensor(value, self._layout)
         else:
@@ -249,13 +247,14 @@ class Variable(KerasVariable):
             return False
 
 
-def convert_to_tensor(x, dtype=None, sparse=None, ragged=None, is_op_output=False):
+def convert_to_tensor(x, dtype=None, sparse=None, ragged=None, layout="auto"):
     if x is None:
         raise ValueError("`convert_to_tensor` received `None`.")
     if sparse:
         raise ValueError("`sparse=True` is not supported with torch backend")
     if ragged:
         raise ValueError("`ragged=True` is not supported with torch backend")
+
     if isinstance(x, Variable) or is_tensor(x):
         if isinstance(x, Variable):
             x = x.value
@@ -311,27 +310,26 @@ def convert_to_tensor(x, dtype=None, sparse=None, ragged=None, is_op_output=Fals
             dtype = to_torch_dtype(dtype)
             x = torch.as_tensor(x, dtype=dtype, device=get_device())
 
+    if layout != "auto":
+        if layout is not None:
+            return torch_dist_lib.distribute_tensor(x, layout)
+        return x
+
     dist = global_state.get_global_attribute("distribution")
     if dist is not None:
-        from keras.src.distribution import TensorLayout
         from keras.src.distribution import distribution_lib as dist_lib
 
         if not isinstance(dist, dist_lib.ModelParallel):
             return x
         if isinstance(x, DTensor):
             return x
-        if is_op_output:
-            if is_tensor(x):
-                layout = TensorLayout([None] * x.ndim, dist.device_mesh)
-                x = torch_dist_lib.distribute_tensor(x, layout)
-        else:
-            is_parameter = isinstance(x, torch.nn.Parameter)
-            is_leaf_tensor = is_tensor(x) and getattr(x, "is_leaf", False)
-            if not (is_parameter or is_leaf_tensor):
-                return x
 
-            layout = TensorLayout([None] * x.ndim, dist.device_mesh)
-            x = torch_dist_lib.distribute_tensor(x, layout)
+        from keras.src.distribution import TensorLayout
+
+        layout = TensorLayout([None] * len(x.shape), dist.device_mesh)
+        return torch_dist_lib.distribute_data_input(
+            x, layout, dist.batch_dim_name
+        )
     return x
 
 
@@ -403,14 +401,11 @@ def compute_output_spec(fn, *args, **kwargs):
                 for i, e in enumerate(shape):
                     if e is None:
                         shape[i] = fill_value
-            device = get_device()
-            if global_state.get_global_attribute("distribution") is not None:
-                device = "meta"
 
             return torch.ones(
                 size=shape,
                 dtype=to_torch_dtype(x.dtype),
-                device=device,
+                device=get_device(),
             )
         return x
 

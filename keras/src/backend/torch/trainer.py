@@ -55,12 +55,38 @@ class TorchTrainer(base_trainer.Trainer):
             if not hasattr(self, "_ddp_model"):
                 if torch.cuda.is_available():
                     device = torch.device(f"cuda:{torch.cuda.current_device()}")
-                    # Move model to the target device before DDP wrapping.
-                    # DDP requires all parameters to be on the same device.
-                    self.to(device)
                     device_ids = [torch.cuda.current_device()]
                 else:
+                    device = torch.device("cpu")
                     device_ids = None
+
+                # Check for mixed placement
+                device_types = set()
+                for v in self.variables:
+                    device_types.add(v.value.device.type)
+                if len(device_types) > 1:
+                    warnings.warn(
+                        "Mixed device placement detected before DDP setup. "
+                        f"Devices found: {device_types}. The model will be "
+                        f"moved to {device}."
+                    )
+
+                # Move model to the target device before DDP wrapping.
+                # DDP requires all parameters to be on the same device.
+                self.to(device)
+
+                # Explicitly move Variables that might not be tracked by
+                # TorchLayer or have DTensor issues.
+                for v in self.variables:
+                    if v.value.device != device:
+                        v.assign(v.value.to(device))
+
+                # Move optimizer state.
+                if self.optimizer is not None:
+                    for v in self.optimizer.variables:
+                        if v.value.device != device:
+                            v.assign(v.value.to(device))
+
                 ddp_model = torch.nn.parallel.DistributedDataParallel(
                     self,
                     device_ids=device_ids,
