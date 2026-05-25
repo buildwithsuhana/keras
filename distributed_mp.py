@@ -3,6 +3,43 @@ import sys
 import numpy as np
 import json
 import time
+import psutil
+import threading
+import contextlib
+import gc
+
+# Pre-import heavy libraries in the parent process to enable memory sharing via 'fork'
+import torch
+import keras
+import keras_hub
+
+class MemoryTracker:
+    def __init__(self):
+        self.peak_memory = 0
+        self.running = False
+        self.thread = None
+
+    def _track(self):
+        process = psutil.Process(os.getpid())
+        while self.running:
+            try:
+                mem = process.memory_info().rss
+                if mem > self.peak_memory:
+                    self.peak_memory = mem
+            except:
+                break
+            time.sleep(0.1)
+
+    def start(self):
+        self.running = True
+        self.thread = threading.Thread(target=self._track, daemon=True)
+        self.thread.start()
+
+    def stop(self):
+        self.running = False
+        if self.thread:
+            self.thread.join()
+        return self.peak_memory / (1024 * 1024) # MB
 
 def get_weights_summary(model):
     summary = {}
@@ -28,7 +65,6 @@ def run_backend(backend, world_size=2):
     if backend == "jax":
         num_gpus = 0
         try:
-            import torch
             num_gpus = torch.cuda.device_count()
         except:
             pass
@@ -39,55 +75,52 @@ def run_backend(backend, world_size=2):
             os.environ["JAX_PLATFORMS"] = "cpu"
         _run_jax(world_size)
     elif backend == "torch":
-        import torch
-        torch.multiprocessing.spawn(_run_torch, args=(world_size,), nprocs=world_size, join=True)
+        # Use 'fork' instead of 'spawn' to share parent memory (libraries/imports)
+        # Note: 'fork' is highly memory-efficient as it avoids duplicating library overhead.
+        ctx = torch.multiprocessing.get_context("fork")
+        processes = []
+        for rank in range(world_size):
+            p = ctx.Process(target=_run_torch, args=(rank, world_size))
+            p.start()
+            processes.append(p)
+        for p in processes:
+            p.join()
 
 def _run_jax(world_size):
     import jax
-    import keras
-    import keras_hub
     keras.utils.set_random_seed(42)
     
+    tracker = MemoryTracker()
+    tracker.start()
+
     devices = keras.distribution.list_devices()
     if len(devices) > world_size:
         devices = devices[:world_size]
     print(f"Using JAX devices: {devices}")
     
     if len(devices) < world_size:
-        raise ValueError(f"Not enough devices found. Expected {world_size}, got {len(devices)}. "
-                         f"Check XLA_FLAGS or GPU availability.")
+        raise ValueError(f"Not enough devices found. Expected {world_size}, got {len(devices)}.")
 
     mesh = keras.distribution.DeviceMesh(shape=(world_size,), axis_names=("model",), devices=devices)
     layout_map = keras.distribution.LayoutMap(mesh)
     
-    # Sharding strategy for all layers
+    # Sharding strategy
     layout_map[".*token_embedding/embeddings"] = keras.distribution.TensorLayout(("model", None), mesh)
     layout_map[".*position_embedding/embeddings"] = keras.distribution.TensorLayout((None, "model"), mesh)
-    
-    # MHA: Q/K/V shard on heads, Attention Output sharded on input dim to match
     layout_map[".*self_attention/query/kernel"] = keras.distribution.TensorLayout((None, "model", None), mesh)
     layout_map[".*self_attention/key/kernel"] = keras.distribution.TensorLayout((None, "model", None), mesh)
     layout_map[".*self_attention/value/kernel"] = keras.distribution.TensorLayout((None, "model", None), mesh)
     layout_map[".*self_attention/attention_output/kernel"] = keras.distribution.TensorLayout(("model", None), mesh)
-    
-    # MLP: Intermediate shard on output dim, Output shard on input dim
     layout_map[".*feedforward_intermediate_dense/kernel"] = keras.distribution.TensorLayout((None, "model"), mesh)
     layout_map[".*feedforward_output_dense/kernel"] = keras.distribution.TensorLayout(("model", None), mesh)
     
-    # Biases
-    layout_map[".*self_attention/query/bias"] = keras.distribution.TensorLayout(("model", None), mesh)
-    layout_map[".*self_attention/key/bias"] = keras.distribution.TensorLayout(("model", None), mesh)
-    layout_map[".*self_attention/value/bias"] = keras.distribution.TensorLayout(("model", None), mesh)
-    layout_map[".*self_attention/attention_output/bias"] = keras.distribution.TensorLayout((None,), mesh)
-    layout_map[".*feedforward_intermediate_dense/bias"] = keras.distribution.TensorLayout(("model",), mesh)
-    layout_map[".*feedforward_output_dense/bias"] = keras.distribution.TensorLayout((None,), mesh)
-    
-    # LayerNorm (replicated to avoid shape mismatch with normalized_shape)
-    layout_map[".*layer_norm/gamma"] = keras.distribution.TensorLayout((None,), mesh)
-    layout_map[".*layer_norm/beta"] = keras.distribution.TensorLayout((None,), mesh)
+    if world_size > 1:
+        distribution = keras.distribution.ModelParallel(layout_map=layout_map, batch_dim_name="model", auto_shard_dataset=False)
+        scope = distribution.scope()
+    else:
+        scope = contextlib.nullcontext()
 
-    distribution = keras.distribution.ModelParallel(layout_map=layout_map, batch_dim_name="model", auto_shard_dataset=False)
-    with distribution.scope():
+    with scope:
         model = keras_hub.models.OPTBackbone.from_preset("opt_125m_en", dropout=0.0)
         model.compile(optimizer=keras.optimizers.Adam(learning_rate=1e-5), loss="mse", jit_compile=False)
         
@@ -99,13 +132,10 @@ def _run_jax(world_size):
         }
         y_full = np.random.normal(size=(40, 32, 768)).astype("float32")
 
-        for i in range(10):
-            base = i * 4
-            x_full["token_ids"][base+2:base+4] = x_full["token_ids"][base:base+2]
-            y_full[base+2:base+4] = y_full[base:base+2]
-
-        # Warmup
+        # Compilation Warmup
+        start_comp = time.time()
         model.fit(x_full, y_full, batch_size=4, epochs=1, steps_per_epoch=1, verbose=1, shuffle=False)
+        compilation_time = time.time() - start_comp
         
         start_time = time.time()
         history = model.fit(x_full, y_full, batch_size=4, epochs=5, steps_per_epoch=1, verbose=1, shuffle=False)
@@ -118,6 +148,8 @@ def _run_jax(world_size):
         perplexity = float(np.exp(step_5_loss))
         after_step_1 = get_weights_summary(model)
 
+    peak_memory = tracker.stop()
+
     results = {
         "initial_weights": {k: {"mean": v["mean"]} for k, v in initial.items()},
         "step_1_loss": step_1_loss,
@@ -125,30 +157,23 @@ def _run_jax(world_size):
         "perplexity": perplexity,
         "throughput": throughput,
         "training_time": training_time,
+        "compilation_time": compilation_time,
+        "peak_memory": peak_memory,
         "step_1_updates": {path: {"mean": float(np.mean(after_step_1[path]["val"] - initial[path]["val"])), "samples": (after_step_1[path]["val"] - initial[path]["val"]).flatten()[:5].tolist()} for path in initial if path in after_step_1},
     }
     with open("results_jax.json", "w") as f: json.dump(results, f, indent=2)
 
 def _run_torch(rank, world_size):
-    import os
-    import torch
+    # Performance Optimization: Limit intra-op threads
+    torch.set_num_threads(1)
     
-    # Monkeypatch DeviceMesh for torch.compile compatibility in Torch 2.9.0
-    from torch.distributed.device_mesh import DeviceMesh as TorchDeviceMesh
-    original_repr = TorchDeviceMesh.__repr__
-    def patched_repr(self):
-        try:
-            return original_repr(self)
-        except AttributeError:
-            return "DeviceMesh(...)"
-    TorchDeviceMesh.__repr__ = patched_repr
-
     os.environ["RANK"] = str(rank)
     os.environ["WORLD_SIZE"] = str(world_size)
     os.environ["LOCAL_RANK"] = str(rank)
     os.environ["MASTER_ADDR"] = "localhost"
     os.environ["MASTER_PORT"] = "29560"
     
+    # Check device availability
     num_gpus = torch.cuda.device_count()
     if num_gpus >= world_size:
         os.environ["KERAS_TORCH_DEVICE"] = "cuda"
@@ -157,67 +182,41 @@ def _run_torch(rank, world_size):
         os.environ["KERAS_TORCH_DEVICE"] = "cpu"
         device_type = "cpu"
     
-    import keras
-    import keras_hub
-    import sys
-    sys.path.insert(0, os.getcwd())
     keras.utils.set_random_seed(42)
     keras.distribution.initialize()
     
-    print(f"[Rank {rank}] Initialized. World size: {world_size}")
-    
+    tracker = MemoryTracker()
+    tracker.start()
+
     devices = keras.distribution.list_devices(device_type)[:world_size]
     mesh = keras.distribution.DeviceMesh(shape=(world_size,), axis_names=("model",), devices=devices)
-    
-    # Patch DeviceMesh for torch.compile compatibility in Torch 2.9.0
-    if hasattr(mesh.backend_mesh, "_mesh_dim_names") and not hasattr(mesh.backend_mesh, "mesh_dim_names"):
-        mesh.backend_mesh.mesh_dim_names = mesh.backend_mesh._mesh_dim_names
-    elif not hasattr(mesh.backend_mesh, "mesh_dim_names"):
-        mesh.backend_mesh.mesh_dim_names = mesh.axis_names
-
     layout_map = keras.distribution.LayoutMap(mesh)
     
-    # Sharding strategy for all layers
+    # Sharding strategy
     layout_map[".*token_embedding/embeddings"] = keras.distribution.TensorLayout(("model", None), mesh)
     layout_map[".*position_embedding/embeddings"] = keras.distribution.TensorLayout((None, "model"), mesh)
-    
-    # MHA: Q/K/V shard on heads, Attention Output sharded on input dim to match
     layout_map[".*self_attention/query/kernel"] = keras.distribution.TensorLayout((None, "model", None), mesh)
     layout_map[".*self_attention/key/kernel"] = keras.distribution.TensorLayout((None, "model", None), mesh)
     layout_map[".*self_attention/value/kernel"] = keras.distribution.TensorLayout((None, "model", None), mesh)
     layout_map[".*self_attention/attention_output/kernel"] = keras.distribution.TensorLayout(("model", None), mesh)
-    
-    # MLP: Intermediate shard on output dim, Output shard on input dim
     layout_map[".*feedforward_intermediate_dense/kernel"] = keras.distribution.TensorLayout((None, "model"), mesh)
     layout_map[".*feedforward_output_dense/kernel"] = keras.distribution.TensorLayout(("model", None), mesh)
-    
-    # Biases
-    layout_map[".*self_attention/query/bias"] = keras.distribution.TensorLayout(("model", None), mesh)
-    layout_map[".*self_attention/key/bias"] = keras.distribution.TensorLayout(("model", None), mesh)
-    layout_map[".*self_attention/value/bias"] = keras.distribution.TensorLayout(("model", None), mesh)
-    layout_map[".*self_attention/attention_output/bias"] = keras.distribution.TensorLayout((None,), mesh)
-    layout_map[".*feedforward_intermediate_dense/bias"] = keras.distribution.TensorLayout(("model",), mesh)
-    layout_map[".*feedforward_output_dense/bias"] = keras.distribution.TensorLayout((None,), mesh)
-    
-    # LayerNorm (replicated to avoid shape mismatch with normalized_shape)
-    layout_map[".*layer_norm/gamma"] = keras.distribution.TensorLayout((None,), mesh)
-    layout_map[".*layer_norm/beta"] = keras.distribution.TensorLayout((None,), mesh)
 
-    distribution = keras.distribution.ModelParallel(layout_map=layout_map, batch_dim_name="model", auto_shard_dataset=False)
-    with distribution.scope():
+    if world_size > 1:
+        distribution = keras.distribution.ModelParallel(layout_map=layout_map, batch_dim_name="model", auto_shard_dataset=False)
+        scope = distribution.scope()
+    else:
+        scope = contextlib.nullcontext()
+
+    with scope:
         model = keras_hub.models.OPTBackbone.from_preset("opt_125m_en", dropout=0.0)
         
-        if rank == 0:
-            print(f"\n[Rank {rank}] Verifying weight sharding:")
-            from torch.distributed.tensor import DTensor
-            for v in model.trainable_variables:
-                val = v.value
-                sharding_info = "❌ Not Sharded"
-                if isinstance(val, DTensor):
-                    sharding_info = "✅ Sharded"
-                print(f"    {v.path:<60} | {sharding_info}")
+        # Memory Optimization: Force GC after model creation but before compilation
+        gc.collect()
+        if device_type == "cuda":
+            torch.cuda.empty_cache()
 
-        model.compile(optimizer=keras.optimizers.Adam(learning_rate=1e-5), loss="mse")
+        model.compile(optimizer=keras.optimizers.Adam(learning_rate=1e-5), loss="mse", jit_compile=False)
         
         initial = get_weights_summary(model)
         np.random.seed(42)
@@ -240,8 +239,10 @@ def _run_torch(rank, world_size):
         x = {k: v[indices] for k, v in x_full.items()}
         y = y_full[indices]
         
-        # Warmup
+        # Compilation Warmup
+        start_comp = time.time()
         model.fit(x, y, batch_size=2, epochs=1, steps_per_epoch=1, verbose=1 if rank == 0 else 0, shuffle=False)
+        compilation_time = time.time() - start_comp
         
         start_time = time.time()
         history = model.fit(x, y, batch_size=2, epochs=5, steps_per_epoch=1, verbose=1 if rank == 0 else 0, shuffle=False)
@@ -250,29 +251,23 @@ def _run_torch(rank, world_size):
         
         after_step_1 = get_weights_summary(model)
 
-        if rank == 0:
-            step_1_loss = float(history.history["loss"][0])
-            step_5_loss = float(history.history["loss"][4])
-            throughput = (4 * 5) / training_time
-            perplexity = float(np.exp(step_5_loss))
-
-            print(f"\n[Rank {rank}] Verifying gradient sharding:")
-            from torch.distributed.tensor import DTensor
-            grad_sharded_count = 0
-            for v in model.trainable_variables:
-                if v.value.grad is not None:
-                    if isinstance(v.value.grad, DTensor):
-                        grad_sharded_count += 1
-            print(f"    Total sharded gradients found: {grad_sharded_count}/{len(model.trainable_variables)}")
+    peak_memory = tracker.stop()
+    
+    # Collective peak memory (max across ranks)
+    peak_mem_tensor = torch.tensor([peak_memory], device='cpu')
+    torch.distributed.all_reduce(peak_mem_tensor, op=torch.distributed.ReduceOp.MAX)
+    global_peak_memory = peak_mem_tensor.item()
 
     if rank == 0:
         results = {
             "initial_weights": {k: {"mean": v["mean"]} for k, v in initial.items()},
-            "step_1_loss": step_1_loss,
-            "step_5_loss": step_5_loss,
-            "perplexity": perplexity,
-            "throughput": throughput,
+            "step_1_loss": float(history.history["loss"][0]) if rank == 0 else 0.0,
+            "step_5_loss": float(history.history["loss"][4]) if rank == 0 else 0.0,
+            "perplexity": float(np.exp(history.history["loss"][4])) if rank == 0 else 0.0,
+            "throughput": (4 * 5) / training_time,
             "training_time": training_time,
+            "compilation_time": compilation_time,
+            "peak_memory": global_peak_memory,
             "step_1_updates": {path: {"mean": float(np.mean(after_step_1[path]["val"] - initial[path]["val"])), "samples": (after_step_1[path]["val"] - initial[path]["val"]).flatten()[:5].tolist()} for path in initial if path in after_step_1},
         }
         with open("results_torch.json", "w") as f: json.dump(results, f, indent=2)
@@ -282,4 +277,6 @@ def _run_torch(rank, world_size):
         torch.distributed.destroy_process_group()
 
 if __name__ == "__main__":
-    run_backend(sys.argv[1])
+    backend = sys.argv[1]
+    world_size = int(sys.argv[2]) if len(sys.argv) > 2 else 2
+    run_backend(backend, world_size)
