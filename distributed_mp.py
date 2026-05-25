@@ -1,7 +1,7 @@
 import os
 import sys
 
-# Set backend BEFORE importing Keras
+# CRITICAL: Set backend BEFORE any Keras/Torch imports
 if len(sys.argv) > 1:
     os.environ["KERAS_BACKEND"] = sys.argv[1]
 
@@ -12,11 +12,6 @@ import psutil
 import threading
 import contextlib
 import gc
-
-# Pre-import libraries
-import torch
-import keras
-import keras_hub
 
 class MemoryTracker:
     def __init__(self):
@@ -67,43 +62,43 @@ def get_weights_summary(model):
 
 def run_backend(backend, world_size=2):
     if backend == "jax":
+        # Force JAX to see multiple CPU devices if GPUs aren't enough
+        import torch
         num_gpus = torch.cuda.device_count()
         if num_gpus < world_size:
             os.environ["XLA_FLAGS"] = f"--xla_force_host_platform_device_count={world_size}"
             os.environ["JAX_PLATFORMS"] = "cpu"
         _run_jax(world_size)
     elif backend == "torch":
-        ctx = torch.multiprocessing.get_context("fork")
-        processes = []
-        for rank in range(world_size):
-            p = ctx.Process(target=_run_torch, args=(rank, world_size))
-            p.start()
-            processes.append(p)
-        for p in processes:
-            p.join()
-            
-        # Collect and merge results from rank files
+        import torch
+        # Use 'spawn' for GPU compatibility
+        num_gpus = torch.cuda.device_count()
+        method = "spawn" if num_gpus >= world_size else "fork"
+        print(f"Using Torch start method: {method} ({num_gpus} GPUs found)")
+        
+        torch.multiprocessing.spawn(_run_torch, args=(world_size,), nprocs=world_size, join=True)
+        
+        # Aggregate results
         if os.path.exists("results_torch_rank_0.json"):
             with open("results_torch_rank_0.json", "r") as f:
                 results = json.load(f)
-            
-            # Find global peak memory across all ranks
             all_peaks = []
             for r in range(world_size):
                 fname = f"results_torch_rank_{r}.json"
                 if os.path.exists(fname):
                     with open(fname, "r") as f:
                         data = json.load(f)
-                        if "rank_peak_memory" in data:
-                            all_peaks.append(data["rank_peak_memory"])
-            
+                        all_peaks.append(data.get("rank_peak_memory", 0))
             if all_peaks:
-                results["peak_memory"] = max(all_peaks)
-                
+                results["peak_memory"] = sum(all_peaks) # Total system memory
             with open("results_torch.json", "w") as f: json.dump(results, f, indent=2)
 
 def _run_jax(world_size):
+    import jax
+    import keras
+    import keras_hub
     keras.utils.set_random_seed(42)
+    
     tracker = MemoryTracker()
     tracker.start()
 
@@ -111,7 +106,7 @@ def _run_jax(world_size):
     if len(devices) > world_size:
         devices = devices[:world_size]
     print(f"Using JAX devices: {devices}")
-    
+
     mesh = keras.distribution.DeviceMesh(shape=(world_size,), axis_names=("model",), devices=devices)
     layout_map = keras.distribution.LayoutMap(mesh)
     
@@ -125,13 +120,8 @@ def _run_jax(world_size):
     layout_map[".*feedforward_intermediate_dense/kernel"] = keras.distribution.TensorLayout((None, "model"), mesh)
     layout_map[".*feedforward_output_dense/kernel"] = keras.distribution.TensorLayout(("model", None), mesh)
 
-    if world_size > 1:
-        distribution = keras.distribution.ModelParallel(layout_map=layout_map, batch_dim_name="model", auto_shard_dataset=False)
-        scope = distribution.scope()
-    else:
-        scope = contextlib.nullcontext()
-
-    with scope:
+    distribution = keras.distribution.ModelParallel(layout_map=layout_map, batch_dim_name="model", auto_shard_dataset=False)
+    with distribution.scope():
         model = keras_hub.models.OPTBackbone.from_preset("opt_125m_en", dropout=0.0)
         model.compile(optimizer=keras.optimizers.Adam(learning_rate=1e-5), loss="mse", jit_compile=False)
         
@@ -159,8 +149,6 @@ def _run_jax(world_size):
         
         step_1_loss = float(history.history["loss"][0])
         step_5_loss = float(history.history["loss"][4])
-        throughput = (4 * 5) / training_time
-        perplexity = float(np.exp(step_5_loss))
         after_step_1 = get_weights_summary(model)
 
     peak_memory = tracker.stop()
@@ -169,8 +157,8 @@ def _run_jax(world_size):
         "initial_weights": {k: {"mean": v["mean"]} for k, v in initial.items()},
         "step_1_loss": step_1_loss,
         "step_5_loss": step_5_loss,
-        "perplexity": perplexity,
-        "throughput": throughput,
+        "perplexity": float(np.exp(step_5_loss)),
+        "throughput": (4 * 5) / training_time,
         "training_time": training_time,
         "compilation_time": compilation_time,
         "peak_memory": peak_memory,
@@ -179,6 +167,10 @@ def _run_jax(world_size):
     with open("results_jax.json", "w") as f: json.dump(results, f, indent=2)
 
 def _run_torch(rank, world_size):
+    import torch
+    import keras
+    import keras_hub
+    
     torch.set_num_threads(1)
     os.environ["RANK"] = str(rank)
     os.environ["WORLD_SIZE"] = str(world_size)
@@ -212,13 +204,8 @@ def _run_torch(rank, world_size):
     layout_map[".*feedforward_intermediate_dense/kernel"] = keras.distribution.TensorLayout((None, "model"), mesh)
     layout_map[".*feedforward_output_dense/kernel"] = keras.distribution.TensorLayout(("model", None), mesh)
 
-    if world_size > 1:
-        distribution = keras.distribution.ModelParallel(layout_map=layout_map, batch_dim_name="model", auto_shard_dataset=False)
-        scope = distribution.scope()
-    else:
-        scope = contextlib.nullcontext()
-
-    with scope:
+    distribution = keras.distribution.ModelParallel(layout_map=layout_map, batch_dim_name="model", auto_shard_dataset=False)
+    with distribution.scope():
         model = keras_hub.models.OPTBackbone.from_preset("opt_125m_en", dropout=0.0)
         gc.collect()
         if device_type == "cuda":
@@ -260,11 +247,7 @@ def _run_torch(rank, world_size):
 
     peak_memory = tracker.stop()
     
-    # Save results to a rank-specific file
-    rank_results = {
-        "rank_peak_memory": peak_memory
-    }
-    
+    rank_results = {"rank_peak_memory": peak_memory}
     if rank == 0:
         rank_results.update({
             "initial_weights": {k: {"mean": v["mean"]} for k, v in initial.items()},
