@@ -87,7 +87,7 @@ def run_training(rank, world_size, layout_map, backend):
         model.compile(
             optimizer=keras.optimizers.Adam(learning_rate=1e-5), 
             loss="mse", 
-            jit_compile=True
+            jit_compile=False
         )
         
         np.random.seed(42)
@@ -220,7 +220,7 @@ def _run_torch(rank, world_size):
     import torch
 
 
-    os.environ.update({"RANK": str(rank), "WORLD_SIZE": str(world_size), "LOCAL_RANK": str(rank), "MASTER_ADDR": "localhost", "MASTER_PORT": "29560"})
+    os.environ.update({"RANK": str(rank), "WORLD_SIZE": str(world_size), "LOCAL_RANK": str(rank), "MASTER_ADDR": "localhost", "MASTER_PORT": "29561"})
     
     num_gpus = torch.cuda.device_count()
     device_type = "cuda" if num_gpus >= world_size else "cpu"

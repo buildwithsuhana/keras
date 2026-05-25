@@ -2,8 +2,8 @@
   "step_1_loss": 1.626810073852539,
   "step_5_loss": 1.5535575151443481,
   "perplexity": 4.728261158484209,
-  "throughput": 12.115315346542518,
-  "compilation_time": 0.7653729915618896,
-  "training_time": 1.6508030891418457,
-  "peak_memory_mb": 2978.734375
+  "throughput": 11.972092261205612,
+  "compilation_time": 0.7663798332214355,
+  "training_time": 1.6705517768859863,
+  "peak_memory_mb": 3194.359375
 }
