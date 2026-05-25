@@ -1,5 +1,10 @@
 import os
 import sys
+
+# CRITICAL: Set backend BEFORE importing Keras
+if len(sys.argv) > 1:
+    os.environ["KERAS_BACKEND"] = sys.argv[1]
+
 import numpy as np
 import json
 import time
@@ -8,7 +13,7 @@ import threading
 import contextlib
 import gc
 
-# Pre-import heavy libraries in the parent process to enable memory sharing via 'fork'
+# Pre-import libraries in the parent process to enable memory sharing via 'fork'
 import torch
 import keras
 import keras_hub
@@ -61,22 +66,14 @@ def get_weights_summary(model):
     return summary
 
 def run_backend(backend, world_size=2):
-    os.environ["KERAS_BACKEND"] = backend
     if backend == "jax":
-        num_gpus = 0
-        try:
-            num_gpus = torch.cuda.device_count()
-        except:
-            pass
-        
+        num_gpus = torch.cuda.device_count()
         if num_gpus < world_size:
             os.environ["XLA_FLAGS"] = f"--xla_force_host_platform_device_count={world_size}"
-            # Force JAX to CPU if we are simulating to avoid using a single GPU if present
             os.environ["JAX_PLATFORMS"] = "cpu"
         _run_jax(world_size)
     elif backend == "torch":
-        # Use 'fork' instead of 'spawn' to share parent memory (libraries/imports)
-        # Note: 'fork' is highly memory-efficient as it avoids duplicating library overhead.
+        # Use 'fork' to share the pre-imported 'keras' and 'torch' memory pages
         ctx = torch.multiprocessing.get_context("fork")
         processes = []
         for rank in range(world_size):
@@ -113,7 +110,7 @@ def _run_jax(world_size):
     layout_map[".*self_attention/attention_output/kernel"] = keras.distribution.TensorLayout(("model", None), mesh)
     layout_map[".*feedforward_intermediate_dense/kernel"] = keras.distribution.TensorLayout((None, "model"), mesh)
     layout_map[".*feedforward_output_dense/kernel"] = keras.distribution.TensorLayout(("model", None), mesh)
-    
+
     if world_size > 1:
         distribution = keras.distribution.ModelParallel(layout_map=layout_map, batch_dim_name="model", auto_shard_dataset=False)
         scope = distribution.scope()
@@ -131,6 +128,11 @@ def _run_jax(world_size):
             "padding_mask": np.ones((40, 32), dtype="int32")
         }
         y_full = np.random.normal(size=(40, 32, 768)).astype("float32")
+
+        for i in range(10):
+            base = i * 4
+            x_full["token_ids"][base+2:base+4] = x_full["token_ids"][base:base+2]
+            y_full[base+2:base+4] = y_full[base:base+2]
 
         # Compilation Warmup
         start_comp = time.time()
@@ -164,23 +166,16 @@ def _run_jax(world_size):
     with open("results_jax.json", "w") as f: json.dump(results, f, indent=2)
 
 def _run_torch(rank, world_size):
-    # Performance Optimization: Limit intra-op threads
     torch.set_num_threads(1)
-    
     os.environ["RANK"] = str(rank)
     os.environ["WORLD_SIZE"] = str(world_size)
     os.environ["LOCAL_RANK"] = str(rank)
     os.environ["MASTER_ADDR"] = "localhost"
     os.environ["MASTER_PORT"] = "29560"
     
-    # Check device availability
     num_gpus = torch.cuda.device_count()
-    if num_gpus >= world_size:
-        os.environ["KERAS_TORCH_DEVICE"] = "cuda"
-        device_type = "cuda"
-    else:
-        os.environ["KERAS_TORCH_DEVICE"] = "cpu"
-        device_type = "cpu"
+    device_type = "cuda" if num_gpus >= world_size else "cpu"
+    os.environ["KERAS_TORCH_DEVICE"] = device_type
     
     keras.utils.set_random_seed(42)
     keras.distribution.initialize()
@@ -188,6 +183,8 @@ def _run_torch(rank, world_size):
     tracker = MemoryTracker()
     tracker.start()
 
+    print(f"[Rank {rank}] Initialized. World size: {world_size} on {device_type}")
+    
     devices = keras.distribution.list_devices(device_type)[:world_size]
     mesh = keras.distribution.DeviceMesh(shape=(world_size,), axis_names=("model",), devices=devices)
     layout_map = keras.distribution.LayoutMap(mesh)
@@ -210,8 +207,6 @@ def _run_torch(rank, world_size):
 
     with scope:
         model = keras_hub.models.OPTBackbone.from_preset("opt_125m_en", dropout=0.0)
-        
-        # Memory Optimization: Force GC after model creation but before compilation
         gc.collect()
         if device_type == "cuda":
             torch.cuda.empty_cache()
@@ -239,7 +234,7 @@ def _run_torch(rank, world_size):
         x = {k: v[indices] for k, v in x_full.items()}
         y = y_full[indices]
         
-        # Compilation Warmup
+        # Warmup
         start_comp = time.time()
         model.fit(x, y, batch_size=2, epochs=1, steps_per_epoch=1, verbose=1 if rank == 0 else 0, shuffle=False)
         compilation_time = time.time() - start_comp
@@ -261,9 +256,9 @@ def _run_torch(rank, world_size):
     if rank == 0:
         results = {
             "initial_weights": {k: {"mean": v["mean"]} for k, v in initial.items()},
-            "step_1_loss": float(history.history["loss"][0]) if rank == 0 else 0.0,
-            "step_5_loss": float(history.history["loss"][4]) if rank == 0 else 0.0,
-            "perplexity": float(np.exp(history.history["loss"][4])) if rank == 0 else 0.0,
+            "step_1_loss": float(history.history["loss"][0]),
+            "step_5_loss": float(history.history["loss"][4]),
+            "perplexity": float(np.exp(history.history["loss"][4])),
             "throughput": (4 * 5) / training_time,
             "training_time": training_time,
             "compilation_time": compilation_time,
