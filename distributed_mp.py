@@ -61,12 +61,15 @@ def get_weights_summary(model):
     return summary
 
 def run_backend(backend, world_size=2):
-    # Clean up old results
-    for f in ["results_torch.json", "results_jax.json"]:
-        if os.path.exists(f): os.remove(f)
-    for r in range(world_size):
-        f = f"results_torch_rank_{r}.json"
-        if os.path.exists(f): os.remove(f)
+    # Only clean up this specific backend's results to avoid deleting previous comparison data
+    f = f"results_{backend}.json"
+    if os.path.exists(f): 
+        os.remove(f)
+    
+    if backend == "torch":
+        for r in range(world_size):
+            rank_f = f"results_torch_rank_{r}.json"
+            if os.path.exists(rank_f): os.remove(rank_f)
 
     if backend == "jax":
         import torch
@@ -116,7 +119,7 @@ def _run_jax(world_size):
     mesh = keras.distribution.DeviceMesh(shape=(world_size,), axis_names=("model",), devices=devices)
     layout_map = keras.distribution.LayoutMap(mesh)
     
-    # Sharding
+    # Sharding strategy
     layout_map[".*token_embedding/embeddings"] = keras.distribution.TensorLayout(("model", None), mesh)
     layout_map[".*position_embedding/embeddings"] = keras.distribution.TensorLayout((None, "model"), mesh)
     layout_map[".*self_attention/query/kernel"] = keras.distribution.TensorLayout((None, "model", None), mesh)
@@ -171,6 +174,7 @@ def _run_jax(world_size):
         "step_1_updates": {path: {"mean": float(np.mean(after_step_1[path]["val"] - initial[path]["val"])), "samples": (after_step_1[path]["val"] - initial[path]["val"]).flatten()[:5].tolist()} for path in initial if path in after_step_1},
     }
     with open("results_jax.json", "w") as f: json.dump(results, f, indent=2)
+    print(f"Results written to results_jax.json (Peak Memory: {peak_memory:.2f} MB)")
 
 def _run_torch(rank, world_size):
     import torch
