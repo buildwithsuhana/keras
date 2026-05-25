@@ -50,11 +50,11 @@ class TorchTrainer(base_trainer.Trainer):
             if DTensor is not None:
                 for variable in getattr(self, "variables", []):
                     if isinstance(getattr(variable, "value", None), DTensor):
-                        warnings.warn(
-                            "Disabling torch.compile for models containing DTensor "
-                            "variables because torch.compile does not currently "
-                            "support DTensor-backed operations."
-                        )
+                        # warnings.warn(
+                        #     "Disabling torch.compile for models containing DTensor "
+                        #     "variables because torch.compile does not currently "
+                        #     "support DTensor-backed operations."
+                        # )
                         return False
 
         return self.jit_compile
