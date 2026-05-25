@@ -61,26 +61,23 @@ def get_weights_summary(model):
     return summary
 
 def run_backend(backend, world_size=2):
-    # Only clean up this specific backend's results to avoid deleting previous comparison data
-    f = f"results_{backend}.json"
-    if os.path.exists(f): 
-        os.remove(f)
-    
-    if backend == "torch":
-        for r in range(world_size):
-            rank_f = f"results_torch_rank_{r}.json"
-            if os.path.exists(rank_f): os.remove(rank_f)
+    # Clean up old results
+    for f in ["results_torch.json", "results_jax.json"]:
+        if os.path.exists(f): os.remove(f)
+    for r in range(world_size):
+        f = f"results_torch_rank_{r}.json"
+        if os.path.exists(f): os.remove(f)
 
     if backend == "jax":
         import torch
-        num_gpus = torch.cuda.device_count()
+        num_gpus = torch.cuda.device_count() if hasattr(torch.cuda, "device_count") else 0
         if num_gpus < world_size:
             os.environ["XLA_FLAGS"] = f"--xla_force_host_platform_device_count={world_size}"
             os.environ["JAX_PLATFORMS"] = "cpu"
         _run_jax(world_size)
     elif backend == "torch":
         import torch
-        num_gpus = torch.cuda.device_count()
+        num_gpus = torch.cuda.device_count() if hasattr(torch.cuda, "device_count") else 0
         method = "spawn" if num_gpus >= world_size else "fork"
         print(f"Using Torch start method: {method} ({num_gpus} GPUs found)")
         
@@ -90,17 +87,20 @@ def run_backend(backend, world_size=2):
         if os.path.exists("results_torch_rank_0.json"):
             with open("results_torch_rank_0.json", "r") as f:
                 results = json.load(f)
-            all_peaks = []
+            
+            per_device_mem = {}
+            total_host_mem = 0
             for r in range(world_size):
                 fname = f"results_torch_rank_{r}.json"
                 if os.path.exists(fname):
                     with open(fname, "r") as f:
                         data = json.load(f)
-                        all_peaks.append(data.get("rank_peak_memory", 0))
-            if all_peaks:
-                results["peak_memory"] = sum(all_peaks) # Total system memory
+                        per_device_mem[f"Device {r}"] = data.get("device_peak_memory", 0)
+                        total_host_mem += data.get("rank_peak_memory", 0)
+            
+            results["per_device_memory"] = per_device_mem
+            results["peak_memory"] = total_host_mem # Total Host RSS
             with open("results_torch.json", "w") as f: json.dump(results, f, indent=2)
-            print(f"Final results written to results_torch.json (System Peak Memory: {results.get('peak_memory'):.2f} MB)")
 
 def _run_jax(world_size):
     import jax
@@ -119,7 +119,7 @@ def _run_jax(world_size):
     mesh = keras.distribution.DeviceMesh(shape=(world_size,), axis_names=("model",), devices=devices)
     layout_map = keras.distribution.LayoutMap(mesh)
     
-    # Sharding strategy
+    # Sharding
     layout_map[".*token_embedding/embeddings"] = keras.distribution.TensorLayout(("model", None), mesh)
     layout_map[".*position_embedding/embeddings"] = keras.distribution.TensorLayout((None, "model"), mesh)
     layout_map[".*self_attention/query/kernel"] = keras.distribution.TensorLayout((None, "model", None), mesh)
@@ -160,7 +160,19 @@ def _run_jax(world_size):
         step_5_loss = float(history.history["loss"][4])
         after_step_1 = get_weights_summary(model)
 
-    peak_memory = tracker.stop()
+    peak_host_memory = tracker.stop()
+    
+    # Collect per-device memory stats
+    per_device_mem = {}
+    for i, d in enumerate(devices):
+        try:
+            stats = d.memory_stats()
+            # bytes to MB
+            mem_mb = stats.get('peak_bytes_in_use', 0) / (1024 * 1024)
+            per_device_mem[f"Device {i}"] = mem_mb
+        except:
+            # Fallback for CPU simulated devices (share process memory)
+            per_device_mem[f"Device {i}"] = peak_host_memory / world_size
 
     results = {
         "initial_weights": {k: {"mean": v["mean"]} for k, v in initial.items()},
@@ -170,11 +182,11 @@ def _run_jax(world_size):
         "throughput": (4 * 5) / training_time,
         "training_time": training_time,
         "compilation_time": compilation_time,
-        "peak_memory": peak_memory,
+        "peak_memory": peak_host_memory,
+        "per_device_memory": per_device_mem,
         "step_1_updates": {path: {"mean": float(np.mean(after_step_1[path]["val"] - initial[path]["val"])), "samples": (after_step_1[path]["val"] - initial[path]["val"]).flatten()[:5].tolist()} for path in initial if path in after_step_1},
     }
     with open("results_jax.json", "w") as f: json.dump(results, f, indent=2)
-    print(f"Results written to results_jax.json (Peak Memory: {peak_memory:.2f} MB)")
 
 def _run_torch(rank, world_size):
     import torch
@@ -220,6 +232,7 @@ def _run_torch(rank, world_size):
         gc.collect()
         if device_type == "cuda":
             torch.cuda.empty_cache()
+            torch.cuda.reset_peak_memory_stats()
 
         model.compile(optimizer=keras.optimizers.Adam(learning_rate=1e-5), loss="mse", jit_compile=False)
         
@@ -255,9 +268,19 @@ def _run_torch(rank, world_size):
         
         after_step_1 = get_weights_summary(model)
 
-    peak_memory = tracker.stop()
+    peak_host_memory = tracker.stop()
     
-    rank_results = {"rank_peak_memory": peak_memory}
+    device_peak_memory = 0
+    if device_type == "cuda":
+        device_peak_memory = torch.cuda.max_memory_allocated() / (1024 * 1024)
+    else:
+        device_peak_memory = peak_host_memory
+
+    rank_results = {
+        "rank_peak_memory": peak_host_memory,
+        "device_peak_memory": device_peak_memory
+    }
+    
     if rank == 0:
         rank_results.update({
             "initial_weights": {k: {"mean": v["mean"]} for k, v in initial.items()},
@@ -270,10 +293,8 @@ def _run_torch(rank, world_size):
             "step_1_updates": {path: {"mean": float(np.mean(after_step_1[path]["val"] - initial[path]["val"])), "samples": (after_step_1[path]["val"] - initial[path]["val"]).flatten()[:5].tolist()} for path in initial if path in after_step_1},
         })
     
-    # Critical: Write rank-specific file
     with open(f"results_torch_rank_{rank}.json", "w") as f:
         json.dump(rank_results, f, indent=2)
-    print(f"[Rank {rank}] Successfully wrote results_torch_rank_{rank}.json")
     
     if torch.distributed.is_initialized():
         torch.distributed.barrier()
