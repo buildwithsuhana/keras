@@ -1,5 +1,6 @@
 import json
 import numpy as np
+import math
 
 def compare():
     try:
@@ -13,26 +14,32 @@ def compare():
     print("-" * 95)
 
     metrics = [
-        ("Step 1 Loss", "step_1_loss"),
+        ("Step 5 Loss", "step_5_loss"),
         ("Perplexity", "perplexity"),
         ("Throughput (samples/sec)", "throughput"),
         ("Training Time (sec)", "training_time"),
+        ("Peak Memory (MB)", "peak_memory_mb"),
     ]
 
     all_pass = True
     for label, key in metrics:
-        v_jax = jax[key]
-        v_torch = torch[key]
-        diff = abs(v_jax - v_torch)
+        v_jax = jax.get(key, float('nan'))
+        v_torch = torch.get(key, float('nan'))
+        
+        is_nan = math.isnan(v_jax) or math.isnan(v_torch)
+        diff = abs(v_jax - v_torch) if not is_nan else float('nan')
+        
         print(f"{label:<30} | {v_jax:<20.12f} | {v_torch:<20.12f} | {diff:<15.8e}")
-        if key not in ["throughput", "training_time"] and diff > 1e-5:
-            all_pass = False
+        
+        if key not in ["throughput", "training_time", "peak_memory_mb"]:
+            if is_nan or diff > 1e-5:
+                all_pass = False
 
     print("\nSummary:")
     if all_pass:
         print("PASS: JAX and Torch results are numerically consistent.")
     else:
-        print("FAIL: JAX and Torch results diverged beyond tolerance.")
+        print("FAIL: JAX and Torch results diverged or produced NaN.")
 
 if __name__ == "__main__":
     compare()
