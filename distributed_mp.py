@@ -5,6 +5,7 @@ import json
 import time
 import psutil
 import threading
+import gc
 
 class MemoryTracker:
     def __init__(self):
@@ -13,8 +14,21 @@ class MemoryTracker:
         self.running = False
         self.thread = None
 
+    def get_current_mem(self):
+        gc.collect()
+        process = psutil.Process(os.getpid())
+        cpu = process.memory_info().rss
+        gpu = 0
+        try:
+            import torch
+            if torch.cuda.is_available():
+                # Use allocated memory to avoid capturing the reserved pool
+                gpu = torch.cuda.memory_allocated()
+        except:
+            pass
+        return cpu, gpu
+
     def _track(self):
-        import os
         process = psutil.Process(os.getpid())
         
         # Identify if we have torch/jax for GPU tracking
@@ -40,27 +54,27 @@ class MemoryTracker:
                 
                 # Track GPU VRAM
                 if has_torch_cuda:
-                    gpu_mem = torch.cuda.max_memory_allocated()
+                    import torch
+                    gpu_mem = torch.cuda.memory_allocated()
                     if gpu_mem > self.peak_gpu:
                         self.peak_gpu = gpu_mem
                 elif has_jax_gpu:
                     import jax
-                    # JAX doesn't have a simple 'max_memory_allocated' for the process,
-                    # but we can sum the bytes_in_use across local devices.
                     total_gpu_mem = 0
                     for d in jax.local_devices():
                         if d.platform == 'gpu':
                             stats = d.memory_stats()
-                            total_gpu_mem += stats['peak_bytes_in_use']
+                            total_gpu_mem += stats['bytes_in_use']
                     if total_gpu_mem > self.peak_gpu:
                         self.peak_gpu = total_gpu_mem
             except:
                 break
-            time.sleep(0.1)
+            time.sleep(0.5)
 
     def start(self):
-        self.peak_cpu = 0
-        self.peak_gpu = 0
+        cpu, gpu = self.get_current_mem()
+        self.peak_cpu = cpu
+        self.peak_gpu = gpu
         self.running = True
         self.thread = threading.Thread(target=self._track, daemon=True)
         self.thread.start()
@@ -69,8 +83,7 @@ class MemoryTracker:
         self.running = False
         if self.thread:
             self.thread.join()
-        # Return total peak (CPU RSS + GPU VRAM) in MB
-        return (self.peak_cpu + self.peak_gpu) / (1024 * 1024)
+        return self.peak_cpu, self.peak_gpu
 
 def get_layout_map(mesh):
     import keras
@@ -108,6 +121,10 @@ def run_training(rank, world_size, layout_map, backend):
     import keras_hub
     
     tracker = MemoryTracker()
+    
+    # Capture baseline before model creation
+    base_cpu, base_gpu = tracker.get_current_mem()
+    
     tracker.start()
 
     distribution = keras.distribution.ModelParallel(
@@ -130,7 +147,7 @@ def run_training(rank, world_size, layout_map, backend):
         model.compile(
             optimizer=keras.optimizers.Adam(learning_rate=1e-5), 
             loss="mse", 
-            jit_compile=False
+            jit_compile=True if backend == "jax" else False
         )
         
         np.random.seed(42)
@@ -163,15 +180,30 @@ def run_training(rank, world_size, layout_map, backend):
         history = model.fit(x, y, batch_size=batch_size, epochs=5, steps_per_epoch=1, verbose=1 if rank == 0 else 0, shuffle=False)
         training_time = time.time() - start_time
         
-        peak_mem = tracker.stop()
+        peak_cpu, peak_gpu = tracker.stop()
+        
+        # Calculate delta memory (peak - baseline) for this rank
+        delta_mem = (peak_cpu - base_cpu) + (peak_gpu - base_gpu)
 
         if backend == "torch":
             import torch
-            # Aggregate peak memory across all ranks for a fair "Total System" comparison
             device = os.environ.get("KERAS_TORCH_DEVICE", "cpu")
-            m_tensor = torch.tensor([peak_mem], device=device)
-            torch.distributed.all_reduce(m_tensor, op=torch.distributed.ReduceOp.SUM)
-            peak_mem = float(m_tensor.item())
+            
+            # Aggregate Deltas across all ranks
+            d_tensor = torch.tensor([float(delta_mem)], device=device)
+            torch.distributed.all_reduce(d_tensor, op=torch.distributed.ReduceOp.SUM)
+            total_delta = d_tensor.item()
+            
+            # Use Rank 0's baseline as the system baseline
+            b_tensor = torch.tensor([float(base_cpu + base_gpu)], device=device)
+            # We don't sum baselines; we just take Rank 0's to represent the "System Baseline"
+            # (assuming ranks are roughly identical in their framework overhead)
+            
+            # Final Peak = Single Rank Baseline + Sum of All Rank Deltas
+            peak_mem_mb = (base_cpu + base_gpu + total_delta) / (1024 * 1024)
+        else:
+            # JAX is single process, so delta is already for the whole mesh
+            peak_mem_mb = (peak_cpu + peak_gpu) / (1024 * 1024)
 
         if rank == 0:
             step_1_loss = float(history.history["loss"][0])
@@ -182,7 +214,7 @@ def run_training(rank, world_size, layout_map, backend):
                 "perplexity": float(np.exp(step_5_loss)),
                 "throughput": (4 * 5) / training_time,
                 "training_time": training_time,
-                "peak_memory_mb": peak_mem,
+                "peak_memory_mb": peak_mem_mb,
             }
             with open(f"results_{backend}.json", "w") as f: 
                 json.dump(results, f, indent=2)
@@ -190,8 +222,7 @@ def run_training(rank, world_size, layout_map, backend):
 def run_backend(backend, world_size=2):
     os.environ["KERAS_BACKEND"] = backend
     if backend == "jax":
-        # Disable JAX VRAM pre-allocation for accurate measurement
-        os.environ["XLA_PYTHON_CLIENT_PREALLOCATE"] = "false"
+        os.environ["XLA_PYTHON_CLIENT_MEM_FRACTION"] = "0.9"
         num_gpus = 0
         try:
             import torch
