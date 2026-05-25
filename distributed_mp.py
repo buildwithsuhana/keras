@@ -157,18 +157,18 @@ def run_training(rank, world_size, layout_map, backend):
                 device_idx = int(os.environ.get("LOCAL_RANK", 0))
                 device = torch.device(f"cuda:{device_idx}")
                 m_tensor = torch.tensor([float(rank_peak_gpu)], device=device)
-                torch.distributed.all_reduce(m_tensor, op=torch.distributed.ReduceOp.SUM)
+                torch.distributed.all_reduce(m_tensor, op=torch.distributed.ReduceOp.MAX)
                 peak_mem_mb = m_tensor.item() / (1024 * 1024)
             else:
                 peak_mem_mb = 0
 
-        # Fallback to sum of CPU deltas if no GPU was found (for local testing)
+        # Fallback to max CPU delta if no GPU was found (for local testing)
         if not has_gpu:
             delta_cpu = float(peak_cpu - base_cpu)
             if backend == "torch":
                 import torch
                 d_tensor = torch.tensor([delta_cpu])
-                torch.distributed.all_reduce(d_tensor, op=torch.distributed.ReduceOp.SUM)
+                torch.distributed.all_reduce(d_tensor, op=torch.distributed.ReduceOp.MAX)
                 peak_mem_mb = d_tensor.item() / (1024 * 1024)
             else:
                 peak_mem_mb = delta_cpu / (1024 * 1024)
