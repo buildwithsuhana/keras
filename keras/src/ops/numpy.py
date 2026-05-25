@@ -717,7 +717,6 @@ def arange(start, stop=None, step=None, dtype=None):
         return Arange(dtype=dtype).symbolic_call(start, stop, step=step)
     return backend.convert_to_tensor(
         backend.numpy.arange(start, stop, step=step, dtype=dtype),
-        is_op_output=True,
     )
 
 

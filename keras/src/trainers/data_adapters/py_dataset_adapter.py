@@ -213,6 +213,7 @@ class PyDatasetAdapter(DataAdapter):
         self.shuffle = shuffle
         self._output_signature = None
         self._within_epoch = False
+        self._epoch = 0
 
         dist = distribution or distribution_lib.distribution()
         self._num_processes = 1
@@ -272,7 +273,7 @@ class PyDatasetAdapter(DataAdapter):
         num_batches = self.py_dataset.num_batches
         indices = list(range(num_batches))
         if self.shuffle:
-            random.shuffle(indices)
+            random.Random(self._epoch).shuffle(indices)
 
         num_batches_per_rank = (
             num_batches + self._num_processes - 1
@@ -283,12 +284,12 @@ class PyDatasetAdapter(DataAdapter):
                 yield self._standardize_batch(self.py_dataset[indices[idx]])
 
     def _infinite_enqueuer_generator(self):
-        self.enqueuer.start()
+        self.enqueuer.start(self._epoch)
         for batch in self.enqueuer.get():
             yield self._standardize_batch(batch)
 
     def _finite_enqueuer_generator(self):
-        self.enqueuer.start()
+        self.enqueuer.start(self._epoch)
         num_batches = (
             self.py_dataset.num_batches + self._num_processes - 1
         ) // self._num_processes
@@ -359,7 +360,7 @@ class PyDatasetAdapter(DataAdapter):
             )
         self._within_epoch = True
         if self.enqueuer:
-            self.enqueuer.start()
+            self.enqueuer.start(self._epoch)
         self.py_dataset.on_epoch_begin()
 
     def on_epoch_end(self):
@@ -367,6 +368,7 @@ class PyDatasetAdapter(DataAdapter):
             self.enqueuer.stop()
         self.py_dataset.on_epoch_end()
         self._within_epoch = False
+        self._epoch += 1
 
     @property
     def num_batches(self):
@@ -494,7 +496,7 @@ class PyDatasetEnqueuer:
         """
         return self.running
 
-    def start(self):
+    def start(self, epoch=None):
         """Starts the handler's workers.
 
         This method is thread safe but is called from the main thread.
@@ -503,6 +505,7 @@ class PyDatasetEnqueuer:
         with self.start_stop_lock:
             if self.running:
                 return
+            self.epoch = epoch
             self.running = True
             self.run_thread = threading.Thread(target=self._run)
             self.run_thread.name = f"Worker_{self.uid}"
@@ -651,7 +654,7 @@ class OrderedEnqueuer(PyDatasetEnqueuer):
                 indices = range(self.py_dataset.num_batches)
                 if self.shuffle:
                     indices = list(indices)
-                    random.shuffle(indices)
+                    random.Random(self.epoch).shuffle(indices)
 
                 if self._num_processes > 1:
                     num_batches = len(indices)
