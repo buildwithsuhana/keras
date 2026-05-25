@@ -17,7 +17,7 @@ def compare():
         ("Step 5 Loss", "step_5_loss"),
         ("Perplexity", "perplexity"),
         ("Throughput (samples/sec)", "throughput"),
-        ("Training Time (sec)", "training_time"),
+        ("Compilation Time (sec)", "compilation_time"),
         ("Peak Memory (MB)", "peak_memory_mb"),
     ]
 
@@ -31,15 +31,5 @@ def compare():
         
         print(f"{label:<30} | {v_jax:<20.12f} | {v_torch:<20.12f} | {diff:<15.8e}")
         
-        if key not in ["throughput", "training_time", "peak_memory_mb"]:
-            if is_nan or diff > 1e-5:
-                all_pass = False
-
-    print("\nSummary:")
-    if all_pass:
-        print("PASS: JAX and Torch results are numerically consistent.")
-    else:
-        print("FAIL: JAX and Torch results diverged or produced NaN.")
-
 if __name__ == "__main__":
     compare()

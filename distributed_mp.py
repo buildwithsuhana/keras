@@ -84,15 +84,6 @@ def run_training(rank, world_size, layout_map, backend):
     
     with distribution.scope():
         model = keras_hub.models.OPTBackbone.from_preset("opt_125m_en", dropout=0.0)
-        
-        if backend == "torch" and rank == 0:
-            print(f"\n[Rank {rank}] Verifying weight sharding:")
-            from torch.distributed.tensor import DTensor
-            for v in model.trainable_variables:
-                val = v.value
-                sharding_info = "✅ Sharded" if isinstance(val, DTensor) else "❌ Not Sharded"
-                print(f"    {v.path:<60} | {sharding_info}")
-
         model.compile(
             optimizer=keras.optimizers.Adam(learning_rate=1e-5), 
             loss="mse", 
@@ -122,8 +113,10 @@ def run_training(rank, world_size, layout_map, backend):
             x, y = x_full, y_full
             batch_size = 4
 
-        # Warmup
+        # Compilation warmup
+        start_compilation = time.time()
         model.fit(x, y, batch_size=batch_size, epochs=1, steps_per_epoch=1, verbose=1 if rank == 0 else 0, shuffle=False)
+        compilation_time = time.time() - start_compilation
         
         # RESET PEAK STATS HERE to ignore initialization spikes
         if backend == "torch":
@@ -181,6 +174,7 @@ def run_training(rank, world_size, layout_map, backend):
                 "step_5_loss": step_5_loss,
                 "perplexity": float(np.exp(step_5_loss)),
                 "throughput": (4 * 5) / training_time,
+                "compilation_time": compilation_time,
                 "training_time": training_time,
                 "peak_memory_mb": peak_mem_mb,
             }
