@@ -83,9 +83,14 @@ def _run_jax(world_size):
     dataset = get_dataset(vocab_size)
     model = get_model(vocab_size)
     
-    devices = list_devices("cpu")
+    # Use auto-detected devices (will pick up GPUs if available)
+    devices = list_devices()
     print(f"INFO: Detected {len(devices)} devices: {devices}")
     
+    if len(devices) < world_size:
+        print(f"⚠️  Requested world_size {world_size} but only {len(devices)} devices found. Adjusting...")
+        world_size = len(devices)
+
     device_mesh = DeviceMesh(
         shape=(1, world_size), axis_names=("data", "model"), devices=devices[:world_size]
     )
@@ -175,7 +180,6 @@ def run_backend(backend, world_size=2):
     
     if backend == "jax":
         os.environ["XLA_PYTHON_CLIENT_MEM_FRACTION"] = "0.9"
-        os.environ["JAX_PLATFORMS"] = "cpu"
         _run_jax(world_size)
     elif backend == "torch":
         import torch
