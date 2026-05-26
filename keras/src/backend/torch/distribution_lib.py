@@ -70,6 +70,9 @@ def initialize(job_addresses=None, num_processes=None, process_id=None):
     os.environ.setdefault("LOCAL_RANK", str(process_id if process_id is not None else 0))
     os.environ.setdefault("WORLD_SIZE", str(num_processes))
 
+    if torch.cuda.is_available():
+        torch.cuda.set_device(int(os.environ["LOCAL_RANK"]))
+
     if not dist.is_initialized():
         backend = "nccl" if torch.cuda.is_available() else "gloo"
         dist.init_process_group(backend=backend, init_method="env://")
