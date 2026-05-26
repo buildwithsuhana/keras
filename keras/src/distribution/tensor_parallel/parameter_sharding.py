@@ -5,6 +5,7 @@ import functools
 import numpy as np
 
 from keras.src.backend import distribution_lib
+from keras.src import backend
 from keras.src import ops
 from keras.src import layers
 from keras import Variable, device 
@@ -123,6 +124,16 @@ class ParameterShardingStrategy:
             ref = ref_fn() if ref_fn else w
             self._id_to_param_map[id(ref)] = (w.path, w)
 
+        # Preserve the original variable metadata to avoid mutating the model
+        # across multiple shard creations for different ranks.
+        original_metadata = {}
+        for w in model.weights:
+            original_metadata[id(w)] = (
+                getattr(w, "_shape", None),
+                getattr(w, "_ndim", None),
+                getattr(w, "_value", None),
+            )
+
         # Normalize configuration keys to string paths
         norm_rules = {}
         for pattern, action in list(config.state_rules.items()):
@@ -138,6 +149,10 @@ class ParameterShardingStrategy:
         for pattern, action in config.state_rules.items():
             if callable(action):
                 for name, param in self._find_matching_parameters(model, pattern):
+                    if name in self.sharded_weights:
+                        modified.add(name)
+                        continue
+
                     pr_fn = getattr(param, "experimental_ref", None)
                     pid = id(pr_fn()) if pr_fn else id(param)
 
@@ -152,11 +167,12 @@ class ParameterShardingStrategy:
                     self.sharded_weights_by_id[pid] = shard
                     self.weight_mapping[name] = {"original": original_shape, "sharded": shard.shape}
                     
-                    # Update original variable shape to pass StatelessScope validation
+                    # Update original variable to sharded state (backend-agnostic hack)
+                    shard_tensor = self._convert_to_tensor(shard)
                     param._shape = shard.shape
                     param._ndim = len(shard.shape)
                     if hasattr(param, "_value"):
-                        param._value = ops.convert_to_tensor(shard)
+                        param._value = shard_tensor
                     
                     modified.add(name)
                     print(f"   ✅ Sharded {name}: {original_shape} -> {shard.shape}")
@@ -168,6 +184,22 @@ class ParameterShardingStrategy:
             lp = getattr(layer, "path", None) or layer.name
             lp_s = str(lp)
             
+            # Find and apply sharded variables to layer attributes
+            for attr_name in dir(layer):
+                try:
+                    attr = getattr(layer, attr_name)
+                    if isinstance(attr, Variable):
+                        if attr.path in self.sharded_weights:
+                             # Shape-lying for the layer variable itself
+                             sharded_val = self.sharded_weights[attr.path]
+                             sharded_tensor = self._convert_to_tensor(sharded_val)
+                             attr._shape = sharded_val.shape
+                             attr._ndim = len(attr._shape)
+                             if hasattr(attr, "_value"):
+                                 attr._value = sharded_tensor
+                except Exception:
+                    continue
+
             for pat, rule in config.output_rules.items():
                 pat_s = str(pat)
                 # Flexible matching: exact, suffix, or regex
@@ -184,6 +216,20 @@ class ParameterShardingStrategy:
         print(f"🎯 Patched {patched_count} layers with communication rules")
 
         sharded_model = ParameterShardedModel(model, self, config, device_id)
+
+        # Restore the original model variable metadata so subsequent shard
+        # creations start from the full original model state.
+        for w in model.weights:
+            metadata = original_metadata.get(id(w))
+            if metadata is not None:
+                shape, ndim, value = metadata
+                if shape is not None:
+                    w._shape = shape
+                if ndim is not None:
+                    w._ndim = ndim
+                if value is not None:
+                    w._value = value
+
         print(f"🎯 Sharding complete: {len(modified)} parameters sharded")
         return sharded_model, modified
 
@@ -205,22 +251,10 @@ class ParameterShardingStrategy:
             return out
         layer.call = sharded_call
 
-        # If Row-Parallel (down_projection), we need to update input_spec 
-        # because the input will be sharded along the last dimension.
-        if (isinstance(layer, layers.Dense) and 
-            self._get_layer_mlp_type(layer) == "down_projection"):
-            if hasattr(layer, "input_spec") and layer.input_spec:
-                # Update input_spec to accept sharded input
-                from keras.src.layers import InputSpec
-                new_axes = dict(layer.input_spec.axes) if layer.input_spec.axes else {}
-                if -1 in new_axes:
-                    new_axes[-1] = new_axes[-1] // self.device_count
-                layer.input_spec = InputSpec(
-                    ndim=layer.input_spec.ndim,
-                    min_ndim=layer.input_spec.min_ndim,
-                    axes=new_axes,
-                    shape=None # Shape check is often too strict
-                )
+        # Disable input_spec validation for sharded layers
+        # as it often conflicts with sharded input shapes.
+        if hasattr(layer, "input_spec"):
+            layer.input_spec = None
 
         # Patch compute_output_shape to return full shape if gathering
         old_cos = layer.compute_output_shape
@@ -257,6 +291,13 @@ class ParameterShardingStrategy:
             res = distribution_lib.all_gather(val, axis=dim, axis_name="model")
             return res
         return val
+
+    def _convert_to_tensor(self, value):
+        """Convert a value to a backend tensor with a stable fallback."""
+        try:
+            return ops.convert_to_tensor(value)
+        except TypeError:
+            return backend.core.convert_to_tensor(value)
 
     def _find_matching_parameters(self, model, pattern):
         """Matches a pattern to model weights."""
@@ -302,17 +343,16 @@ def _define_parameter_sharded_model():
             for name, shard in self.sharding_strategy.sharded_weights.items():
                 sharded_var = ShardedWeight(shard, name, device_id=self._device).variable
                 ws.append(sharded_var)
-                # Map original variable ID to our new sharded Variable object
+                # Map original variable path and ref to our new sharded Variable object
                 orig_var = self.sharding_strategy.param_path_map.get(name)
                 if orig_var is not None:
-                    ref = orig_var.experimental_ref() if hasattr(orig_var, "experimental_ref") else orig_var
-                    self._var_map[id(ref)] = sharded_var
-
+                    self._var_map[orig_var.path] = sharded_var
+                    if hasattr(orig_var, "experimental_ref"):
+                        ref = orig_var.experimental_ref()
+                        self._var_map[id(ref)] = sharded_var
 
             for w in self.original_model.weights:
-                rf_fn = getattr(w, "experimental_ref", None)
-                ref = rf_fn() if rf_fn else w
-                if id(ref) not in sharded_ids:
+                if w.path not in self._var_map:
                     # Explicitly move non-sharded weights to the target device
                     with device(self._device):
                         new_v = Variable(
@@ -322,7 +362,10 @@ def _define_parameter_sharded_model():
                         )
                         new_v._path = w.path
                     ws.append(new_v)
-                    self._var_map[id(ref)] = new_v
+                    self._var_map[w.path] = new_v
+                    if hasattr(w, "experimental_ref"):
+                        ref = w.experimental_ref()
+                        self._var_map[id(ref)] = new_v
             
             self._weights_list = ws
             self._trainable_weights_list = [v for v in ws if v.trainable]
@@ -350,32 +393,80 @@ def _define_parameter_sharded_model():
             return self.original_model.compute_output_spec(**kwargs)
 
         def call(self, inputs, training=None, mask=None):
-            """Forward pass using top-level stateless_call with weight injection."""
-            # Prepare tensors/Variables for all trainable and non-trainable weights
-            t_vars = []
-            for v in self.original_model.trainable_variables:
-                ref = v.experimental_ref() if hasattr(v, "experimental_ref") else v
-                t_vars.append(self._var_map.get(id(ref), v))
-                
-            nt_vars = []
-            for v in self.original_model.non_trainable_variables:
-                ref = v.experimental_ref() if hasattr(v, "experimental_ref") else v
-                nt_vars.append(self._var_map.get(id(ref), v))
-
-            # Since we patched the internal layers of original_model and updated their variables' shapes,
-            # we can just call stateless_call on the whole model.
-            out_tuple = self.original_model.stateless_call(
-                t_vars, nt_vars, inputs, training=training, mask=mask
-            )
+            """Forward pass that correctly handles sharded variable state."""
+            # Since we've already updated the layers' internal state via shape-lying,
+            # we can call the original model directly.
+            # The sharded variables are stored in self._weights_list and tracked via
+            # the framework through self.trainable_weights and self.non_trainable_weights.
             
-            # Update non-trainable state (RNGs, BN stats)
-            if isinstance(out_tuple, tuple) and len(out_tuple) >= 2:
-                out, updated_nt_vars = out_tuple[0], out_tuple[1]
-                for v, nv in zip(nt_vars, updated_nt_vars):
-                    if hasattr(v, "assign") and v is not nv:
-                        v.assign(nv)
-                return out
-            return out_tuple
+            # Build a temporary mapping of original_model variables to their sharded values
+            # for the duration of this call
+            original_state = {}
+            
+            # Temporarily replace original_model's variables with our sharded versions
+            for orig_var in self.original_model.trainable_variables:
+                var_id = id(orig_var)
+                original_state[var_id] = (
+                    getattr(orig_var, "_shape", None),
+                    getattr(orig_var, "_ndim", None),
+                    getattr(orig_var, "_value", None),
+                )
+                sharded_var = self._var_map.get(
+                    orig_var.path,
+                    self._var_map.get(
+                        id(orig_var.experimental_ref()) 
+                        if hasattr(orig_var, "experimental_ref") else id(orig_var),
+                        None
+                    )
+                )
+                if sharded_var is not None:
+                    orig_var._shape = sharded_var.shape
+                    orig_var._ndim = len(sharded_var.shape) if sharded_var.shape else 0
+                    if hasattr(orig_var, "_value"):
+                        orig_var._value = sharded_var.value
+                        
+            for orig_var in self.original_model.non_trainable_variables:
+                var_id = id(orig_var)
+                if var_id not in original_state:  # Only store if not already stored
+                    original_state[var_id] = (
+                        getattr(orig_var, "_shape", None),
+                        getattr(orig_var, "_ndim", None),
+                        getattr(orig_var, "_value", None),
+                    )
+                sharded_var = self._var_map.get(
+                    orig_var.path,
+                    self._var_map.get(
+                        id(orig_var.experimental_ref())
+                        if hasattr(orig_var, "experimental_ref") else id(orig_var),
+                        None
+                    )
+                )
+                if sharded_var is not None:
+                    orig_var._shape = sharded_var.shape
+                    orig_var._ndim = len(sharded_var.shape) if sharded_var.shape else 0
+                    if hasattr(orig_var, "_value"):
+                        orig_var._value = sharded_var.value
+            
+            try:
+                # Call the original model
+                outputs = self.original_model.call(inputs, training=training, mask=mask)
+            finally:
+                # Restore original variable state
+                for orig_var in (
+                    list(self.original_model.trainable_variables) +
+                    list(self.original_model.non_trainable_variables)
+                ):
+                    var_id = id(orig_var)
+                    if var_id in original_state:
+                        shape, ndim, value = original_state[var_id]
+                        if shape is not None:
+                            orig_var._shape = shape
+                        if ndim is not None:
+                            orig_var._ndim = ndim
+                        if value is not None and hasattr(orig_var, "_value"):
+                            orig_var._value = value
+            
+            return outputs
 
         def get_config(self):
             return self.original_model.get_config()

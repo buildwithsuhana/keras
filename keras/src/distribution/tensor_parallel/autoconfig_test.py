@@ -139,6 +139,36 @@ class AutoConfigTest(testing.TestCase):
         attn_out_rule = state_rules[attn_out_key]
         self.check_rule(attn_out_rule, device_count, 0)
 
+    def test_position_embedding_layer_sharding(self):
+        """Tests that position embedding layers without .embeddings attr are discovered."""
+        device_count = 2
+        devices = [f"gpu:{i}" for i in range(device_count)]
+
+        class PositionEmbeddingLayer(layers.Layer):
+            def build(self, input_shape):
+                self._position_embeddings = self.add_weight(
+                    name="embeddings",
+                    shape=(64, 32),
+                )
+
+            def call(self, inputs):
+                return inputs
+
+        inputs = keras.Input(shape=(16,))
+        outputs = PositionEmbeddingLayer(name="position_embedding")(inputs)
+        model = keras.Model(inputs=inputs, outputs=outputs, name="position_embedding_model")
+        model(keras.ops.zeros((1, 16)))
+
+        layout_map = get_default_config(model, devices)
+        state_rules = layout_map.state_rules
+        output_rules = layout_map.output_rules
+
+        embeddings_var = model.layers[1].weights[0]
+        self.assertIn(id(embeddings_var), state_rules)
+        emb_rule = state_rules[id(embeddings_var)]
+        self.check_rule(emb_rule, device_count, 0)
+        self.assertIn("position_embedding", output_rules)
+
     def test_nested_model(self):
         """Tests that the recursive traversal finds layers in nested models."""
         device_count = 2

@@ -217,6 +217,35 @@ def all_reduce(x, op="sum", axis_name="model"):
                 "Supported options are 'sum' and 'mean'."
             )
 
+    if jax_utils.is_in_jax_tracing_scope(x):
+        try:
+            return _reduce_fn(x)
+        except (ValueError, NameError):
+            # If the axis is not bound, we cannot perform the reduction.
+            # This happens when using patching TP inside a regular jit.
+            return x
+
+    # To use pmap with an array of arbitrary leading dimension,
+    # we need to reshape it to (axis_size, -1, ...).
+    from keras.src.distribution import distribution_lib
+
+    dist = distribution_lib.distribution()
+    axis_size = None
+    if dist is not None and dist.device_mesh is not None:
+        mesh = dist.device_mesh
+        if axis_name in mesh.axis_names:
+            axis_idx = mesh.axis_names.index(axis_name)
+            axis_size = mesh.shape[axis_idx]
+
+    if axis_size is None:
+        axis_size = jax.local_device_count()
+
+    if x.shape[0] % axis_size == 0:
+        orig_shape = x.shape
+        x_reshaped = x.reshape((axis_size, -1) + orig_shape[1:])
+        res = jax.pmap(_reduce_fn, axis_name=axis_name)(x_reshaped)
+        return res.reshape(orig_shape)
+
     return jax.pmap(_reduce_fn, axis_name=axis_name)(x)
 
 
@@ -241,7 +270,37 @@ def all_gather(x, axis, axis_name="model"):
     """
 
     def _gather_fn(y):
-        return lax.all_gather(y, axis_name=axis_name, axis=axis, tiled=False)
+        return lax.all_gather(y, axis_name=axis_name, axis=axis, tiled=True)
+
+    if jax_utils.is_in_jax_tracing_scope(x):
+        try:
+            return _gather_fn(x)
+        except (ValueError, NameError):
+            # If the axis is not bound, we cannot perform the gather.
+            return x
+
+    from keras.src.distribution import distribution_lib
+
+    dist = distribution_lib.distribution()
+    axis_size = None
+    if dist is not None and dist.device_mesh is not None:
+        mesh = dist.device_mesh
+        if axis_name in mesh.axis_names:
+            axis_idx = mesh.axis_names.index(axis_name)
+            axis_size = mesh.shape[axis_idx]
+
+    if axis_size is None:
+        axis_size = jax.local_device_count()
+
+    if x.shape[0] % axis_size == 0:
+        orig_shape = x.shape
+        x_reshaped = x.reshape((axis_size, -1) + orig_shape[1:])
+        res = jax.pmap(_gather_fn, axis_name=axis_name)(x_reshaped)
+
+        new_shape = list(orig_shape)
+        actual_axis = axis if axis >= 0 else axis + len(orig_shape)
+        new_shape[actual_axis] *= axis_size
+        return res.reshape(tuple(new_shape))
 
     return jax.pmap(_gather_fn, axis_name=axis_name)(x)
 

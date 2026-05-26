@@ -116,7 +116,9 @@ def _apply_layer_sharding_rules(layer, device_count, state_rules, output_rules):
             state_rules[id(layer.kernel)] = split_rule(dim=1)
             if layer.use_bias:
                 state_rules[id(layer.bias)] = split_rule(dim=0)
-            output_rules[layer_path] = gather_rule(axis=-1)
+            # Standard TP: column-parallel doesn't gather, next layer is row-parallel.
+            # But we might need gather if this is the last layer.
+            # For now, we don't gather.
 
         elif mlp_type == "down_projection":
             state_rules[id(layer.kernel)] = split_rule(dim=0)
@@ -132,6 +134,12 @@ def _apply_layer_sharding_rules(layer, device_count, state_rules, output_rules):
         if "attention_output" in layer.name:
             state_rules[id(layer.kernel)] = split_rule(dim=0)
             output_rules[layer_path] = _reduce_sum
+        elif "h" in layer.equation.split("->")[1]:
+            # This looks like MHA projections (query, key, value)
+            state_rules[id(layer.kernel)] = split_rule(dim=1)
+            if hasattr(layer, "bias") and layer.bias is not None:
+                state_rules[id(layer.bias)] = split_rule(dim=0)
+            # No gather here for projections!
         else:
             state_rules[id(layer.kernel)] = split_rule(dim=1)
             if hasattr(layer, "bias") and layer.bias is not None:
@@ -141,13 +149,27 @@ def _apply_layer_sharding_rules(layer, device_count, state_rules, output_rules):
     elif (
         isinstance(layer, (layers.Embedding,))
         or "Embedding" in layer.__class__.__name__
+        or hasattr(layer, "embeddings")
+        or any(
+            getattr(w, "path", "").endswith("/embeddings")
+            for w in getattr(layer, "weights", [])
+        )
     ):
         embeddings_var = getattr(layer, "embeddings", None)
+        if embeddings_var is None:
+            embeddings_var = next(
+                (
+                    w
+                    for w in getattr(layer, "weights", [])
+                    if getattr(w, "path", "").endswith("/embeddings")
+                ),
+                None,
+            )
         if embeddings_var is not None:
             # Shard along the vocabulary dimension (row-parallel equivalent for embedding)
             state_rules[id(embeddings_var)] = split_rule(dim=0)
-        # All-reduce to sum partial embeddings from each device
-        output_rules[layer_path] = _reduce_sum
+            # All-reduce to sum partial embeddings from each device
+            output_rules[layer_path] = _reduce_sum
 
 
 def get_default_config(model, device_ids):

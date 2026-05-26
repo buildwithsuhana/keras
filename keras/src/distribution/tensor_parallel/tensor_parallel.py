@@ -354,7 +354,7 @@ class TensorParallelKeras(Model):
             )
 
         for pattern, action in self.tensor_parallel_config.state_rules.items():
-            if re.search(pattern, final_kernel_name):
+            if isinstance(pattern, str) and re.search(pattern, final_kernel_name):
                 if hasattr(action, "sharding_type"):
                     sharding_type = action.sharding_type
                 break
