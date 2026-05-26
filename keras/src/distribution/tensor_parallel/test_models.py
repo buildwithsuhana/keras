@@ -25,7 +25,7 @@ os.environ["XLA_FLAGS"] = "--xla_force_host_platform_device_count=12"
 
 import jax
 import keras_hub
-import matplotlib.pyplot as plt
+# import matplotlib.pyplot as plt
 import tensorflow as tf
 import tensorflow_datasets as tfds
 
@@ -148,42 +148,42 @@ def get_model_from_preset(preset_name, model_class):
 
 def plot_training_graphs(tp_history, preset_name):
     """Plots and saves the loss and perplexity graphs for the TP run."""
-    fig, (ax1, ax2) = plt.subplots(2, 1, figsize=(12, 10))
-    fig.suptitle(f"{preset_name} - Tensor Parallel Training Metrics", fontsize=16)
+    # fig, (ax1, ax2) = plt.subplots(2, 1, figsize=(12, 10))
+    # fig.suptitle(f"{preset_name} - Tensor Parallel Training Metrics", fontsize=16)
 
-    # Plotting Loss
-    ax1.plot(
-        tp_history.history["val_loss"],
-        label="Tensor Parallel - Validation Loss",
-        color="green",
-        linestyle="-",
-        marker="o",
-    )
-    ax1.set_title("Validation Loss")
-    ax1.set_ylabel("Loss")
-    ax1.set_xlabel("Epoch")
-    ax1.legend()
-    ax1.grid(True)
+    # # Plotting Loss
+    # ax1.plot(
+    #     tp_history.history["val_loss"],
+    #     label="Tensor Parallel - Validation Loss",
+    #     color="green",
+    #     linestyle="-",
+    #     marker="o",
+    # )
+    # ax1.set_title("Validation Loss")
+    # ax1.set_ylabel("Loss")
+    # ax1.set_xlabel("Epoch")
+    # ax1.legend()
+    # ax1.grid(True)
 
-    # Plotting Perplexity
-    ax2.plot(
-        tp_history.history["val_perplexity"],
-        label="Tensor Parallel - Validation Perplexity",
-        color="purple",
-        linestyle="-",
-        marker="o",
-    )
-    ax2.set_title("Validation Perplexity")
-    ax2.set_ylabel("Perplexity")
-    ax2.set_xlabel("Epoch")
-    ax2.legend()
-    ax2.grid(True)
+    # # Plotting Perplexity
+    # ax2.plot(
+    #     tp_history.history["val_perplexity"],
+    #     label="Tensor Parallel - Validation Perplexity",
+    #     color="purple",
+    #     linestyle="-",
+    #     marker="o",
+    # )
+    # ax2.set_title("Validation Perplexity")
+    # ax2.set_ylabel("Perplexity")
+    # ax2.set_xlabel("Epoch")
+    # ax2.legend()
+    # ax2.grid(True)
 
-    output_filename = f"{preset_name}_tp_training.png"
-    plt.tight_layout(rect=[0, 0.03, 1, 0.95])
-    plt.savefig(output_filename)
-    logger.info(f"\nTraining graph saved to {output_filename}")
-    plt.close()
+    # output_filename = f"{preset_name}_tp_training.png"
+    # plt.tight_layout(rect=[0, 0.03, 1, 0.95])
+    # plt.savefig(output_filename)
+    # logger.info(f"\nTraining graph saved to {output_filename}")
+    # plt.close()
 
 
 # ----------------------------------------------------------------------

@@ -3,10 +3,6 @@ import sys
 import time
 import numpy as np
 
-# Force CPU for everything - COMMENTED OUT TO ALLOW GPU USAGE
-# os.environ["CUDA_VISIBLE_DEVICES"] = "-1"
-# os.environ["XLA_FLAGS"] = "--xla_force_host_platform_device_count=2"
-
 # Ensure we use the local keras source
 sys.path.insert(0, os.path.abspath(os.path.join(os.path.dirname(__file__), ".")))
 
@@ -103,6 +99,14 @@ def _run_jax(world_size):
         weighted_metrics=[keras.metrics.SparseCategoricalAccuracy()],
     )
     
+    # Explicit build
+    print("[JAX] Explicitly building sharded model...")
+    dummy_input = {
+        "token_ids": np.ones((8, 128), dtype="int32"),
+        "padding_mask": np.ones((8, 128), dtype="int32"),
+    }
+    sharded_model(dummy_input)
+    
     sharded_model.fit(dataset, epochs=1, steps_per_epoch=1)
     print("JAX run completed.")
 
@@ -113,6 +117,10 @@ def _run_torch(rank, world_size):
     os.environ["LOCAL_RANK"] = str(rank)
     os.environ["MASTER_ADDR"] = "localhost"
     os.environ["MASTER_PORT"] = "29505"
+    
+    # Use CUDA_VISIBLE_DEVICES to isolate GPUs - each process only sees ONE GPU
+    # This is the most robust way to avoid NCCL device conflicts
+    os.environ["CUDA_VISIBLE_DEVICES"] = str(rank)
     
     # Prevent JAX from hogging GPUs during Torch runs
     os.environ["JAX_PLATFORMS"] = "cpu"
@@ -126,7 +134,9 @@ def _run_torch(rank, world_size):
     
     print(f"[Process {rank}] Initializing distribution with world_size {world_size}")
     if torch.cuda.is_available():
-        torch.cuda.set_device(rank)
+        # Since we set CUDA_VISIBLE_DEVICES, each process sees its GPU as index 0
+        torch.cuda.set_device(0)
+    
     initialize(num_processes=world_size, process_id=rank)
     
     vocab_size = 10000
@@ -137,12 +147,13 @@ def _run_torch(rank, world_size):
     with keras.device("cpu"):
         model = get_model(vocab_size)
     
-    # Use real devices if available, otherwise fallback to CPU
-    available_devices = list_devices()
-    if not available_devices:
-        available_devices = [f"cpu:{i}" for i in range(world_size)]
-    
-    devices = available_devices[:world_size]
+    # Each process only sees one device (cuda:0) due to CUDA_VISIBLE_DEVICES
+    # But for Keras TP mesh, we need to provide all devices.
+    # HOWEVER, in Torch multi-process mode, each process's DeviceMesh
+    # should ideally contain the devices IT can see.
+    # If we use physical index strings like 'cuda:0', 'cuda:1', Torch will try to use them.
+    # If we use 'cuda:0' for all processes, but they are isolated, it works!
+    devices = [f"cuda:0" for _ in range(world_size)]
     print(f"[Process {rank}] Using devices for mesh: {devices}")
     
     device_mesh = DeviceMesh(
@@ -163,6 +174,14 @@ def _run_torch(rank, world_size):
     gc.collect()
     if torch.cuda.is_available():
         torch.cuda.empty_cache()
+    
+    # Explicit build to ensure variables are registered with optimizer
+    print(f"[Process {rank}] Explicitly building sharded model...")
+    dummy_input = {
+        "token_ids": torch.ones((8, 128), dtype=torch.int32).cuda(),
+        "padding_mask": torch.ones((8, 128), dtype=torch.int32).cuda(),
+    }
+    sharded_model(dummy_input)
     
     print(f"[Process {rank}] Starting fit")
     sharded_model.fit(dataset, epochs=1, steps_per_epoch=1)
