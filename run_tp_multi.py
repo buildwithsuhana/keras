@@ -100,7 +100,13 @@ def _run_torch(rank, world_size):
     os.environ["MASTER_ADDR"] = "localhost"
     os.environ["MASTER_PORT"] = "29505"
     
+    # Force Keras to use the correct local device for this process
     import torch
+    if torch.cuda.is_available():
+        os.environ["KERAS_TORCH_DEVICE"] = f"cuda:{rank}"
+    elif hasattr(torch, "xpu") and torch.xpu.is_available():
+        os.environ["KERAS_TORCH_DEVICE"] = f"xpu:{rank}"
+    
     import torch.distributed as dist
     import keras
     from keras.src.distribution.distribution_lib import AutoTPDistribution, DeviceMesh, list_devices, initialize
