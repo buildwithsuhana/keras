@@ -38,7 +38,7 @@ class ShardedWeight:
             self._variable = Variable(initializer=tensor_shard, trainable=trainable, name=safe_name)
         
         # Ensure the variable has a path for optimizer tracking
-        self._variable.path = name
+        self._variable._path = name
         self.path = name
         self.regularizer = None
 
