@@ -89,6 +89,9 @@ def _run_jax(world_size):
         weighted_metrics=[keras.metrics.SparseCategoricalAccuracy()],
     )
     
+    print("\n--- Model Summary with Sharding (JAX) ---")
+    sharded_model.summary(show_sharding=True)
+    
     sharded_model.fit(dataset, epochs=1, steps_per_epoch=1)
     print("JAX run completed.")
 
@@ -141,6 +144,10 @@ def _run_torch(rank, world_size):
         loss=keras.losses.SparseCategoricalCrossentropy(from_logits=True),
         weighted_metrics=[keras.metrics.SparseCategoricalAccuracy()],
     )
+
+    print(f"\n[Process {rank}] --- Model Summary with Sharding (Torch) ---")
+    if rank == 0:
+        sharded_model.summary(show_sharding=True)
 
     # Explicit build to ensure variables are registered with optimizer
     print(f"[Process {rank}] Explicitly building sharded model...")
