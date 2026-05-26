@@ -185,24 +185,40 @@ class ParameterShardingStrategy:
         return sharded_model, modified
 
     def _patch_layer(self, layer, rule):
-        """Patches a layer's call method to apply communication rules."""
+        """Patches a layer's call and compute_output_shape methods."""
         if hasattr(layer, "_is_tp_patched"):
             return
         
+        # Patch call
         old_call = layer.call
         @functools.wraps(old_call)
         def sharded_call(*args, **kwargs):
             out = old_call(*args, **kwargs)
             if rule:
-                print(f"DEBUG: Layer {layer.name} output shape BEFORE rule: {getattr(out, 'shape', 'N/A')}")
                 if callable(rule):
                     out = rule(out)
                 elif isinstance(rule, str):
                     out = self._comm(out, rule)
-                print(f"DEBUG: Layer {layer.name} output shape AFTER rule: {getattr(out, 'shape', 'N/A')}")
             return out
-        
         layer.call = sharded_call
+
+        # Patch compute_output_shape to return full shape if gathering
+        old_cos = layer.compute_output_shape
+        @functools.wraps(old_cos)
+        def sharded_cos(input_shape):
+            shape = old_cos(input_shape)
+            if isinstance(rule, str) and "gather" in rule:
+                parts = rule.split(" ")
+                dim = int(parts[-1]) if len(parts) > 1 and parts[-1].lstrip('-').isdigit() else -1
+                # Adjust negative axis to positive
+                axis = dim if dim >= 0 else len(shape) + dim
+                new_shape = list(shape)
+                if new_shape[axis] is not None:
+                    new_shape[axis] *= self.device_count
+                return tuple(new_shape)
+            return shape
+        layer.compute_output_shape = sharded_cos
+        
         layer._is_tp_patched = True
         print(f"   🔗 Patched layer {layer.name} with communication rule")
 
@@ -261,7 +277,6 @@ def _define_parameter_sharded_model():
                 sharded_var = ShardedWeight(shard, name, device_id=self._device).variable
                 ws.append(sharded_var)
                 # Map original variable ID to our new sharded Variable object
-                # Find the original variable for this name
                 orig_var = self.sharding_strategy.param_path_map.get(name)
                 if orig_var is not None:
                     ref = orig_var.experimental_ref() if hasattr(orig_var, "experimental_ref") else orig_var

@@ -114,6 +114,9 @@ def _run_torch(rank, world_size):
     os.environ["MASTER_ADDR"] = "localhost"
     os.environ["MASTER_PORT"] = "29505"
     
+    # Prevent JAX from hogging GPUs during Torch runs
+    os.environ["JAX_PLATFORMS"] = "cpu"
+    
     import torch
     import torch.distributed as dist
     import keras
@@ -121,8 +124,8 @@ def _run_torch(rank, world_size):
     
     from keras.src.distribution.distribution_lib import AutoTPDistribution, DeviceMesh, initialize, list_devices
     
-    print(f"[Process {rank}] Initializing distribution")
-    initialize()
+    print(f"[Process {rank}] Initializing distribution with world_size {world_size}")
+    initialize(num_processes=world_size, process_id=rank)
     
     vocab_size = 10000
     dataset = get_dataset(vocab_size)
