@@ -36,6 +36,10 @@ class ShardedWeight:
         safe_name = name.replace("/", "_").replace(":", "_")
         with device(dev_name):
             self._variable = Variable(initializer=tensor_shard, trainable=trainable, name=safe_name)
+        
+        # Ensure the variable has a path for optimizer tracking
+        self._variable.path = name
+        self.path = name
         self.regularizer = None
 
     @property
@@ -224,7 +228,9 @@ def _define_parameter_sharded_model():
             """Merges sharded and original weights into a definitive list."""
             ws, sids = [], set(self.sharding_strategy.sharded_weights_by_id.keys())
             for name, shard in self.sharding_strategy.sharded_weights.items():
-                ws.append(ShardedWeight(shard, name, device_id=self._device))
+                # Store the actual Variable object, not the ShardedWeight wrapper
+                sharded_var = ShardedWeight(shard, name, device_id=self._device).variable
+                ws.append(sharded_var)
             for w in self.original_model.weights:
                 rf_fn = getattr(w, "experimental_ref", None)
                 ref = rf_fn() if rf_fn else w

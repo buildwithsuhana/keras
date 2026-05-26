@@ -3,9 +3,9 @@ import sys
 import time
 import numpy as np
 
-# Force CPU for everything
-os.environ["CUDA_VISIBLE_DEVICES"] = "-1"
-os.environ["XLA_FLAGS"] = "--xla_force_host_platform_device_count=2"
+# Force CPU for everything - COMMENTED OUT TO ALLOW GPU USAGE
+# os.environ["CUDA_VISIBLE_DEVICES"] = "-1"
+# os.environ["XLA_FLAGS"] = "--xla_force_host_platform_device_count=2"
 
 # Ensure we use the local keras source
 sys.path.insert(0, os.path.abspath(os.path.join(os.path.dirname(__file__), ".")))
@@ -102,14 +102,7 @@ def _run_jax(world_size):
     print("JAX run completed.")
 
 def _run_torch(rank, world_size):
-    # Force CPU in each process
-    os.environ["CUDA_VISIBLE_DEVICES"] = "-1"
-    # To hide MPS, we can't easily use an env var for torch, but Keras's list_devices
-    # for torch checks for mps. We want it to fall through to CPU.
-    # We can try to trick it by masking MPS if we had a way, but let's just 
-    # make sure we pass 'cpu' to list_devices if we can, or rely on XLA_FLAGS.
-    os.environ["XLA_FLAGS"] = f"--xla_force_host_platform_device_count={world_size}"
-    
+    # Set Rank and World Size for Torch Distributed
     os.environ["RANK"] = str(rank)
     os.environ["WORLD_SIZE"] = str(world_size)
     os.environ["LOCAL_RANK"] = str(rank)
@@ -119,7 +112,8 @@ def _run_torch(rank, world_size):
     import torch
     import torch.distributed as dist
     import keras
-    from keras.src.distribution.distribution_lib import AutoTPDistribution, DeviceMesh, list_devices, initialize
+    
+    from keras.src.distribution.distribution_lib import AutoTPDistribution, DeviceMesh, initialize, list_devices
     
     print(f"[Process {rank}] Initializing distribution")
     initialize()
@@ -128,16 +122,16 @@ def _run_torch(rank, world_size):
     dataset = get_dataset(vocab_size)
     model = get_model(vocab_size)
     
-    # Force CPU devices
-    devices = list_devices("cpu")
-    print(f"[Process {rank}] Detected CPU devices: {devices}")
-    if len(devices) < world_size:
-        devices = [f"cpu:{i}" for i in range(world_size)]
-
-    print(f"[Process {rank}] Using devices for mesh: {devices[:world_size]}")
+    # Use real devices if available, otherwise fallback to CPU
+    available_devices = list_devices()
+    if not available_devices:
+        available_devices = [f"cpu:{i}" for i in range(world_size)]
+    
+    devices = available_devices[:world_size]
+    print(f"[Process {rank}] Using devices for mesh: {devices}")
     
     device_mesh = DeviceMesh(
-        shape=(1, world_size), axis_names=("data", "model"), devices=devices[:world_size]
+        shape=(1, world_size), axis_names=("data", "model"), devices=devices
     )
     # Ensure AutoTPDistribution uses these devices
     distribution = AutoTPDistribution(model, device_mesh=device_mesh)
