@@ -242,6 +242,32 @@ class ParameterShardingStrategy:
         old_call = layer.call
         @functools.wraps(old_call)
         def sharded_call(*args, **kwargs):
+            # Rule 3: For Row Parallel layers, bias should be added AFTER all_reduce
+            from keras.src.distribution.tensor_parallel.autoconfig import _reduce_sum
+            
+            if rule == "parallel_dropout":
+                # Rule 5: Parallel regions use different seeds
+                if hasattr(layer, "seed_generator"):
+                    # We slightly shift the seed based on rank to get different masks
+                    # This is a simple way to achieve Rule 5 parallel RNG behavior
+                    seed_state = layer.seed_generator.state
+                    seed_state.assign(seed_state.value + self.rank * 1000)
+                return old_call(*args, **kwargs)
+
+            use_bias = getattr(layer, "use_bias", False)
+            if use_bias and rule == _reduce_sum:
+                # Temporarily disable bias addition in the original call
+                layer.use_bias = False
+                out = old_call(*args, **kwargs)
+                layer.use_bias = True
+                
+                # Apply the rule (AllReduce)
+                out = rule(out)
+                
+                # Add the bias manually after AllReduce
+                out = out + layer.bias
+                return out
+
             out = old_call(*args, **kwargs)
             if rule:
                 if callable(rule):
@@ -282,6 +308,15 @@ class ParameterShardingStrategy:
 
     def _comm(self, val, rule):
         """Internal communication wrapper."""
+        if rule == "parallel_dropout":
+            # Rule 5: Parallel Dropout needs different seeds on different devices.
+            # We achieve this by adding the rank to the seed if possible, 
+            # or by doing nothing if the backend already handles it.
+            # In Keras 3.0, we can use a seed_generator or just rely on the rank
+            # being part of the global state.
+            # For simplicity, we ensure that if we are in a parallel region, 
+            # we are not syncing seeds.
+            return val
         if "sum" in rule or "allreduce" in rule:
             res = distribution_lib.all_reduce(val, op="sum", axis_name="model")
             return res

@@ -163,6 +163,20 @@ class Trainer:
             in the transfer learning guide.
         """
         optimizer = optimizers.get(optimizer)
+        
+        # AutoTP integration: Wrap optimizer if AutoTPDistribution is active
+        from keras.src.distribution.distribution_lib import distribution, AutoTPDistribution
+        from keras.src.distribution.tensor_parallel.coordinated_optimizer import TensorParallelOptimizer
+        
+        current_dist = distribution()
+        if isinstance(current_dist, AutoTPDistribution):
+            if optimizer is not None and not isinstance(optimizer, TensorParallelOptimizer):
+                optimizer = TensorParallelOptimizer(
+                    optimizer,
+                    device_count=current_dist.model.device_count,
+                    tensor_parallel_config=current_dist.model.tensor_parallel_config,
+                )
+
         self.optimizer = optimizer
         if (
             auto_scale_loss

@@ -1004,6 +1004,16 @@ class AutoTPDistribution(Distribution):
             world_size=np.prod(self.device_mesh.shape),
             device_ids=self.device_mesh.devices.flatten().tolist(),
         )
+        # Attach sharding config to the original model for summary/compile
+        self._original_model._tensor_parallel_config = self.model.tensor_parallel_config
+        self._original_model._distribution = self
+
+    @property
+    def num_model_replicas(self):
+        mesh_batch_dim_index = self.device_mesh.axis_names.index(
+            self.batch_dim_name
+        )
+        return self.device_mesh.shape[mesh_batch_dim_index]
 
     def get_data_layout(self, data_shape):
         data_shard_spec = [None] * len(data_shape)
@@ -1011,7 +1021,16 @@ class AutoTPDistribution(Distribution):
         return TensorLayout(data_shard_spec, self.device_mesh)
 
     def get_variable_layout(self, variable):
-        return None
+        """Returns the layout for a variable. 
+        
+        For AutoTP, layouts are managed internally by TensorParallelKeras,
+        but we return a replicated layout here as a default for any
+        non-sharded variables.
+        """
+        import warnings
+        warnings.warn("Variable layout is determined automatically by AutoTPDistribution.")
+        variable_shard_spec = [None] * len(variable.shape)
+        return TensorLayout(variable_shard_spec, self.device_mesh)
 
     def get_tensor_layout(self, path):
         return None

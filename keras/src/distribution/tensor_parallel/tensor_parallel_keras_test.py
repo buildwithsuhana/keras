@@ -6,7 +6,7 @@ from keras import layers
 import numpy as np
 
 # Import the class to be tested
-from tensor_parallel_keras import TensorParallelKeras
+from keras.src.distribution.tensor_parallel.tensor_parallel import TensorParallelKeras
 # Import the Keras testing base class
 from keras.src import testing
 

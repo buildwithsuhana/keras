@@ -171,6 +171,11 @@ def _apply_layer_sharding_rules(layer, device_count, state_rules, output_rules):
             # All-reduce to sum partial embeddings from each device
             output_rules[layer_path] = _reduce_sum
 
+    elif isinstance(layer, layers.Dropout):
+        # Rule 5: Mark dropout layers for parallel RNG handling if they follow a sharded op
+        # For now we mark all dropout layers, the patcher will decide.
+        output_rules[layer_path] = "parallel_dropout"
+
 
 def get_default_config(model, device_ids):
     """Generates a default tensor parallelism configuration for a model.

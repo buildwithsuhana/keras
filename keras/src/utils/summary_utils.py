@@ -127,6 +127,7 @@ def print_summary(
     expand_nested=False,
     show_trainable=False,
     layer_range=None,
+    show_sharding=False,
 ):
     """Prints a summary of a model.
 
@@ -154,6 +155,8 @@ def print_summary(
             `layer_range[0]` and the ending layer will be the last element that
             matches `layer_range[1]`. By default (`None`) all
             layers in the model are included in the summary.
+        show_sharding: Whether to show sharding information for the model.
+            If not provided, defaults to `False`.
     """
     from keras.src.models import Functional
     from keras.src.models import Sequential
@@ -219,6 +222,12 @@ def print_summary(
         positions = [p * 0.90 for p in positions] + [1.0]
         header.append("Trainable")
         alignment.append("center")
+
+    if show_sharding:
+        default_line_length += 20
+        positions = [p * 0.85 for p in positions] + [1.0]
+        header.append("Sharding")
+        alignment.append("left")
 
     # Compute columns widths
     default_line_length = min(
@@ -293,6 +302,24 @@ def print_summary(
                 )
             else:
                 fields.append(bold_text("-"))
+        
+        if show_sharding:
+            config = getattr(model, "_tensor_parallel_config", None)
+            if config:
+                rules = []
+                for pat, rule in config.state_rules.items():
+                    if str(pat) in layer.name or (hasattr(layer, "path") and str(pat) in layer.path):
+                         sharding_type = getattr(rule, "sharding_type", "sharded")
+                         rules.append(sharding_type)
+                for pat, rule in config.output_rules.items():
+                    if str(pat) in layer.name or (hasattr(layer, "path") and str(pat) in layer.path):
+                         rules.append("comm")
+                if rules:
+                    fields.append(", ".join(set(rules)))
+                else:
+                    fields.append("replicated")
+            else:
+                fields.append("-")
         return fields
 
     def print_layer(layer, nested_level=0):
