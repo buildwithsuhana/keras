@@ -162,8 +162,17 @@ def _run_torch(rank, world_size):
         dist.destroy_process_group()
 
 def run_backend(backend, world_size=2):
-    print(f"\n{'='*20} BACKEND: {backend} {'='*20}")
     os.environ["KERAS_BACKEND"] = backend
+    
+    import keras
+    from keras.src.distribution.distribution_lib import list_devices
+    
+    # Use provided world_size or default to 2
+    if world_size is None:
+        world_size = 2
+    
+    print(f"\n{'='*20} BACKEND: {backend} (World Size: {world_size}) {'='*20}")
+    
     if backend == "jax":
         os.environ["XLA_PYTHON_CLIENT_MEM_FRACTION"] = "0.9"
         os.environ["JAX_PLATFORMS"] = "cpu"
@@ -176,6 +185,7 @@ if __name__ == "__main__":
     import argparse
     parser = argparse.ArgumentParser()
     parser.add_argument("--backend", type=str, default="torch", choices=["torch", "jax"])
+    parser.add_argument("--world_size", type=int, default=None)
     args = parser.parse_args()
     
-    run_backend(args.backend)
+    run_backend(args.backend, args.world_size)

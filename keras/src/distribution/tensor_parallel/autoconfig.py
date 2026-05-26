@@ -116,7 +116,8 @@ def _apply_layer_sharding_rules(layer, device_count, state_rules, output_rules):
             state_rules[id(layer.kernel)] = split_rule(dim=1)
             if layer.use_bias:
                 state_rules[id(layer.bias)] = split_rule(dim=0)
-            output_rules[layer_path] = gather_rule(axis=-1)
+            # Intermediate projection stays sharded for row-parallel down_projection
+            output_rules[layer_path] = lambda x: x
 
         elif mlp_type == "down_projection":
             state_rules[id(layer.kernel)] = split_rule(dim=0)
@@ -136,7 +137,8 @@ def _apply_layer_sharding_rules(layer, device_count, state_rules, output_rules):
             state_rules[id(layer.kernel)] = split_rule(dim=1)
             if hasattr(layer, "bias") and layer.bias is not None:
                 state_rules[id(layer.bias)] = split_rule(dim=0)
-            output_rules[layer_path] = gather_rule(axis=-1)
+            # QKV projections stay sharded for multi-head attention
+            output_rules[layer_path] = lambda x: x
 
     elif (
         isinstance(layer, (layers.Embedding,))
@@ -145,7 +147,7 @@ def _apply_layer_sharding_rules(layer, device_count, state_rules, output_rules):
         embeddings_var = getattr(layer, "embeddings", None)
         if embeddings_var is not None:
             state_rules[id(embeddings_var)] = split_rule(dim=1)
-        output_rules[layer_path] = lambda x: x
+        output_rules[layer_path] = gather_rule(axis=-1)
 
 
 def get_default_config(model, device_ids):
