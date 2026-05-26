@@ -194,10 +194,12 @@ class ParameterShardingStrategy:
         def sharded_call(*args, **kwargs):
             out = old_call(*args, **kwargs)
             if rule:
+                print(f"DEBUG: Layer {layer.name} output shape BEFORE rule: {getattr(out, 'shape', 'N/A')}")
                 if callable(rule):
-                    return rule(out)
+                    out = rule(out)
                 elif isinstance(rule, str):
-                    return self._comm(out, rule)
+                    out = self._comm(out, rule)
+                print(f"DEBUG: Layer {layer.name} output shape AFTER rule: {getattr(out, 'shape', 'N/A')}")
             return out
         
         layer.call = sharded_call
@@ -207,11 +209,13 @@ class ParameterShardingStrategy:
     def _comm(self, val, rule):
         """Internal communication wrapper."""
         if "sum" in rule or "allreduce" in rule:
-            return distribution_lib.all_reduce(val, op="sum", axis_name="model")
+            res = distribution_lib.all_reduce(val, op="sum", axis_name="model")
+            return res
         if "gather" in rule:
             parts = rule.split(" ")
             dim = int(parts[-1]) if len(parts) > 1 and parts[-1].lstrip('-').isdigit() else -1
-            return distribution_lib.all_gather(val, axis=dim, axis_name="model")
+            res = distribution_lib.all_gather(val, axis=dim, axis_name="model")
+            return res
         return val
 
     def _find_matching_parameters(self, model, pattern):
@@ -245,6 +249,7 @@ def _define_parameter_sharded_model():
                 self.original_model.build(self.original_model.inputs[0].shape)
             
             self._build_and_cache_weights()
+            self.built = True
             print("🚀 ParameterShardedModel created successfully")
 
         def _build_and_cache_weights(self):
