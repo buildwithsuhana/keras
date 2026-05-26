@@ -36,10 +36,6 @@ class ShardedWeight:
         safe_name = name.replace("/", "_").replace(":", "_")
         with device(dev_name):
             self._variable = Variable(initializer=tensor_shard, trainable=trainable, name=safe_name)
-        
-        # Ensure the variable has a path for optimizer tracking
-        self._variable._path = name
-        self.path = name
         self.regularizer = None
 
     @property
@@ -97,6 +93,7 @@ class ParameterShardingStrategy:
         self.device_count = device_count
         self.rank = rank
         self.sharded_weights = {}
+        self.original_weights = {}
         self.weight_mapping = {}
         self.sharded_weights_by_id = {}
         self.param_path_map = {}
@@ -116,12 +113,24 @@ class ParameterShardingStrategy:
         ParameterShardedModel = _define_parameter_sharded_model()
         print(f"🔧 Applying parameter-level sharding to {model.name}")
 
-        # Map build & Auto-Discovery
+        # Map build & Auto-Discovery (reaches 122 params)
         self.param_path_map = {w.path: w for w in model.weights}
         for w in model.weights:
             ref_fn = getattr(w, "experimental_ref", None)
             ref = ref_fn() if ref_fn else w
             self._id_to_param_map[id(ref)] = (w.path, w)
+
+        for layer in model._flatten_layers(recursive=True, include_self=True):
+            if "Embedding" in layer.__class__.__name__:
+                for attr in ["embeddings", "position_embeddings", "_embeddings"]:
+                    var = getattr(layer, attr, None)
+                    if var is not None:
+                        vrf_fn = getattr(var, "experimental_ref", None)
+                        vid = id(vrf_fn()) if vrf_fn else id(var)
+                        if vid not in config.state_rules:
+                            config.state_rules[vid] = functools.partial(
+                                split_tensor_for_parallelism, device_count=self.device_count, dim=1
+                            )
 
         # Normalize configuration keys to string paths
         norm_rules = {}
@@ -132,9 +141,9 @@ class ParameterShardingStrategy:
                 del config.state_rules[pattern]
         config.state_rules.update(norm_rules)
 
+        self._store_original_weights(model)
         modified = set()
 
-        # 1. Shard variables and apply shape-lying hack
         for pattern, action in config.state_rules.items():
             if callable(action):
                 for name, param in self._find_matching_parameters(model, pattern):
@@ -150,89 +159,18 @@ class ParameterShardingStrategy:
                     self.sharded_weights[name] = shard
                     self.sharded_weights_by_id[pid] = shard
                     self.weight_mapping[name] = {"original": param.shape, "sharded": shard.shape}
-                    
-                    # Update original variable shape to pass StatelessScope validation
-                    param._shape = shard.shape
-                    param._ndim = len(shard.shape)
-                    
                     modified.add(name)
                     print(f"   ✅ Sharded {name}: {param.shape} -> {shard.shape}")
-
-        # 2. Patch layers recursively with output rules (communication ops)
-        print("🔗 Patching layers with communication rules...")
-        patched_count = 0
-        for layer in model._flatten_layers(recursive=True, include_self=True):
-            lp = getattr(layer, "path", None) or layer.name
-            lp_s = str(lp)
-            
-            for pat, rule in config.output_rules.items():
-                pat_s = str(pat)
-                # Flexible matching: exact, suffix, or regex
-                matched = (pat_s == lp_s or 
-                           lp_s.endswith("/" + pat_s) or 
-                           pat_s.endswith("/" + lp_s) or
-                           (isinstance(pat_s, str) and re.search(pat_s, lp_s)))
-                
-                if matched:
-                    actual_rule = rule.get(0) if isinstance(rule, dict) else rule
-                    self._patch_layer(layer, actual_rule)
-                    patched_count += 1
-                    break
-        print(f"🎯 Patched {patched_count} layers with communication rules")
 
         sharded_model = ParameterShardedModel(model, self, config, device_id)
         print(f"🎯 Sharding complete: {len(modified)} parameters sharded")
         return sharded_model, modified
 
-    def _patch_layer(self, layer, rule):
-        """Patches a layer's call and compute_output_shape methods."""
-        if hasattr(layer, "_is_tp_patched"):
-            return
-        
-        # Patch call
-        old_call = layer.call
-        @functools.wraps(old_call)
-        def sharded_call(*args, **kwargs):
-            out = old_call(*args, **kwargs)
-            if rule:
-                if callable(rule):
-                    out = rule(out)
-                elif isinstance(rule, str):
-                    out = self._comm(out, rule)
-            return out
-        layer.call = sharded_call
-
-        # Patch compute_output_shape to return full shape if gathering
-        old_cos = layer.compute_output_shape
-        @functools.wraps(old_cos)
-        def sharded_cos(input_shape):
-            shape = old_cos(input_shape)
-            if isinstance(rule, str) and "gather" in rule:
-                parts = rule.split(" ")
-                dim = int(parts[-1]) if len(parts) > 1 and parts[-1].lstrip('-').isdigit() else -1
-                # Adjust negative axis to positive
-                axis = dim if dim >= 0 else len(shape) + dim
-                new_shape = list(shape)
-                if new_shape[axis] is not None:
-                    new_shape[axis] *= self.device_count
-                return tuple(new_shape)
-            return shape
-        layer.compute_output_shape = sharded_cos
-        
-        layer._is_tp_patched = True
-        print(f"   🔗 Patched layer {layer.name} with communication rule")
-
-    def _comm(self, val, rule):
-        """Internal communication wrapper."""
-        if "sum" in rule or "allreduce" in rule:
-            res = distribution_lib.all_reduce(val, op="sum", axis_name="model")
-            return res
-        if "gather" in rule:
-            parts = rule.split(" ")
-            dim = int(parts[-1]) if len(parts) > 1 and parts[-1].lstrip('-').isdigit() else -1
-            res = distribution_lib.all_gather(val, axis=dim, axis_name="model")
-            return res
-        return val
+    def _store_original_weights(self, model):
+        """Backs up weights as numpy arrays."""
+        for w in model.weights:
+            if hasattr(w, "numpy"):
+                self.original_weights[w.path] = w.numpy()
 
     def _find_matching_parameters(self, model, pattern):
         """Matches a pattern to model weights."""
@@ -248,10 +186,10 @@ class ParameterShardingStrategy:
 
 def _define_parameter_sharded_model():
     """Defines the wrapper model class dynamically."""
-    from keras.src.models import Model
+    from keras.src.models import Model, Functional
 
     class ParameterShardedModel(Model):
-        """Wrapper model implementing distributed forward pass logic via weight injection."""
+        """Wrapper model implementing distributed forward pass logic."""
 
         def __init__(self, original_model, sharding_strategy, config, device_id):
             """Initializes the model and caches mappings."""
@@ -265,88 +203,157 @@ def _define_parameter_sharded_model():
                 self.original_model.build(self.original_model.inputs[0].shape)
             
             self._build_and_cache_weights()
-            self.built = True
-            print("🚀 ParameterShardedModel created and marked as BUILT")
+            self._layer_rules = self._cache_layer_rules()
+            print("🚀 ParameterShardedModel created successfully")
+
+        def _cache_layer_rules(self):
+            """Pre-maps layers to communication rules to fix NoneType and re.search errors."""
+            rules = {}
+            for layer in self.original_model.layers:
+                lp = getattr(layer, "path", layer.name)
+                if lp is None:
+                    continue
+                lp_s = str(lp)
+                for pat, rule in self.config.output_rules.items():
+                    if pat == lp_s or lp_s.endswith("/" + pat) or (isinstance(pat, str) and re.search(pat, lp_s)):
+                        rules[id(layer)] = rule.get(0) if isinstance(rule, dict) else rule
+                        break
+            return rules
 
         def _build_and_cache_weights(self):
             """Merges sharded and original weights into a definitive list."""
-            ws, self._var_map = [], {}
-            sharded_ids = set(self.sharding_strategy.sharded_weights_by_id.keys())
-
+            ws, sids = [], set(self.sharding_strategy.sharded_weights_by_id.keys())
             for name, shard in self.sharding_strategy.sharded_weights.items():
-                sharded_var = ShardedWeight(shard, name, device_id=self._device).variable
-                ws.append(sharded_var)
-                # Map original variable ID to our new sharded Variable object
-                orig_var = self.sharding_strategy.param_path_map.get(name)
-                if orig_var is not None:
-                    ref = orig_var.experimental_ref() if hasattr(orig_var, "experimental_ref") else orig_var
-                    self._var_map[id(ref)] = sharded_var
-
-
+                ws.append(ShardedWeight(shard, name, device_id=self._device))
             for w in self.original_model.weights:
                 rf_fn = getattr(w, "experimental_ref", None)
                 ref = rf_fn() if rf_fn else w
-                if id(ref) not in sharded_ids:
+                if id(ref) not in sids:
                     ws.append(w)
-            
             self._weights_list = ws
-            self._trainable_weights_list = [v for v in ws if v.trainable]
-            self._non_trainable_weights_list = [v for v in ws if not v.trainable]
 
         @property
         def weights(self):
-            """Returns model weights (shards for sharded params, original for others)."""
+            """Returns model weights."""
             return self._weights_list
 
-        @property
-        def trainable_weights(self):
-            return self._trainable_weights_list
-
-        @property
-        def non_trainable_weights(self):
-            return self._non_trainable_weights_list
-
         def compute_output_shape(self, input_shape):
+            """Returns original output shape."""
             return self.original_model.compute_output_shape(input_shape)
 
         def compute_output_spec(self, *args, **kwargs):
+            """Returns original output spec."""
             if args:
                 return self.original_model.compute_output_spec(args[0])
             return self.original_model.compute_output_spec(**kwargs)
 
         def call(self, inputs, training=None, mask=None):
-            """Forward pass using top-level stateless_call with weight injection."""
-            # Prepare tensors/Variables for all trainable and non-trainable weights
-            t_vars = []
-            for v in self.original_model.trainable_variables:
-                ref = v.experimental_ref() if hasattr(v, "experimental_ref") else v
-                t_vars.append(self._var_map.get(id(ref), v))
-                
-            nt_vars = []
-            for v in self.original_model.non_trainable_variables:
-                ref = v.experimental_ref() if hasattr(v, "experimental_ref") else v
-                nt_vars.append(self._var_map.get(id(ref), v))
+            """Optimized forward pass using pre-calculated mappings."""
+            cache = {}
+            model_inps = self.original_model.inputs
+            if isinstance(inputs, dict):
+                for t in model_inps:
+                    nm = getattr(t, "name", "")
+                    val = inputs.get(nm, inputs.get(nm.split(":")[0]))
+                    if val is not None:
+                        cache[id(t)] = val
+                        if nm:
+                            cache[nm] = val
+                            cache[nm.split(":")[0]] = val
+            else:
+                in_l = inputs if isinstance(inputs, (list, tuple)) else [inputs]
+                for i, t in enumerate(model_inps):
+                    if i < len(in_l):
+                        val = in_l[i]
+                        cache[id(t)] = val
+                        nm = getattr(t, "name", "")
+                        if nm:
+                            cache[nm] = val
+                            cache[nm.split(":")[0]] = val
 
-            # Since we patched the internal layers of original_model and updated their variables' shapes,
-            # we can just call stateless_call on the whole model.
-            out_tuple = self.original_model.stateless_call(
-                t_vars, nt_vars, inputs, training=training, mask=mask
-            )
-            
-            # Update non-trainable state (RNGs, BN stats)
-            if isinstance(out_tuple, tuple) and len(out_tuple) >= 2:
-                out, updated_nt_vars = out_tuple[0], out_tuple[1]
-                for v, nv in zip(nt_vars, updated_nt_vars):
-                    if hasattr(v, "assign") and v is not nv:
-                        v.assign(nv)
-                return out
-            return out_tuple
+            for layer in self.original_model.layers:
+                if isinstance(layer, layers.InputLayer):
+                    continue
+
+                nodes = getattr(layer, "_inbound_nodes", [])
+                if not nodes:
+                    continue
+                node = nodes[0]
+                recon = []
+                for sym in node.input_tensors:
+                    val = cache.get(id(sym))
+                    if val is None:
+                        snm = getattr(sym, "name", "")
+                        val = cache.get(snm, cache.get(snm.split(":")[0]))
+                    if val is not None:
+                        recon.append(val)
+
+                # Dictionary reconstruction for Backbones
+                if len(recon) == 0:
+                    l_in = inputs
+                elif isinstance(layer, (Functional, Model)):
+                    nms = getattr(layer, "input_names", None)
+                    if not nms:
+                        in_t = getattr(layer, "inputs", [])
+                        nms = [getattr(x, "name", "").split(":")[0] for x in in_t]
+                    l_in = dict(zip(nms, recon)) if nms and len(recon) == len(nms) else recon
+                else:
+                    l_in = recon[0] if len(recon) == 1 else recon
+
+                kwargs = {"training": training} if training is not None else {}
+                node_args = getattr(node, "arguments", None)
+                if node_args:
+                    for k, v in (getattr(node_args, "kwargs", {}) or {}).items():
+                        if k != "training":
+                            kwargs[k] = v
+
+                out = layer(l_in, **kwargs)
+
+                rule = self._layer_rules.get(id(layer))
+                if rule:
+                    out = rule(out) if callable(rule) else self._comm(out, layer.name, rule)
+
+                for n in nodes:
+                    syms = getattr(n, "output_tensors", [])
+                    vals = out if isinstance(out, (list, tuple)) else [out]
+                    for o_idx, (s, v) in enumerate(zip(syms, vals)):
+                        cache[id(s)] = v
+                        cache[("node", layer.name, 0, o_idx)] = v
+                        snm = getattr(s, "name", "")
+                        if snm:
+                            cache[snm] = v
+                            cache[snm.split(":")[0]] = v
+
+            results = []
+            for s_out in self.original_model.outputs:
+                val = cache.get(id(s_out))
+                if val is None:
+                    hist = getattr(s_out, "_keras_history", None)
+                    if hist and len(hist) >= 3:
+                        val = cache.get(("node", getattr(hist[0], "name", ""), hist[1], hist[2]))
+                if val is None:
+                    raise RuntimeError(f"Missing runtime value for: {s_out}.")
+                results.append(val)
+
+            return results[0] if len(results) == 1 else results
+
+        def _comm(self, val, name, rule):
+            """Internal communication wrapper."""
+            if "sum" in rule or "allreduce" in rule:
+                return distribution_lib.all_reduce(val, op="sum", axis_name="model")
+            if "gather" in rule:
+                parts = rule.split(" ")
+                dim = int(parts[-1]) if len(parts) > 1 and parts[-1].lstrip('-').isdigit() else -1
+                return distribution_lib.all_gather(val, axis=dim, axis_name="model")
+            return val
 
         def get_config(self):
+            """Returns model configuration."""
             return self.original_model.get_config()
 
         @classmethod
         def from_config(cls, config, custom_objects=None):
+            """Rebuilds sharded model from config."""
             return cls(**config)
 
     return ParameterShardedModel

@@ -114,6 +114,7 @@ class TensorParallelKeras(Model):
             self.tensor_parallel_config = get_default_config(
                 model, device_names
             )
+            print(self.tensor_parallel_config)
             logger.info(
                 "Using automatic config with auto sharding strategy: sharding individual Dense/Conv/Embedding layers"
             )
@@ -128,10 +129,6 @@ class TensorParallelKeras(Model):
                 f"   - Multi-layer model detected: {len(model.layers)} layers"
             )
 
-        from keras.src.backend import distribution_lib
-        current_process_id = distribution_lib.process_id()
-        num_processes = distribution_lib.num_processes()
-
         self.model_shards = []
         self.modified_parameters_names = set()
 
@@ -139,16 +136,7 @@ class TensorParallelKeras(Model):
             f"✅ Using '{keras.backend.backend()}' backend for parameter sharding."
         )
 
-        if num_processes > 1:
-            # Multi-process mode: each process builds its own shard
-            ranks_to_build = [current_process_id % self.device_count]
-            logger.info(f"   - Multi-process detected. Process {current_process_id} building shard {ranks_to_build[0]}")
-        else:
-            # Single process mode: build all shards
-            ranks_to_build = range(self.device_count)
-
-        for rank in ranks_to_build:
-            device_id = self.devices[rank]
+        for rank, device_id in enumerate(self.devices):
             print(f"[{device_id}] ➡️  Starting sharding process for Rank {rank}")
             shard, modified_parameters_names = make_parameter_sharded_model(
                 model,
@@ -425,7 +413,7 @@ class TensorParallelKeras(Model):
         to properly coordinate optimizer states across tensor parallel shards.
         JAX backend does not need this as it handles distributed gradients natively.
         """
-        if len(self.model_shards) > 0 and self.device_count > 1 and optimizer is not None:
+        if len(self.model_shards) > 1 and optimizer is not None:
             self.coordinated_optimizer = TensorParallelOptimizer(
                 optimizer,
                 self.device_count,

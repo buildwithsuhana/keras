@@ -121,8 +121,6 @@ class TensorParallelOptimizer(optimizers.Optimizer):
                 continue
 
             for model_var in self._model_variables:
-                if not hasattr(model_var, "path") or model_var.path is None:
-                    continue
                 m_path_norm = model_var.path.replace("/", "_")
                 s_path_norm = path.replace("/", "_")
 
