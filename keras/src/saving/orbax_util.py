@@ -3,7 +3,6 @@
 import os
 
 from keras.src import backend
-from keras.src.distribution import distribution as get_distribution
 from keras.src.utils import file_utils
 from keras.src.utils.module_utils import ocp
 
@@ -80,6 +79,8 @@ def build_orbax_abstract_pytree(checkpoint_path, ref_state=None):
     """
     if backend.backend() != "jax":
         return None
+
+    from keras.src.distribution import distribution as get_distribution
 
     if get_distribution() is None:
         return None

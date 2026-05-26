@@ -14,26 +14,26 @@ def list_devices(device_type: Optional[str] = None):
     """
     device_type = device_type.lower() if device_type else None
 
-    if torch.cuda.is_available():
+    if (device_type is None or device_type in ("gpu", "cuda")) and torch.cuda.is_available():
         num_devices = torch.cuda.device_count()
         return [f"cuda:{i}" for i in range(num_devices)]
-    if hasattr(torch, "mps") and torch.mps.is_available():
+    if (device_type is None or device_type == "mps") and hasattr(torch, "mps") and torch.mps.is_available():
         return ["mps:0"]
     if device_type == "cpu" or device_type is None:
-        return ["cpu:0"]
+        num_devices = 1
+        xla_flags = os.environ.get("XLA_FLAGS", "")
+        if "--xla_force_host_platform_device_count=" in xla_flags:
+            import re
+            match = re.search(r"--xla_force_host_platform_device_count=(\d+)", xla_flags)
+            if match:
+                num_devices = int(match.group(1))
+        return [f"cpu:{i}" for i in range(num_devices)]
     return []
 
 
 def get_device_count(device_type: Optional[str] = None):
     """Return the number of available devices of the specified type."""
-    device_type = device_type.lower() if device_type else None
-    if torch.cuda.is_available():
-        return torch.cuda.device_count()
-    if hasattr(torch, "mps") and torch.mps.is_available():
-        return 1
-    if device_type == "cpu" or device_type is None:
-        return 1
-    return 0
+    return len(list_devices(device_type))
 
 
 def initialize(job_addresses=None, num_processes=None, process_id=None):
@@ -428,5 +428,3 @@ def broadcast(tensor, src=0):
     dist.broadcast(tensor, src=src)
 
     return tensor
-
->>>>>>> tp_2

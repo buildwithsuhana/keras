@@ -57,7 +57,6 @@ def get_device_count(device_type=None):
     Returns:
         int: The total number of devices for the specified type.
     """
-    """
     return distribution_lib.get_device_count(device_type=device_type)
 
 

@@ -9597,7 +9597,7 @@ def array_split(x, indices_or_sections, axis=0):
      array([4, 5, 6], dtype=int32),
      array([7, 8, 9], dtype=int32))
     """
-    if not isinstance(indices_or_sections, int):
+    if not isinstance(indices_or_sections, (int, np.integer)):
         raise TypeError(
             "Argument `indices_or_sections` must be of type `int`. "
             f"Received: indices_or_sections={indices_or_sections}"

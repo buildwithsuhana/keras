@@ -1,5 +1,9 @@
 import os
+import sys
 import time
+
+# Ensure we use the local keras source
+sys.path.insert(0, os.path.abspath(os.path.join(os.path.dirname(__file__), "../../..")))
 
 # --- Force CPU and Simulate 2 Devices ---
 # This block MUST come before any tensorflow or keras imports.
@@ -9,10 +13,11 @@ os.environ["CUDA_VISIBLE_DEVICES"] = "-1"
 os.environ["XLA_FLAGS"] = "--xla_force_host_platform_device_count=2"
 
 import keras_nlp
-import matplotlib.pyplot as plt
 import tensorflow as tf
-
 import keras
+
+# Set seeds for reproducibility
+keras.utils.set_random_seed(42)
 
 # --- Import your custom distribution strategy ---
 from keras.src.distribution.distribution_lib import AutoTPDistribution
@@ -35,11 +40,15 @@ with open(path) as f:
     text_data = f.read()
 
 print("INFO: Building vocabulary...")
-tokenizer = keras_nlp.tokenizers.WordPieceTokenizer(
+vocab = keras_nlp.tokenizers.compute_word_piece_vocabulary(
+    [path],
     vocabulary_size=VOCAB_SIZE,
     lowercase=True,
 )
-tokenizer.train_on_batch([text_data])
+tokenizer = keras_nlp.tokenizers.WordPieceTokenizer(
+    vocabulary=vocab,
+    lowercase=True,
+)
 
 print("INFO: Preprocessing data into sequences...")
 tokens = tokenizer.tokenize(text_data)
@@ -50,7 +59,11 @@ dataset = dataset.batch(SEQ_LENGTH + 1, drop_remainder=True)
 def split_input_target(chunk):
     input_text = chunk[:-1]
     target_text = chunk[1:]
-    return input_text, target_text
+    # OPTCausalLM expects token_ids and padding_mask
+    return {
+        "token_ids": input_text,
+        "padding_mask": tf.ones_like(input_text),
+    }, target_text
 
 
 train_dataset = dataset.map(split_input_target).batch(
@@ -65,13 +78,13 @@ def create_model():
     opt_model = keras_nlp.models.OPTCausalLM.from_preset(
         "opt_125m_en",
         load_weights=False,
+        preprocessor=None,
     )
     opt_model.backbone.token_embedding.embeddings_initializer = (
         keras.initializers.RandomNormal(stddev=0.02)
     )
     opt_model.backbone.token_embedding._built = False
     opt_model.backbone.token_embedding.vocabulary_size = VOCAB_SIZE
-    opt_model.preprocessor.tokenizer.vocabulary_size = VOCAB_SIZE
 
     opt_model.compile(
         optimizer=keras.optimizers.Adam(2e-5),
@@ -87,22 +100,35 @@ print(" S T A R T I N G   D I S T R I B U T E D   T R A I N I N G ")
 print("=" * 50)
 
 # Keras will now automatically detect the 2 virtual CPU devices from XLA_FLAGS
-DEVICES = list_devices()
+# Pass "cpu" to list_devices to ensure we get the virtual CPU devices.
+DEVICES = list_devices("cpu")
 print(f"INFO: Detected {len(DEVICES)} virtual CPU devices: {DEVICES}")
 
-# Create the DeviceMesh and the distribution strategy
-device_mesh = DeviceMesh(
-    shape=(len(DEVICES),), axis_names=("model",), devices=DEVICES
-)
-distribution = AutoTPDistribution(device_mesh=device_mesh)
-
+# Create the model first
 model_to_shard = create_model()
-sharded_model = distribution.shard(model_to_shard)
+
+# Create the DeviceMesh and the distribution strategy
+# AutoTPDistribution requires a 'data' axis.
+device_mesh = DeviceMesh(
+    shape=(1, len(DEVICES)), axis_names=("data", "model"), devices=DEVICES
+)
+distribution = AutoTPDistribution(model_to_shard, device_mesh=device_mesh)
+
+sharded_model = distribution.model
+
+# Re-compile the sharded model to ensure TensorParallelOptimizer is created
+# for Torch backend, and that the model is marked as compiled.
+sharded_model.compile(
+    optimizer=keras.optimizers.Adam(2e-5),
+    loss=keras.losses.SparseCategoricalCrossentropy(from_logits=True),
+    weighted_metrics=[keras.metrics.SparseCategoricalAccuracy()],
+)
 
 start_time = time.time()
 distributed_history = sharded_model.fit(
     train_dataset,
     epochs=EPOCHS,
+    steps_per_epoch=1,
 )
 distributed_time = time.time() - start_time
 print(f"Distributed training took: {distributed_time:.2f} seconds.")
@@ -113,12 +139,15 @@ print("\n" + "=" * 50)
 print(" S T A R T I N G   S I N G L E   D E V I C E   T R A I N I N G ")
 print("=" * 50)
 
+# Reset seeds before second model creation to ensure identical initialization
+keras.utils.set_random_seed(42)
 single_device_model = create_model()
 
 start_time = time.time()
 single_device_history = single_device_model.fit(
     train_dataset,
     epochs=EPOCHS,
+    steps_per_epoch=1,
 )
 single_device_time = time.time() - start_time
 print(f"Single device training took: {single_device_time:.2f} seconds.")
@@ -128,26 +157,6 @@ print(f"Single device training took: {single_device_time:.2f} seconds.")
 print("\n" + "=" * 50)
 print(" C O M P A R I N G   R E S U L T S ")
 print("=" * 50)
-
-plt.figure(figsize=(10, 6))
-plt.plot(
-    distributed_history.history["loss"],
-    label="Distributed Training Loss (2 Virtual CPUs)",
-    marker="o",
-)
-plt.plot(
-    single_device_history.history["loss"],
-    label="Single Device Loss (Baseline)",
-    marker="x",
-    linestyle="--",
-)
-plt.title("Training Loss Comparison: OPT-125M on Tiny Shakespeare")
-plt.xlabel("Epoch")
-plt.ylabel("Loss")
-plt.xticks(range(EPOCHS))
-plt.legend()
-plt.grid(True)
-plt.show()
 
 final_dist_loss = distributed_history.history["loss"][-1]
 final_single_loss = single_device_history.history["loss"][-1]
