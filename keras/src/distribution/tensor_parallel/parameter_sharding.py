@@ -146,17 +146,18 @@ class ParameterShardingStrategy:
                         modified.add(name)
                         continue
 
+                    original_shape = param.shape
                     shard = action(param, self.rank)
                     self.sharded_weights[name] = shard
                     self.sharded_weights_by_id[pid] = shard
-                    self.weight_mapping[name] = {"original": param.shape, "sharded": shard.shape}
+                    self.weight_mapping[name] = {"original": original_shape, "sharded": shard.shape}
                     
                     # Update original variable shape to pass StatelessScope validation
                     param._shape = shard.shape
                     param._ndim = len(shard.shape)
                     
                     modified.add(name)
-                    print(f"   ✅ Sharded {name}: {param.shape} -> {shard.shape}")
+                    print(f"   ✅ Sharded {name}: {original_shape} -> {shard.shape}")
 
         # 2. Patch layers recursively with output rules (communication ops)
         print("🔗 Patching layers with communication rules...")

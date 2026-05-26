@@ -416,6 +416,20 @@ class TensorParallelKeras(Model):
         """
         Compile the tensor parallel model.
         """
+        from keras.src.distribution.tensor_parallel.coordinated_optimizer import (
+            TensorParallelOptimizer,
+        )
+
+        if optimizer is not None and not isinstance(
+            optimizer, TensorParallelOptimizer
+        ):
+            print("🔧 Automatically wrapping optimizer in TensorParallelOptimizer")
+            optimizer = TensorParallelOptimizer(
+                optimizer,
+                device_count=self.device_count,
+                tensor_parallel_config=self.tensor_parallel_config,
+            )
+
         super().compile(
             optimizer=optimizer,
             loss=loss,
@@ -426,6 +440,45 @@ class TensorParallelKeras(Model):
         logger.info(
             "Compiled TensorParallelKeras model with native Keras distribution logic."
         )
+
+    def summary(self, line_length=None, positions=None, print_fn=None, expand_nested=False, show_trainable=False, layer_range=None, show_sharding=False):
+        """Prints a string summary of the network."""
+        if not show_sharding:
+            return super().summary(
+                line_length=line_length,
+                positions=positions,
+                print_fn=print_fn,
+                expand_nested=expand_nested,
+                show_trainable=show_trainable,
+                layer_range=layer_range
+            )
+        
+        if print_fn is None:
+            print_fn = print
+
+        print_fn("-" * 80)
+        print_fn(f"Model: \"{self.name}\" (Tensor Parallel Sharded)")
+        print_fn("-" * 80)
+        print_fn(f"{'Variable Path':<50} | {'Sharding Strategy':<20}")
+        print_fn("-" * 80)
+
+        sharded_params = set()
+        if self.tensor_parallel_config:
+            for pattern, rule in self.tensor_parallel_config.state_rules.items():
+                # This is a bit simplified, ideally we match patterns to actual weights
+                print_fn(f"{str(pattern):<50} | {str(rule):<20}")
+                sharded_params.add(pattern)
+
+        # Also list non-sharded (replicated) parameters
+        replicated_count = 0
+        for w in self.weights:
+             if w.path not in sharded_params and id(w) not in sharded_params:
+                 replicated_count += 1
+        
+        print_fn("-" * 80)
+        print_fn(f"Total sharded parameters: {len(sharded_params)}")
+        print_fn(f"Total replicated parameters: {replicated_count}")
+        print_fn("-" * 80)
 
     def fit(self, x=None, y=None, **kwargs):
         """Use standard Keras training which correctly handles the train_step."""

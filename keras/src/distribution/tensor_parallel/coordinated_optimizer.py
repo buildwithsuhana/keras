@@ -211,16 +211,40 @@ class TensorParallelOptimizer(optimizers.Optimizer):
         Returns:
             A list of lists containing synchronized gradients.
         """
-        if self.tensor_parallel_config:
-            return gradients_and_vars
+        # If not sharded (single list of tuples), we still might need to sync
+        # if we are in a multi-process environment.
+        is_nested = (
+            isinstance(gradients_and_vars, list)
+            and len(gradients_and_vars) > 0
+            and isinstance(gradients_and_vars[0], list)
+        )
 
+        if not is_nested:
+            # Single shard case: we still sync replicated vars across processes
+            new_grads_and_vars = []
+            for g, v in gradients_and_vars:
+                if g is not None and not self._is_sharded_variable(v):
+                    g = distribution_lib.all_reduce(g, op="mean", axis_name="model")
+                new_grads_and_vars.append((g, v))
+            return new_grads_and_vars
+
+        # Multi-shard (local simulation) case
         def sync_variable(shards_for_this_var):
             """Calculates the mean gradient across all shards for a variable."""
+            v = shards_for_this_var[0][1]
+            if self._is_sharded_variable(v):
+                return shards_for_this_var
+
             grads = [g for g, v in shards_for_this_var if g is not None]
             if not grads:
                 return shards_for_this_var
 
+            # Mean across local shards
             reduced_grad = ops.mean(ops.stack(grads), axis=0)
+            
+            # Mean across processes (if applicable)
+            reduced_grad = distribution_lib.all_reduce(reduced_grad, op="mean", axis_name="model")
+            
             return [(reduced_grad, v) for _, v in shards_for_this_var]
 
         return [
@@ -229,6 +253,24 @@ class TensorParallelOptimizer(optimizers.Optimizer):
                 *[sync_variable(v) for v in zip(*gradients_and_vars)]
             )
         ]
+
+    def _is_sharded_variable(self, variable):
+        """Checks if a variable is sharded according to the TP config."""
+        if not self.tensor_parallel_config:
+            return False
+        
+        # Check by ID
+        ref = variable.experimental_ref() if hasattr(variable, "experimental_ref") else variable
+        if id(ref) in self.tensor_parallel_config.state_rules:
+            return True
+            
+        # Check by path
+        path = getattr(variable, "path", None)
+        if path and path in self.tensor_parallel_config.state_rules:
+            return True
+            
+        return False
+
 
     def get_config(self):
         """Returns the configuration of the optimizer for serialization.

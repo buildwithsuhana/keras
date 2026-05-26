@@ -145,7 +145,7 @@ def _apply_layer_sharding_rules(layer, device_count, state_rules, output_rules):
         embeddings_var = getattr(layer, "embeddings", None)
         if embeddings_var is not None:
             state_rules[id(embeddings_var)] = split_rule(dim=1)
-        output_rules[layer_path] = lambda x: x
+        output_rules[layer_path] = gather_rule(axis=-1)
 
 
 def get_default_config(model, device_ids):
