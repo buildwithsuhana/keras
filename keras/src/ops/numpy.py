@@ -9522,7 +9522,10 @@ def histogram(x, bins=10, range=None):
         )
     return backend.numpy.histogram(x, bins=bins, range=range)
 
+<<<<<<< HEAD
 
+=======
+>>>>>>> tp_2
 class ArraySplit(Operation):
     def __init__(self, indices_or_sections, axis=0, *, name=None):
         super().__init__(name=name)
@@ -9573,23 +9576,34 @@ class ArraySplit(Operation):
 @keras_export(["keras.ops.array_split", "keras.ops.numpy.array_split"])
 def array_split(x, indices_or_sections, axis=0):
     """Splits an array into multiple sub-arrays (unevenly).
+<<<<<<< HEAD
 
+=======
+>>>>>>> tp_2
     This is similar to `keras.ops.split`, but it allows for
     unequal splits. `indices_or_sections` must be an integer
     that indicates the total number of sub-arrays to create.
     If the tensor cannot be divided evenly, the first `remainder`
     splits will have size `quotient + 1`, and the rest will
     have size `quotient`.
+<<<<<<< HEAD
 
+=======
+>>>>>>> tp_2
     Args:
         x: Input tensor.
         indices_or_sections: An integer indicating the number of
             sub-arrays to create.
         axis: The axis along which to split. Defaults to 0.
+<<<<<<< HEAD
 
     Returns:
         A list of sub-tensors.
 
+=======
+    Returns:
+        A list of sub-tensors.
+>>>>>>> tp_2
     Example:
     >>> x = keras.ops.arange(10)
     >>> keras.ops.array_split(x, 3)
@@ -9621,6 +9635,7 @@ def array_split(x, indices_or_sections, axis=0):
 
     return backend.numpy.array_split(
         x, indices_or_sections=indices_or_sections, axis=axis
+<<<<<<< HEAD
     )
 
 
@@ -9794,3 +9809,6 @@ def unique(
         size=size,
         fill_value=fill_value,
     )
+=======
+    )
+>>>>>>> tp_2

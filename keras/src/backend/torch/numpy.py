@@ -2384,6 +2384,7 @@ def argpartition(x, kth, axis=-1):
 
 def histogram(x, bins=10, range=None):
     hist_result = torch.histogram(x, bins=bins, range=range)
+<<<<<<< HEAD
     return hist_result.hist, hist_result.bin_edges
 
 
@@ -2466,3 +2467,6 @@ def unique(
     elif return_index:
         output[1] = unique_indices
     return output[0] if len(output) == 1 else tuple(output)
+=======
+    return hist_result.hist, hist_result.bin_edges
+>>>>>>> tp_2

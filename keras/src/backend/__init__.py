@@ -37,12 +37,17 @@ from keras.src.backend.config import standardize_data_format
 if backend() == "tensorflow":
     from keras.src.backend.tensorflow import *  # noqa: F403
     from keras.src.backend.tensorflow.core import Variable as BackendVariable
+
 elif backend() == "jax":
     from keras.src.backend.jax import *  # noqa: F403
     from keras.src.backend.jax.core import Variable as BackendVariable
 elif backend() == "torch":
     from keras.src.backend.torch import *  # noqa: F403
     from keras.src.backend.torch.core import Variable as BackendVariable
+<<<<<<< HEAD
+=======
+
+>>>>>>> tp_2
 elif backend() == "numpy":
     from keras.src.backend.numpy import *  # noqa: F403
     from keras.src.backend.numpy.core import Variable as BackendVariable
