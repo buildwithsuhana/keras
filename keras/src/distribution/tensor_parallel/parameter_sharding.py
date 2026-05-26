@@ -208,6 +208,7 @@ def _define_parameter_sharded_model():
             
             self._build_and_cache_weights()
             self._layer_rules = self._cache_layer_rules()
+            self._layer_vars = self._cache_layer_variables()
             print("🚀 ParameterShardedModel created successfully")
 
         def _cache_layer_rules(self):
@@ -237,11 +238,36 @@ def _define_parameter_sharded_model():
                 if id(ref) not in sids:
                     ws.append(w)
             self._weights_list = ws
+            self._trainable_weights_list = [v for v in ws if v.trainable]
+            self._non_trainable_weights_list = [v for v in ws if not v.trainable]
+
+        def _cache_layer_variables(self):
+            """Maps each original layer to its set of potentially sharded variables."""
+            layer_vars = {}
+            sharded_map = {v._path: v for v in self._weights_list if hasattr(v, "_path")}
+            
+            for layer in self.original_model.layers:
+                t_vars = []
+                for v in layer.trainable_variables:
+                    t_vars.append(sharded_map.get(v.path, v))
+                nt_vars = []
+                for v in layer.non_trainable_variables:
+                    nt_vars.append(sharded_map.get(v.path, v))
+                layer_vars[id(layer)] = (t_vars, nt_vars)
+            return layer_vars
 
         @property
         def weights(self):
             """Returns model weights."""
             return self._weights_list
+
+        @property
+        def trainable_weights(self):
+            return self._trainable_weights_list
+
+        @property
+        def non_trainable_weights(self):
+            return self._non_trainable_weights_list
 
         def compute_output_shape(self, input_shape):
             """Returns original output shape."""
@@ -254,7 +280,7 @@ def _define_parameter_sharded_model():
             return self.original_model.compute_output_spec(**kwargs)
 
         def call(self, inputs, training=None, mask=None):
-            """Optimized forward pass using pre-calculated mappings."""
+            """Optimized forward pass using pre-calculated mappings and stateless_call."""
             cache = {}
             model_inps = self.original_model.inputs
             if isinstance(inputs, dict):
@@ -313,7 +339,25 @@ def _define_parameter_sharded_model():
                         if k != "training":
                             kwargs[k] = v
 
-                out = layer(l_in, **kwargs)
+                # Use stateless_call to inject sharded variables
+                t_vars, nt_vars = self._layer_vars.get(id(layer), ([], []))
+                if t_vars or nt_vars:
+                    # layer.stateless_call signature: (trainable_vars, non_trainable_vars, *args, **kwargs)
+                    if isinstance(l_in, (list, tuple)):
+                        out_tuple = layer.stateless_call(t_vars, nt_vars, *l_in, **kwargs)
+                    else:
+                        out_tuple = layer.stateless_call(t_vars, nt_vars, l_in, **kwargs)
+                    
+                    if isinstance(out_tuple, tuple) and len(out_tuple) >= 2:
+                        out, updated_nt_vars = out_tuple[0], out_tuple[1]
+                        # Sync non-trainable state (RNGs, BN stats)
+                        for v, nv in zip(nt_vars, updated_nt_vars):
+                            if hasattr(v, "assign"):
+                                v.assign(nv)
+                    else:
+                        out = out_tuple
+                else:
+                    out = layer(l_in, **kwargs)
 
                 rule = self._layer_rules.get(id(layer))
                 if rule:

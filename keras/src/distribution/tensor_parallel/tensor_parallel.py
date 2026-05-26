@@ -131,6 +131,10 @@ class TensorParallelKeras(Model):
                 f"   - Multi-layer model detected: {len(model.layers)} layers"
             )
 
+        from keras.src.backend import distribution_lib
+        current_process_id = distribution_lib.process_id()
+        num_processes = distribution_lib.num_processes()
+
         self.model_shards = []
         self.modified_parameters_names = set()
 
@@ -138,7 +142,18 @@ class TensorParallelKeras(Model):
             f"✅ Using '{keras.backend.backend()}' backend for parameter sharding."
         )
 
-        for rank, device_id in enumerate(self.devices):
+        if num_processes > 1:
+            # Multi-process mode: each process builds its own shard
+            # We assume 1 process = 1 shard for simplicity.
+            # If device_count > num_processes, we might need to adjust this.
+            ranks_to_build = [current_process_id % self.device_count]
+            logger.info(f"   - Multi-process detected. Process {current_process_id} building shard {ranks_to_build[0]}")
+        else:
+            # Single process mode: build all shards
+            ranks_to_build = range(self.device_count)
+
+        for rank in ranks_to_build:
+            device_id = self.devices[rank]
             print(f"[{device_id}] ➡️  Starting sharding process for Rank {rank}")
             shard, modified_parameters_names = make_parameter_sharded_model(
                 model,
@@ -400,20 +415,95 @@ class TensorParallelKeras(Model):
         """
         return self.assembled_model(inputs, training=training, **kwargs)
 
-    def compile(self, optimizer=None, loss=None, metrics=None, loss_weights=None, **kwargs):
+    def compile(
+        self,
+        optimizer=None,
+        loss=None,
+        metrics=None,
+        loss_weights=None,
+        **kwargs
+    ):
         """
         Compile the tensor parallel model.
+
+        For Torch backend, wraps the optimizer with CoordinatedOptimizer
+        to properly coordinate optimizer states across tensor parallel shards.
+        JAX backend does not need this as it handles distributed gradients natively.
         """
-        super().compile(
-            optimizer=optimizer,
-            loss=loss,
-            metrics=metrics,
-            loss_weights=loss_weights,
-            **kwargs
-        )
-        logger.info(
-            "Compiled TensorParallelKeras model with native Keras distribution logic."
-        )
+        if len(self.model_shards) > 0 and self.device_count > 1 and optimizer is not None:
+            from keras.src.distribution.tensor_parallel.coordinated_optimizer import (
+                TensorParallelOptimizer)
+                
+            self.coordinated_optimizer = TensorParallelOptimizer(
+                optimizer,
+                self.device_count,
+                tensor_parallel_config=self.tensor_parallel_config,
+            )
+            logger.info(
+                f"Created coordinated optimizer for {self.device_count} shards"
+            )
+            
+            try:
+                # We need to map the variables of the assembled model to the shards
+                # so that the coordinated optimizer can sync them.
+                self.coordinated_optimizer._shard_models = self.model_shards
+
+                var_map = {}
+                assembled = getattr(self, "assembled_model", None)
+                assembled_vars = (
+                    assembled.variables if assembled is not None else []
+                )
+
+                # Match by name suffix (since assembled model vars have Input prefixes etc.)
+                for a_var in assembled_vars:
+                    key = getattr(a_var, "path", None) or a_var.name
+                    suffix = key.split("/")[-1]
+                    per_shard = []
+                    for shard in self.model_shards:
+                        match = next(
+                            (
+                                v
+                                for v in shard.variables
+                                if v.name.endswith(suffix)
+                            ),
+                            None,
+                        )
+                        per_shard.append(match)
+                    var_map[key] = per_shard
+
+                self.coordinated_optimizer._shard_var_map = var_map
+                
+                # Some implementations might have a nested coordinated_optimizer
+                inner = getattr(
+                    self.coordinated_optimizer, "coordinated_optimizer", None
+                )
+                if inner is not None:
+                    inner._shard_models = self.model_shards
+                    inner._shard_var_map = var_map
+            except Exception:
+                logger.exception(
+                    "Failed to register shard mapping on coordinated optimizer"
+                )
+
+            super().compile(
+                optimizer=self.coordinated_optimizer,
+                loss=loss,
+                metrics=metrics,
+                loss_weights=loss_weights,
+                **kwargs,
+            )
+            logger.info(
+                "Compiled TensorParallelKeras model with coordinated optimizer."
+            )
+
+        else:
+            super().compile(
+                optimizer=optimizer,
+                loss=loss,
+                metrics=metrics,
+                loss_weights=loss_weights,
+                **kwargs
+            )
 
     def fit(self, x=None, y=None, **kwargs):
         """Use standard Keras training which correctly handles the train_step."""
