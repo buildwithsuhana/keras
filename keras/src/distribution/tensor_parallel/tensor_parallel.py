@@ -18,6 +18,7 @@ from keras.src.distribution.tensor_parallel.parameter_sharding import (
     make_parameter_sharded_model,
 )
 
+from keras.src.backend import distribution_lib
 from keras.src.distribution import list_devices
 
 logger = logging.getLogger(__file__)
@@ -58,6 +59,8 @@ class TensorParallelKeras(Model):
         accel_devices = list_devices()
         device_ids = list(self.check_device_ids(device_ids))
 
+        num_processes = distribution_lib.num_processes()
+
         if accel_devices:
             backend_name = keras.backend.backend()
             print(
@@ -65,7 +68,10 @@ class TensorParallelKeras(Model):
             )
             print(f"🔍 Devices: {[str(d) for d in accel_devices]}")
 
-            if len(accel_devices) >= device_count:
+            if num_processes > 1:
+                print(f"✅ Multi-process environment detected ({num_processes} processes). Trusting global device_count={device_count}.")
+                # In multi-process, device_ids should probably stay as requested/configured
+            elif len(accel_devices) >= device_count:
                 print(
                     f"✅ Using REAL tensor parallelism on {device_count} discovered devices."
                 )
@@ -93,7 +99,7 @@ class TensorParallelKeras(Model):
         self.devices = device_ids
         self.device_count = device_count
 
-        if self.device_count <= 1:
+        if self.device_count <= 1 and num_processes <= 1:
             self.model_shards = [model]
             self.distributed = False
             if len(self.devices) == 1:
@@ -138,7 +144,13 @@ class TensorParallelKeras(Model):
             f"✅ Using '{keras.backend.backend()}' backend for parameter sharding."
         )
 
+        process_id = distribution_lib.process_id()
+
         for rank, device_id in enumerate(self.devices):
+            # In multi-process mode, each process only creates its own shard.
+            if num_processes > 1 and rank != process_id:
+                continue
+
             print(f"[{device_id}] ➡️  Starting sharding process for Rank {rank}")
             shard, modified_parameters_names = make_parameter_sharded_model(
                 model,

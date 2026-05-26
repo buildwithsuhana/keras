@@ -289,7 +289,16 @@ def _define_parameter_sharded_model():
                 rf_fn = getattr(w, "experimental_ref", None)
                 ref = rf_fn() if rf_fn else w
                 if id(ref) not in sharded_ids:
-                    ws.append(w)
+                    # Explicitly move non-sharded weights to the target device
+                    with device(self._device):
+                        new_v = Variable(
+                            initializer=w.value,
+                            trainable=w.trainable,
+                            name=w.name.replace("/", "_").replace(":", "_") + "_sharded",
+                        )
+                        new_v._path = w.path
+                    ws.append(new_v)
+                    self._var_map[id(ref)] = new_v
             
             self._weights_list = ws
             self._trainable_weights_list = [v for v in ws if v.trainable]
