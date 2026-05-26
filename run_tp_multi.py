@@ -51,6 +51,7 @@ def get_dataset(vocab_size):
     )
 
     tokens = tokenizer.tokenize(text_data)
+    tokens = keras.ops.convert_to_numpy(tokens)
     dataset = tf.data.Dataset.from_tensor_slices(tokens)
     dataset = dataset.batch(128 + 1, drop_remainder=True)
 
