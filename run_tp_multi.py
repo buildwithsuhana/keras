@@ -125,6 +125,8 @@ def _run_torch(rank, world_size):
     from keras.src.distribution.distribution_lib import AutoTPDistribution, DeviceMesh, initialize, list_devices
     
     print(f"[Process {rank}] Initializing distribution with world_size {world_size}")
+    if torch.cuda.is_available():
+        torch.cuda.set_device(rank)
     initialize(num_processes=world_size, process_id=rank)
     
     vocab_size = 10000
