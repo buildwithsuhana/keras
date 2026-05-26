@@ -266,13 +266,13 @@ def _define_parameter_sharded_model():
             
             self._build_and_cache_weights()
             self.built = True
-            print("🚀 ParameterShardedModel created successfully")
+            print("🚀 ParameterShardedModel created and marked as BUILT")
 
         def _build_and_cache_weights(self):
             """Merges sharded and original weights into a definitive list."""
             ws, self._var_map = [], {}
             sharded_ids = set(self.sharding_strategy.sharded_weights_by_id.keys())
-            
+
             for name, shard in self.sharding_strategy.sharded_weights.items():
                 sharded_var = ShardedWeight(shard, name, device_id=self._device).variable
                 ws.append(sharded_var)
@@ -281,6 +281,7 @@ def _define_parameter_sharded_model():
                 if orig_var is not None:
                     ref = orig_var.experimental_ref() if hasattr(orig_var, "experimental_ref") else orig_var
                     self._var_map[id(ref)] = sharded_var
+
 
             for w in self.original_model.weights:
                 rf_fn = getattr(w, "experimental_ref", None)
