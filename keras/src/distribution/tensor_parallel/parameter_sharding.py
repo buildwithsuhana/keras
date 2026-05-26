@@ -159,16 +159,26 @@ class ParameterShardingStrategy:
                     print(f"   ✅ Sharded {name}: {param.shape} -> {shard.shape}")
 
         # 2. Patch layers recursively with output rules (communication ops)
+        print("🔗 Patching layers with communication rules...")
+        patched_count = 0
         for layer in model._flatten_layers(recursive=True, include_self=True):
-            lp = getattr(layer, "path", layer.name)
-            if lp:
-                lp_s = str(lp)
-                for pat, rule in config.output_rules.items():
-                    # Match pattern against full path or suffix
-                    if pat == lp_s or lp_s.endswith("/" + pat) or (isinstance(pat, str) and re.search(pat, lp_s)):
-                        actual_rule = rule.get(0) if isinstance(rule, dict) else rule
-                        self._patch_layer(layer, actual_rule)
-                        break
+            lp = getattr(layer, "path", None) or layer.name
+            lp_s = str(lp)
+            
+            for pat, rule in config.output_rules.items():
+                pat_s = str(pat)
+                # Flexible matching: exact, suffix, or regex
+                matched = (pat_s == lp_s or 
+                           lp_s.endswith("/" + pat_s) or 
+                           pat_s.endswith("/" + lp_s) or
+                           (isinstance(pat_s, str) and re.search(pat_s, lp_s)))
+                
+                if matched:
+                    actual_rule = rule.get(0) if isinstance(rule, dict) else rule
+                    self._patch_layer(layer, actual_rule)
+                    patched_count += 1
+                    break
+        print(f"🎯 Patched {patched_count} layers with communication rules")
 
         sharded_model = ParameterShardedModel(model, self, config, device_id)
         print(f"🎯 Sharding complete: {len(modified)} parameters sharded")
@@ -248,7 +258,7 @@ def _define_parameter_sharded_model():
                 # Map original variable ID to our new sharded Variable object
                 # Find the original variable for this name
                 orig_var = self.sharding_strategy.param_path_map.get(name)
-                if orig_var:
+                if orig_var is not None:
                     ref = orig_var.experimental_ref() if hasattr(orig_var, "experimental_ref") else orig_var
                     self._var_map[id(ref)] = sharded_var
 
