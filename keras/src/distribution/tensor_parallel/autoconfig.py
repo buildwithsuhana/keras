@@ -144,8 +144,10 @@ def _apply_layer_sharding_rules(layer, device_count, state_rules, output_rules):
     ):
         embeddings_var = getattr(layer, "embeddings", None)
         if embeddings_var is not None:
-            state_rules[id(embeddings_var)] = split_rule(dim=1)
-        output_rules[layer_path] = gather_rule(axis=-1)
+            # Shard along the vocabulary dimension (row-parallel equivalent for embedding)
+            state_rules[id(embeddings_var)] = split_rule(dim=0)
+        # All-reduce to sum partial embeddings from each device
+        output_rules[layer_path] = _reduce_sum
 
 
 def get_default_config(model, device_ids):

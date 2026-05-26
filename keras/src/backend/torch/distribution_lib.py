@@ -345,7 +345,7 @@ def all_reduce(tensor, op="sum", axis_name="model"):
     Args:
         tensor: The tensor to reduce.
         op: The reduction operation. One of "sum", "product", "min",
-            "max". Defaults to "sum".
+            "max", "mean". Defaults to "sum".
         axis_name: The name of the mesh axis to reduce over.
             Defaults to "model".
 
@@ -363,6 +363,14 @@ def all_reduce(tensor, op="sum", axis_name="model"):
         reduce_op = dist.ReduceOp.MIN
     elif op == "max":
         reduce_op = dist.ReduceOp.MAX
+    elif op == "mean":
+        if hasattr(dist.ReduceOp, "AVG"):
+            reduce_op = dist.ReduceOp.AVG
+        else:
+            # Fallback for older torch versions
+            dist.all_reduce(tensor, dist.ReduceOp.SUM)
+            tensor.div_(dist.get_world_size())
+            return tensor
     else:
         reduce_op = dist.ReduceOp.SUM
 

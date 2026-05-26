@@ -3,10 +3,6 @@ import sys
 import time
 import numpy as np
 
-# Force CPU for everything - COMMENTED OUT TO ALLOW GPU USAGE
-# os.environ["CUDA_VISIBLE_DEVICES"] = "-1"
-# os.environ["XLA_FLAGS"] = "--xla_force_host_platform_device_count=2"
-
 # Ensure we use the local keras source
 sys.path.insert(0, os.path.abspath(os.path.join(os.path.dirname(__file__), ".")))
 
@@ -55,12 +51,6 @@ def get_dataset(vocab_size):
     )
 
     tokens = tokenizer.tokenize(text_data)
-    # Convert to numpy to avoid device issues
-    if hasattr(tokens, "cpu"):
-        tokens = tokens.cpu().numpy()
-    elif hasattr(tokens, "numpy"):
-        tokens = tokens.numpy()
-    
     dataset = tf.data.Dataset.from_tensor_slices(tokens)
     dataset = dataset.batch(128 + 1, drop_remainder=True)
 
@@ -83,14 +73,9 @@ def _run_jax(world_size):
     dataset = get_dataset(vocab_size)
     model = get_model(vocab_size)
     
-    # Use auto-detected devices (will pick up GPUs if available)
-    devices = list_devices()
+    devices = list_devices("cpu")
     print(f"INFO: Detected {len(devices)} devices: {devices}")
     
-    if len(devices) < world_size:
-        print(f"⚠️  Requested world_size {world_size} but only {len(devices)} devices found. Adjusting...")
-        world_size = len(devices)
-
     device_mesh = DeviceMesh(
         shape=(1, world_size), axis_names=("data", "model"), devices=devices[:world_size]
     )
@@ -107,7 +92,7 @@ def _run_jax(world_size):
     print("JAX run completed.")
 
 def _run_torch(rank, world_size):
-    # Set Rank and World Size for Torch Distributed
+    # This will be called by mp.spawn
     os.environ["RANK"] = str(rank)
     os.environ["WORLD_SIZE"] = str(world_size)
     os.environ["LOCAL_RANK"] = str(rank)
@@ -117,33 +102,30 @@ def _run_torch(rank, world_size):
     import torch
     import torch.distributed as dist
     import keras
-    import gc
-    
-    from keras.src.distribution.distribution_lib import AutoTPDistribution, DeviceMesh, initialize, list_devices
+    from keras.src.distribution.distribution_lib import AutoTPDistribution, DeviceMesh, list_devices, initialize
     
     print(f"[Process {rank}] Initializing distribution")
     initialize()
     
     vocab_size = 10000
+    # In multi-process, we might want to avoid all processes downloading/processing data
+    # but for this example we'll just do it.
     dataset = get_dataset(vocab_size)
+    model = get_model(vocab_size)
     
-    # Create model on CPU to avoid GPU memory bottleneck before sharding
-    print(f"[Process {rank}] Creating initial model on CPU...")
-    with keras.device("cpu"):
-        model = get_model(vocab_size)
-    
-    # Use real devices if available, otherwise fallback to CPU
-    available_devices = list_devices()
-    if not available_devices:
-        available_devices = [f"cpu:{i}" for i in range(world_size)]
-    
-    devices = available_devices[:world_size]
-    print(f"[Process {rank}] Using devices for mesh: {devices}")
+    if torch.cuda.is_available():
+        devices = list_devices("gpu")
+    else:
+        devices = list_devices("cpu")
+        # Mock devices if not enough
+        if len(devices) < world_size:
+            devices = [f"cpu:{i}" for i in range(world_size)]
+
+    print(f"[Process {rank}] Using devices: {devices[:world_size]}")
     
     device_mesh = DeviceMesh(
-        shape=(1, world_size), axis_names=("data", "model"), devices=devices
+        shape=(1, world_size), axis_names=("data", "model"), devices=devices[:world_size]
     )
-    # Shard the model onto GPUs
     distribution = AutoTPDistribution(model, device_mesh=device_mesh)
     
     sharded_model = distribution.model
@@ -152,12 +134,15 @@ def _run_torch(rank, world_size):
         loss=keras.losses.SparseCategoricalCrossentropy(from_logits=True),
         weighted_metrics=[keras.metrics.SparseCategoricalAccuracy()],
     )
-    
-    # Cleanup original model memory
-    del model
-    gc.collect()
-    if torch.cuda.is_available():
-        torch.cuda.empty_cache()
+
+    # Explicit build to ensure variables are registered with optimizer
+    print(f"[Process {rank}] Explicitly building sharded model...")
+    import tensorflow as tf
+    dummy_input = {
+        "token_ids": np.ones((8, 128), dtype="int32"),
+        "padding_mask": np.ones((8, 128), dtype="int32"),
+    }
+    sharded_model(dummy_input)
     
     print(f"[Process {rank}] Starting fit")
     sharded_model.fit(dataset, epochs=1, steps_per_epoch=1)
@@ -167,29 +152,23 @@ def _run_torch(rank, world_size):
         dist.destroy_process_group()
 
 def run_backend(backend, world_size=2):
+    print(f"{'='*20} BACKEND: {backend} {'='*20}")
     os.environ["KERAS_BACKEND"] = backend
-    
-    import keras
-    from keras.src.distribution.distribution_lib import list_devices
-    
-    # Use provided world_size or default to 2
-    if world_size is None:
-        world_size = 2
-    
-    print(f"\n{'='*20} BACKEND: {backend} (World Size: {world_size}) {'='*20}")
-    
     if backend == "jax":
         os.environ["XLA_PYTHON_CLIENT_MEM_FRACTION"] = "0.9"
+        # Force CPU simulation for JAX if not enough GPUs
+        os.environ["XLA_FLAGS"] = f"--xla_force_host_platform_device_count={world_size}"
+        os.environ["JAX_PLATFORMS"] = "cpu"
         _run_jax(world_size)
     elif backend == "torch":
         import torch
+        # Note: torch.multiprocessing.spawn handles the rank argument automatically
         torch.multiprocessing.spawn(_run_torch, args=(world_size,), nprocs=world_size, join=True)
 
 if __name__ == "__main__":
     import argparse
     parser = argparse.ArgumentParser()
     parser.add_argument("--backend", type=str, default="torch", choices=["torch", "jax"])
-    parser.add_argument("--world_size", type=int, default=None)
     args = parser.parse_args()
     
-    run_backend(args.backend, args.world_size)
+    run_backend(args.backend)

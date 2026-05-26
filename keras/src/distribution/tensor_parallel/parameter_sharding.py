@@ -155,6 +155,8 @@ class ParameterShardingStrategy:
                     # Update original variable shape to pass StatelessScope validation
                     param._shape = shard.shape
                     param._ndim = len(shard.shape)
+                    if hasattr(param, "_value"):
+                        param._value = ops.convert_to_tensor(shard)
                     
                     modified.add(name)
                     print(f"   ✅ Sharded {name}: {original_shape} -> {shard.shape}")
@@ -203,6 +205,23 @@ class ParameterShardingStrategy:
             return out
         layer.call = sharded_call
 
+        # If Row-Parallel (down_projection), we need to update input_spec 
+        # because the input will be sharded along the last dimension.
+        if (isinstance(layer, layers.Dense) and 
+            self._get_layer_mlp_type(layer) == "down_projection"):
+            if hasattr(layer, "input_spec") and layer.input_spec:
+                # Update input_spec to accept sharded input
+                from keras.src.layers import InputSpec
+                new_axes = dict(layer.input_spec.axes) if layer.input_spec.axes else {}
+                if -1 in new_axes:
+                    new_axes[-1] = new_axes[-1] // self.device_count
+                layer.input_spec = InputSpec(
+                    ndim=layer.input_spec.ndim,
+                    min_ndim=layer.input_spec.min_ndim,
+                    axes=new_axes,
+                    shape=None # Shape check is often too strict
+                )
+
         # Patch compute_output_shape to return full shape if gathering
         old_cos = layer.compute_output_shape
         @functools.wraps(old_cos)
@@ -222,6 +241,10 @@ class ParameterShardingStrategy:
         
         layer._is_tp_patched = True
         print(f"   🔗 Patched layer {layer.name} with communication rule")
+
+    def _get_layer_mlp_type(self, layer):
+        from keras.src.distribution.tensor_parallel.autoconfig import analyze_dense_layer
+        return analyze_dense_layer(layer)
 
     def _comm(self, val, rule):
         """Internal communication wrapper."""
