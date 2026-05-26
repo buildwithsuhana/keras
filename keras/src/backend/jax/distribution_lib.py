@@ -1,8 +1,10 @@
 """Utilities for distribution strategy with JAX backend."""
 
 import jax
+import jax.lax as lax
 import numpy as np
 
+from keras.src.backend.common import global_state
 from keras.src.random import seed_generator
 from keras.src.utils import jax_utils
 from keras.src.utils import rng_utils
@@ -38,6 +40,26 @@ def get_device_count(device_type=None):
     """
     device_type = device_type.lower() if device_type else None
     return jax.device_count(device_type)
+
+
+def distribute_variable(value, layout):
+    """Create a distributed variable for JAX.
+
+    Since JAX doesn't have a variable class, this will just return a `jax.Array`
+    with the corresponding layout/sharding specified.
+
+    Note that this function should be used in eager context, not in jitted
+    function.
+
+    Args:
+        value: the initial value of the variable.
+        layout: `TensorLayout` for the created variable, or a
+            JAX-supported layout instance (e.g. `jax.sharding.Sharding`).
+
+    Returns:
+        jax.Array which is the distributed variable.
+    """
+    return distribute_tensor(value, layout)
 
 
 def distribute_tensor(tensor, layout):
@@ -172,6 +194,58 @@ def process_id():
     return jax.process_index()
 
 
+def all_reduce(x, op="sum", axis_name="model"):
+    """Reduces a tensor across a device mesh axis using a collective.
+
+    Args:
+        x: The tensor to reduce.
+        op: The reduction operation. "sum" or "mean".
+        axis_name: The name of the mesh axis to reduce over.
+
+    Returns:
+        The reduced tensor.
+    """
+
+    def _reduce_fn(y):
+        if op == "sum":
+            return lax.psum(y, axis_name=axis_name)
+        elif op == "mean":
+            return lax.pmean(y, axis_name=axis_name)
+        else:
+            raise ValueError(
+                f"Unsupported reduction operation: {op}. "
+                "Supported options are 'sum' and 'mean'."
+            )
+
+    return jax.pmap(_reduce_fn, axis_name=axis_name)(x)
+
+
+def all_gather(x, axis, axis_name="model"):
+    """Gathers and concatenates tensors from all devices across a mesh axis.
+
+    This function assumes it is called within a `pjit` context. It takes
+    the local shard `x` from each device along the `axis_name` of the mesh
+    and concatenates them along the specified tensor `axis` to form a
+    single, larger tensor that is then replicated on all participating devices.
+
+    Args:
+        x (jax.Array): The input JAX array (tensor) shard on the local device.
+        axis (int): The tensor axis along which to concatenate the gathered
+            shards.
+        axis_name (str, optional): The name of the mesh axis to gather
+            from. Defaults to 'model'.
+
+    Returns:
+        jax.Array: The full, gathered JAX array, which is identical across
+        all devices participating in the gather.
+    """
+
+    def _gather_fn(y):
+        return lax.all_gather(y, axis_name=axis_name, axis=axis, tiled=False)
+
+    return jax.pmap(_gather_fn, axis_name=axis_name)(x)
+
+
 def _to_backend_device(device_name):
     if isinstance(device_name, jax.Device):
         return device_name
@@ -220,8 +294,3 @@ def _to_backend_layout(tensor_layout):
     partition_spec = jax.sharding.PartitionSpec(*tensor_layout.axes)
     jax_mesh = tensor_layout.device_mesh.backend_mesh
     return jax.sharding.NamedSharding(jax_mesh, partition_spec)
-
-
-def set_distribution(value):
-    """Set the distribution as the global distribution setting."""
-    pass
