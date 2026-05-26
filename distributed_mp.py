@@ -91,25 +91,51 @@ def run_training(rank, world_size, layout_map, backend):
         )
         
         np.random.seed(42)
-        x_full = {
-            "token_ids": np.random.randint(0, 50272, (40, 32)).astype("int32"),
-            "padding_mask": np.ones((40, 32), dtype="int32")
-        }
-        y_full = np.random.normal(size=(40, 32, 768)).astype("float32")
-
-        for i in range(10):
-            base = i * 4
-            x_full["token_ids"][base+2:base+4] = x_full["token_ids"][base:base+2]
-            y_full[base+2:base+4] = y_full[base:base+2]
-
         if backend == "torch":
             indices = []
             for i in range(10):
-                 base = i * 4
-                 indices.extend([base, base + 1] if rank == 0 else [base + 2, base + 3])
-            x, y = {k: v[indices] for k, v in x_full.items()}, y_full[indices]
+                base = i * 4
+                indices.extend([base, base + 1] if rank == 0 else [base + 2, base + 3])
+            
+            # Optimization: only generate what we need or delete full arrays immediately
+            full_token_ids = np.random.randint(0, 50272, (40, 32)).astype("int32")
+            full_padding_mask = np.ones((40, 32), dtype="int32")
+            full_y = np.random.normal(size=(40, 32, 768)).astype("float32")
+
+            for i in range(10):
+                base = i * 4
+                full_token_ids[base+2:base+4] = full_token_ids[base:base+2]
+                full_y[base+2:base+4] = full_y[base:base+2]
+            
+            x = {
+                "token_ids": full_token_ids[indices],
+                "padding_mask": full_padding_mask[indices]
+            }
+            y = full_y[indices]
+            
+            del full_token_ids, full_padding_mask, full_y
+            gc.collect()
+            
+            # Explicitly convert to tensors on the correct device to avoid later replication
+            import torch
+            device_idx = int(os.environ.get("LOCAL_RANK", 0))
+            device = torch.device(f"cuda:{device_idx}" if torch.cuda.is_available() else "cpu")
+            x = {k: torch.from_numpy(v).to(device) for k, v in x.items()}
+            y = torch.from_numpy(y).to(device)
+            gc.collect()
+            
             batch_size = 2
         else:
+            x_full = {
+                "token_ids": np.random.randint(0, 50272, (40, 32)).astype("int32"),
+                "padding_mask": np.ones((40, 32), dtype="int32")
+            }
+            y_full = np.random.normal(size=(40, 32, 768)).astype("float32")
+
+            for i in range(10):
+                base = i * 4
+                x_full["token_ids"][base+2:base+4] = x_full["token_ids"][base:base+2]
+                y_full[base+2:base+4] = y_full[base:base+2]
             x, y = x_full, y_full
             batch_size = 4
 
@@ -134,14 +160,15 @@ def run_training(rank, world_size, layout_map, backend):
         has_gpu = False
         if backend == "jax":
             import jax
-            total_gpu_peak = 0
+            device_peaks = []
             for d in jax.local_devices():
                 if d.platform == 'gpu':
                     has_gpu = True
-                    # JAX stats are cumulative for the process, we use the peak reached.
-                    # Since JAX is single-process, this sum is the total system peak.
-                    total_gpu_peak += d.memory_stats()['peak_bytes_in_use']
-            peak_mem_mb = total_gpu_peak / (1024 * 1024)
+                    # Get peak for each device separately
+                    device_peaks.append(d.memory_stats()['peak_bytes_in_use'])
+            
+            # Use MAX to get the peak of the busiest device
+            peak_mem_mb = max(device_peaks) / (1024 * 1024) if device_peaks else 0
         else:
             import torch
             if torch.cuda.is_available():
@@ -150,6 +177,7 @@ def run_training(rank, world_size, layout_map, backend):
                 device_idx = int(os.environ.get("LOCAL_RANK", 0))
                 device = torch.device(f"cuda:{device_idx}")
                 m_tensor = torch.tensor([float(rank_peak_gpu)], device=device)
+                # Use MAX to see the busiest GPU's peak
                 torch.distributed.all_reduce(m_tensor, op=torch.distributed.ReduceOp.MAX)
                 peak_mem_mb = m_tensor.item() / (1024 * 1024)
             else:
@@ -161,6 +189,7 @@ def run_training(rank, world_size, layout_map, backend):
             if backend == "torch":
                 import torch
                 d_tensor = torch.tensor([delta_cpu])
+                # Use MAX to see the busiest process's peak delta
                 torch.distributed.all_reduce(d_tensor, op=torch.distributed.ReduceOp.MAX)
                 peak_mem_mb = d_tensor.item() / (1024 * 1024)
             else:
