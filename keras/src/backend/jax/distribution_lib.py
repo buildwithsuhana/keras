@@ -1,7 +1,6 @@
 """Utilities for distribution strategy with JAX backend."""
 
 import jax
-import jax.lax as lax
 import numpy as np
 
 from keras.src.random import seed_generator
@@ -29,30 +28,6 @@ def list_devices(device_type=None):
 
 def get_device_count(device_type=None):
     """Returns the number of available JAX devices.
-<<<<<<< HEAD
-=======
-    Args:
-        device_type: Optional device type to count (e.g., "cpu", "gpu", "tpu").
-            If `None`, it defaults to counting "gpu" or "tpu" devices if
-            available, otherwise it counts "cpu" devices. It does not
-            return the sum of all device types.
-    Returns:
-        int: The total number of JAX devices for the specified type.
-    """
-    device_type = device_type.lower() if device_type else None
-    return jax.device_count(device_type)
-
-
-def distribute_variable(value, layout):
-    """Create a distributed variable for JAX.
-
-    Since JAX doesn't have a variable class, this will just return a `jax.Array`
-    with the corresponding layout/sharding specified.
-
-    Note that this function should be used in eager context, not in jitted
-    function.
-
->>>>>>> tp_2
     Args:
         device_type: Optional device type to count (e.g., "cpu", "gpu", "tpu").
             If `None`, it defaults to counting "gpu" or "tpu" devices if
@@ -159,26 +134,6 @@ def initialize_rng():
         # Set the global seed.
         rng_utils.set_random_seed(global_seed)
 
-<<<<<<< HEAD
-=======
-    # Check if the global seed generator is set and ensure it has an initialized
-    # seed.  Otherwise, reset the seed to the global seed.
-    global_seed_generator = global_state.get_global_attribute(
-        seed_generator.GLOBAL_SEED_GENERATOR
-    )
-    if global_seed_generator is not None:
-        seed = global_seed_generator.get_config()["seed"]
-        if seed is None:
-            global_state.set_global_attribute(
-                seed_generator.GLOBAL_SEED_GENERATOR,
-                seed_generator.SeedGenerator(
-                    seed=global_seed,
-                    name=global_seed_generator.name,
-                    backend=global_seed_generator.backend,
-                ),
-            )
-
->>>>>>> tp_2
 
 def initialize(job_addresses, num_processes, process_id):
     if job_addresses and "," in job_addresses:
@@ -215,58 +170,6 @@ def num_processes():
 def process_id():
     """Return the current process ID for the distribution setting."""
     return jax.process_index()
-
-
-def all_reduce(x, op="sum", axis_name="model"):
-    """Reduces a tensor across a device mesh axis using a collective.
-
-    Args:
-        x: The tensor to reduce.
-        op: The reduction operation. "sum" or "mean".
-        axis_name: The name of the mesh axis to reduce over.
-
-    Returns:
-        The reduced tensor.
-    """
-
-    def _reduce_fn(y):
-        if op == "sum":
-            return lax.psum(y, axis_name=axis_name)
-        elif op == "mean":
-            return lax.pmean(y, axis_name=axis_name)
-        else:
-            raise ValueError(
-                f"Unsupported reduction operation: {op}. "
-                "Supported options are 'sum' and 'mean'."
-            )
-
-    return jax.pmap(_reduce_fn, axis_name=axis_name)(x)
-
-
-def all_gather(x, axis, axis_name="model"):
-    """Gathers and concatenates tensors from all devices across a mesh axis.
-
-    This function assumes it is called within a `pjit` context. It takes
-    the local shard `x` from each device along the `axis_name` of the mesh
-    and concatenates them along the specified tensor `axis` to form a
-    single, larger tensor that is then replicated on all participating devices.
-
-    Args:
-        x (jax.Array): The input JAX array (tensor) shard on the local device.
-        axis (int): The tensor axis along which to concatenate the gathered
-            shards.
-        axis_name (str, optional): The name of the mesh axis to gather
-            from. Defaults to 'model'.
-
-    Returns:
-        jax.Array: The full, gathered JAX array, which is identical across
-        all devices participating in the gather.
-    """
-
-    def _gather_fn(y):
-        return lax.all_gather(y, axis_name=axis_name, axis=axis, tiled=False)
-
-    return jax.pmap(_gather_fn, axis_name=axis_name)(x)
 
 
 def _to_backend_device(device_name):
