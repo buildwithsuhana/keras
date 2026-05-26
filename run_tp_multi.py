@@ -112,6 +112,7 @@ def _run_torch(rank, world_size):
     import torch
     import torch.distributed as dist
     import keras
+    import gc
     
     from keras.src.distribution.distribution_lib import AutoTPDistribution, DeviceMesh, initialize, list_devices
     
@@ -120,7 +121,11 @@ def _run_torch(rank, world_size):
     
     vocab_size = 10000
     dataset = get_dataset(vocab_size)
-    model = get_model(vocab_size)
+    
+    # Create model on CPU to avoid GPU memory bottleneck before sharding
+    print(f"[Process {rank}] Creating initial model on CPU...")
+    with keras.device("cpu"):
+        model = get_model(vocab_size)
     
     # Use real devices if available, otherwise fallback to CPU
     available_devices = list_devices()
@@ -133,7 +138,7 @@ def _run_torch(rank, world_size):
     device_mesh = DeviceMesh(
         shape=(1, world_size), axis_names=("data", "model"), devices=devices
     )
-    # Ensure AutoTPDistribution uses these devices
+    # Shard the model onto GPUs
     distribution = AutoTPDistribution(model, device_mesh=device_mesh)
     
     sharded_model = distribution.model
@@ -142,6 +147,12 @@ def _run_torch(rank, world_size):
         loss=keras.losses.SparseCategoricalCrossentropy(from_logits=True),
         weighted_metrics=[keras.metrics.SparseCategoricalAccuracy()],
     )
+    
+    # Cleanup original model memory
+    del model
+    gc.collect()
+    if torch.cuda.is_available():
+        torch.cuda.empty_cache()
     
     print(f"[Process {rank}] Starting fit")
     sharded_model.fit(dataset, epochs=1, steps_per_epoch=1)

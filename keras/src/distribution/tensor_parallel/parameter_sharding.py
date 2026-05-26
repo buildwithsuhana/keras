@@ -97,7 +97,6 @@ class ParameterShardingStrategy:
         self.device_count = device_count
         self.rank = rank
         self.sharded_weights = {}
-        self.original_weights = {}
         self.weight_mapping = {}
         self.sharded_weights_by_id = {}
         self.param_path_map = {}
@@ -145,7 +144,6 @@ class ParameterShardingStrategy:
                 del config.state_rules[pattern]
         config.state_rules.update(norm_rules)
 
-        self._store_original_weights(model)
         modified = set()
 
         for pattern, action in config.state_rules.items():
@@ -163,18 +161,15 @@ class ParameterShardingStrategy:
                     self.sharded_weights[name] = shard
                     self.sharded_weights_by_id[pid] = shard
                     self.weight_mapping[name] = {"original": param.shape, "sharded": shard.shape}
+                    # Bypass StatelessScope shape validation by updating original variable shape
+                    param._shape = shard.shape
+                    param._ndim = len(shard.shape)
                     modified.add(name)
                     print(f"   ✅ Sharded {name}: {param.shape} -> {shard.shape}")
 
         sharded_model = ParameterShardedModel(model, self, config, device_id)
         print(f"🎯 Sharding complete: {len(modified)} parameters sharded")
         return sharded_model, modified
-
-    def _store_original_weights(self, model):
-        """Backs up weights as numpy arrays."""
-        for w in model.weights:
-            if hasattr(w, "numpy"):
-                self.original_weights[w.path] = w.numpy()
 
     def _find_matching_parameters(self, model, pattern):
         """Matches a pattern to model weights."""
