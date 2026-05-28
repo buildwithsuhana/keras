@@ -92,6 +92,17 @@ def run_training(rank, world_size, layout_map, backend):
     import keras
     import keras_hub
     
+    # Calculate global batch size based on mesh and local batch size
+    # For 2x2 mesh, data_parallel_size = 2, local_batch_size = 2 -> global = 4
+    # For world_size=1, global = 4
+    if world_size > 1:
+        # In this specific 2x2 setup, data axis has size 2
+        data_parallel_size = 2 
+        local_batch_size = 2
+        global_batch_size = data_parallel_size * local_batch_size
+    else:
+        global_batch_size = 4
+    
     gc.collect()
     tracker = MemoryTracker()
     base_cpu = psutil.Process(os.getpid()).memory_info().rss
