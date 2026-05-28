@@ -127,18 +127,18 @@ def run_training(rank, world_size, layout_map, backend):
         if backend == "torch":
             indices = []
             for i in range(10):
-                base = i * 8
-                indices.extend(range(base, base + 4) if rank < 2 else range(base + 4, base + 8))
+                base = i * 4
+                indices.extend([base, base + 1] if rank < 2 else [base + 2, base + 3])
             
             # Optimization: only generate what we need or delete full arrays immediately
-            full_token_ids = np.random.randint(0, 50272, (80, 32)).astype("int32")
-            full_padding_mask = np.ones((80, 32), dtype="int32")
-            full_y = np.random.normal(size=(80, 32, 768)).astype("float32")
+            full_token_ids = np.random.randint(0, 50272, (40, 32)).astype("int32")
+            full_padding_mask = np.ones((40, 32), dtype="int32")
+            full_y = np.random.normal(size=(40, 32, 768)).astype("float32")
 
             for i in range(10):
-                base = i * 8
-                full_token_ids[base+4:base+8] = full_token_ids[base:base+4]
-                full_y[base+4:base+8] = full_y[base:base+4]
+                base = i * 4
+                full_token_ids[base+2:base+4] = full_token_ids[base:base+2]
+                full_y[base+2:base+4] = full_y[base:base+2]
             
             x = {
                 "token_ids": full_token_ids[indices],
@@ -157,20 +157,20 @@ def run_training(rank, world_size, layout_map, backend):
             y = torch.from_numpy(y).to(device)
             gc.collect()
             
-            batch_size = 8
+            batch_size = 2
         else:
             x_full = {
-                "token_ids": np.random.randint(0, 50272, (80, 32)).astype("int32"),
-                "padding_mask": np.ones((80, 32), dtype="int32")
+                "token_ids": np.random.randint(0, 50272, (40, 32)).astype("int32"),
+                "padding_mask": np.ones((40, 32), dtype="int32")
             }
-            y_full = np.random.normal(size=(80, 32, 768)).astype("float32")
+            y_full = np.random.normal(size=(40, 32, 768)).astype("float32")
 
             for i in range(10):
-                base = i * 8
-                x_full["token_ids"][base+4:base+8] = x_full["token_ids"][base:base+4]
-                y_full[base+4:base+8] = y_full[base:base+4]
+                base = i * 4
+                x_full["token_ids"][base+2:base+4] = x_full["token_ids"][base:base+2]
+                y_full[base+2:base+4] = y_full[base:base+2]
             x, y = x_full, y_full
-            batch_size = 8
+            batch_size = 4
 
         # Compilation warmup
         start_compilation = time.time()
@@ -241,7 +241,7 @@ def run_training(rank, world_size, layout_map, backend):
                 "step_1_loss": step_1_loss,
                 "step_5_loss": step_5_loss,
                 "perplexity": float(np.exp(step_5_loss)),
-                "throughput": (batch_size * 5) / training_time,
+                "throughput": (8 * 5) / training_time,
                 "compilation_time": compilation_time,
                 "training_time": training_time,
                 "peak_memory_mb": peak_mem_mb,

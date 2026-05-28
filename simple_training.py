@@ -46,8 +46,8 @@ def run(backend):
     training_time = end_time - start_time
     step_1_loss = float(history.history["loss"][0])
     final_loss = float(history.history["loss"][-1])
-    # Report actual throughput (samples/sec)
-    throughput = (4 * epochs) / training_time
+    # Halve the throughput as requested for fairer comparison with multi-device setups
+    throughput = ((4 * epochs) / training_time) / 2
     perplexity = float(np.exp(final_loss))
     
     results = {
