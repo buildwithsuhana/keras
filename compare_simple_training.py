@@ -17,7 +17,7 @@ def compare():
         ("Final Loss (Epoch 5)", "final_loss"),
         ("Perplexity", "perplexity"),
         ("Throughput (samples/sec)", "throughput"),
-        ("Training Time (sec)", "training_time"),
+        # ("Training Time (sec)", "training_time"),
     ]
 
     all_pass = True
@@ -26,7 +26,7 @@ def compare():
         v_torch = torch[key]
         diff = abs(v_jax - v_torch)
         print(f"{label:<30} | {v_jax:<20.12f} | {v_torch:<20.12f} | {diff:<15.8e}")
-        if key not in ["throughput", "training_time"] and diff > 1e-5:
+        if key not in ["throughput"] and diff > 1e-5:
             all_pass = False
 
     print("\nSummary:")

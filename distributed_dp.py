@@ -85,7 +85,7 @@ def _run_jax(world_size):
         "step_1_loss": step_1_loss,
         "step_5_loss": step_5_loss,
         "perplexity": perplexity,
-        "training_time": training_time,
+        # "training_time": training_time,
         "throughput": throughput,
     }
     with open("results_jax_dp.json", "w") as f: json.dump(results, f, indent=2)
@@ -171,7 +171,7 @@ def _run_torch(rank, world_size, port):
             "step_1_loss": step_1_loss,
             "step_5_loss": step_5_loss,
             "perplexity": perplexity,
-            "training_time": training_time,
+            # "training_time": training_time,
             "throughput": throughput,
         }
         with open("results_torch_dp.json", "w") as f: json.dump(results, f, indent=2)
@@ -200,7 +200,7 @@ if __name__ == "__main__":
             ("Step 5 Loss", "step_5_loss"),
             ("Perplexity", "perplexity"),
             ("Throughput (samples/sec)", "throughput"),
-            ("Training Time (sec)", "training_time"),
+            # ("Training Time (sec)", "training_time"),
         ]
 
         all_pass = True
@@ -209,6 +209,6 @@ if __name__ == "__main__":
             v_torch = torch_res[key]
             diff = abs(v_jax - v_torch)
             print(f"{label:<30} | {v_jax:<20.12f} | {v_torch:<20.12f} | {diff:<15.8e}")
-            if key not in ["throughput", "training_time"] and diff > 1e-5:
+            if key not in ["throughput"] and diff > 1e-5:
                 all_pass = False
 
