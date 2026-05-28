@@ -93,12 +93,12 @@ def run_training(rank, world_size, layout_map, backend):
     import keras_hub
     
     # Calculate global batch size based on mesh and local batch size
-    # For 2x2 mesh, data_parallel_size = 2, local_batch_size = 2 -> global = 4
+    # For 2x2 mesh, data_parallel_size = 2, we'll use local_batch_size = 4 -> global = 8
     # For world_size=1, global = 4
     if world_size > 1:
         # In this specific 2x2 setup, data axis has size 2
         data_parallel_size = 2 
-        local_batch_size = 2
+        local_batch_size = 4
         global_batch_size = data_parallel_size * local_batch_size
     else:
         global_batch_size = 4
@@ -138,18 +138,21 @@ def run_training(rank, world_size, layout_map, backend):
         if backend == "torch":
             indices = []
             for i in range(10):
-                base = i * 4
-                indices.extend([base, base + 1] if rank < 2 else [base + 2, base + 3])
+                # global_batch_size = 8. shard 0 gets [base, base+3], shard 1 gets [base+4, base+7]
+                base = i * global_batch_size
+                indices.extend(range(base, base + local_batch_size) if rank < 2 else range(base + 4, base + 8))
             
             # Optimization: only generate what we need or delete full arrays immediately
-            full_token_ids = np.random.randint(0, 50272, (40, 32)).astype("int32")
-            full_padding_mask = np.ones((40, 32), dtype="int32")
-            full_y = np.random.normal(size=(40, 32, 768)).astype("float32")
+            num_total_samples = global_batch_size * 10
+            full_token_ids = np.random.randint(0, 50272, (num_total_samples, 32)).astype("int32")
+            full_padding_mask = np.ones((num_total_samples, 32), dtype="int32")
+            full_y = np.random.normal(size=(num_total_samples, 32, 768)).astype("float32")
 
             for i in range(10):
-                base = i * 4
-                full_token_ids[base+2:base+4] = full_token_ids[base:base+2]
-                full_y[base+2:base+4] = full_y[base:base+2]
+                base = i * global_batch_size
+                # Match JAX bitwise by duplicating shards
+                full_token_ids[base+4:base+8] = full_token_ids[base:base+4]
+                full_y[base+4:base+8] = full_y[base:base+4]
             
             x = {
                 "token_ids": full_token_ids[indices],
@@ -168,20 +171,21 @@ def run_training(rank, world_size, layout_map, backend):
             y = torch.from_numpy(y).to(device)
             gc.collect()
             
-            batch_size = 2
+            batch_size = global_batch_size
         else:
+            num_total_samples = global_batch_size * 10
             x_full = {
-                "token_ids": np.random.randint(0, 50272, (40, 32)).astype("int32"),
-                "padding_mask": np.ones((40, 32), dtype="int32")
+                "token_ids": np.random.randint(0, 50272, (num_total_samples, 32)).astype("int32"),
+                "padding_mask": np.ones((num_total_samples, 32), dtype="int32")
             }
-            y_full = np.random.normal(size=(40, 32, 768)).astype("float32")
+            y_full = np.random.normal(size=(num_total_samples, 32, 768)).astype("float32")
 
             for i in range(10):
-                base = i * 4
-                x_full["token_ids"][base+2:base+4] = x_full["token_ids"][base:base+2]
-                y_full[base+2:base+4] = y_full[base:base+2]
+                base = i * global_batch_size
+                x_full["token_ids"][base+4:base+8] = x_full["token_ids"][base:base+4]
+                y_full[base+4:base+8] = y_full[base:base+4]
             x, y = x_full, y_full
-            batch_size = 4
+            batch_size = global_batch_size
 
         # Compilation warmup
         start_compilation = time.time()

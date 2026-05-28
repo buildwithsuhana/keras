@@ -152,12 +152,12 @@ def _run_torch(rank, world_size, port):
         with sdpa_kernel(torch.nn.attention.SDPBackend.MATH):
             # Warmup (1 step)
             model.fit({k: v[:base_batch_size] for k, v in x.items()}, y[:base_batch_size], 
-                      batch_size=base_batch_size, epochs=1, steps_per_epoch=1, verbose=1 if rank == 0 else 0, shuffle=False)
+                      batch_size=global_batch_size, epochs=1, steps_per_epoch=1, verbose=1 if rank == 0 else 0, shuffle=False)
 
             start_time = time.time()
             # Training (5 epochs, 1 step each)
             history = model.fit({k: v[base_batch_size:] for k, v in x.items()}, y[base_batch_size:], 
-                                batch_size=base_batch_size, epochs=5, steps_per_epoch=1, verbose=1 if rank == 0 else 0, shuffle=False)
+                                batch_size=global_batch_size, epochs=5, steps_per_epoch=1, verbose=1 if rank == 0 else 0, shuffle=False)
             end_time = time.time()
 
             step_1_loss = float(history.history["loss"][0])
