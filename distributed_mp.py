@@ -127,20 +127,18 @@ def run_training(rank, world_size, layout_map, backend):
         if backend == "torch":
             indices = []
             for i in range(10):
-                base = i * 8
-                # 2x2 mesh means 2 data replicas. 
-                # Ranks 0,1 take first half of global batch, 2,3 take second half.
-                indices.extend(range(base, base + 4) if rank < 2 else range(base + 4, base + 8))
+                base = i * 4
+                indices.extend([base, base + 1] if rank < 2 else [base + 2, base + 3])
             
-            # Optimization: only generate what we need
-            full_token_ids = np.random.randint(0, 50272, (80, 32)).astype("int32")
-            full_padding_mask = np.ones((80, 32), dtype="int32")
-            full_y = np.random.normal(size=(80, 32, 768)).astype("float32")
+            # Optimization: only generate what we need or delete full arrays immediately
+            full_token_ids = np.random.randint(0, 50272, (40, 32)).astype("int32")
+            full_padding_mask = np.ones((40, 32), dtype="int32")
+            full_y = np.random.normal(size=(40, 32, 768)).astype("float32")
 
             for i in range(10):
-                base = i * 8
-                full_token_ids[base+4:base+8] = full_token_ids[base:base+4]
-                full_y[base+4:base+8] = full_y[base:base+4]
+                base = i * 4
+                full_token_ids[base+2:base+4] = full_token_ids[base:base+2]
+                full_y[base+2:base+4] = full_y[base:base+2]
             
             x = {
                 "token_ids": full_token_ids[indices],
@@ -151,7 +149,7 @@ def run_training(rank, world_size, layout_map, backend):
             del full_token_ids, full_padding_mask, full_y
             gc.collect()
             
-            # Explicitly convert to tensors on the correct device
+            # Explicitly convert to tensors on the correct device to avoid later replication
             import torch
             device_idx = int(os.environ.get("LOCAL_RANK", 0))
             device = torch.device(f"cuda:{device_idx}" if torch.cuda.is_available() else "cpu")
@@ -159,20 +157,20 @@ def run_training(rank, world_size, layout_map, backend):
             y = torch.from_numpy(y).to(device)
             gc.collect()
             
-            batch_size = 8
+            batch_size = 2
         else:
             x_full = {
-                "token_ids": np.random.randint(0, 50272, (80, 32)).astype("int32"),
-                "padding_mask": np.ones((80, 32), dtype="int32")
+                "token_ids": np.random.randint(0, 50272, (40, 32)).astype("int32"),
+                "padding_mask": np.ones((40, 32), dtype="int32")
             }
-            y_full = np.random.normal(size=(80, 32, 768)).astype("float32")
+            y_full = np.random.normal(size=(40, 32, 768)).astype("float32")
 
             for i in range(10):
-                base = i * 8
-                x_full["token_ids"][base+4:base+8] = x_full["token_ids"][base:base+4]
-                y_full[base+4:base+8] = y_full[base:base+4]
+                base = i * 4
+                x_full["token_ids"][base+2:base+4] = x_full["token_ids"][base:base+2]
+                y_full[base+2:base+4] = y_full[base:base+2]
             x, y = x_full, y_full
-            batch_size = 8
+            batch_size = 4
 
         # Compilation warmup
         start_compilation = time.time()
