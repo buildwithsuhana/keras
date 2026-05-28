@@ -33,10 +33,14 @@ def run_backend(backend, world_size=2):
         torch.multiprocessing.spawn(_run_torch, args=(world_size, port), nprocs=world_size, join=True)
 
 def _run_jax(world_size):
-    import jax
     import keras
     import keras_hub
     keras.utils.set_random_seed(42)
+
+    # Limit threads per process to show scaling
+    os.environ["OMP_NUM_THREADS"] = "1"
+    os.environ["MKL_NUM_THREADS"] = "1"
+    os.environ["OPENBLAS_NUM_THREADS"] = "1"
 
     devices = keras.distribution.list_devices()
     if len(devices) > world_size:
@@ -57,7 +61,7 @@ def _run_jax(world_size):
         np.random.seed(42)
         base_batch_size = 4
         global_batch_size = base_batch_size * world_size
-        num_samples = global_batch_size * 10
+        num_samples = global_batch_size * 50
         x_full = {
             "token_ids": np.random.randint(0, 50272, (num_samples, 32)).astype("int32"),
             "padding_mask": np.ones((num_samples, 32), dtype="int32")
@@ -68,17 +72,18 @@ def _run_jax(world_size):
         model.fit(x_full, y_full, batch_size=global_batch_size, epochs=1, steps_per_epoch=1, verbose=1, shuffle=False)
 
         start_time = time.time()
-        # Use second half of data for timed run
+        # Use more steps for better measurement
+        steps = 20
         x_train = {k: v[global_batch_size:] for k, v in x_full.items()}
         y_train = y_full[global_batch_size:]
         history = model.fit(x_train, y_train, 
-                            batch_size=global_batch_size, epochs=5, steps_per_epoch=1, verbose=1, shuffle=False)
+                            batch_size=global_batch_size, epochs=1, steps_per_epoch=steps, verbose=1, shuffle=False)
         end_time = time.time()
 
         step_1_loss = float(history.history["loss"][0])
-        step_5_loss = float(history.history["loss"][4])
+        step_5_loss = float(history.history["loss"][-1])
         training_time = end_time - start_time
-        throughput = (5 * global_batch_size) / training_time
+        throughput = (steps * global_batch_size) / training_time
         perplexity = float(np.exp(step_5_loss))
 
     results = {
@@ -98,6 +103,10 @@ def _run_torch(rank, world_size, port):
     os.environ["LOCAL_RANK"] = str(rank)
     os.environ["MASTER_ADDR"] = "localhost"
     os.environ["MASTER_PORT"] = port
+
+    # Limit threads to 1 per process to show scaling on a multi-core machine
+    torch.set_num_threads(1)
+    os.environ["OMP_NUM_THREADS"] = "1"
 
     num_gpus = torch.cuda.device_count()
     if num_gpus >= world_size:
@@ -127,7 +136,7 @@ def _run_torch(rank, world_size, port):
         np.random.seed(42)
         base_batch_size = 4
         global_batch_size = base_batch_size * world_size
-        num_samples = global_batch_size * 10
+        num_samples = global_batch_size * 50
         x_full = {
             "token_ids": np.random.randint(0, 50272, (num_samples, 32)).astype("int32"),
             "padding_mask": np.ones((num_samples, 32), dtype="int32")
@@ -135,13 +144,12 @@ def _run_torch(rank, world_size, port):
         y_full = np.random.normal(size=(num_samples, 32, 768)).astype("float32")
 
         # Sharding: each rank takes its local batch from each step's global slice
-        # For simplicity, we just take our portion of the full dataset
         start_idx = rank * base_batch_size
         indices = []
         # Step 0 (Warmup)
         indices.extend(range(start_idx, start_idx + base_batch_size))
-        # Steps 1-5 (Training)
-        for step in range(1, 6):
+        # Steps 1-20 (Training)
+        for step in range(1, 21):
             base = step * global_batch_size + start_idx
             indices.extend(range(base, base + base_batch_size))
             
@@ -155,15 +163,16 @@ def _run_torch(rank, world_size, port):
                       batch_size=global_batch_size, epochs=1, steps_per_epoch=1, verbose=1 if rank == 0 else 0, shuffle=False)
 
             start_time = time.time()
-            # Training (5 epochs, 1 step each)
+            # Training (1 epoch, 20 steps)
+            steps = 20
             history = model.fit({k: v[base_batch_size:] for k, v in x.items()}, y[base_batch_size:], 
-                                batch_size=global_batch_size, epochs=5, steps_per_epoch=1, verbose=1 if rank == 0 else 0, shuffle=False)
+                                batch_size=global_batch_size, epochs=1, steps_per_epoch=steps, verbose=1 if rank == 0 else 0, shuffle=False)
             end_time = time.time()
 
             step_1_loss = float(history.history["loss"][0])
-            step_5_loss = float(history.history["loss"][4])
+            step_5_loss = float(history.history["loss"][-1])
             training_time = end_time - start_time
-            throughput = (5 * global_batch_size) / training_time
+            throughput = (steps * global_batch_size) / training_time
             perplexity = float(np.exp(step_5_loss))
 
     if rank == 0:
@@ -175,6 +184,42 @@ def _run_torch(rank, world_size, port):
             "throughput": throughput,
         }
         with open("results_torch_dp.json", "w") as f: json.dump(results, f, indent=2)
+
+if __name__ == "__main__":
+    if len(sys.argv) > 1:
+        run_backend(sys.argv[1])
+    else:
+        print("Running JAX backend...", flush=True)
+        subprocess.run([sys.executable, __file__, "jax"], check=True)
+        print("\nRunning Torch backend...", flush=True)
+        subprocess.run([sys.executable, __file__, "torch"], check=True)
+
+        try:
+            with open("results_jax_dp.json", "r") as f: jax_res = json.load(f)
+            with open("results_torch_dp.json", "r") as f: torch_res = json.load(f)
+        except FileNotFoundError:
+            print("Missing results files.")
+            sys.exit(1)
+
+        print("\n" + f"{'Metric':<30} | {'JAX':<20} | {'Torch':<20} | {'Diff':<15}")
+        print("-" * 95)
+
+        metrics = [
+            ("Step 1 Loss", "step_1_loss"),
+            ("Final Loss", "step_5_loss"),
+            ("Perplexity", "perplexity"),
+            ("Throughput (samples/sec)", "throughput"),
+            # ("Training Time (sec)", "training_time"),
+        ]
+
+        all_pass = True
+        for label, key in metrics:
+            v_jax = jax_res[key]
+            v_torch = torch_res[key]
+            diff = abs(v_jax - v_torch)
+            print(f"{label:<30} | {v_jax:<20.12f} | {v_torch:<20.12f} | {diff:<15.8e}")
+            if key not in ["throughput"] and diff > 1e-5:
+                all_pass = False
 
 if __name__ == "__main__":
     if len(sys.argv) > 1:
