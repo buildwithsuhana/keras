@@ -37,6 +37,20 @@ class MemoryTracker:
             self.thread.join()
         return self.peak_cpu
 
+def find_free_port():
+    import socket
+    import time
+    for _ in range(5):
+        try:
+            with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as s:
+                s.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
+                s.bind(("localhost", 0))
+                return s.getsockname()[1]
+        except OSError:
+            time.sleep(0.1)
+            continue
+    return 29500 + np.random.randint(0, 1000) # Fallback
+
 def get_layout_map(mesh):
     import keras
     layout_map = keras.distribution.LayoutMap(mesh)
@@ -78,7 +92,7 @@ def run_training(rank, world_size, layout_map, backend):
 
     distribution = keras.distribution.ModelParallel(
         layout_map=layout_map, 
-        batch_dim_name="model", 
+        batch_dim_name="data", 
         auto_shard_dataset=False
     )
     
@@ -95,7 +109,7 @@ def run_training(rank, world_size, layout_map, backend):
             indices = []
             for i in range(10):
                 base = i * 4
-                indices.extend([base, base + 1] if rank == 0 else [base + 2, base + 3])
+                indices.extend([base, base + 1] if rank < 2 else [base + 2, base + 3])
             
             # Optimization: only generate what we need or delete full arrays immediately
             full_token_ids = np.random.randint(0, 50272, (40, 32)).astype("int32")
@@ -194,6 +208,10 @@ def run_training(rank, world_size, layout_map, backend):
                 peak_mem_mb = d_tensor.item() / (1024 * 1024)
             else:
                 peak_mem_mb = delta_cpu / (1024 * 1024)
+            
+            # Normalize JAX memory to "per-device" for fairer comparison with Torch multi-process
+            if backend == "jax":
+                peak_mem_mb = peak_mem_mb / world_size
 
         if rank == 0:
             step_1_loss = float(history.history["loss"][0])
@@ -210,7 +228,7 @@ def run_training(rank, world_size, layout_map, backend):
             with open(f"results_{backend}.json", "w") as f: 
                 json.dump(results, f, indent=2)
 
-def run_backend(backend, world_size=2):
+def run_backend(backend, world_size=4):
     os.environ["KERAS_BACKEND"] = backend
     if backend == "jax":
         os.environ["XLA_PYTHON_CLIENT_MEM_FRACTION"] = "0.9"
@@ -227,7 +245,8 @@ def run_backend(backend, world_size=2):
         _run_jax(world_size)
     elif backend == "torch":
         import torch
-        torch.multiprocessing.spawn(_run_torch, args=(world_size,), nprocs=world_size, join=True)
+        port = str(find_free_port())
+        torch.multiprocessing.spawn(_run_torch, args=(world_size, port), nprocs=world_size, join=True)
 
 def _run_jax(world_size):
     import keras
@@ -241,15 +260,21 @@ def _run_jax(world_size):
     if len(devices) < world_size:
         raise ValueError(f"Not enough devices found. Expected {world_size}, got {len(devices)}.")
 
-    mesh = keras.distribution.DeviceMesh(shape=(world_size,), axis_names=("model",), devices=devices)
+    mesh = keras.distribution.DeviceMesh(shape=(2, 2), axis_names=("data", "model"), devices=devices)
     run_training(0, world_size, get_layout_map(mesh), "jax")
 
-def _run_torch(rank, world_size):
+def _run_torch(rank, world_size, port):
     import os
     import torch
 
 
-    os.environ.update({"RANK": str(rank), "WORLD_SIZE": str(world_size), "LOCAL_RANK": str(rank), "MASTER_ADDR": "localhost", "MASTER_PORT": "29561"})
+    os.environ.update({
+        "RANK": str(rank),
+        "WORLD_SIZE": str(world_size),
+        "LOCAL_RANK": str(rank),
+        "MASTER_ADDR": "127.0.0.1",
+        "MASTER_PORT": port,
+    })
     
     num_gpus = torch.cuda.device_count()
     device_type = "cuda" if num_gpus >= world_size else "cpu"
@@ -262,7 +287,7 @@ def _run_torch(rank, world_size):
     print(f"[Rank {rank}] Initialized. World size: {world_size}")
     
     devices = keras.distribution.list_devices(device_type)[:world_size]
-    mesh = keras.distribution.DeviceMesh(shape=(world_size,), axis_names=("model",), devices=devices)
+    mesh = keras.distribution.DeviceMesh(shape=(2, 2), axis_names=("data", "model"), devices=devices)
     run_training(rank, world_size, get_layout_map(mesh), "torch")
     
     if torch.distributed.is_initialized():

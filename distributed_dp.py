@@ -7,6 +7,12 @@ import subprocess
 
 os.environ["TF_CPP_MIN_LOG_LEVEL"] = "3"
 
+def find_free_port():
+    import socket
+    with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as s:
+        s.bind(("127.0.0.1", 0))
+        return s.getsockname()[1]
+
 def run_backend(backend, world_size=2):
     os.environ["KERAS_BACKEND"] = backend
     if backend == "jax":
@@ -23,7 +29,7 @@ def run_backend(backend, world_size=2):
         _run_jax(world_size)
     elif backend == "torch":
         import torch
-        port = str(np.random.randint(29500, 29999))
+        port = str(find_free_port())
         torch.multiprocessing.spawn(_run_torch, args=(world_size, port), nprocs=world_size, join=True)
 
 def _run_jax(world_size):

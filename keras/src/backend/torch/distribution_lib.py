@@ -85,29 +85,16 @@ def initialize(job_addresses=None, num_processes=None, process_id=None):
     """Initialize the current process for distributed training."""
     if not torch.distributed.is_initialized():
         if num_processes is not None:
-            world_size = int(num_processes)
-        elif "WORLD_SIZE" in os.environ:
-            world_size = int(os.environ["WORLD_SIZE"])
-        else:
-            world_size = 1
-
+            os.environ["WORLD_SIZE"] = str(num_processes)
         if process_id is not None:
-            rank = int(process_id)
-        elif "RANK" in os.environ:
-            rank = int(os.environ["RANK"])
-        else:
-            rank = 0
+            os.environ["RANK"] = str(process_id)
 
-        if world_size > 1:
-            local_rank = int(os.environ.get("LOCAL_RANK", rank))
+        if "WORLD_SIZE" in os.environ and int(os.environ["WORLD_SIZE"]) > 1:
             if torch.cuda.is_available():
+                local_rank = int(os.environ.get("LOCAL_RANK", os.environ.get("RANK", 0)))
                 torch.cuda.set_device(local_rank)
             backend = "nccl" if torch.cuda.is_available() else "gloo"
-            torch.distributed.init_process_group(
-                backend=backend,
-                rank=rank,
-                world_size=world_size,
-            )
+            torch.distributed.init_process_group(backend=backend)
 
 
 def num_processes():
@@ -151,12 +138,15 @@ def _to_backend_mesh(keras_mesh):
 
     if isinstance(keras_mesh, TorchDeviceMesh):
         return keras_mesh
+    if hasattr(keras_mesh, "_backend_mesh"):
+        return keras_mesh._backend_mesh
     device_type = "cuda" if torch.cuda.is_available() else "cpu"
-    return init_device_mesh(
+    keras_mesh._backend_mesh = init_device_mesh(
         device_type,
         mesh_shape=tuple(keras_mesh.shape),
         mesh_dim_names=tuple(keras_mesh.axis_names),
     )
+    return keras_mesh._backend_mesh
 
 
 class DTensorLayout:
@@ -227,6 +217,19 @@ def distribute_tensor(tensor, layout):
         layout = _to_backend_layout(layout)
 
     from torch.distributed.tensor import DTensor
+    from torch.distributed.tensor import Replicate
+
+    if all(isinstance(p, Replicate) for p in layout.placements):
+        if isinstance(tensor, DTensor):
+            return tensor
+        if not isinstance(tensor, torch.Tensor):
+            from keras.src.backend.torch import core as torch_core
+
+            tensor = torch_core.convert_to_tensor(tensor, layout=None)
+
+        return DTensor.from_local(
+            tensor, device_mesh=layout.device_mesh, placements=layout.placements
+        )
 
     if isinstance(tensor, DTensor):
         return tensor.redistribute(
