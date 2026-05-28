@@ -15,21 +15,12 @@ def get_data(num_samples=40, seq_len=32, embed_dim=768, vocab_size=50272):
 
 def run(backend):
     os.environ["KERAS_BACKEND"] = backend
-    
-    # Limit threads to 1 to simulate a single "device" on a multi-core CPU
-    # This allows showing scaling when moving to world_size=2
-    os.environ["OMP_NUM_THREADS"] = "1"
-    os.environ["MKL_NUM_THREADS"] = "1"
-    os.environ["OPENBLAS_NUM_THREADS"] = "1"
-    os.environ["VECLIB_MAXIMUM_THREADS"] = "1"
-    os.environ["NUMEXPR_NUM_THREADS"] = "1"
-
     import keras
     import keras_hub
+    
     if backend == "torch":
         import torch
-        torch.set_num_threads(1)
-        # Use MATH kernel for consistency
+        # Use MATH kernel for consistency across environments
         from torch.nn.attention import sdpa_kernel
         cm = sdpa_kernel(torch.nn.attention.SDPBackend.MATH)
     else:
@@ -41,25 +32,22 @@ def run(backend):
     model = keras_hub.models.OPTBackbone.from_preset("opt_125m_en", dropout=0.0)
     model.compile(optimizer=keras.optimizers.Adam(learning_rate=1e-5), loss="mse")
     
-    # Increase samples for a longer run
-    x, y = get_data(num_samples=200)
+    x, y = get_data()
     
     with cm:
         # Warmup
         model.fit(x, y, batch_size=4, epochs=1, steps_per_epoch=1, verbose=1, shuffle=False)
         
         start_time = time.time()
-        # Run 20 steps to amortize overhead
-        epochs = 1
-        steps = 20
-        history = model.fit(x, y, batch_size=4, epochs=epochs, steps_per_epoch=steps, verbose=1, shuffle=False)
+        epochs = 5
+        history = model.fit(x, y, batch_size=4, epochs=epochs, steps_per_epoch=1, verbose=1, shuffle=False)
         end_time = time.time()
     
     training_time = end_time - start_time
     step_1_loss = float(history.history["loss"][0])
     final_loss = float(history.history["loss"][-1])
-    # Throughput (total samples / total time)
-    throughput = (4 * steps) / training_time
+    # Report actual throughput (samples/sec)
+    throughput = (4 * epochs) / training_time
     perplexity = float(np.exp(final_loss))
     
     results = {
