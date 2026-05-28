@@ -177,12 +177,7 @@ def run_training(rank, world_size, layout_map, backend):
         model.fit(x, y, batch_size=batch_size, epochs=1, steps_per_epoch=1, verbose=1 if rank == 0 else 0, shuffle=False)
         compilation_time = time.time() - start_compilation
         
-        # RESET PEAK STATS HERE to ignore initialization spikes
-        tracker.reset()
-        if backend == "torch":
-            import torch
-            if torch.cuda.is_available():
-                torch.cuda.reset_peak_memory_stats()
+        # We no longer reset here because we want to include sharded weights in the peak
         
         start_time = time.time()
         history = model.fit(x, y, batch_size=batch_size, epochs=5, steps_per_epoch=1, verbose=1 if rank == 0 else 0, shuffle=False)
@@ -219,15 +214,15 @@ def run_training(rank, world_size, layout_map, backend):
 
         # Fallback to max of absolute CPU peaks if no GPU was found (for local testing)
         if not has_gpu:
-            delta = float(peak_absolute - tracker.base_memory)
+            delta = float(peak_absolute - base_cpu)
             if backend == "torch":
                 import torch
                 p_tensor = torch.tensor([delta])
-                # Use MAX to see the busiest process's peak delta during training
+                # Use MAX to see the busiest process's peak delta (Weights + States + Activations)
                 torch.distributed.all_reduce(p_tensor, op=torch.distributed.ReduceOp.MAX)
                 peak_mem_mb = p_tensor.item() / (1024 * 1024)
             else:
-                # Normalize JAX (single-process) by world_size to get per-device equivalent delta
+                # Normalize JAX total delta by world_size to get per-device equivalent
                 peak_mem_mb = (delta / world_size) / (1024 * 1024)
 
         if rank == 0:
