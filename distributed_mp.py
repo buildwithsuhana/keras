@@ -10,6 +10,7 @@ import gc
 class MemoryTracker:
     def __init__(self):
         self.peak_cpu = 0
+        self.base_memory = 0
         self.running = False
         self.thread = None
 
@@ -26,7 +27,8 @@ class MemoryTracker:
 
     def start(self):
         gc.collect()
-        self.peak_cpu = psutil.Process(os.getpid()).memory_info().rss
+        self.base_memory = psutil.Process(os.getpid()).memory_info().rss
+        self.peak_cpu = self.base_memory
         self.running = True
         self.thread = threading.Thread(target=self._track, daemon=True)
         self.thread.start()
@@ -39,7 +41,8 @@ class MemoryTracker:
 
     def reset(self):
         gc.collect()
-        self.peak_cpu = psutil.Process(os.getpid()).memory_info().rss
+        self.base_memory = psutil.Process(os.getpid()).memory_info().rss
+        self.peak_cpu = self.base_memory
 
 def find_free_port():
     import socket
@@ -216,16 +219,15 @@ def run_training(rank, world_size, layout_map, backend):
 
         # Fallback to max of absolute CPU peaks if no GPU was found (for local testing)
         if not has_gpu:
-            delta = float(peak_absolute - base_cpu)
+            delta = float(peak_absolute - tracker.base_memory)
             if backend == "torch":
                 import torch
                 p_tensor = torch.tensor([delta])
-                # Use MAX to see the busiest process's peak delta
+                # Use MAX to see the busiest process's peak delta during training
                 torch.distributed.all_reduce(p_tensor, op=torch.distributed.ReduceOp.MAX)
                 peak_mem_mb = p_tensor.item() / (1024 * 1024)
             else:
-                # For JAX, delta is total memory added for ALL devices.
-                # Normalize by world_size to get per-device equivalent.
+                # Normalize JAX (single-process) by world_size to get per-device equivalent delta
                 peak_mem_mb = (delta / world_size) / (1024 * 1024)
 
         if rank == 0:
