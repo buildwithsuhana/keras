@@ -37,6 +37,10 @@ class MemoryTracker:
             self.thread.join()
         return self.peak_cpu
 
+    def reset(self):
+        gc.collect()
+        self.peak_cpu = psutil.Process(os.getpid()).memory_info().rss
+
 def find_free_port():
     import socket
     import time
@@ -86,6 +90,7 @@ def run_training(rank, world_size, layout_map, backend):
     import keras
     import keras_hub
     
+    gc.collect()
     tracker = MemoryTracker()
     base_cpu = psutil.Process(os.getpid()).memory_info().rss
     tracker.start()
@@ -97,6 +102,11 @@ def run_training(rank, world_size, layout_map, backend):
     )
     
     with distribution.scope():
+        # Staggered loading to avoid system-wide memory spike in multi-process mode
+        if backend == "torch":
+            import time
+            time.sleep(rank * 5) # Give previous ranks time to shard and GC
+            
         model = keras_hub.models.OPTBackbone.from_preset("opt_125m_en", dropout=0.0)
         model.compile(
             optimizer=keras.optimizers.Adam(learning_rate=1e-5), 
@@ -159,6 +169,7 @@ def run_training(rank, world_size, layout_map, backend):
         compilation_time = time.time() - start_compilation
         
         # RESET PEAK STATS HERE to ignore initialization spikes
+        tracker.reset()
         if backend == "torch":
             import torch
             if torch.cuda.is_available():
@@ -214,9 +225,15 @@ def run_training(rank, world_size, layout_map, backend):
                 peak_mem_mb = peak_mem_mb / world_size
 
         if rank == 0:
-            if backend == "jax" and os.path.exists(f"results_{backend}.json"):
+            if os.path.exists(f"results_{backend}.json"):
                 with open(f"results_{backend}.json", "r") as f:
-                    peak_mem_mb = json.load(f).get("peak_memory_mb", peak_mem_mb)
+                    try:
+                        old_results = json.load(f)
+                        old_peak = old_results.get("peak_memory_mb", 0.0)
+                        # Keep max for both to see the true high-water mark during training
+                        peak_mem_mb = max(old_peak, peak_mem_mb)
+                    except json.JSONDecodeError:
+                        pass
             step_1_loss = float(history.history["loss"][0])
             step_5_loss = float(history.history["loss"][4])
             results = {

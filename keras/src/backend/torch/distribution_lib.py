@@ -236,9 +236,16 @@ def distribute_tensor(tensor, layout):
             device_mesh=layout.device_mesh, placements=layout.placements
         )
 
-    return torch.distributed.tensor.distribute_tensor(
+    output = torch.distributed.tensor.distribute_tensor(
         tensor, device_mesh=layout.device_mesh, placements=layout.placements
     )
+    if (
+        not tensor.is_meta
+        and hasattr(tensor, "storage")
+        and tensor.storage().size() > 0
+    ):
+        tensor.set_(torch.empty(0, device=tensor.device, dtype=tensor.dtype))
+    return output
 
 
 def distribute_data_input(tensor, layout, batch_dim_name):
