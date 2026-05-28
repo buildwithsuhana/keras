@@ -241,7 +241,7 @@ def run_training(rank, world_size, layout_map, backend):
                 "step_1_loss": step_1_loss,
                 "step_5_loss": step_5_loss,
                 "perplexity": float(np.exp(step_5_loss)),
-                "throughput": (4 * 5) / training_time,
+                "throughput": (global_batch_size * 5) / training_time,
                 "compilation_time": compilation_time,
                 "training_time": training_time,
                 "peak_memory_mb": peak_mem_mb,
