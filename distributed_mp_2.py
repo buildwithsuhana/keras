@@ -35,11 +35,7 @@ class MemoryTracker:
         self.running = False
         if self.thread:
             self.thread.join()
-        return float(self.peak_cpu)
-
-    def reset(self):
-        gc.collect()
-        self.peak_cpu = psutil.Process(os.getpid()).memory_info().rss
+        return self.peak_cpu
 
 def find_free_port():
     import socket
@@ -89,43 +85,30 @@ def run_training(rank, world_size, layout_map, backend):
     import keras
     import keras_hub
     
-    gc.collect()
     tracker = MemoryTracker()
     base_cpu = psutil.Process(os.getpid()).memory_info().rss
     tracker.start()
 
     distribution = keras.distribution.ModelParallel(
         layout_map=layout_map, 
-        batch_dim_name="data", 
+        batch_dim_name="model", 
         auto_shard_dataset=False
     )
     
     with distribution.scope():
-        # Staggered loading to avoid system-wide memory spike in multi-process mode
-        if backend == "torch":
-            time.sleep(rank * 10) # Give previous ranks time to shard and GC
-            
         model = keras_hub.models.OPTBackbone.from_preset("opt_125m_en", dropout=0.0)
-        gc.collect()
-
         model.compile(
             optimizer=keras.optimizers.Adam(learning_rate=1e-5), 
             loss="mse", 
             jit_compile=True
         )
-        gc.collect()
-
-        if backend == "torch":
-            import torch
-            if torch.distributed.is_initialized():
-                torch.distributed.barrier()
         
         np.random.seed(42)
         if backend == "torch":
             indices = []
             for i in range(10):
                 base = i * 4
-                indices.extend([base, base + 1] if rank < 2 else [base + 2, base + 3])
+                indices.extend([base, base + 1] if rank == 0 else [base + 2, base + 3])
             
             # Optimization: only generate what we need or delete full arrays immediately
             full_token_ids = np.random.randint(0, 50272, (40, 32)).astype("int32")
@@ -175,7 +158,6 @@ def run_training(rank, world_size, layout_map, backend):
         compilation_time = time.time() - start_compilation
         
         # RESET PEAK STATS HERE to ignore initialization spikes
-        tracker.reset()
         if backend == "torch":
             import torch
             if torch.cuda.is_available():
@@ -185,7 +167,7 @@ def run_training(rank, world_size, layout_map, backend):
         history = model.fit(x, y, batch_size=batch_size, epochs=5, steps_per_epoch=1, verbose=1 if rank == 0 else 0, shuffle=False)
         training_time = time.time() - start_time
         
-        peak_absolute = tracker.stop()
+        peak_cpu = tracker.stop()
 
         # Compare GPU memory specifically
         has_gpu = False
@@ -198,8 +180,8 @@ def run_training(rank, world_size, layout_map, backend):
                     # Get peak for each device separately
                     device_peaks.append(d.memory_stats()['peak_bytes_in_use'])
             
-            # Use SUM to get the total memory across all devices
-            peak_mem_mb = sum(device_peaks) / (1024 * 1024) if device_peaks else 0
+            # Use MAX to get the peak of the busiest device
+            peak_mem_mb = max(device_peaks) / (1024 * 1024) if device_peaks else 0
         else:
             import torch
             if torch.cuda.is_available():
@@ -208,8 +190,8 @@ def run_training(rank, world_size, layout_map, backend):
                 device_idx = int(os.environ.get("LOCAL_RANK", 0))
                 device = torch.device(f"cuda:{device_idx}")
                 m_tensor = torch.tensor([float(rank_peak_gpu)], device=device)
-                # Use SUM to see the total aggregate peak
-                torch.distributed.all_reduce(m_tensor, op=torch.distributed.ReduceOp.SUM)
+                # Use MAX to see the busiest GPU's peak
+                torch.distributed.all_reduce(m_tensor, op=torch.distributed.ReduceOp.MAX)
                 peak_mem_mb = m_tensor.item() / (1024 * 1024)
             else:
                 peak_mem_mb = 0
@@ -218,23 +200,14 @@ def run_training(rank, world_size, layout_map, backend):
         if not has_gpu:
             if backend == "torch":
                 import torch
-                p_tensor = torch.tensor([peak_absolute])
+                p_tensor = torch.tensor([float(peak_cpu)])
                 # Use MAX to see the busiest process's peak
                 torch.distributed.all_reduce(p_tensor, op=torch.distributed.ReduceOp.MAX)
                 peak_mem_mb = p_tensor.item() / (1024 * 1024)
             else:
-                peak_mem_mb = peak_absolute / (1024 * 1024)
+                peak_mem_mb = peak_cpu / (1024 * 1024)
 
         if rank == 0:
-            if os.path.exists(f"results_{backend}.json"):
-                with open(f"results_{backend}.json", "r") as f:
-                    try:
-                        old_results = json.load(f)
-                        old_peak = old_results.get("peak_memory_mb", 0.0)
-                        # Keep max for both to see the true high-water mark during training
-                        peak_mem_mb = max(old_peak, peak_mem_mb)
-                    except json.JSONDecodeError:
-                        pass
             step_1_loss = float(history.history["loss"][0])
             step_5_loss = float(history.history["loss"][4])
             results = {
@@ -249,7 +222,7 @@ def run_training(rank, world_size, layout_map, backend):
             with open(f"results_{backend}.json", "w") as f: 
                 json.dump(results, f, indent=2)
 
-def run_backend(backend, world_size=4):
+def run_backend(backend, world_size=2):
     os.environ["KERAS_BACKEND"] = backend
     if backend == "jax":
         os.environ["XLA_PYTHON_CLIENT_MEM_FRACTION"] = "0.9"
@@ -281,15 +254,12 @@ def _run_jax(world_size):
     if len(devices) < world_size:
         raise ValueError(f"Not enough devices found. Expected {world_size}, got {len(devices)}.")
 
-    mesh = keras.distribution.DeviceMesh(shape=(2, 2), axis_names=("data", "model"), devices=devices)
+    mesh = keras.distribution.DeviceMesh(shape=(world_size,), axis_names=("model",), devices=devices)
     run_training(0, world_size, get_layout_map(mesh), "jax")
 
 def _run_torch(rank, world_size, port):
+    import os
     import torch
-    
-    # Minimize per-process thread overhead
-    torch.set_num_threads(1)
-    torch.set_num_interop_threads(1)
 
 
     os.environ.update({
@@ -311,7 +281,7 @@ def _run_torch(rank, world_size, port):
     print(f"[Rank {rank}] Initialized. World size: {world_size}")
     
     devices = keras.distribution.list_devices(device_type)[:world_size]
-    mesh = keras.distribution.DeviceMesh(shape=(2, 2), axis_names=("data", "model"), devices=devices)
+    mesh = keras.distribution.DeviceMesh(shape=(world_size,), axis_names=("model",), devices=devices)
     run_training(rank, world_size, get_layout_map(mesh), "torch")
     
     if torch.distributed.is_initialized():
