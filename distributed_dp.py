@@ -55,7 +55,9 @@ def _run_jax(world_size):
         model.compile(optimizer=keras.optimizers.Adam(learning_rate=1e-5), loss="mse")
 
         np.random.seed(42)
-        num_samples = 8 
+        base_batch_size = 4
+        global_batch_size = base_batch_size * world_size
+        num_samples = global_batch_size * 10
         x_full = {
             "token_ids": np.random.randint(0, 50272, (num_samples, 32)).astype("int32"),
             "padding_mask": np.ones((num_samples, 32), dtype="int32")
@@ -63,17 +65,20 @@ def _run_jax(world_size):
         y_full = np.random.normal(size=(num_samples, 32, 768)).astype("float32")
 
         # Warmup
-        model.fit(x_full, y_full, batch_size=4, epochs=1, steps_per_epoch=1, verbose=1, shuffle=False)
+        model.fit(x_full, y_full, batch_size=global_batch_size, epochs=1, steps_per_epoch=1, verbose=1, shuffle=False)
 
         start_time = time.time()
-        history = model.fit({k: v[4:8] for k, v in x_full.items()}, y_full[4:8], 
-                            batch_size=4, epochs=5, steps_per_epoch=1, verbose=1, shuffle=False)
+        # Use second half of data for timed run
+        x_train = {k: v[global_batch_size:] for k, v in x_full.items()}
+        y_train = y_full[global_batch_size:]
+        history = model.fit(x_train, y_train, 
+                            batch_size=global_batch_size, epochs=5, steps_per_epoch=1, verbose=1, shuffle=False)
         end_time = time.time()
 
         step_1_loss = float(history.history["loss"][0])
         step_5_loss = float(history.history["loss"][4])
         training_time = end_time - start_time
-        throughput = (5 * 4) / training_time
+        throughput = (5 * global_batch_size) / training_time
         perplexity = float(np.exp(step_5_loss))
 
     results = {
@@ -120,32 +125,45 @@ def _run_torch(rank, world_size, port):
         model.compile(optimizer=keras.optimizers.Adam(learning_rate=1e-5), loss="mse")
 
         np.random.seed(42)
-        num_samples = 8
+        base_batch_size = 4
+        global_batch_size = base_batch_size * world_size
+        num_samples = global_batch_size * 10
         x_full = {
             "token_ids": np.random.randint(0, 50272, (num_samples, 32)).astype("int32"),
             "padding_mask": np.ones((num_samples, 32), dtype="int32")
         }
         y_full = np.random.normal(size=(num_samples, 32, 768)).astype("float32")
 
-        indices = [rank * 2, rank * 2 + 1, 4 + rank * 2, 4 + rank * 2 + 1]
+        # Sharding: each rank takes its local batch from each step's global slice
+        # For simplicity, we just take our portion of the full dataset
+        start_idx = rank * base_batch_size
+        indices = []
+        # Step 0 (Warmup)
+        indices.extend(range(start_idx, start_idx + base_batch_size))
+        # Steps 1-5 (Training)
+        for step in range(1, 6):
+            base = step * global_batch_size + start_idx
+            indices.extend(range(base, base + base_batch_size))
+            
         x = {k: v[indices] for k, v in x_full.items()}
         y = y_full[indices]
 
         from torch.nn.attention import sdpa_kernel
         with sdpa_kernel(torch.nn.attention.SDPBackend.MATH):
-            # Warmup
-            model.fit({k: v[:2] for k, v in x.items()}, y[:2], 
-                      batch_size=2, epochs=1, steps_per_epoch=1, verbose=1 if rank == 0 else 0, shuffle=False)
+            # Warmup (1 step)
+            model.fit({k: v[:base_batch_size] for k, v in x.items()}, y[:base_batch_size], 
+                      batch_size=base_batch_size, epochs=1, steps_per_epoch=1, verbose=1 if rank == 0 else 0, shuffle=False)
 
             start_time = time.time()
-            history = model.fit({k: v[2:] for k, v in x.items()}, y[2:], 
-                                batch_size=2, epochs=5, steps_per_epoch=1, verbose=1 if rank == 0 else 0, shuffle=False)
+            # Training (5 epochs, 1 step each)
+            history = model.fit({k: v[base_batch_size:] for k, v in x.items()}, y[base_batch_size:], 
+                                batch_size=base_batch_size, epochs=5, steps_per_epoch=1, verbose=1 if rank == 0 else 0, shuffle=False)
             end_time = time.time()
 
             step_1_loss = float(history.history["loss"][0])
             step_5_loss = float(history.history["loss"][4])
             training_time = end_time - start_time
-            throughput = (5 * 4) / training_time
+            throughput = (5 * global_batch_size) / training_time
             perplexity = float(np.exp(step_5_loss))
 
     if rank == 0:
