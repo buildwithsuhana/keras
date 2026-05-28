@@ -198,8 +198,8 @@ def run_training(rank, world_size, layout_map, backend):
                     # Get peak for each device separately
                     device_peaks.append(d.memory_stats()['peak_bytes_in_use'])
             
-            # Use SUM to get the total memory across all devices
-            peak_mem_mb = sum(device_peaks) / (1024 * 1024) if device_peaks else 0
+            # Use MAX to get the peak of the busiest device
+            peak_mem_mb = max(device_peaks) / (1024 * 1024) if device_peaks else 0
         else:
             import torch
             if torch.cuda.is_available():
@@ -208,22 +208,25 @@ def run_training(rank, world_size, layout_map, backend):
                 device_idx = int(os.environ.get("LOCAL_RANK", 0))
                 device = torch.device(f"cuda:{device_idx}")
                 m_tensor = torch.tensor([float(rank_peak_gpu)], device=device)
-                # Use SUM to see the total aggregate peak
-                torch.distributed.all_reduce(m_tensor, op=torch.distributed.ReduceOp.SUM)
+                # Use MAX to see the busiest GPU's peak
+                torch.distributed.all_reduce(m_tensor, op=torch.distributed.ReduceOp.MAX)
                 peak_mem_mb = m_tensor.item() / (1024 * 1024)
             else:
                 peak_mem_mb = 0
 
         # Fallback to max of absolute CPU peaks if no GPU was found (for local testing)
         if not has_gpu:
+            delta = float(peak_absolute - base_cpu)
             if backend == "torch":
                 import torch
-                p_tensor = torch.tensor([peak_absolute])
-                # Use MAX to see the busiest process's peak
+                p_tensor = torch.tensor([delta])
+                # Use MAX to see the busiest process's peak delta
                 torch.distributed.all_reduce(p_tensor, op=torch.distributed.ReduceOp.MAX)
                 peak_mem_mb = p_tensor.item() / (1024 * 1024)
             else:
-                peak_mem_mb = peak_absolute / (1024 * 1024)
+                # For JAX, delta is total memory added for ALL devices.
+                # Normalize by world_size to get per-device equivalent.
+                peak_mem_mb = (delta / world_size) / (1024 * 1024)
 
         if rank == 0:
             if os.path.exists(f"results_{backend}.json"):

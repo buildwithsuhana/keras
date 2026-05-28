@@ -19,7 +19,7 @@ def compare():
         ("Perplexity", "perplexity"),
         ("Throughput (samples/sec)", "throughput"),
         ("Training Time (sec)", "training_time"),
-        ("Total Memory (MB)", "total_memory_mb"),
+        ("Peak Memory (MB)", "peak_memory_mb"),
     ]
 
     all_pass = True
