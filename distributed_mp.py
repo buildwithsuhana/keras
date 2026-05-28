@@ -43,7 +43,6 @@ class MemoryTracker:
 
 def find_free_port():
     import socket
-    import time
     for _ in range(5):
         try:
             with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as s:
@@ -104,15 +103,22 @@ def run_training(rank, world_size, layout_map, backend):
     with distribution.scope():
         # Staggered loading to avoid system-wide memory spike in multi-process mode
         if backend == "torch":
-            import time
-            time.sleep(rank * 5) # Give previous ranks time to shard and GC
+            time.sleep(rank * 10) # Give previous ranks time to shard and GC
             
         model = keras_hub.models.OPTBackbone.from_preset("opt_125m_en", dropout=0.0)
+        gc.collect()
+
         model.compile(
             optimizer=keras.optimizers.Adam(learning_rate=1e-5), 
             loss="mse", 
             jit_compile=True
         )
+        gc.collect()
+
+        if backend == "torch":
+            import torch
+            if torch.distributed.is_initialized():
+                torch.distributed.barrier()
         
         np.random.seed(42)
         if backend == "torch":
@@ -192,8 +198,8 @@ def run_training(rank, world_size, layout_map, backend):
                     # Get peak for each device separately
                     device_peaks.append(d.memory_stats()['peak_bytes_in_use'])
             
-            # Use MAX to get the peak of the busiest device
-            peak_mem_mb = max(device_peaks) / (1024 * 1024) if device_peaks else 0
+            # Use SUM to get the total memory across all devices
+            peak_mem_mb = sum(device_peaks) / (1024 * 1024) if device_peaks else 0
         else:
             import torch
             if torch.cuda.is_available():
@@ -202,34 +208,30 @@ def run_training(rank, world_size, layout_map, backend):
                 device_idx = int(os.environ.get("LOCAL_RANK", 0))
                 device = torch.device(f"cuda:{device_idx}")
                 m_tensor = torch.tensor([float(rank_peak_gpu)], device=device)
-                # Use MAX to see the busiest GPU's peak
-                torch.distributed.all_reduce(m_tensor, op=torch.distributed.ReduceOp.MAX)
+                # Use SUM to see the total aggregate peak
+                torch.distributed.all_reduce(m_tensor, op=torch.distributed.ReduceOp.SUM)
                 peak_mem_mb = m_tensor.item() / (1024 * 1024)
             else:
                 peak_mem_mb = 0
 
-        # Fallback to max CPU delta if no GPU was found (for local testing)
+        # Fallback to sum of CPU deltas if no GPU was found (for local testing)
         if not has_gpu:
             delta_cpu = float(peak_cpu - base_cpu)
             if backend == "torch":
                 import torch
                 d_tensor = torch.tensor([delta_cpu])
-                # Use MAX to see the busiest process's peak delta
-                torch.distributed.all_reduce(d_tensor, op=torch.distributed.ReduceOp.MAX)
+                # Use SUM to see the total aggregate peak delta
+                torch.distributed.all_reduce(d_tensor, op=torch.distributed.ReduceOp.SUM)
                 peak_mem_mb = d_tensor.item() / (1024 * 1024)
             else:
                 peak_mem_mb = delta_cpu / (1024 * 1024)
-            
-            # Normalize JAX memory to "per-device" for fairer comparison with Torch multi-process
-            if backend == "jax":
-                peak_mem_mb = peak_mem_mb / world_size
 
         if rank == 0:
             if os.path.exists(f"results_{backend}.json"):
                 with open(f"results_{backend}.json", "r") as f:
                     try:
                         old_results = json.load(f)
-                        old_peak = old_results.get("peak_memory_mb", 0.0)
+                        old_peak = old_results.get("total_memory_mb", 0.0)
                         # Keep max for both to see the true high-water mark during training
                         peak_mem_mb = max(old_peak, peak_mem_mb)
                     except json.JSONDecodeError:
@@ -243,7 +245,7 @@ def run_training(rank, world_size, layout_map, backend):
                 "throughput": (4 * 5) / training_time,
                 "compilation_time": compilation_time,
                 "training_time": training_time,
-                "peak_memory_mb": peak_mem_mb,
+                "total_memory_mb": peak_mem_mb,
             }
             with open(f"results_{backend}.json", "w") as f: 
                 json.dump(results, f, indent=2)
@@ -284,8 +286,11 @@ def _run_jax(world_size):
     run_training(0, world_size, get_layout_map(mesh), "jax")
 
 def _run_torch(rank, world_size, port):
-    import os
     import torch
+    
+    # Minimize per-process thread overhead
+    torch.set_num_threads(1)
+    torch.set_num_interop_threads(1)
 
 
     os.environ.update({
