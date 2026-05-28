@@ -214,6 +214,9 @@ def run_training(rank, world_size, layout_map, backend):
                 peak_mem_mb = peak_mem_mb / world_size
 
         if rank == 0:
+            if backend == "jax" and os.path.exists(f"results_{backend}.json"):
+                with open(f"results_{backend}.json", "r") as f:
+                    peak_mem_mb = json.load(f).get("peak_memory_mb", peak_mem_mb)
             step_1_loss = float(history.history["loss"][0])
             step_5_loss = float(history.history["loss"][4])
             results = {
