@@ -15,6 +15,8 @@ def get_data(num_samples=500, seq_len=32, embed_dim=768, vocab_size=50272):
 
 def run(backend):
     os.environ["KERAS_BACKEND"] = backend
+    if backend == "jax":
+        os.environ["XLA_FLAGS"] = "--xla_cpu_parallelify_with_num_threads=1"
     import keras
     import keras_hub
     
@@ -33,7 +35,7 @@ def run(backend):
     
     x, y = get_data()
     
-    batch_size = 2
+    batch_size = 8
     epochs = 5
     
     with cm:

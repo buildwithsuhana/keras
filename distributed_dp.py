@@ -24,7 +24,7 @@ def run_backend(backend, world_size=2):
             pass
 
         if num_gpus < world_size:
-            os.environ["XLA_FLAGS"] = f"--xla_force_host_platform_device_count={world_size}"
+            os.environ["XLA_FLAGS"] = f"--xla_force_host_platform_device_count={world_size} --xla_cpu_parallelify_with_num_threads=1"
             os.environ["JAX_PLATFORMS"] = "cpu"
         _run_jax(world_size)
     elif backend == "torch":
