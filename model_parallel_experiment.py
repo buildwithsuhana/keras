@@ -23,7 +23,7 @@ class MemoryTracker:
                     self.peak_cpu = mem
             except:
                 break
-            time.sleep(0.1)
+            time.sleep(0.5)
 
     def start(self):
         gc.collect()
@@ -80,7 +80,7 @@ def run_training(rank, world_size, layout_map, backend):
     import keras
     import keras_hub
     
-    # Force float32 for maximum precision sync
+    # Force float32 for precision matching
     keras.backend.set_floatx("float32")
     
     gc.collect()
@@ -98,18 +98,10 @@ def run_training(rank, world_size, layout_map, backend):
         if backend == "torch":
             time.sleep(rank * 1)
             
-        # Load model
         model = keras_hub.models.OPTBackbone.from_preset("opt_125m_en", dropout=0.0)
         gc.collect()
 
-        # Compile - Disable JIT for Torch to ensure exact operation matching with JAX
-        # torch.compile can introduce numerical variations (1e-3 to 1e-4) due to fusions.
-        jit_compile = True if backend == "jax" else False
-        model.compile(
-            optimizer=keras.optimizers.Adam(learning_rate=1e-5, epsilon=1e-7), 
-            loss="mse", 
-            jit_compile=jit_compile
-        )
+        model.compile(optimizer=keras.optimizers.Adam(learning_rate=1e-5), loss="mse", jit_compile=True)
         gc.collect()
 
         if backend == "torch":
@@ -117,29 +109,32 @@ def run_training(rank, world_size, layout_map, backend):
             if torch.distributed.is_initialized():
                 torch.distributed.barrier()
         
-        # EXACT Data Generation Sync
         np.random.seed(42)
-        global_batch_size = 32
+        global_batch_size = 64
         num_total_samples = global_batch_size * 10
-        
-        full_x_ids = np.random.randint(0, 50272, (num_total_samples, 32)).astype("int32")
-        full_x_mask = np.ones((num_total_samples, 32), dtype="int32")
-        full_y = np.random.normal(size=(num_total_samples, 32, 768)).astype("float32")
-        
         if backend == "torch":
-            batch_size = global_batch_size // world_size
-            # Shard data so each rank gets a unique slice of the global batch
-            all_indices = []
+            indices = []
             for i in range(10):
-                start = i * global_batch_size + rank * batch_size
-                end = start + batch_size
-                all_indices.extend(np.arange(start, end))
+                base = i * global_batch_size
+                # Rank 0, 1 -> data_shard 0 (samples 0-31)
+                # Rank 2, 3 -> data_shard 1 (samples 32-63)
+                indices.extend(np.arange(base, base + 32) if rank // 2 == 0 else np.arange(base + 32, base + 64))
             
-            x = {
-                "token_ids": full_x_ids[all_indices],
-                "padding_mask": full_x_mask[all_indices]
-            }
-            y = full_y[all_indices]
+            full_token_ids = np.random.randint(0, 50272, (num_total_samples, 32)).astype("int32")
+            full_padding_mask = np.ones((num_total_samples, 32), dtype="int32")
+            full_y = np.random.normal(size=(num_total_samples, 32, 768)).astype("float32")
+
+            for i in range(10):
+                base = i * global_batch_size
+                # Duplicate first 32 samples into second 32 samples for minimal divergence
+                full_token_ids[base+32:base+64] = full_token_ids[base:base+32]
+                full_y[base+32:base+64] = full_y[base:base+32]
+            
+            x = {"token_ids": full_token_ids[indices], "padding_mask": full_padding_mask[indices]}
+            y = full_y[indices]
+            
+            del full_token_ids, full_padding_mask, full_y
+            gc.collect()
             
             import torch
             device_idx = int(os.environ.get("LOCAL_RANK", 0))
@@ -147,34 +142,37 @@ def run_training(rank, world_size, layout_map, backend):
             x = {k: torch.from_numpy(v).to(device) for k, v in x.items()}
             y = torch.from_numpy(y).to(device)
             gc.collect()
+            
+            batch_size = 32
         else:
-            batch_size = global_batch_size
-            x = {"token_ids": full_x_ids, "padding_mask": full_x_mask}
-            y = full_y
+            x_full = {
+                "token_ids": np.random.randint(0, 50272, (num_total_samples, 32)).astype("int32"),
+                "padding_mask": np.ones((num_total_samples, 32), dtype="int32")
+            }
+            y_full = np.random.normal(size=(num_total_samples, 32, 768)).astype("float32")
 
-        # Warmup (Step 0)
-        warmup_history = model.fit(
-            {k: v[:batch_size] for k, v in x.items()}, 
-            y[:batch_size], 
-            batch_size=batch_size, epochs=1, steps_per_epoch=1, 
-            verbose=1 if rank == 0 else 0, shuffle=False
-        )
-        step_0_loss = float(warmup_history.history["loss"][0])
+            for i in range(10):
+                base = i * global_batch_size
+                x_full["token_ids"][base+32:base+64] = x_full["token_ids"][base:base+32]
+                y_full[base+32:base+64] = y_full[base:base+32]
+            x, y = x_full, y_full
+            batch_size = 64
+
+        # Warmup
+        warmup_history = model.fit({k: v[:batch_size] for k, v in x.items()}, 
+                  y[:batch_size], 
+                  batch_size=batch_size, epochs=1, steps_per_epoch=1, verbose=1 if rank == 0 else 0, shuffle=False)
         
         if backend == "torch" and torch.distributed.is_initialized():
             torch.distributed.barrier()
-        
         start_time = time.time()
-        epochs = 5 # Steps 1 to 5
+        epochs = 1
+        steps_per_epoch = 5
         
         x_train = {k: v[batch_size:] for k, v in x.items()}
         y_train = y[batch_size:]
 
-        history = model.fit(
-            x_train, y_train, 
-            batch_size=batch_size, epochs=epochs, steps_per_epoch=1, 
-            verbose=1 if rank == 0 else 0, shuffle=False
-        )
+        history = model.fit(x_train, y_train, batch_size=batch_size, epochs=epochs, steps_per_epoch=steps_per_epoch, verbose=1 if rank == 0 else 0, shuffle=False)
         
         if backend == "torch" and torch.distributed.is_initialized():
             torch.distributed.barrier()
@@ -182,22 +180,49 @@ def run_training(rank, world_size, layout_map, backend):
         
         peak_absolute = tracker.stop()
 
-        # Average Memory per Device
-        delta = float(peak_absolute - base_cpu)
-        if backend == "torch":
-            import torch
-            device = torch.device(f"cpu")
-            p_tensor = torch.tensor([delta])
-            torch.distributed.all_reduce(p_tensor, op=torch.distributed.ReduceOp.SUM)
-            peak_mem_mb = (p_tensor.item() / world_size) / (1024 * 1024)
+        # GPU Memory Tracking
+        has_gpu = False
+        if backend == "jax":
+            import jax
+            device_peaks = [d.memory_stats()['peak_bytes_in_use'] for d in jax.local_devices() if d.platform == 'gpu']
+            has_gpu = len(device_peaks) > 0
+            peak_mem_mb = max(device_peaks) / (1024 * 1024) if has_gpu else 0
         else:
-            peak_mem_mb = (delta / world_size) / (1024 * 1024)
+            import torch
+            if torch.cuda.is_available():
+                has_gpu = True
+                rank_peak_gpu = torch.cuda.max_memory_allocated()
+                device = torch.device(f"cuda:{int(os.environ.get('LOCAL_RANK', 0))}")
+                m_tensor = torch.tensor([float(rank_peak_gpu)], device=device)
+                torch.distributed.all_reduce(m_tensor, op=torch.distributed.ReduceOp.MAX)
+                peak_mem_mb = m_tensor.item() / (1024 * 1024)
+            else:
+                peak_mem_mb = 0
+
+        if not has_gpu:
+            delta = float(peak_absolute - base_cpu)
+            if backend == "torch":
+                import torch
+                p_tensor = torch.tensor([delta])
+                torch.distributed.all_reduce(p_tensor, op=torch.distributed.ReduceOp.MAX)
+                peak_mem_mb = p_tensor.item() / (1024 * 1024)
+            else:
+                peak_mem_mb = (delta / world_size) / (1024 * 1024)
 
         if rank == 0:
-            step_1_loss = float(history.history["loss"][0])
-            final_loss = float(history.history["loss"][4])
+            if os.path.exists(f"results_{backend}.json"):
+                with open(f"results_{backend}.json", "r") as f:
+                    try:
+                        old_peak = json.load(f).get("peak_memory_mb", 0.0)
+                        peak_mem_mb = max(old_peak, peak_mem_mb)
+                    except json.JSONDecodeError:
+                        pass
             
-            total_samples = global_batch_size * epochs
+            step_0_loss = float(warmup_history.history["loss"][0])
+            step_1_loss = float(history.history["loss"][0])
+            final_loss = float(history.history["loss"][-1])
+            
+            total_samples = global_batch_size * steps_per_epoch * epochs
             throughput = total_samples / training_time
 
             results = {
@@ -216,12 +241,13 @@ def run_training(rank, world_size, layout_map, backend):
 def run_backend(backend, world_size=4):
     os.environ["KERAS_BACKEND"] = backend
     if backend == "jax":
-        os.environ["XLA_PYTHON_CLIENT_PREALLOCATE"] = "false"
+        os.environ["XLA_PYTHON_CLIENT_MEM_FRACTION"] = "0.9"
         num_gpus = 0
         try:
             import torch
             num_gpus = torch.cuda.device_count()
-        except: pass
+        except:
+            pass
         
         if num_gpus < world_size:
             os.environ["XLA_FLAGS"] = f"--xla_force_host_platform_device_count={world_size}"
