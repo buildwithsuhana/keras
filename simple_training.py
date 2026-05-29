@@ -20,7 +20,6 @@ def run(backend):
     
     if backend == "torch":
         import torch
-        # Use MATH kernel for consistency across environments
         from torch.nn.attention import sdpa_kernel
         cm = sdpa_kernel(torch.nn.attention.SDPBackend.MATH)
     else:
@@ -33,21 +32,23 @@ def run(backend):
     model.compile(optimizer=keras.optimizers.Adam(learning_rate=1e-5), loss="mse")
     
     x, y = get_data()
+    batch_size = 4
+    epochs = 5
     
     with cm:
         # Warmup
-        model.fit(x, y, batch_size=4, epochs=1, steps_per_epoch=1, verbose=1, shuffle=False)
+        model.fit(x, y, batch_size=batch_size, epochs=1, steps_per_epoch=1, verbose=1, shuffle=False)
         
         start_time = time.time()
-        epochs = 5
-        history = model.fit(x, y, batch_size=4, epochs=epochs, steps_per_epoch=1, verbose=1, shuffle=False)
+        history = model.fit(x, y, batch_size=batch_size, epochs=epochs, steps_per_epoch=1, verbose=1, shuffle=False)
         end_time = time.time()
     
     training_time = end_time - start_time
     step_1_loss = float(history.history["loss"][0])
     final_loss = float(history.history["loss"][-1])
-    # Halve the throughput as requested for fairer comparison with multi-device setups
-    throughput = ((4 * epochs) / training_time) / 2
+    
+    total_samples = batch_size * 1 * epochs
+    throughput = total_samples / training_time
     perplexity = float(np.exp(final_loss))
     
     results = {

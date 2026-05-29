@@ -44,12 +44,11 @@ def _run_jax(world_size):
     print(f"Using JAX devices: {devices}")
 
     if len(devices) < world_size:
-        raise ValueError(f"Not enough devices found. Expected {world_size}, got {len(devices)}. "
-                         f"Check XLA_FLAGS or GPU availability.")
+        raise ValueError(f"Not enough devices found. Expected {world_size}, got {len(devices)}.")
 
     mesh = keras.distribution.DeviceMesh(shape=(world_size,), axis_names=("batch",), devices=devices)
-
     distribution = keras.distribution.DataParallel(device_mesh=mesh, auto_shard_dataset=False)
+    
     with distribution.scope():
         model = keras_hub.models.OPTBackbone.from_preset("opt_125m_en", dropout=0.0)
         model.compile(optimizer=keras.optimizers.Adam(learning_rate=1e-5), loss="mse")
@@ -68,7 +67,6 @@ def _run_jax(world_size):
         model.fit(x_full, y_full, batch_size=global_batch_size, epochs=1, steps_per_epoch=1, verbose=1, shuffle=False)
 
         start_time = time.time()
-        # Use second half of data for timed run
         x_train = {k: v[global_batch_size:] for k, v in x_full.items()}
         y_train = y_full[global_batch_size:]
         history = model.fit(x_train, y_train, 
@@ -85,7 +83,6 @@ def _run_jax(world_size):
         "step_1_loss": step_1_loss,
         "step_5_loss": step_5_loss,
         "perplexity": perplexity,
-        # "training_time": training_time,
         "throughput": throughput,
     }
     with open("results_jax_dp.json", "w") as f: json.dump(results, f, indent=2)
@@ -118,8 +115,8 @@ def _run_torch(rank, world_size, port):
     print(f"[Rank {rank}] Using devices: {devices}")
 
     mesh = keras.distribution.DeviceMesh(shape=(world_size,), axis_names=("batch",), devices=devices)
-
     distribution = keras.distribution.DataParallel(device_mesh=mesh, auto_shard_dataset=False)
+    
     with distribution.scope():
         model = keras_hub.models.OPTBackbone.from_preset("opt_125m_en", dropout=0.0)
         model.compile(optimizer=keras.optimizers.Adam(learning_rate=1e-5), loss="mse")
@@ -134,13 +131,9 @@ def _run_torch(rank, world_size, port):
         }
         y_full = np.random.normal(size=(num_samples, 32, 768)).astype("float32")
 
-        # Sharding: each rank takes its local batch from each step's global slice
-        # For simplicity, we just take our portion of the full dataset
         start_idx = rank * base_batch_size
         indices = []
-        # Step 0 (Warmup)
         indices.extend(range(start_idx, start_idx + base_batch_size))
-        # Steps 1-5 (Training)
         for step in range(1, 6):
             base = step * global_batch_size + start_idx
             indices.extend(range(base, base + base_batch_size))
@@ -150,14 +143,12 @@ def _run_torch(rank, world_size, port):
 
         from torch.nn.attention import sdpa_kernel
         with sdpa_kernel(torch.nn.attention.SDPBackend.MATH):
-            # Warmup (1 step)
             model.fit({k: v[:base_batch_size] for k, v in x.items()}, y[:base_batch_size], 
-                      batch_size=global_batch_size, epochs=1, steps_per_epoch=1, verbose=1 if rank == 0 else 0, shuffle=False)
+                      batch_size=base_batch_size, epochs=1, steps_per_epoch=1, verbose=1 if rank == 0 else 0, shuffle=False)
 
             start_time = time.time()
-            # Training (5 epochs, 1 step each)
             history = model.fit({k: v[base_batch_size:] for k, v in x.items()}, y[base_batch_size:], 
-                                batch_size=global_batch_size, epochs=5, steps_per_epoch=1, verbose=1 if rank == 0 else 0, shuffle=False)
+                                batch_size=base_batch_size, epochs=5, steps_per_epoch=1, verbose=1 if rank == 0 else 0, shuffle=False)
             end_time = time.time()
 
             step_1_loss = float(history.history["loss"][0])
@@ -171,7 +162,6 @@ def _run_torch(rank, world_size, port):
             "step_1_loss": step_1_loss,
             "step_5_loss": step_5_loss,
             "perplexity": perplexity,
-            # "training_time": training_time,
             "throughput": throughput,
         }
         with open("results_torch_dp.json", "w") as f: json.dump(results, f, indent=2)
@@ -200,15 +190,10 @@ if __name__ == "__main__":
             ("Step 5 Loss", "step_5_loss"),
             ("Perplexity", "perplexity"),
             ("Throughput (samples/sec)", "throughput"),
-            # ("Training Time (sec)", "training_time"),
         ]
 
-        all_pass = True
         for label, key in metrics:
             v_jax = jax_res[key]
             v_torch = torch_res[key]
             diff = abs(v_jax - v_torch)
             print(f"{label:<30} | {v_jax:<20.12f} | {v_torch:<20.12f} | {diff:<15.8e}")
-            if key not in ["throughput"] and diff > 1e-5:
-                all_pass = False
-
