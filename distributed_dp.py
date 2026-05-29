@@ -54,7 +54,6 @@ def _run_jax(world_size):
         base_batch_size = 4
         global_batch_size = base_batch_size * world_size
         
-        # Sized for exactly 6 steps total (1 Warmup step + 5 Training steps)
         num_samples = global_batch_size * 6 
         x_full = {
             "token_ids": np.random.randint(0, 50272, (num_samples, 32)).astype("int32"),
@@ -89,6 +88,7 @@ def _run_jax(world_size):
 def _run_torch(rank, world_size, port):
     import os
     import torch
+    import torch.distributed as dist  # Added for process synchronization
     os.environ["RANK"] = str(rank)
     os.environ["WORLD_SIZE"] = str(world_size)
     os.environ["LOCAL_RANK"] = str(rank)
@@ -124,7 +124,6 @@ def _run_torch(rank, world_size, port):
         base_batch_size = 4
         global_batch_size = base_batch_size * world_size
         
-        # Sized for exactly 6 steps total (1 Warmup step + 5 Training steps)
         num_samples = global_batch_size * 6 
         x_full = {
             "token_ids": np.random.randint(0, 50272, (num_samples, 32)).astype("int32"),
@@ -147,9 +146,15 @@ def _run_torch(rank, world_size, port):
             model.fit({k: v[:base_batch_size] for k, v in x.items()}, y[:base_batch_size], 
                       batch_size=base_batch_size, epochs=1, steps_per_epoch=1, verbose=1 if rank == 0 else 0, shuffle=False)
 
+            if dist.is_initialized():
+                dist.barrier()
             start_time = time.time()
+
             history = model.fit({k: v[base_batch_size:] for k, v in x.items()}, y[base_batch_size:], 
                                 batch_size=base_batch_size, epochs=5, steps_per_epoch=1, verbose=1 if rank == 0 else 0, shuffle=False)
+            
+            if dist.is_initialized():
+                dist.barrier()
             end_time = time.time()
 
             step_1_loss = float(history.history["loss"][0])
