@@ -233,11 +233,7 @@ def run_training(rank, world_size, layout_map, backend):
             step_5_loss = float(history.history["loss"][4])
             
             data_parallel_dimension = distribution.device_mesh.shape[0] # Yields 2 from your (2,2) mesh layout
-            
-            if backend == "jax":
-                true_global_batch = batch_size  # JAX interprets the input parameter directly as global size
-            else:
-                true_global_batch = batch_size * data_parallel_dimension # Torch multiplies local size by active data paths
+            true_global_batch = batch_size * data_parallel_dimension
             
             total_samples = epochs * 1 * true_global_batch
             throughput = total_samples / training_time
