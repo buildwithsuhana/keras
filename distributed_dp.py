@@ -51,7 +51,7 @@ def _run_jax(world_size):
         model.compile(optimizer=keras.optimizers.Adam(learning_rate=1e-5), loss="mse")
 
         np.random.seed(42)
-        base_batch_size = 4
+        base_batch_size = 32
         global_batch_size = base_batch_size * world_size
         
         num_samples = global_batch_size * 6 
@@ -67,13 +67,16 @@ def _run_jax(world_size):
         y_train = y_full[global_batch_size:]
 
         start_time = time.time()
+        epochs = 1
+        steps_per_epoch = 5
         history = model.fit(x_train, y_train, 
-                            batch_size=global_batch_size, epochs=1, steps_per_epoch=5, verbose=1, shuffle=False)
+                            batch_size=global_batch_size, epochs=epochs, steps_per_epoch=steps_per_epoch, verbose=1, shuffle=False)
         end_time = time.time()
 
         final_loss = float(history.history["loss"][0])
         training_time = end_time - start_time
-        throughput = (5 * global_batch_size) / training_time
+        total_samples = global_batch_size * steps_per_epoch * epochs
+        throughput = total_samples / training_time
         perplexity = float(np.exp(final_loss))
 
     results = {
@@ -86,7 +89,7 @@ def _run_jax(world_size):
 def _run_torch(rank, world_size, port):
     import os
     import torch
-    import torch.distributed as dist  # Added for process synchronization
+    import torch.distributed as dist
     os.environ["RANK"] = str(rank)
     os.environ["WORLD_SIZE"] = str(world_size)
     os.environ["LOCAL_RANK"] = str(rank)
@@ -119,7 +122,7 @@ def _run_torch(rank, world_size, port):
         model.compile(optimizer=keras.optimizers.Adam(learning_rate=1e-5), loss="mse")
 
         np.random.seed(42)
-        base_batch_size = 4
+        base_batch_size = 32
         global_batch_size = base_batch_size * world_size
         
         num_samples = global_batch_size * 6 
@@ -148,8 +151,10 @@ def _run_torch(rank, world_size, port):
                 dist.barrier()
             start_time = time.time()
 
+            epochs = 1
+            steps_per_epoch = 5
             history = model.fit({k: v[base_batch_size:] for k, v in x.items()}, y[base_batch_size:], 
-                                batch_size=base_batch_size, epochs=1, steps_per_epoch=5, verbose=1 if rank == 0 else 0, shuffle=False)
+                                batch_size=base_batch_size, epochs=epochs, steps_per_epoch=steps_per_epoch, verbose=1 if rank == 0 else 0, shuffle=False)
             
             if dist.is_initialized():
                 dist.barrier()
@@ -157,7 +162,8 @@ def _run_torch(rank, world_size, port):
 
             final_loss = float(history.history["loss"][0])
             training_time = end_time - start_time
-            throughput = (5 * global_batch_size) / training_time
+            total_samples = global_batch_size * steps_per_epoch * epochs
+            throughput = total_samples / training_time
             perplexity = float(np.exp(final_loss))
 
     if rank == 0:
