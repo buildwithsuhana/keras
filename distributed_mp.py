@@ -135,7 +135,7 @@ def run_training(rank, world_size, layout_map, backend):
             y = torch.from_numpy(y).to(device)
             gc.collect()
             
-            batch_size = 4
+            batch_size = 8
         else:
             x_full = {
                 "token_ids": np.random.randint(0, 50272, (80, 32)).astype("int32"),
