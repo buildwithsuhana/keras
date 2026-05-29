@@ -33,7 +33,7 @@ def run(backend):
     
     x, y = get_data()
     
-    batch_size = 8
+    batch_size = 4
     epochs = 5
     
     with cm:
