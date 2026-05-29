@@ -55,7 +55,7 @@ def _run_jax(world_size):
 
     mesh = keras.distribution.DeviceMesh(shape=(world_size,), axis_names=("batch",), devices=devices)
     distribution = keras.distribution.DataParallel(device_mesh=mesh, auto_shard_dataset=False)
-    
+
     with distribution.scope():
         model = keras_hub.models.OPTBackbone.from_preset("opt_125m_en", dropout=0.0)
         model.compile(optimizer=keras.optimizers.Adam(learning_rate=1e-5), loss="mse")
@@ -137,7 +137,7 @@ def _run_torch(rank, world_size, port):
         model.compile(optimizer=keras.optimizers.Adam(learning_rate=1e-5), loss="mse")
 
         np.random.seed(42)
-        base_batch_size = 32
+        base_batch_size = 16
         global_batch_size = base_batch_size * world_size
         
         num_samples = global_batch_size * 6 
