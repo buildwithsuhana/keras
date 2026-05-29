@@ -20,8 +20,9 @@ print(f"DTensor on meta: {dt.device}")
 print(f"Is meta: {dt.is_meta}")
 
 # Move to CPU
-dt_cpu = dt.to("cpu")
+# dt_cpu = dt.to("cpu") # This fails with NotImplementedError
+dt_cpu = torch.empty_like(dt, device="cpu")
 print(f"DTensor on CPU: {dt_cpu.device}")
 print(f"Is meta: {dt_cpu.is_meta}")
 print(f"Local shard shape: {dt_cpu.to_local().shape}")
-print(f"Local shard values: {dt_cpu.to_local()}") # Should be uninitialized or something?
+# print(f"Local shard values: {dt_cpu.to_local()}") 

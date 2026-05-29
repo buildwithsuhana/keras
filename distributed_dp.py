@@ -52,7 +52,7 @@ def _run_jax(world_size):
 
         np.random.seed(42)
         # SCALE LOCAL AND GLOBAL WORKLOAD
-        base_batch_size = 64
+        base_batch_size = 4
         global_batch_size = base_batch_size * world_size
         num_samples = global_batch_size * 10
         x_full = {
