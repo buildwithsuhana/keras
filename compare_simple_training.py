@@ -13,8 +13,7 @@ def compare():
     print("-" * 95)
 
     metrics = [
-        ("Step 1 Loss", "step_1_loss"),
-        ("Final Loss (Epoch 5)", "final_loss"),
+        ("Final Loss", "final_loss"),
         ("Perplexity", "perplexity"),
         ("Throughput (samples/sec)", "throughput"),
         # ("Training Time (sec)", "training_time"),
