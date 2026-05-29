@@ -28,11 +28,5 @@ def compare():
         if key not in ["throughput"] and diff > 1e-5:
             all_pass = False
 
-    print("\nSummary:")
-    if all_pass:
-        print("PASS: JAX and Torch simple results are numerically consistent.")
-    else:
-        print("FAIL: JAX and Torch simple results diverged beyond tolerance.")
-
 if __name__ == "__main__":
     compare()
