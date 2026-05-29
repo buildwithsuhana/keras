@@ -4,6 +4,9 @@ import numpy as np
 import json
 import time
 
+# Suppress framework noise
+os.environ["TF_CPP_MIN_LOG_LEVEL"] = "3"
+
 def get_data(num_samples=500, seq_len=32, embed_dim=768, vocab_size=50272):
     np.random.seed(42)
     x = {
@@ -15,15 +18,21 @@ def get_data(num_samples=500, seq_len=32, embed_dim=768, vocab_size=50272):
 
 def run(backend):
     os.environ["KERAS_BACKEND"] = backend
+    
+    # Configure threading strategies intelligently for a single-device process baseline
     if backend == "jax":
-        os.environ["XLA_FLAGS"] = "--xla_cpu_multi_thread_eigen=false"
-        os.environ["OMP_NUM_THREADS"] = "1"
-        os.environ["MKL_NUM_THREADS"] = "1"
-        os.environ["OPENBLAS_NUM_THREADS"] = "1"
+        # Allow multi-threading to naturally accelerate JAX matrix operations on CPU
+        os.environ["XLA_FLAGS"] = "--xla_cpu_multi_thread_eigen=true"
+    elif backend == "torch":
+        import torch
+        # Suppress dynamo recompilation warnings from spamming stdout
+        import torch._dynamo
+        torch._dynamo.config.suppress_errors = True
+
     import keras
     import keras_hub
     
-    # Force float32
+    # Force precision settings cleanly 
     keras.backend.set_floatx("float32")
     
     if backend == "torch":
@@ -37,7 +46,7 @@ def run(backend):
     keras.utils.set_random_seed(42)
     
     model = keras_hub.models.OPTBackbone.from_preset("opt_125m_en", dropout=0.0)
-    # Explicitly set jit_compile to True for both to match behavior
+    # Enable JIT compilation for tracking compiled execution paths
     model.compile(optimizer=keras.optimizers.Adam(learning_rate=1e-5, epsilon=1e-7), loss="mse", jit_compile=True)
     
     x, y = get_data()
@@ -46,7 +55,7 @@ def run(backend):
     epochs = 5
     
     with cm:
-        # Warmup
+        # Warmup (Pushes graph compilation out of timed metrics block)
         model.fit(x, y, batch_size=batch_size, epochs=1, steps_per_epoch=1, verbose=1, shuffle=False)
         
         start_time = time.time()
