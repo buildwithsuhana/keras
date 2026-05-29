@@ -110,17 +110,17 @@ def run_training(rank, world_size, layout_map, backend):
         if backend == "torch":
             indices = []
             for i in range(10):
-                base = i * 16
-                indices.extend([base, base + 1, base + 2, base + 3, base + 4, base + 5, base + 6, base + 7] if rank < 2 else [base + 8, base + 9, base + 10, base + 11, base + 12, base + 13, base + 14, base + 15])
+                base = i * 8
+                indices.extend([base, base + 1, base + 2, base + 3] if rank < 2 else [base + 4, base + 5, base + 6, base + 7])
             
-            full_token_ids = np.random.randint(0, 50272, (160, 32)).astype("int32")
-            full_padding_mask = np.ones((160, 32), dtype="int32")
-            full_y = np.random.normal(size=(160, 32, 768)).astype("float32")
+            full_token_ids = np.random.randint(0, 50272, (80, 32)).astype("int32")
+            full_padding_mask = np.ones((80, 32), dtype="int32")
+            full_y = np.random.normal(size=(80, 32, 768)).astype("float32")
 
             for i in range(10):
-                base = i * 16
-                full_token_ids[base+8:base+16] = full_token_ids[base:base+8]
-                full_y[base+8:base+16] = full_y[base:base+8]
+                base = i * 8
+                full_token_ids[base+4:base+8] = full_token_ids[base:base+4]
+                full_y[base+4:base+8] = full_y[base:base+4]
             
             x = {"token_ids": full_token_ids[indices], "padding_mask": full_padding_mask[indices]}
             y = full_y[indices]
@@ -135,20 +135,20 @@ def run_training(rank, world_size, layout_map, backend):
             y = torch.from_numpy(y).to(device)
             gc.collect()
             
-            batch_size = 8
+            batch_size = 4
         else:
             x_full = {
-                "token_ids": np.random.randint(0, 50272, (160, 32)).astype("int32"),
-                "padding_mask": np.ones((160, 32), dtype="int32")
+                "token_ids": np.random.randint(0, 50272, (80, 32)).astype("int32"),
+                "padding_mask": np.ones((80, 32), dtype="int32")
             }
-            y_full = np.random.normal(size=(160, 32, 768)).astype("float32")
+            y_full = np.random.normal(size=(80, 32, 768)).astype("float32")
 
             for i in range(10):
-                base = i * 16
-                x_full["token_ids"][base+8:base+16] = x_full["token_ids"][base:base+8]
-                y_full[base+8:base+16] = y_full[base:base+8]
+                base = i * 8
+                x_full["token_ids"][base+4:base+8] = x_full["token_ids"][base:base+4]
+                y_full[base+4:base+8] = y_full[base:base+4]
             x, y = x_full, y_full
-            batch_size = 16
+            batch_size = 8
 
         # Warmup
         model.fit(x, y, batch_size=batch_size, epochs=1, steps_per_epoch=1, verbose=1 if rank == 0 else 0, shuffle=False)
