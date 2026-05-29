@@ -110,15 +110,15 @@ def run_training(rank, world_size, layout_map, backend):
                 torch.distributed.barrier()
         
         np.random.seed(42)
-        global_batch_size = 64
+        global_batch_size = 32
         num_total_samples = global_batch_size * 10
         if backend == "torch":
             indices = []
             for i in range(10):
                 base = i * global_batch_size
-                # Rank 0, 1 -> data_shard 0 (samples 0-31)
-                # Rank 2, 3 -> data_shard 1 (samples 32-63)
-                indices.extend(np.arange(base, base + 32) if rank // 2 == 0 else np.arange(base + 32, base + 64))
+                # Rank 0, 1 -> data_shard 0 (samples 0-15)
+                # Rank 2, 3 -> data_shard 1 (samples 16-31)
+                indices.extend(np.arange(base, base + 16) if rank // 2 == 0 else np.arange(base + 16, base + 32))
             
             full_token_ids = np.random.randint(0, 50272, (num_total_samples, 32)).astype("int32")
             full_padding_mask = np.ones((num_total_samples, 32), dtype="int32")
@@ -126,9 +126,9 @@ def run_training(rank, world_size, layout_map, backend):
 
             for i in range(10):
                 base = i * global_batch_size
-                # Duplicate first 32 samples into second 32 samples for minimal divergence
-                full_token_ids[base+32:base+64] = full_token_ids[base:base+32]
-                full_y[base+32:base+64] = full_y[base:base+32]
+                # Duplicate first 16 samples into second 16 samples for minimal divergence
+                full_token_ids[base+16:base+32] = full_token_ids[base:base+16]
+                full_y[base+16:base+32] = full_y[base:base+16]
             
             x = {"token_ids": full_token_ids[indices], "padding_mask": full_padding_mask[indices]}
             y = full_y[indices]
@@ -143,7 +143,7 @@ def run_training(rank, world_size, layout_map, backend):
             y = torch.from_numpy(y).to(device)
             gc.collect()
             
-            batch_size = 32
+            batch_size = 16
         else:
             x_full = {
                 "token_ids": np.random.randint(0, 50272, (num_total_samples, 32)).astype("int32"),
@@ -153,10 +153,10 @@ def run_training(rank, world_size, layout_map, backend):
 
             for i in range(10):
                 base = i * global_batch_size
-                x_full["token_ids"][base+32:base+64] = x_full["token_ids"][base:base+32]
-                y_full[base+32:base+64] = y_full[base:base+32]
+                x_full["token_ids"][base+16:base+32] = x_full["token_ids"][base:base+16]
+                y_full[base+16:base+32] = y_full[base:base+16]
             x, y = x_full, y_full
-            batch_size = 64
+            batch_size = 32
 
         # Warmup
         warmup_history = model.fit({k: v[:batch_size] for k, v in x.items()}, 

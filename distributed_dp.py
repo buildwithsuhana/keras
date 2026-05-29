@@ -61,7 +61,7 @@ def _run_jax(world_size):
         model.compile(optimizer=keras.optimizers.Adam(learning_rate=1e-5), loss="mse")
 
         np.random.seed(42)
-        base_batch_size = 32
+        base_batch_size = 16
         global_batch_size = base_batch_size * world_size
         
         num_samples = global_batch_size * 6 
