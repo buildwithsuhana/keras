@@ -39,11 +39,6 @@ class MemoryTracker:
             self.thread.join()
         return float(self.peak_cpu)
 
-    def reset(self):
-        gc.collect()
-        self.base_memory = psutil.Process(os.getpid()).memory_info().rss
-        self.peak_cpu = self.base_memory
-
 def find_free_port():
     import socket
     for _ in range(5):
@@ -55,27 +50,21 @@ def find_free_port():
         except OSError:
             time.sleep(0.1)
             continue
-    return 29500 + np.random.randint(0, 1000) # Fallback
+    return 29500 + np.random.randint(0, 1000)
 
 def get_layout_map(mesh):
     import keras
     layout_map = keras.distribution.LayoutMap(mesh)
     
-    # Sharding strategy for all layers
     layout_map[".*token_embedding/embeddings"] = keras.distribution.TensorLayout(("model", None), mesh)
     layout_map[".*position_embedding/embeddings"] = keras.distribution.TensorLayout((None, "model"), mesh)
-    
-    # MHA: Q/K/V shard on heads, Attention Output sharded on input dim to match
     layout_map[".*self_attention/query/kernel"] = keras.distribution.TensorLayout((None, "model", None), mesh)
     layout_map[".*self_attention/key/kernel"] = keras.distribution.TensorLayout((None, "model", None), mesh)
     layout_map[".*self_attention/value/kernel"] = keras.distribution.TensorLayout((None, "model", None), mesh)
     layout_map[".*self_attention/attention_output/kernel"] = keras.distribution.TensorLayout(("model", None), mesh)
-    
-    # MLP: Intermediate shard on output dim, Output shard on input dim
     layout_map[".*feedforward_intermediate_dense/kernel"] = keras.distribution.TensorLayout((None, "model"), mesh)
     layout_map[".*feedforward_output_dense/kernel"] = keras.distribution.TensorLayout(("model", None), mesh)
     
-    # Biases
     layout_map[".*self_attention/query/bias"] = keras.distribution.TensorLayout(("model", None), mesh)
     layout_map[".*self_attention/key/bias"] = keras.distribution.TensorLayout(("model", None), mesh)
     layout_map[".*self_attention/value/bias"] = keras.distribution.TensorLayout(("model", None), mesh)
@@ -83,7 +72,6 @@ def get_layout_map(mesh):
     layout_map[".*feedforward_intermediate_dense/bias"] = keras.distribution.TensorLayout(("model",), mesh)
     layout_map[".*feedforward_output_dense/bias"] = keras.distribution.TensorLayout((None,), mesh)
     
-    # LayerNorm (replicated to avoid shape mismatch with normalized_shape)
     layout_map[".*layer_norm/gamma"] = keras.distribution.TensorLayout((None,), mesh)
     layout_map[".*layer_norm/beta"] = keras.distribution.TensorLayout((None,), mesh)
     return layout_map
@@ -104,18 +92,13 @@ def run_training(rank, world_size, layout_map, backend):
     )
     
     with distribution.scope():
-        # Staggered loading to avoid system-wide memory spike in multi-process mode
         if backend == "torch":
-            time.sleep(rank * 10) # Give previous ranks time to shard and GC
+            time.sleep(rank * 10)
             
         model = keras_hub.models.OPTBackbone.from_preset("opt_125m_en", dropout=0.0)
         gc.collect()
 
-        model.compile(
-            optimizer=keras.optimizers.Adam(learning_rate=1e-5), 
-            loss="mse", 
-            jit_compile=True
-        )
+        model.compile(optimizer=keras.optimizers.Adam(learning_rate=1e-5), loss="mse", jit_compile=True)
         gc.collect()
 
         if backend == "torch":
@@ -130,7 +113,6 @@ def run_training(rank, world_size, layout_map, backend):
                 base = i * 4
                 indices.extend([base, base + 1] if rank < 2 else [base + 2, base + 3])
             
-            # Optimization: only generate what we need or delete full arrays immediately
             full_token_ids = np.random.randint(0, 50272, (40, 32)).astype("int32")
             full_padding_mask = np.ones((40, 32), dtype="int32")
             full_y = np.random.normal(size=(40, 32, 768)).astype("float32")
@@ -140,16 +122,12 @@ def run_training(rank, world_size, layout_map, backend):
                 full_token_ids[base+2:base+4] = full_token_ids[base:base+2]
                 full_y[base+2:base+4] = full_y[base:base+2]
             
-            x = {
-                "token_ids": full_token_ids[indices],
-                "padding_mask": full_padding_mask[indices]
-            }
+            x = {"token_ids": full_token_ids[indices], "padding_mask": full_padding_mask[indices]}
             y = full_y[indices]
             
             del full_token_ids, full_padding_mask, full_y
             gc.collect()
             
-            # Explicitly convert to tensors on the correct device to avoid later replication
             import torch
             device_idx = int(os.environ.get("LOCAL_RANK", 0))
             device = torch.device(f"cuda:{device_idx}" if torch.cuda.is_available() else "cpu")
@@ -157,8 +135,7 @@ def run_training(rank, world_size, layout_map, backend):
             y = torch.from_numpy(y).to(device)
             gc.collect()
             
-            batch_size = 4
-            epochs = 5
+            batch_size = 2
         else:
             x_full = {
                 "token_ids": np.random.randint(0, 50272, (40, 32)).astype("int32"),
@@ -172,43 +149,36 @@ def run_training(rank, world_size, layout_map, backend):
                 y_full[base+2:base+4] = y_full[base:base+2]
             x, y = x_full, y_full
             batch_size = 4
-            epochs = 5
 
-        # Compilation warmup
+        # Warmup
         model.fit(x, y, batch_size=batch_size, epochs=1, steps_per_epoch=1, verbose=1 if rank == 0 else 0, shuffle=False)
         
-        # Start targeted tracking for throughput execution
         start_time = time.time()
+        epochs = 5
         history = model.fit(x, y, batch_size=batch_size, epochs=epochs, steps_per_epoch=1, verbose=1 if rank == 0 else 0, shuffle=False)
         training_time = time.time() - start_time
         
         peak_absolute = tracker.stop()
 
-        # Compare GPU memory specifically
+        # GPU Memory Tracking
         has_gpu = False
         if backend == "jax":
             import jax
-            device_peaks = []
-            for d in jax.local_devices():
-                if d.platform == 'gpu':
-                    has_gpu = True
-                    device_peaks.append(d.memory_stats()['peak_bytes_in_use'])
-            
-            peak_mem_mb = max(device_peaks) / (1024 * 1024) if device_peaks else 0
+            device_peaks = [d.memory_stats()['peak_bytes_in_use'] for d in jax.local_devices() if d.platform == 'gpu']
+            has_gpu = len(device_peaks) > 0
+            peak_mem_mb = max(device_peaks) / (1024 * 1024) if has_gpu else 0
         else:
             import torch
             if torch.cuda.is_available():
                 has_gpu = True
                 rank_peak_gpu = torch.cuda.max_memory_allocated()
-                device_idx = int(os.environ.get("LOCAL_RANK", 0))
-                device = torch.device(f"cuda:{device_idx}")
+                device = torch.device(f"cuda:{int(os.environ.get('LOCAL_RANK', 0))}")
                 m_tensor = torch.tensor([float(rank_peak_gpu)], device=device)
                 torch.distributed.all_reduce(m_tensor, op=torch.distributed.ReduceOp.MAX)
                 peak_mem_mb = m_tensor.item() / (1024 * 1024)
             else:
                 peak_mem_mb = 0
 
-        # Fallback to max of absolute CPU peaks if no GPU was found (for local testing)
         if not has_gpu:
             delta = float(peak_absolute - base_cpu)
             if backend == "torch":
@@ -223,19 +193,16 @@ def run_training(rank, world_size, layout_map, backend):
             if os.path.exists(f"results_{backend}.json"):
                 with open(f"results_{backend}.json", "r") as f:
                     try:
-                        old_results = json.load(f)
-                        old_peak = old_results.get("peak_memory_mb", 0.0)
+                        old_peak = json.load(f).get("peak_memory_mb", 0.0)
                         peak_mem_mb = max(old_peak, peak_mem_mb)
                     except json.JSONDecodeError:
                         pass
-                        
+            
             step_1_loss = float(history.history["loss"][0])
             step_5_loss = float(history.history["loss"][4])
             
-            data_parallel_dimension = distribution.device_mesh.shape[0] # Yields 2 from your (2,2) mesh layout
-            true_global_batch = batch_size * data_parallel_dimension
-            
-            total_samples = epochs * 1 * true_global_batch
+            global_batch_size = batch_size if backend == "jax" else batch_size * 2
+            total_samples = global_batch_size * 1 * epochs
             throughput = total_samples / training_time
 
             results = {
@@ -273,21 +240,16 @@ def run_backend(backend, world_size=4):
 def _run_jax(world_size):
     import keras
     keras.utils.set_random_seed(42)
-    
     devices = keras.distribution.list_devices()
     if len(devices) > world_size:
         devices = devices[:world_size]
     print(f"Using JAX devices: {devices}")
     
-    if len(devices) < world_size:
-        raise ValueError(f"Not enough devices found. Expected {world_size}, got {len(devices)}.")
-
     mesh = keras.distribution.DeviceMesh(shape=(2, 2), axis_names=("data", "model"), devices=devices)
     run_training(0, world_size, get_layout_map(mesh), "jax")
 
 def _run_torch(rank, world_size, port):
     import torch
-    
     torch.set_num_threads(1)
     torch.set_num_interop_threads(1)
 
@@ -306,8 +268,6 @@ def _run_torch(rank, world_size, port):
     import keras
     keras.utils.set_random_seed(42)
     keras.distribution.initialize()
-    
-    print(f"[Rank {rank}] Initialized. World size: {world_size}")
     
     devices = keras.distribution.list_devices(device_type)[:world_size]
     mesh = keras.distribution.DeviceMesh(shape=(2, 2), axis_names=("data", "model"), devices=devices)
