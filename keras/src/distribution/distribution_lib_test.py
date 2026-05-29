@@ -14,8 +14,8 @@ from keras.src.distribution import distribution_lib
 
 
 @pytest.mark.skipif(
-    backend.backend() != "jax",
-    reason="Only JAX has the backend to mock at the moment",
+    backend.backend() not in ("jax", "torch"),
+    reason="Only JAX and Torch have the backend to mock at the moment",
 )
 @mock.patch.object(
     backend_dlib,
@@ -134,6 +134,10 @@ class TensorLayoutTest(testing.TestCase):
             layout.device_mesh = self.mesh
 
 
+@pytest.mark.skipif(
+    backend.backend() not in ("jax", "torch"),
+    reason="Only JAX and Torch have the backend to mock at the moment",
+)
 class DistributionTest(testing.TestCase):
     def setUp(self):
         super().setUp()
@@ -165,8 +169,8 @@ class DistributionTest(testing.TestCase):
 
 
 @pytest.mark.skipif(
-    backend.backend() != "jax",
-    reason="Only JAX has the proper backend distribution lib",
+    backend.backend() not in ("jax", "torch"),
+    reason="Only JAX and Torch have the proper backend distribution lib",
 )
 class DataParallelDistributionTest(testing.TestCase):
     def setUp(self):
@@ -191,7 +195,7 @@ class DataParallelDistributionTest(testing.TestCase):
 
         self.assertFalse(distribution._is_multi_process)
         self.assertEqual(distribution._process_id, 0)
-        self.assertEqual(distribution._num_process, 1)
+        self.assertEqual(distribution.num_processes, 1)
 
     def test_create_with_devices(self):
         distribution = distribution_lib.DataParallel(devices=self.devices)
@@ -263,13 +267,17 @@ class DataParallelDistributionTest(testing.TestCase):
         distribution = distribution_lib.DataParallel(
             device_mesh=self.device_mesh
         )
-        distributed_dataset = distribution.distribute_dataset(dataset)
+        distributed_dataset = distribution.distribute_tf_dataset(dataset)
         self.assertIs(dataset, distributed_dataset)
+
+        # Test alias
+        distributed_dataset_alias = distribution.distribute_dataset(dataset)
+        self.assertIs(dataset, distributed_dataset_alias)
 
 
 @pytest.mark.skipif(
-    backend.backend() != "jax",
-    reason="Only JAX has the proper backend distribution lib",
+    backend.backend() not in ("jax", "torch"),
+    reason="Only JAX and Torch have the proper backend distribution lib",
 )
 class ModelParallelDistributionTest(testing.TestCase):
     def setUp(self):
@@ -355,7 +363,7 @@ class ModelParallelDistributionTest(testing.TestCase):
         distribution = distribution_lib.ModelParallel(
             layout_map=layout_map, batch_dim_name="data"
         )
-        distributed_dataset = distribution.distribute_dataset(dataset)
+        distributed_dataset = distribution.distribute_tf_dataset(dataset)
         self.assertIs(dataset, distributed_dataset)
 
     @mock.patch.object(backend_dlib, "num_processes", return_value=4)
@@ -524,12 +532,12 @@ class DataShardingIntegrationTest(testing.TestCase):
 
         # Simulate one process per local device to exercise process-group
         # sharding semantics without backend mocking.
-        distribution._num_process = num_devices
+        distribution._num_processes = num_devices
         distribution._is_multi_process = True
 
         for process_id in range(num_devices):
             distribution._process_id = process_id
-            ds = distribution.distribute_dataset(global_dataset)
+            ds = distribution.distribute_tf_dataset(global_dataset)
             shards.append(list(ds.unbatch().as_numpy_iterator()))
 
         processes_per_replica = num_devices // num_model_replicas

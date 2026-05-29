@@ -215,7 +215,7 @@ class TestTFDatasetAdapter(testing.TestCase):
         data_distribution = mock.Mock()
         # Mimic that there are 2 worker, and each of the worker will get batch
         # size of 8
-        data_distribution.distribute_dataset = mock.MagicMock(
+        data_distribution.distribute_tf_dataset = mock.MagicMock(
             return_value=base_ds.rebatch(8).shard(2, index=0)
         )
 

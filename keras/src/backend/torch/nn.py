@@ -1404,6 +1404,33 @@ def _can_use_flash_attention(
     return can_use_flash_attention(spda_params, False)
 
 
+def _scaled_dot_product_attention(
+    query, key, value, mask, is_causal, scale, flash_attention
+):
+    if flash_attention:
+        with torch.nn.attention.sdpa_kernel(
+            backends=[torch.nn.attention.SDPBackend.FLASH_ATTENTION],
+        ):
+            return torch.nn.functional.scaled_dot_product_attention(
+                query,
+                key,
+                value,
+                attn_mask=mask,
+                is_causal=is_causal,
+                scale=scale,
+            )
+    if mask is not None:
+        mask = mask.contiguous()
+    return torch.nn.functional.scaled_dot_product_attention(
+        query.contiguous(),
+        key.contiguous(),
+        value.contiguous(),
+        attn_mask=mask,
+        is_causal=is_causal,
+        scale=scale,
+    )
+
+
 def dot_product_attention(
     query,
     key,
@@ -1447,38 +1474,37 @@ def dot_product_attention(
     key = torch.transpose(key, axis0, axis1)
     value = torch.transpose(value, axis0, axis1)
 
+    is_dtensor = hasattr(query, "to_local")
+
     if flash_attention is None:
-        flash_attention = _can_use_flash_attention(
-            query, key, value, mask, is_causal
-        )
+        q_l = query.to_local() if is_dtensor else query
+        k_l = key.to_local() if is_dtensor else key
+        v_l = value.to_local() if is_dtensor else value
+        m_l = mask.to_local() if is_dtensor and mask is not None else mask
+        flash_attention = _can_use_flash_attention(q_l, k_l, v_l, m_l, is_causal)
     elif flash_attention is True:
-        # Use `raise_error=True` to provide more details if the inputs failed to
-        # use flash attention
-        _can_use_flash_attention(
-            query, key, value, mask, is_causal, raise_error=True
+        q_l = query.to_local() if is_dtensor else query
+        k_l = key.to_local() if is_dtensor else key
+        v_l = value.to_local() if is_dtensor else value
+        m_l = mask.to_local() if is_dtensor and mask is not None else mask
+        _can_use_flash_attention(q_l, k_l, v_l, m_l, is_causal, raise_error=True)
+
+    if is_dtensor:
+        from torch.distributed.tensor import DTensor
+
+        q_l = query.to_local()
+        k_l = key.to_local()
+        v_l = value.to_local()
+        m_l = mask.to_local() if mask is not None else None
+        output_local = _scaled_dot_product_attention(
+            q_l, k_l, v_l, m_l, is_causal, scale, flash_attention
         )
-    if flash_attention:
-        with torch.nn.attention.sdpa_kernel(
-            backends=[torch.nn.attention.SDPBackend.FLASH_ATTENTION],
-        ):
-            attention_output = torch.nn.functional.scaled_dot_product_attention(
-                query,
-                key,
-                value,
-                attn_mask=mask,
-                is_causal=is_causal,
-                scale=scale,
-            )
+        attention_output = DTensor.from_local(
+            output_local, query.device_mesh, query.placements
+        )
     else:
-        if mask is not None:
-            mask = mask.contiguous()
-        attention_output = torch.nn.functional.scaled_dot_product_attention(
-            query.contiguous(),
-            key.contiguous(),
-            value.contiguous(),
-            attn_mask=mask,
-            is_causal=is_causal,
-            scale=scale,
+        attention_output = _scaled_dot_product_attention(
+            query, key, value, mask, is_causal, scale, flash_attention
         )
     return torch.transpose(attention_output, axis1, axis0)
 

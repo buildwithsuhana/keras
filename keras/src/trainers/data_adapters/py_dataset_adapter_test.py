@@ -1,5 +1,6 @@
 import math
 import time
+from unittest.mock import patch
 
 import jax
 import numpy as np
@@ -10,6 +11,7 @@ from absl.testing import parameterized
 
 from keras.src import backend
 from keras.src import testing
+from keras.src.distribution import distribution_lib as dist_lib
 from keras.src.testing.test_utils import named_product
 from keras.src.trainers.data_adapters import py_dataset_adapter
 from keras.src.utils.rng_utils import set_random_seed
@@ -453,3 +455,60 @@ class PyDatasetAdapterTest(testing.TestCase):
         for index, _ in enumerate(NoLenDataset()):
             if index >= 10:
                 break
+
+    @parameterized.named_parameters(
+        ("dataparallel", "dp", 4, 1, 4, 1),
+        ("modelparallel", "mp", 8, 5, 8, 5),
+    )
+    @patch("keras.src.distribution.distribution_lib.distribution")
+    def test_sharding(
+        self,
+        dist_type,
+        world_size,
+        rank,
+        expected_num_processes,
+        expected_process_id,
+        mock_distribution,
+    ):
+        if backend.backend() not in ("torch", "jax"):
+            pytest.skip(
+                "Distribution support is only available for torch and jax."
+            )
+        from keras.src.backend import distribution_lib as backend_dist_lib
+
+        with (
+            patch.object(
+                backend_dist_lib, "num_processes", return_value=world_size
+            ),
+            patch.object(backend_dist_lib, "process_id", return_value=rank),
+        ):
+            if dist_type == "dp":
+                dist = dist_lib.DataParallel(devices=["cpu:0"] * world_size)
+            else:
+                device_mesh = dist_lib.DeviceMesh(
+                    shape=(world_size,),
+                    axis_names=("data",),
+                    devices=["cpu:0"] * world_size,
+                )
+                dist = dist_lib.ModelParallel(
+                    device_mesh=device_mesh,
+                    layout_map=dist_lib.LayoutMap(device_mesh),
+                    batch_dim_name="data",
+                )
+            dist.auto_shard_dataset = True
+            mock_distribution.return_value = dist
+
+            x = np.random.random((16, 4)).astype("float32")
+            y = np.random.random((16, 2)).astype("float32")
+            py_dataset = ExamplePyDataset(x, y, batch_size=2)
+            adapter = py_dataset_adapter.PyDatasetAdapter(
+                py_dataset, shuffle=False
+            )
+
+            self.assertEqual(adapter._num_processes, expected_num_processes)
+            self.assertEqual(adapter._process_id, expected_process_id)
+
+            it = adapter._get_iterator()
+            batches = list(it)
+            expected_num_batches = 8 // expected_num_processes
+            self.assertEqual(len(batches), expected_num_batches)

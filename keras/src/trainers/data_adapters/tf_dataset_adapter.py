@@ -31,7 +31,7 @@ class TFDatasetAdapter(DataAdapter):
                 make_class_weight_map_fn(class_weight)
             ).prefetch(tf.data.AUTOTUNE)
         if distribution is not None:
-            dataset = distribution.distribute_dataset(dataset)
+            dataset = distribution.distribute_tf_dataset(dataset)
         self._dataset = dataset
 
     def get_numpy_iterator(self):
