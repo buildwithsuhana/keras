@@ -43,9 +43,6 @@ def _run_jax(world_size):
         devices = devices[:world_size]
     print(f"Using JAX devices: {devices}")
 
-    if len(devices) < world_size:
-        raise ValueError(f"Not enough devices found. Expected {world_size}, got {len(devices)}.")
-
     mesh = keras.distribution.DeviceMesh(shape=(world_size,), axis_names=("batch",), devices=devices)
     distribution = keras.distribution.DataParallel(device_mesh=mesh, auto_shard_dataset=False)
     
@@ -54,7 +51,8 @@ def _run_jax(world_size):
         model.compile(optimizer=keras.optimizers.Adam(learning_rate=1e-5), loss="mse")
 
         np.random.seed(42)
-        base_batch_size = 4
+        # SCALE LOCAL AND GLOBAL WORKLOAD
+        base_batch_size = 64
         global_batch_size = base_batch_size * world_size
         num_samples = global_batch_size * 10
         x_full = {
@@ -63,7 +61,6 @@ def _run_jax(world_size):
         }
         y_full = np.random.normal(size=(num_samples, 32, 768)).astype("float32")
 
-        # Warmup
         model.fit(x_full, y_full, batch_size=global_batch_size, epochs=1, steps_per_epoch=1, verbose=1, shuffle=False)
 
         start_time = time.time()
@@ -112,8 +109,6 @@ def _run_torch(rank, world_size, port):
     keras.distribution.initialize()
 
     devices = keras.distribution.list_devices(device_type)[:world_size]
-    print(f"[Rank {rank}] Using devices: {devices}")
-
     mesh = keras.distribution.DeviceMesh(shape=(world_size,), axis_names=("batch",), devices=devices)
     distribution = keras.distribution.DataParallel(device_mesh=mesh, auto_shard_dataset=False)
     
@@ -122,7 +117,8 @@ def _run_torch(rank, world_size, port):
         model.compile(optimizer=keras.optimizers.Adam(learning_rate=1e-5), loss="mse")
 
         np.random.seed(42)
-        base_batch_size = 4
+        # SCALE LOCAL AND GLOBAL WORKLOAD
+        base_batch_size = 64
         global_batch_size = base_batch_size * world_size
         num_samples = global_batch_size * 10
         x_full = {

@@ -23,7 +23,7 @@ class MemoryTracker:
                     self.peak_cpu = mem
             except:
                 break
-            time.sleep(0.5)
+            time.sleep(0.1)
 
     def start(self):
         gc.collect()
@@ -91,11 +91,26 @@ def run_training(rank, world_size, layout_map, backend):
         auto_shard_dataset=False
     )
     
+    # Target heavily scaled dimensions to force compute weight over communication
+    seq_len = 128
+    embed_dim = 3072
+    
     with distribution.scope():
         if backend == "torch":
-            time.sleep(rank * 10)
+            time.sleep(rank * 5)
             
-        model = keras_hub.models.OPTBackbone.from_preset("opt_125m_en", dropout=0.0)
+        # Custom scaled configuration instead of standard preset
+        cfg = keras_hub.models.OPTBackbone.get_layout_map.__self__.from_preset("opt_125m_en", preprocessor=None)
+        # Manually alter configuration parameters for extreme compute strain
+        model = keras_hub.models.OPTBackbone(
+            vocabulary_size=50272,
+            num_layers=4,
+            num_heads=16,
+            hidden_dim=embed_dim,
+            intermediate_dim=embed_dim * 4,
+            max_sequence_length=seq_len,
+            dropout=0.0
+        )
         gc.collect()
 
         model.compile(optimizer=keras.optimizers.Adam(learning_rate=1e-5), loss="mse", jit_compile=True)
@@ -113,9 +128,9 @@ def run_training(rank, world_size, layout_map, backend):
                 base = i * 4
                 indices.extend([base, base + 1] if rank < 2 else [base + 2, base + 3])
             
-            full_token_ids = np.random.randint(0, 50272, (40, 32)).astype("int32")
-            full_padding_mask = np.ones((40, 32), dtype="int32")
-            full_y = np.random.normal(size=(40, 32, 768)).astype("float32")
+            full_token_ids = np.random.randint(0, 50272, (40, seq_len)).astype("int32")
+            full_padding_mask = np.ones((40, seq_len), dtype="int32")
+            full_y = np.random.normal(size=(40, seq_len, embed_dim)).astype("float32")
 
             for i in range(10):
                 base = i * 4
@@ -138,10 +153,10 @@ def run_training(rank, world_size, layout_map, backend):
             batch_size = 2
         else:
             x_full = {
-                "token_ids": np.random.randint(0, 50272, (40, 32)).astype("int32"),
-                "padding_mask": np.ones((40, 32), dtype="int32")
+                "token_ids": np.random.randint(0, 50272, (40, seq_len)).astype("int32"),
+                "padding_mask": np.ones((40, seq_len), dtype="int32")
             }
-            y_full = np.random.normal(size=(40, 32, 768)).astype("float32")
+            y_full = np.random.normal(size=(40, seq_len, embed_dim)).astype("float32")
 
             for i in range(10):
                 base = i * 4
@@ -160,7 +175,6 @@ def run_training(rank, world_size, layout_map, backend):
         
         peak_absolute = tracker.stop()
 
-        # GPU Memory Tracking
         has_gpu = False
         if backend == "jax":
             import jax

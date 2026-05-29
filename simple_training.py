@@ -4,7 +4,7 @@ import numpy as np
 import json
 import time
 
-def get_data(num_samples=40, seq_len=32, embed_dim=768, vocab_size=50272):
+def get_data(num_samples=500, seq_len=32, embed_dim=768, vocab_size=50272):
     np.random.seed(42)
     x = {
         "token_ids": np.random.randint(0, vocab_size, (num_samples, seq_len)).astype("int32"),
@@ -32,7 +32,9 @@ def run(backend):
     model.compile(optimizer=keras.optimizers.Adam(learning_rate=1e-5), loss="mse")
     
     x, y = get_data()
-    batch_size = 4
+    
+    # INCREASED BATCH SIZE FOR COMPUTE WEIGHT
+    batch_size = 64
     epochs = 5
     
     with cm:
