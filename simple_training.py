@@ -38,7 +38,7 @@ def run(backend):
     
     x, y = get_data()
     
-    batch_size = 2
+    batch_size = 32
     epochs = 1
     steps_per_epoch = 5
     
