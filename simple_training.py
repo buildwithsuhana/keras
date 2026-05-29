@@ -39,26 +39,25 @@ def run(backend):
     x, y = get_data()
     
     batch_size = 2
-    epochs = 5
+    epochs = 1
+    steps_per_epoch = 5
     
     with cm:
         # Warmup
         model.fit(x, y, batch_size=batch_size, epochs=1, steps_per_epoch=1, verbose=1, shuffle=False)
         
         start_time = time.time()
-        history = model.fit(x, y, batch_size=batch_size, epochs=epochs, steps_per_epoch=1, verbose=1, shuffle=False)
+        history = model.fit(x, y, batch_size=batch_size, epochs=epochs, steps_per_epoch=steps_per_epoch, verbose=1, shuffle=False)
         end_time = time.time()
     
     training_time = end_time - start_time
-    step_1_loss = float(history.history["loss"][0])
     final_loss = float(history.history["loss"][-1])
     
-    total_samples = batch_size * 1 * epochs
+    total_samples = batch_size * steps_per_epoch * epochs
     throughput = total_samples / training_time
     perplexity = float(np.exp(final_loss))
     
     results = {
-        "step_1_loss": step_1_loss,
         "final_loss": final_loss,
         "perplexity": perplexity,
         "throughput": throughput,

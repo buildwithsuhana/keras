@@ -68,18 +68,16 @@ def _run_jax(world_size):
 
         start_time = time.time()
         history = model.fit(x_train, y_train, 
-                            batch_size=global_batch_size, epochs=5, steps_per_epoch=1, verbose=1, shuffle=False)
+                            batch_size=global_batch_size, epochs=1, steps_per_epoch=5, verbose=1, shuffle=False)
         end_time = time.time()
 
-        step_1_loss = float(history.history["loss"][0])
-        step_5_loss = float(history.history["loss"][4])
+        final_loss = float(history.history["loss"][0])
         training_time = end_time - start_time
         throughput = (5 * global_batch_size) / training_time
-        perplexity = float(np.exp(step_5_loss))
+        perplexity = float(np.exp(final_loss))
 
     results = {
-        "step_1_loss": step_1_loss,
-        "step_5_loss": step_5_loss,
+        "final_loss": final_loss,
         "perplexity": perplexity,
         "throughput": throughput,
     }
@@ -151,22 +149,20 @@ def _run_torch(rank, world_size, port):
             start_time = time.time()
 
             history = model.fit({k: v[base_batch_size:] for k, v in x.items()}, y[base_batch_size:], 
-                                batch_size=base_batch_size, epochs=5, steps_per_epoch=1, verbose=1 if rank == 0 else 0, shuffle=False)
+                                batch_size=base_batch_size, epochs=1, steps_per_epoch=5, verbose=1 if rank == 0 else 0, shuffle=False)
             
             if dist.is_initialized():
                 dist.barrier()
             end_time = time.time()
 
-            step_1_loss = float(history.history["loss"][0])
-            step_5_loss = float(history.history["loss"][4])
+            final_loss = float(history.history["loss"][0])
             training_time = end_time - start_time
             throughput = (5 * global_batch_size) / training_time
-            perplexity = float(np.exp(step_5_loss))
+            perplexity = float(np.exp(final_loss))
 
     if rank == 0:
         results = {
-            "step_1_loss": step_1_loss,
-            "step_5_loss": step_5_loss,
+            "final_loss": final_loss,
             "perplexity": perplexity,
             "throughput": throughput,
         }
@@ -192,8 +188,7 @@ if __name__ == "__main__":
         print("-" * 95)
 
         metrics = [
-            ("Step 1 Loss", "step_1_loss"),
-            ("Step 5 Loss", "step_5_loss"),
+            ("Final Loss", "final_loss"),
             ("Perplexity", "perplexity"),
             ("Throughput (samples/sec)", "throughput"),
         ]

@@ -157,12 +157,13 @@ def run_training(rank, world_size, layout_map, backend):
         if backend == "torch" and torch.distributed.is_initialized():
             torch.distributed.barrier()
         start_time = time.time()
-        epochs = 5
+        epochs = 1
+        steps_per_epoch = 5
         
         x_train = {k: v[batch_size:] for k, v in x.items()} if backend == "torch" else x
         y_train = y[batch_size:] if backend == "torch" else y
 
-        history = model.fit(x_train, y_train, batch_size=batch_size, epochs=epochs, steps_per_epoch=1, verbose=1 if rank == 0 else 0, shuffle=False)
+        history = model.fit(x_train, y_train, batch_size=batch_size, epochs=epochs, steps_per_epoch=steps_per_epoch, verbose=1 if rank == 0 else 0, shuffle=False)
         
         if backend == "torch" and torch.distributed.is_initialized():
             torch.distributed.barrier()
@@ -208,17 +209,15 @@ def run_training(rank, world_size, layout_map, backend):
                     except json.JSONDecodeError:
                         pass
             
-            step_1_loss = float(history.history["loss"][0])
-            step_5_loss = float(history.history["loss"][4])
+            final_loss = float(history.history["loss"][0])
             
             global_batch_size = batch_size if backend == "jax" else batch_size * 2
-            total_samples = global_batch_size * 1 * epochs
+            total_samples = global_batch_size * steps_per_epoch * epochs
             throughput = total_samples / training_time
 
             results = {
-                "step_1_loss": step_1_loss,
-                "step_5_loss": step_5_loss,
-                "perplexity": float(np.exp(step_5_loss)),
+                "final_loss": final_loss,
+                "perplexity": float(np.exp(final_loss)),
                 "throughput": throughput,
                 "training_time": training_time,
                 "peak_memory_mb": peak_mem_mb,
