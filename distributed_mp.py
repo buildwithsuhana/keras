@@ -111,7 +111,7 @@ def run_training(rank, world_size, layout_map, backend):
             indices = []
             for i in range(10):
                 base = i * 8
-                indices.extend([base, base + 1, base + 2, base + 3] if rank % 2 == 0 else [base + 4, base + 5, base + 6, base + 7])
+                indices.extend([base, base + 1, base + 2, base + 3] if rank // 2 == 0 else [base + 4, base + 5, base + 6, base + 7])
             
             full_token_ids = np.random.randint(0, 50272, (80, 32)).astype("int32")
             full_padding_mask = np.ones((80, 32), dtype="int32")
@@ -150,8 +150,8 @@ def run_training(rank, world_size, layout_map, backend):
             x, y = x_full, y_full
             batch_size = 8
 
-        model.fit({k: v[:batch_size] for k, v in x.items()} if backend == "torch" else x, 
-                  y[:batch_size] if backend == "torch" else y, 
+        model.fit({k: v[:batch_size] for k, v in x.items()} if backend == "torch" else {k: v[:batch_size] for k, v in x.items()}, 
+                  y[:batch_size], 
                   batch_size=batch_size, epochs=1, steps_per_epoch=1, verbose=1 if rank == 0 else 0, shuffle=False)
         
         if backend == "torch" and torch.distributed.is_initialized():
@@ -160,8 +160,8 @@ def run_training(rank, world_size, layout_map, backend):
         epochs = 1
         steps_per_epoch = 5
         
-        x_train = {k: v[batch_size:] for k, v in x.items()} if backend == "torch" else x
-        y_train = y[batch_size:] if backend == "torch" else y
+        x_train = {k: v[batch_size:] for k, v in x.items()}
+        y_train = y[batch_size:]
 
         history = model.fit(x_train, y_train, batch_size=batch_size, epochs=epochs, steps_per_epoch=steps_per_epoch, verbose=1 if rank == 0 else 0, shuffle=False)
         
