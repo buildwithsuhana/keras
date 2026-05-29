@@ -154,10 +154,9 @@ def run_training(rank, world_size, layout_map, backend):
             for i in range(10):
                 base = i * global_batch_size
                 x_full["token_ids"][base+32:base+64] = x_full["token_ids"][base:base+32]
-                y_full[base+32:base+64] = y_full[base:base+4] # Typo in original code? base+4 vs base+32
-                # Correcting typo:
-                # y_full[base+32:base+64] = y_full[base:base+32]
-            # Actually let me use the exact indexing from distributed_mp which I know works.
+                y_full[base+32:base+64] = y_full[base:base+32]
+            x, y = x_full, y_full
+            batch_size = 64
 
         # Warmup
         warmup_history = model.fit({k: v[:batch_size] for k, v in x.items()}, 
