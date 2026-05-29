@@ -23,6 +23,9 @@ def run(backend):
     import keras
     import keras_hub
     
+    # Force float32
+    keras.backend.set_floatx("float32")
+    
     if backend == "torch":
         import torch
         from torch.nn.attention import sdpa_kernel
@@ -34,7 +37,8 @@ def run(backend):
     keras.utils.set_random_seed(42)
     
     model = keras_hub.models.OPTBackbone.from_preset("opt_125m_en", dropout=0.0)
-    model.compile(optimizer=keras.optimizers.Adam(learning_rate=1e-5), loss="mse")
+    # Explicitly set jit_compile to True for both to match behavior
+    model.compile(optimizer=keras.optimizers.Adam(learning_rate=1e-5, epsilon=1e-7), loss="mse", jit_compile=True)
     
     x, y = get_data()
     
