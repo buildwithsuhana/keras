@@ -215,7 +215,7 @@ def run_training(rank, world_size, layout_map, backend):
             step_1_loss = float(history.history["loss"][0])
             step_5_loss = float(history.history["loss"][4])
             
-            global_batch_size = batch_size if backend == "jax" else batch_size * 2
+            global_batch_size = batch_size * 2
             total_samples = global_batch_size * 1 * epochs
             throughput = total_samples / training_time
 

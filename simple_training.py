@@ -33,8 +33,7 @@ def run(backend):
     
     x, y = get_data()
     
-    # INCREASED BATCH SIZE FOR COMPUTE WEIGHT
-    batch_size = 64
+    batch_size = 2
     epochs = 5
     
     with cm:
