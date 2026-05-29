@@ -42,7 +42,7 @@ def run(backend):
     
     x, y = get_data()
     
-    batch_size = 32
+    batch_size = 16
     epochs = 5
     
     with cm:
