@@ -51,7 +51,7 @@ def _run_jax(world_size):
         model.compile(optimizer=keras.optimizers.Adam(learning_rate=1e-5), loss="mse")
 
         np.random.seed(42)
-        base_batch_size = 8
+        base_batch_size = 4
         global_batch_size = base_batch_size * world_size
         
         # Sized for exactly 6 steps total (1 Warmup step + 5 Training steps)
@@ -121,7 +121,7 @@ def _run_torch(rank, world_size, port):
         model.compile(optimizer=keras.optimizers.Adam(learning_rate=1e-5), loss="mse")
 
         np.random.seed(42)
-        base_batch_size = 8
+        base_batch_size = 4
         global_batch_size = base_batch_size * world_size
         
         # Sized for exactly 6 steps total (1 Warmup step + 5 Training steps)
