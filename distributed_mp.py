@@ -159,7 +159,6 @@ def run_training(rank, world_size, layout_map, backend):
             
             batch_size = 4
             epochs = 5
-            global_batch_size = batch_size * world_size
         else:
             x_full = {
                 "token_ids": np.random.randint(0, 50272, (40, 32)).astype("int32"),
@@ -174,15 +173,11 @@ def run_training(rank, world_size, layout_map, backend):
             x, y = x_full, y_full
             batch_size = 4
             epochs = 5
-            global_batch_size = batch_size * world_size
 
         # Compilation warmup
-        start_compilation = time.time()
         model.fit(x, y, batch_size=batch_size, epochs=1, steps_per_epoch=1, verbose=1 if rank == 0 else 0, shuffle=False)
-        compilation_time = time.time() - start_compilation
         
-        # We no longer reset here because we want to include sharded weights in the peak
-        
+        # Start targeted tracking for throughput execution
         start_time = time.time()
         history = model.fit(x, y, batch_size=batch_size, epochs=epochs, steps_per_epoch=1, verbose=1 if rank == 0 else 0, shuffle=False)
         training_time = time.time() - start_time
@@ -197,10 +192,8 @@ def run_training(rank, world_size, layout_map, backend):
             for d in jax.local_devices():
                 if d.platform == 'gpu':
                     has_gpu = True
-                    # Get peak for each device separately
                     device_peaks.append(d.memory_stats()['peak_bytes_in_use'])
             
-            # Use MAX to get the peak of the busiest device
             peak_mem_mb = max(device_peaks) / (1024 * 1024) if device_peaks else 0
         else:
             import torch
@@ -210,7 +203,6 @@ def run_training(rank, world_size, layout_map, backend):
                 device_idx = int(os.environ.get("LOCAL_RANK", 0))
                 device = torch.device(f"cuda:{device_idx}")
                 m_tensor = torch.tensor([float(rank_peak_gpu)], device=device)
-                # Use MAX to see the busiest GPU's peak
                 torch.distributed.all_reduce(m_tensor, op=torch.distributed.ReduceOp.MAX)
                 peak_mem_mb = m_tensor.item() / (1024 * 1024)
             else:
@@ -222,11 +214,9 @@ def run_training(rank, world_size, layout_map, backend):
             if backend == "torch":
                 import torch
                 p_tensor = torch.tensor([delta])
-                # Use MAX to see the busiest process's peak delta (Weights + States + Activations)
                 torch.distributed.all_reduce(p_tensor, op=torch.distributed.ReduceOp.MAX)
                 peak_mem_mb = p_tensor.item() / (1024 * 1024)
             else:
-                # Normalize JAX total delta by world_size to get per-device equivalent
                 peak_mem_mb = (delta / world_size) / (1024 * 1024)
 
         if rank == 0:
@@ -235,18 +225,28 @@ def run_training(rank, world_size, layout_map, backend):
                     try:
                         old_results = json.load(f)
                         old_peak = old_results.get("peak_memory_mb", 0.0)
-                        # Keep max for both to see the true high-water mark during training
                         peak_mem_mb = max(old_peak, peak_mem_mb)
                     except json.JSONDecodeError:
                         pass
+                        
             step_1_loss = float(history.history["loss"][0])
             step_5_loss = float(history.history["loss"][4])
+            
+            data_parallel_dimension = distribution.device_mesh.shape[0] # Yields 2 from your (2,2) mesh layout
+            
+            if backend == "jax":
+                true_global_batch = batch_size  # JAX interprets the input parameter directly as global size
+            else:
+                true_global_batch = batch_size * data_parallel_dimension # Torch multiplies local size by active data paths
+            
+            total_samples = epochs * 1 * true_global_batch
+            throughput = total_samples / training_time
+
             results = {
                 "step_1_loss": step_1_loss,
                 "step_5_loss": step_5_loss,
                 "perplexity": float(np.exp(step_5_loss)),
-                "throughput": (epochs * 1 * global_batch_size) / training_time,
-                "compilation_time": compilation_time,
+                "throughput": throughput,
                 "training_time": training_time,
                 "peak_memory_mb": peak_mem_mb,
             }
@@ -292,10 +292,8 @@ def _run_jax(world_size):
 def _run_torch(rank, world_size, port):
     import torch
     
-    # Minimize per-process thread overhead
     torch.set_num_threads(1)
     torch.set_num_interop_threads(1)
-
 
     os.environ.update({
         "RANK": str(rank),
@@ -324,4 +322,7 @@ def _run_torch(rank, world_size, port):
         torch.distributed.destroy_process_group()
 
 if __name__ == "__main__":
+    if len(sys.argv) < 2:
+        print("Usage: python model_parallel_experiment.py <backend>")
+        sys.exit(1)
     run_backend(sys.argv[1])
