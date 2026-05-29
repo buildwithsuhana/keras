@@ -5,6 +5,7 @@ import json
 import time
 import subprocess
 
+# Suppress framework noise
 os.environ["TF_CPP_MIN_LOG_LEVEL"] = "3"
 
 def find_free_port():
@@ -16,6 +17,15 @@ def find_free_port():
 def run_backend(backend, world_size=2):
     os.environ["KERAS_BACKEND"] = backend
     if backend == "jax":
+        os.environ["XLA_FLAGS"] = (
+            f"--xla_force_host_platform_device_count={world_size} "
+            "--xla_cpu_multi_thread_eigen=false "
+            "intra_op_parallelism_threads=1"
+        )
+        os.environ["OMP_NUM_THREADS"] = "1"
+        os.environ["MKL_NUM_THREADS"] = "1"
+        os.environ["OPENBLAS_NUM_THREADS"] = "1"
+        
         num_gpus = 0
         try:
             import torch
@@ -24,9 +34,9 @@ def run_backend(backend, world_size=2):
             pass
 
         if num_gpus < world_size:
-            os.environ["XLA_FLAGS"] = f"--xla_force_host_platform_device_count={world_size}"
             os.environ["JAX_PLATFORMS"] = "cpu"
         _run_jax(world_size)
+        
     elif backend == "torch":
         import torch
         port = str(find_free_port())
@@ -61,6 +71,7 @@ def _run_jax(world_size):
         }
         y_full = np.random.normal(size=(num_samples, 32, 768)).astype("float32")
 
+        # Warmup Step
         model.fit(x_full, y_full, batch_size=global_batch_size, epochs=1, steps_per_epoch=1, verbose=1, shuffle=False)
 
         x_train = {k: v[global_batch_size:] for k, v in x_full.items()}
@@ -90,6 +101,10 @@ def _run_torch(rank, world_size, port):
     import os
     import torch
     import torch.distributed as dist
+    
+    torch.set_num_threads(1)
+    torch.set_num_interop_threads(1)
+    
     os.environ["RANK"] = str(rank)
     os.environ["WORLD_SIZE"] = str(world_size)
     os.environ["LOCAL_RANK"] = str(rank)
