@@ -51,10 +51,11 @@ def _run_jax(world_size):
         model.compile(optimizer=keras.optimizers.Adam(learning_rate=1e-5), loss="mse")
 
         np.random.seed(42)
-        # SCALE LOCAL AND GLOBAL WORKLOAD
         base_batch_size = 4
         global_batch_size = base_batch_size * world_size
-        num_samples = global_batch_size * 10
+        
+        # Sized for exactly 6 steps total (1 Warmup step + 5 Training steps)
+        num_samples = global_batch_size * 6 
         x_full = {
             "token_ids": np.random.randint(0, 50272, (num_samples, 32)).astype("int32"),
             "padding_mask": np.ones((num_samples, 32), dtype="int32")
@@ -63,9 +64,10 @@ def _run_jax(world_size):
 
         model.fit(x_full, y_full, batch_size=global_batch_size, epochs=1, steps_per_epoch=1, verbose=1, shuffle=False)
 
-        start_time = time.time()
         x_train = {k: v[global_batch_size:] for k, v in x_full.items()}
         y_train = y_full[global_batch_size:]
+
+        start_time = time.time()
         history = model.fit(x_train, y_train, 
                             batch_size=global_batch_size, epochs=5, steps_per_epoch=1, verbose=1, shuffle=False)
         end_time = time.time()
@@ -109,6 +111,8 @@ def _run_torch(rank, world_size, port):
     keras.distribution.initialize()
 
     devices = keras.distribution.list_devices(device_type)[:world_size]
+    print(f"[Rank {rank}] Using devices: {devices}")
+
     mesh = keras.distribution.DeviceMesh(shape=(world_size,), axis_names=("batch",), devices=devices)
     distribution = keras.distribution.DataParallel(device_mesh=mesh, auto_shard_dataset=False)
     
@@ -119,7 +123,9 @@ def _run_torch(rank, world_size, port):
         np.random.seed(42)
         base_batch_size = 4
         global_batch_size = base_batch_size * world_size
-        num_samples = global_batch_size * 10
+        
+        # Sized for exactly 6 steps total (1 Warmup step + 5 Training steps)
+        num_samples = global_batch_size * 6 
         x_full = {
             "token_ids": np.random.randint(0, 50272, (num_samples, 32)).astype("int32"),
             "padding_mask": np.ones((num_samples, 32), dtype="int32")
