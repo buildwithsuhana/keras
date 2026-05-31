@@ -117,37 +117,6 @@ class Variable(KerasVariable):
             else:
                 self._layout = tensor_layout
 
-    def _initialize_with_initializer(self, initializer):
-        self._initialize_layout()
-        if self._layout is not None:
-            # Use meta tensor to avoid OOM
-            with device_scope("meta"):
-                value = self._convert_to_tensor(
-                    initializer(self._shape, dtype=self._dtype)
-                )
-            self._initialize(value)
-
-            # Now self._value is a meta DTensor Parameter.
-            # We need to initialize it.
-            if self._value.is_meta:
-                mesh = self._value.device_mesh
-                placements = self._value.placements
-                shard_shape = self._value.to_local().shape
-
-                device = torch_dist_lib.to_backend_device(None)
-                with device_scope(device):
-                    # Here we call the initializer with the shard_shape.
-                    # This avoids creating the full tensor in RAM/GPU.
-                    shard_value = initializer(shard_shape, dtype=self._dtype)
-                    shard_value = self._convert_to_tensor(shard_value)
-
-                # Replace the meta DTensor with a real one.
-                self._value.data = DTensor.from_local(
-                    shard_value, mesh, placements
-                )
-        else:
-            super()._initialize_with_initializer(initializer)
-
     def _initialize(self, value):
         self._shape = self._validate_shape(value.shape)
         self._initialize_layout()
