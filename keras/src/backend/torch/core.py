@@ -163,6 +163,8 @@ class Variable(KerasVariable):
                 requires_grad=self.trainable
                 and (torch.is_floating_point(value) or torch.is_complex(value)),
             )
+            # Try to free original value if it was a large tensor
+            del value
         else:
             if isinstance(value, torch.nn.Parameter):
                 self._value = value
@@ -190,6 +192,7 @@ class Variable(KerasVariable):
                         or torch.is_complex(param_value)
                     ),
                 )
+                del param_value
 
     def _direct_assign(self, value):
         value = convert_to_tensor(value, dtype=self._dtype)
@@ -201,6 +204,7 @@ class Variable(KerasVariable):
                 value = value.to_local()
         with torch.no_grad():
             self._value.copy_(value)
+        del value
 
     def _convert_to_tensor(self, value, dtype=None):
         return convert_to_tensor(value, dtype=dtype)
@@ -276,6 +280,22 @@ class Variable(KerasVariable):
             return super().__eq__(other)
         except Exception:
             return False
+
+    def __repr__(self):
+        if hasattr(self, "_value") and self._value is not None:
+            if isinstance(self._value, DTensor):
+                return (
+                    f"<Variable path={self.path}, shape={self.shape}, "
+                    f"dtype={self.dtype}, device_mesh={self._value.device_mesh}, "
+                    f"placements={self._value.placements}>"
+                )
+        try:
+            return super().__repr__()
+        except:
+            return (
+                f"<Variable path={self.path}, shape={self.shape}, "
+                f"dtype={self.dtype}>"
+            )
 
 
 def convert_to_tensor(x, dtype=None, sparse=None, ragged=None, layout="auto"):
@@ -368,6 +388,10 @@ def convert_to_numpy(x):
     def transform(x):
         if is_tensor(x):
             if isinstance(x, DTensor):
+                if torch_dist_lib.num_processes() > 1:
+                    # In a distributed context, avoid materializing the full
+                    # tensor as it leads to OOM. Return the local shard instead.
+                    return np.array(x.to_local().cpu())
                 x = x.full_tensor()
             if x.requires_grad:
                 x = x.detach()
