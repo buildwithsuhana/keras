@@ -112,51 +112,40 @@ def run_training(rank, world_size, layout_map, backend):
         np.random.seed(42)
         global_batch_size = 32
         num_total_samples = global_batch_size * 10
+        
+        # Generate full data on rank 0 and broadcast, or just ensure identical seeds
+        full_token_ids = np.random.randint(0, 50272, (num_total_samples, 32)).astype("int32")
+        full_padding_mask = np.ones((num_total_samples, 32), dtype="int32")
+        full_y = np.random.normal(size=(num_total_samples, 32, 768)).astype("float32")
+
         if backend == "torch":
+            # For Torch ModelParallel, we want to ensure that if a sample is 
+            # replicated, it is truly identical.
+            # Ranks 0, 1 -> data shard 0
+            # Ranks 2, 3 -> data shard 1
             indices = []
             for i in range(10):
                 base = i * global_batch_size
-                # Rank 0, 1 -> data_shard 0 (samples 0-15)
-                # Rank 2, 3 -> data_shard 1 (samples 16-31)
-                indices.extend(np.arange(base, base + 16) if rank // 2 == 0 else np.arange(base + 16, base + 32))
-            
-            full_token_ids = np.random.randint(0, 50272, (num_total_samples, 32)).astype("int32")
-            full_padding_mask = np.ones((num_total_samples, 32), dtype="int32")
-            full_y = np.random.normal(size=(num_total_samples, 32, 768)).astype("float32")
-
-            for i in range(10):
-                base = i * global_batch_size
-                # Duplicate first 16 samples into second 16 samples for minimal divergence
-                full_token_ids[base+16:base+32] = full_token_ids[base:base+16]
-                full_y[base+16:base+32] = full_y[base:base+16]
+                if rank // 2 == 0:
+                    indices.extend(np.arange(base, base + 16))
+                else:
+                    indices.extend(np.arange(base + 16, base + 32))
             
             x = {"token_ids": full_token_ids[indices], "padding_mask": full_padding_mask[indices]}
             y = full_y[indices]
-            
-            del full_token_ids, full_padding_mask, full_y
-            gc.collect()
             
             import torch
             device_idx = int(os.environ.get("LOCAL_RANK", 0))
             device = torch.device(f"cuda:{device_idx}" if torch.cuda.is_available() else "cpu")
             x = {k: torch.from_numpy(v).to(device) for k, v in x.items()}
             y = torch.from_numpy(y).to(device)
-            gc.collect()
-            
             batch_size = 16
         else:
-            x_full = {
-                "token_ids": np.random.randint(0, 50272, (num_total_samples, 32)).astype("int32"),
-                "padding_mask": np.ones((num_total_samples, 32), dtype="int32")
-            }
-            y_full = np.random.normal(size=(num_total_samples, 32, 768)).astype("float32")
-
-            for i in range(10):
-                base = i * global_batch_size
-                x_full["token_ids"][base+16:base+32] = x_full["token_ids"][base:base+16]
-                y_full[base+16:base+32] = y_full[base:base+16]
-            x, y = x_full, y_full
+            x, y = {"token_ids": full_token_ids, "padding_mask": full_padding_mask}, full_y
             batch_size = 32
+
+        del full_token_ids, full_padding_mask, full_y
+        gc.collect()
 
         # Warmup
         warmup_history = model.fit({k: v[:batch_size] for k, v in x.items()}, 

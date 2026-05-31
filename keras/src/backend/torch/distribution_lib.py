@@ -273,6 +273,8 @@ def distribute_data_input(tensor, layout, batch_dim_name):
         layout = _to_backend_layout(layout)
 
     from torch.distributed.tensor import DTensor
+    from torch.distributed.tensor import Replicate
+    from torch.distributed.tensor import Shard
 
     if isinstance(tensor, DTensor):
         return tensor
@@ -285,8 +287,23 @@ def distribute_data_input(tensor, layout, batch_dim_name):
     if tensor.device.type == "meta":
         return tensor
 
+    # For data inputs in ModelParallel, we typically have a shard of the
+    # global batch on each process. We want to wrap this local shard
+    # as a DTensor that is sharded on the batch dimension.
+    
+    # If batch_dim_name is in mesh axis names, it means the data is 
+    # distributed across that mesh dimension.
+    placements = []
+    for mesh_dim_name in layout.device_mesh.mesh_dim_names:
+        if mesh_dim_name == batch_dim_name:
+            # Data is sharded on the first dimension (batch dimension)
+            # across this mesh dimension.
+            placements.append(Shard(0))
+        else:
+            placements.append(Replicate())
+    
     return DTensor.from_local(
-        tensor, device_mesh=layout.device_mesh, placements=layout.placements
+        tensor, device_mesh=layout.device_mesh, placements=tuple(placements)
     )
 
 
