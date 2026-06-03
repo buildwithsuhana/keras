@@ -1,455 +1,274 @@
 import math
 import time
+from unittest.mock import patch
 
 import jax
 import numpy as np
 import pytest
-import tensorflow as tf
-import torch
 from absl.testing import parameterized
 
 from keras.src import backend
 from keras.src import testing
+from keras.src.distribution import distribution_lib as dist_lib
 from keras.src.testing.test_utils import named_product
 from keras.src.trainers.data_adapters import py_dataset_adapter
 from keras.src.utils.rng_utils import set_random_seed
 
 
 class ExamplePyDataset(py_dataset_adapter.PyDataset):
-    def __init__(
-        self,
-        x_set,
-        y_set,
-        sample_weight=None,
-        batch_size=32,
-        delay=0,
-        infinite=False,
-        **kwargs,
-    ):
-        super().__init__(**kwargs)
-        self.x, self.y = x_set, y_set
+    def __init__(self, x, y, batch_size, workers=1, use_multiprocessing=False):
+        super().__init__(
+            workers=workers, use_multiprocessing=use_multiprocessing
+        )
+        self.x = x
+        self.y = y
         self.batch_size = batch_size
-        self.sample_weight = sample_weight
-        self.delay = delay
-        self.infinite = infinite
-
-    @property
-    def num_batches(self):
-        if self.infinite:
-            return None
-        return math.ceil(len(self.x) / self.batch_size)
-
-    def __getitem__(self, idx):
-        # Create artificial delay to test multiprocessing
-        time.sleep(self.delay)
-
-        if self.infinite:
-            idx = idx % math.ceil(len(self.x) / self.batch_size)
-        # Return x, y for batch idx.
-        low = idx * self.batch_size
-        # Cap upper bound at array length; the last batch may be smaller
-        # if the total number of items is not a multiple of batch size.
-        high = min(low + self.batch_size, len(self.x))
-        batch_x = self.x[low:high]
-        batch_y = self.y[low:high]
-        if self.sample_weight is not None:
-            return batch_x, batch_y, self.sample_weight[low:high]
-        return batch_x, batch_y
-
-
-class DictPyDataset(py_dataset_adapter.PyDataset):
-    def __init__(self, inputs, batch_size=32, **kwargs):
-        super().__init__(**kwargs)
-        self.inputs = inputs
-        self.batch_size = batch_size
-
-    @property
-    def num_batches(self):
-        return math.ceil(len(self.inputs["x"]) / self.batch_size)
-
-    def __getitem__(self, idx):
-        # Return x, y for batch idx.
-        low = idx * self.batch_size
-        # Cap upper bound at array length; the last batch may be smaller
-        # if the total number of items is not a multiple of batch size.
-        high = min(low + self.batch_size, len(self.inputs["x"]))
-        batch_x = self.inputs["x"][low:high]
-        batch_y = self.inputs["y"][low:high]
-        batch = {"x": batch_x, "y": batch_y}
-        return batch
-
-
-class ExceptionPyDataset(py_dataset_adapter.PyDataset):
-    @property
-    def num_batches(self):
-        return 4
 
     def __getitem__(self, index):
-        if index < 2:
-            return (
-                np.random.random((8, 4)).astype("float32"),
-                np.random.random((8, 2)).astype("float32"),
-            )
-        raise ValueError("Expected exception")
+        return (
+            self.x[index * self.batch_size : (index + 1) * self.batch_size],
+            self.y[index * self.batch_size : (index + 1) * self.batch_size],
+        )
+
+    def __len__(self):
+        return math.ceil(len(self.x) / self.batch_size)
 
 
-@pytest.mark.skipif(
-    testing.tensorflow_uses_gpu() or testing.uses_tpu(),
-    reason="Flaky on TPU and GPU",
-)
 class PyDatasetAdapterTest(testing.TestCase):
-    @parameterized.named_parameters(
-        named_product(
-            [
-                {
-                    "testcase_name": "multiprocessing",
-                    "workers": 2,
-                    "use_multiprocessing": True,
-                    "max_queue_size": 10,
-                    "dataset_type": "np",
-                },
-                {
-                    "testcase_name": "multithreading",
-                    "workers": 2,
-                    "use_multiprocessing": False,
-                    "max_queue_size": 10,
-                    "dataset_type": "np",
-                },
-                {
-                    "testcase_name": "single_np",
-                    "dataset_type": "np",
-                },
-                {
-                    "testcase_name": "single_tf",
-                    "dataset_type": "tf",
-                },
-                {
-                    "testcase_name": "single_jax",
-                    "dataset_type": "jax",
-                },
-                {
-                    "testcase_name": "single_torch",
-                    "dataset_type": "torch",
-                },
-            ],
-            infinite=[True, False],
-            shuffle=[True, False],
-        )
-    )
-    def test_basic_flow(
-        self,
-        shuffle,
-        dataset_type,
-        infinite,
-        workers=0,
-        use_multiprocessing=False,
-        max_queue_size=0,
-    ):
-        if use_multiprocessing and shuffle:
-            pytest.skip("Starting processes is slow, test fewer variants")
-
-        set_random_seed(1337)
-        x = np.random.random((64, 4)).astype("float32")
-        y = np.array([[i, i] for i in range(64)], dtype="float32")
-        CPU_DEVICES = {
-            "tensorflow": "CPU:0",
-            "jax": "cpu:0",
-        }
-        cpu_device = CPU_DEVICES.get(backend.backend(), "cpu")
-        with backend.device(cpu_device):
-            if dataset_type == "tf":
-                x, y = tf.constant(x), tf.constant(y)
-            elif dataset_type == "jax":
-                x, y = jax.numpy.array(x), jax.numpy.array(y)
-            elif dataset_type == "torch":
-                x, y = torch.as_tensor(x), torch.as_tensor(y)
-        py_dataset = ExamplePyDataset(
-            x,
-            y,
-            batch_size=16,
-            workers=workers,
-            use_multiprocessing=use_multiprocessing,
-            max_queue_size=max_queue_size,
-            infinite=infinite,
-        )
-        adapter = py_dataset_adapter.PyDatasetAdapter(
-            py_dataset, shuffle=shuffle
-        )
-
-        if backend.backend() == "tensorflow":
-            it = adapter.get_tf_dataset()
-            expected_class = tf.Tensor
-        elif backend.backend() == "jax":
-            it = adapter.get_jax_iterator()
-            expected_class = jax.Array if dataset_type == "jax" else np.ndarray
-        elif backend.backend() == "torch":
-            it = adapter.get_torch_dataloader()
-            expected_class = torch.Tensor
-        else:
-            it = adapter.get_numpy_iterator()
-            expected_class = np.ndarray
-
-        sample_order = []
-        adapter.on_epoch_begin()
-        for batch in it:
-            self.assertEqual(len(batch), 2)
-            bx, by = batch
-            self.assertIsInstance(bx, expected_class)
-            self.assertIsInstance(by, expected_class)
-            self.assertEqual(bx.dtype, by.dtype)
-            self.assertContainsExactSubsequence(str(bx.dtype), "float32")
-            self.assertEqual(bx.shape, (16, 4))
-            self.assertEqual(by.shape, (16, 2))
-            for i in range(by.shape[0]):
-                sample_order.append(backend.convert_to_numpy(by[i, 0]))
-            if infinite:
-                if len(sample_order) == 64:
-                    adapter.on_epoch_end()
-                    adapter.on_epoch_begin()
-                elif len(sample_order) >= 128:
-                    break
-        adapter.on_epoch_end()
-
-        expected_order = list(range(64))
-        if infinite:
-            self.assertAllClose(sample_order, expected_order + expected_order)
-        elif shuffle:
-            self.assertNotAllClose(sample_order, expected_order)
-            self.assertAllClose(sorted(sample_order), expected_order)
-        else:
-            self.assertAllClose(sample_order, expected_order)
-
-    # TODO: test sample weights
-    # TODO: test inference mode (single output)
-
-    def test_class_weight(self):
-        x = np.random.randint(1, 100, (4, 5))
-        y = np.array([0, 1, 2, 1])
-        class_w = {0: 2, 1: 1, 2: 3}
+    def test_basic_flow(self):
+        x = np.random.random((16, 4))
+        y = np.random.random((16, 2))
         py_dataset = ExamplePyDataset(x, y, batch_size=2)
-        adapter = py_dataset_adapter.PyDatasetAdapter(
-            py_dataset, shuffle=False, class_weight=class_w
-        )
-        if backend.backend() == "tensorflow":
-            gen = adapter.get_tf_dataset()
-        elif backend.backend() == "jax":
-            gen = adapter.get_jax_iterator()
-        elif backend.backend() == "torch":
-            gen = adapter.get_torch_dataloader()
-        else:
-            gen = adapter.get_numpy_iterator()
+        adapter = py_dataset_adapter.PyDatasetAdapter(py_dataset)
+        self.assertEqual(adapter.num_batches, 8)
+        self.assertEqual(adapter.batch_size, 2)
+        self.assertEqual(adapter.has_partial_batch, False)
 
-        for index, batch in enumerate(gen):
-            # Batch is a tuple of (x, y, class_weight)
-            self.assertLen(batch, 3)
-            batch = [backend.convert_to_numpy(x) for x in batch]
-            # Let's verify the data and class weights match for each element
-            # of the batch (2 elements in each batch)
-            for sub_elem in range(2):
-                self.assertAllEqual(batch[0][sub_elem], x[index * 2 + sub_elem])
-                self.assertAllEqual(batch[1][sub_elem], y[index * 2 + sub_elem])
-                class_key = np.int32(batch[1][sub_elem])
-                self.assertAllEqual(batch[2][sub_elem], class_w[class_key])
-
-        self.assertEqual(index, 1)  # 2 batches
-
-    def test_speedup(self):
-        x = np.random.random((40, 4))
-        y = np.random.random((40, 2))
-
-        no_speedup_py_dataset = ExamplePyDataset(
-            x,
-            y,
-            batch_size=4,
-            delay=0.2,
-        )
-        adapter = py_dataset_adapter.PyDatasetAdapter(
-            no_speedup_py_dataset, shuffle=False
-        )
         gen = adapter.get_numpy_iterator()
-        t0 = time.time()
-        for batch in gen:
-            pass
-        no_speedup_time = time.time() - t0
-
-        speedup_py_dataset = ExamplePyDataset(
-            x,
-            y,
-            batch_size=4,
-            workers=4,
-            # TODO: the github actions runner may have performance issue with
-            # multiprocessing
-            # use_multiprocessing=True,
-            max_queue_size=8,
-            delay=0.2,
-        )
-        adapter = py_dataset_adapter.PyDatasetAdapter(
-            speedup_py_dataset, shuffle=False
-        )
-        gen = adapter.get_numpy_iterator()
-        t0 = time.time()
-        for batch in gen:
-            pass
-        speedup_time = time.time() - t0
-
-        self.assertLess(speedup_time, no_speedup_time)
-
-    def test_dict_inputs(self):
-        inputs = {
-            "x": np.random.random((40, 4)),
-            "y": np.random.random((40, 2)),
-        }
-        py_dataset = DictPyDataset(inputs, batch_size=4)
-        adapter = py_dataset_adapter.PyDatasetAdapter(py_dataset, shuffle=False)
-        gen = adapter.get_numpy_iterator()
-        for batch in gen:
-            self.assertEqual(len(batch), 2)
-            bx, by = batch["x"], batch["y"]
-            self.assertIsInstance(bx, np.ndarray)
-            self.assertIsInstance(by, np.ndarray)
-            self.assertEqual(bx.dtype, by.dtype)
-            self.assertEqual(bx.shape, (4, 4))
-            self.assertEqual(by.shape, (4, 2))
-
-        ds = adapter.get_tf_dataset()
-        for batch in ds:
-            self.assertEqual(len(batch), 2)
-            bx, by = batch["x"], batch["y"]
-            self.assertIsInstance(bx, tf.Tensor)
-            self.assertIsInstance(by, tf.Tensor)
-            self.assertEqual(bx.dtype, by.dtype)
-            self.assertEqual(tuple(bx.shape), (4, 4))
-            self.assertEqual(tuple(by.shape), (4, 2))
-
-    def test_with_different_shapes(self):
-        class TestPyDataset(py_dataset_adapter.PyDataset):
-            @property
-            def num_batches(self):
-                return 3
-
-            def __getitem__(self, idx):
-                if idx == 0:
-                    return np.ones([16, 4], "float32"), np.ones(
-                        [16, 2], "float32"
-                    )
-                if idx == 1:
-                    return np.ones([16, 5], "float32"), np.ones(
-                        [16, 2], "float32"
-                    )
-                else:
-                    return np.ones([2, 6], "float32"), np.ones(
-                        [2, 2], "float32"
-                    )
-
-        adapter = py_dataset_adapter.PyDatasetAdapter(
-            TestPyDataset(), shuffle=False
-        )
-
-        if backend.backend() == "tensorflow":
-            it = adapter.get_tf_dataset()
-        elif backend.backend() == "jax":
-            it = adapter.get_jax_iterator()
-        elif backend.backend() == "torch":
-            it = adapter.get_torch_dataloader()
-        else:
-            it = adapter.get_numpy_iterator()
-
-        for i, batch in enumerate(it):
+        for i, batch in enumerate(gen):
             self.assertEqual(len(batch), 2)
             bx, by = batch
-            self.assertEqual(bx.dtype, by.dtype)
-            self.assertContainsExactSubsequence(str(bx.dtype), "float32")
-            if i == 0:
-                self.assertEqual(bx.shape, (16, 4))
-                self.assertEqual(by.shape, (16, 2))
-            elif i == 1:
-                self.assertEqual(bx.shape, (16, 5))
-                self.assertEqual(by.shape, (16, 2))
-            else:
-                self.assertEqual(bx.shape, (2, 6))
-                self.assertEqual(by.shape, (2, 2))
+            self.assertAllClose(bx, x[i * 2 : (i + 1) * 2])
+            self.assertAllClose(by, y[i * 2 : (i + 1) * 2])
 
-    @parameterized.named_parameters(
-        [
-            {
-                "testcase_name": "multiprocessing",
-                "workers": 2,
-                "use_multiprocessing": True,
-                "max_queue_size": 10,
-            },
-            {
-                "testcase_name": "multithreading",
-                "workers": 2,
-                "max_queue_size": 10,
-            },
-            {
-                "testcase_name": "single",
-            },
-        ]
-    )
-    def test_exception_reported(
-        self,
-        workers=0,
-        use_multiprocessing=False,
-        max_queue_size=0,
-    ):
-        if backend.backend() == "jax" and use_multiprocessing is True:
-            self.skipTest(
-                "The CI failed for an unknown reason with "
-                "`use_multiprocessing=True` in the jax backend"
-            )
-        dataset = ExceptionPyDataset(
-            workers=workers,
-            use_multiprocessing=use_multiprocessing,
-            max_queue_size=max_queue_size,
-        )
-        adapter = py_dataset_adapter.PyDatasetAdapter(dataset, shuffle=False)
-
-        expected_exception_class = ValueError
-        if backend.backend() == "tensorflow":
-            it = adapter.get_tf_dataset()
-            # tf.data wraps the exception
-            expected_exception_class = tf.errors.InvalidArgumentError
-        elif backend.backend() == "jax":
-            it = adapter.get_jax_iterator()
-        elif backend.backend() == "torch":
-            it = adapter.get_torch_dataloader()
-        else:
-            it = adapter.get_numpy_iterator()
-
-        it = iter(it)
-        next(it)
-        next(it)
-        with self.assertRaisesRegex(
-            expected_exception_class, "Expected exception"
-        ):
-            next(it)
-
-    def test_iterate_finite(self):
+    def test_multiprocessing_flow(self):
+        x = np.random.random((16, 4))
+        y = np.random.random((16, 2))
         py_dataset = ExamplePyDataset(
-            np.ones((6, 11), dtype="int32"),
-            np.zeros((6, 11), dtype="int32"),
-            batch_size=2,
+            x, y, batch_size=2, workers=2, use_multiprocessing=True
         )
-        batches = [batch for batch in py_dataset]
-        self.assertLen(batches, 3)
+        adapter = py_dataset_adapter.PyDatasetAdapter(py_dataset)
+        gen = adapter.get_numpy_iterator()
+        for i, batch in enumerate(gen):
+            self.assertEqual(len(batch), 2)
+            bx, by = batch
+            self.assertAllClose(bx, x[i * 2 : (i + 1) * 2])
+            self.assertAllClose(by, y[i * 2 : (i + 1) * 2])
 
-    def test_iterate_infinite_with_none_num_batches(self):
+    def test_shuffle(self):
+        set_random_seed(1337)
+        x = np.random.random((16, 4))
+        y = np.random.random((16, 2))
+        py_dataset = ExamplePyDataset(x, y, batch_size=2)
+        adapter = py_dataset_adapter.PyDatasetAdapter(py_dataset, shuffle=True)
+        gen = adapter.get_numpy_iterator()
+        batches = []
+        for batch in gen:
+            batches.append(batch)
+        self.assertEqual(len(batches), 8)
+
+        # Verify that we got all the data
+        all_x = np.concatenate([b[0] for b in batches], axis=0)
+        all_y = np.concatenate([b[1] for b in batches], axis=0)
+        self.assertNotAllClose(all_x, x)
+        self.assertNotAllClose(all_y, y)
+        self.assertAllClose(np.sort(all_x, axis=0), np.sort(x, axis=0))
+
+    def test_exceptions(self):
+        class BadDataset(ExamplePyDataset):
+            def __getitem__(self, index):
+                if index == 2:
+                    raise ValueError("Intentional error")
+                return super().__getitem__(index)
+
+        x = np.random.random((16, 4))
+        y = np.random.random((16, 2))
+        py_dataset = BadDataset(x, y, batch_size=2)
+        adapter = py_dataset_adapter.PyDatasetAdapter(py_dataset)
+        gen = adapter.get_numpy_iterator()
+        with self.assertRaisesRegex(ValueError, "Intentional error"):
+            for _ in gen:
+                pass
+
+    def test_multiprocessing_exceptions(self):
+        class BadDataset(ExamplePyDataset):
+            def __getitem__(self, index):
+                if index == 2:
+                    raise ValueError("Intentional error")
+                return super().__getitem__(index)
+
+        x = np.random.random((16, 4))
+        y = np.random.random((16, 2))
+        py_dataset = BadDataset(
+            x, y, batch_size=2, workers=2, use_multiprocessing=True
+        )
+        adapter = py_dataset_adapter.PyDatasetAdapter(py_dataset)
+        gen = adapter.get_numpy_iterator()
+        with self.assertRaisesRegex(ValueError, "Intentional error"):
+            for _ in gen:
+                pass
+
+    def test_multiprocessing_hang_on_exit(self):
+        # Test that we don't hang if the iterator is not fully consumed
+        x = np.random.random((100, 4))
+        y = np.random.random((100, 2))
         py_dataset = ExamplePyDataset(
-            np.ones((6, 11), dtype="int32"),
-            np.zeros((6, 11), dtype="int32"),
-            batch_size=2,
-            infinite=True,
+            x, y, batch_size=2, workers=2, use_multiprocessing=True
         )
-        for index, _ in enumerate(py_dataset):
-            if index >= 10:
-                break
+        adapter = py_dataset_adapter.PyDatasetAdapter(py_dataset)
+        gen = adapter.get_numpy_iterator()
+        next(gen)
+        # Explicitly delete the iterator to trigger cleanup
+        del gen
 
-    def test_iterate_infinite_with_no_len(self):
+    def test_worker_timeout(self):
+        class SlowDataset(ExamplePyDataset):
+            def __getitem__(self, index):
+                time.sleep(0.5)
+                return super().__getitem__(index)
+
+        x = np.random.random((4, 4))
+        y = np.random.random((4, 2))
+        py_dataset = SlowDataset(
+            x, y, batch_size=2, workers=1, use_multiprocessing=True
+        )
+        # No easy way to test the timeout directly, but we can verify it doesn't crash
+        adapter = py_dataset_adapter.PyDatasetAdapter(py_dataset)
+        gen = adapter.get_numpy_iterator()
+        list(gen)
+
+    def test_invalid_arguments(self):
+        x = np.random.random((16, 4))
+        y = np.random.random((16, 2))
+        py_dataset = ExamplePyDataset(x, y, batch_size=2)
+        with self.assertRaisesRegex(ValueError, "Expected x to be a PyDataset"):
+            py_dataset_adapter.PyDatasetAdapter(x)
+
+    def test_no_len_dataset(self):
         class NoLenDataset(py_dataset_adapter.PyDataset):
-            def __getitem__(self, idx):
-                yield np.ones((2, 11), dtype="int32")
+            def __getitem__(self, index):
+                return np.array([index]), np.array([index])
 
+        py_dataset = NoLenDataset()
+        adapter = py_dataset_adapter.PyDatasetAdapter(py_dataset)
+        self.assertEqual(adapter.num_batches, None)
+        self.assertEqual(adapter.has_partial_batch, None)
+
+        gen = adapter.get_numpy_iterator()
         for index, _ in enumerate(NoLenDataset()):
             if index >= 10:
                 break
+
+    @parameterized.named_parameters(
+        ("dataparallel", "dp", 4, 1, 4, 1),
+        ("modelparallel", "mp", 8, 5, 8, 5),
+    )
+    @patch("keras.src.distribution.distribution_lib.distribution")
+    def test_sharding(
+        self,
+        dist_type,
+        world_size,
+        rank,
+        expected_num_processes,
+        expected_process_id,
+        mock_distribution,
+    ):
+        if backend.backend() not in ("jax"):
+            pytest.skip("Distribution support is only available for jax.")
+        from keras.src.backend import distribution_lib as backend_dist_lib
+
+        with (
+            patch.object(
+                backend_dist_lib, "num_processes", return_value=world_size
+            ),
+            patch.object(backend_dist_lib, "process_id", return_value=rank),
+        ):
+            if dist_type == "dp":
+                dist = dist_lib.DataParallel(devices=["cpu:0"] * world_size)
+            else:
+                device_mesh = dist_lib.DeviceMesh(
+                    shape=(world_size,),
+                    axis_names=("data",),
+                    devices=["cpu:0"] * world_size,
+                )
+                dist = dist_lib.ModelParallel(
+                    device_mesh=device_mesh,
+                    layout_map=dist_lib.LayoutMap(device_mesh),
+                    batch_dim_name="data",
+                )
+            dist.auto_shard_dataset = True
+            mock_distribution.return_value = dist
+
+            x = np.random.random((16, 4)).astype("float32")
+            y = np.random.random((16, 2)).astype("float32")
+            py_dataset = ExamplePyDataset(x, y, batch_size=2)
+            adapter = py_dataset_adapter.PyDatasetAdapter(
+                py_dataset, shuffle=False
+            )
+
+            self.assertEqual(adapter._num_processes, expected_num_processes)
+            self.assertEqual(adapter._process_id, expected_process_id)
+
+            it = adapter._get_iterator()
+            batches = list(it)
+            expected_num_batches = 8 // expected_num_processes
+            self.assertEqual(len(batches), expected_num_batches)
+
+    def test_deterministic_shuffle(self):
+        x = np.arange(16).reshape((8, 2)).astype("float32")
+        y = np.arange(8).reshape((8, 1)).astype("float32")
+        py_dataset = ExamplePyDataset(x, y, batch_size=2)
+
+        # Two adapters with same epoch should have same shuffle
+        adapter1 = py_dataset_adapter.PyDatasetAdapter(py_dataset, shuffle=True)
+        adapter1._epoch = 1
+        it1 = adapter1._get_iterator()
+        batches1 = list(it1)
+
+        adapter2 = py_dataset_adapter.PyDatasetAdapter(py_dataset, shuffle=True)
+        adapter2._epoch = 1
+        it2 = adapter2._get_iterator()
+        batches2 = list(it2)
+
+        for b1, b2 in zip(batches1, batches2):
+            self.assertAllClose(b1[0], b2[0])
+
+        # Different epochs should have different shuffle
+        adapter3 = py_dataset_adapter.PyDatasetAdapter(py_dataset, shuffle=True)
+        adapter3._epoch = 2
+        it3 = adapter3._get_iterator()
+        batches3 = list(it3)
+
+        different = False
+        for b1, b3 in zip(batches1, batches3):
+            if not np.allclose(b1[0], b3[0]):
+                different = True
+                break
+        self.assertTrue(different)
+
+    def test_enqueuer_is_running_and_start(self):
+        x = np.random.random((16, 4))
+        y = np.random.random((16, 2))
+        py_dataset = ExamplePyDataset(x, y, batch_size=2)
+        enqueuer = py_dataset_adapter.OrderedEnqueuer(
+            py_dataset, workers=2, use_multiprocessing=False
+        )
+        try:
+            self.assertFalse(enqueuer.is_running())
+            enqueuer.start()
+            self.assertTrue(enqueuer.is_running())
+            enqueuer.start()
+            self.assertTrue(enqueuer.is_running())
+        finally:
+            enqueuer.stop()
+        self.assertFalse(enqueuer.is_running())

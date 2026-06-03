@@ -583,9 +583,7 @@ class DataParallel(Distribution):
             self._initialize_mesh_from_list_devices(auto_shard_dataset)
 
         # Those following attributes might get convert to public methods.
-        self._num_process = distribution_lib.num_processes()
-        self._process_id = distribution_lib.process_id()
-        self._is_multi_process = self._num_process > 1
+        self._is_multi_process = self.num_processes > 1
 
     @property
     def num_model_replicas(self):
@@ -756,9 +754,7 @@ class ModelParallel(Distribution):
         self._layout_map = layout_map
 
         # Those following attributes might get convert to public methods.
-        self._num_process = distribution_lib.num_processes()
-        self._process_id = distribution_lib.process_id()
-        self._is_multi_process = self._num_process > 1
+        self._is_multi_process = self.num_processes > 1
 
         mesh_batch_dim_index = self.device_mesh.axis_names.index(
             self.batch_dim_name
@@ -766,13 +762,13 @@ class ModelParallel(Distribution):
         num_model_replicas = self.device_mesh.shape[mesh_batch_dim_index]
         if (
             self._is_multi_process
-            and self._num_process > num_model_replicas
-            and self._num_process % num_model_replicas != 0
+            and self.num_processes > num_model_replicas
+            and self.num_processes % num_model_replicas != 0
         ):
             raise ValueError(
                 "If `num_process` is greater than `num_model_replicas`, "
                 "`num_process` must be divisible by `num_model_replicas`. "
-                f"Got num_process={self._num_process}, "
+                f"Got num_process={self.num_processes}, "
                 f"num_model_replicas={num_model_replicas}."
             )
 
@@ -785,7 +781,8 @@ class ModelParallel(Distribution):
 
     def get_data_layout(self, data_shape):
         data_shard_spec = [None] * len(data_shape)
-        data_shard_spec[0] = self.batch_dim_name  # Shard on the first dim
+        if len(data_shard_spec) > 0:
+            data_shard_spec[0] = self.batch_dim_name  # Shard on the first dim
         return TensorLayout(data_shard_spec, self.device_mesh)
 
     def get_variable_layout(self, variable):
@@ -825,10 +822,18 @@ class LayoutMap(collections.abc.MutableMapping):
     ```python
     layout_map = LayoutMap(device_mesh)
     layout_map['.*dense.*kernel'] = (None, 'model')
-    layout_map['.*bias'] = ('model',)
+    layout_map['.*dense.*bias'] = ('model',)
+    layout_map['.*conv2d.*kernel'] = (None, None, None, 'model')
+    layout_map['.*conv2d.*bias'] = ('model',)
 
     layout_1 = layout_map['dense_1.kernel']             # layout_1 == layout_2d
     layout_2 = layout_map['dense_1.bias']               # layout_2 == layout_1d
+    layout_3 = layout_map['dense_2.kernel']             # layout_3 == layout_2d
+    layout_4 = layout_map['dense_2.bias']               # layout_4 == layout_1d
+    layout_5 = layout_map['my_model/conv2d_123/kernel'] # layout_5 == layout_4d
+    layout_6 = layout_map['my_model/conv2d_123/bias']   # layout_6 == layout_1d
+    layout_7 = layout_map['my_model/conv3d_1/kernel']   # layout_7 == None
+    layout_8 = layout_map['my_model/conv3d_1/bias']     # layout_8 == None
     ```
 
     Args:
@@ -950,3 +955,5 @@ def set_distribution(value):
         value: a `Distribution` instance.
     """
     global_state.set_global_attribute(GLOBAL_ATTRIBUTE_NAME, value)
+    if hasattr(distribution_lib, "set_distribution"):
+        distribution_lib.set_distribution(value)
