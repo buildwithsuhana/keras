@@ -326,6 +326,33 @@ class Distribution:
         self._device_mesh = device_mesh
         self._batch_dim_name = batch_dim_name
         self._auto_shard_dataset = auto_shard_dataset
+        if distribution_lib is not None:
+            self._num_processes = distribution_lib.num_processes()
+            self._process_id = distribution_lib.process_id()
+        else:
+            self._num_processes = 1
+            self._process_id = 0
+        self._is_multi_process = self._num_processes > 1
+
+    @property
+    def num_processes(self):
+        """Total number of processes in the cluster."""
+        return self._num_processes
+
+    @property
+    def num_model_replicas(self):
+        """Number of model replicas."""
+        raise NotImplementedError()
+
+    @property
+    def data_shard_id(self):
+        """ID of the data shard for the current process."""
+        num_model_replicas = self.num_model_replicas
+        if num_model_replicas >= self.num_processes:
+            return self._process_id
+        else:
+            processes_per_replica = self.num_processes // num_model_replicas
+            return self._process_id // processes_per_replica
 
     def get_data_layout(self, data_shape):
         """Retrieve the `TensorLayout` for the input data.
@@ -453,6 +480,10 @@ class DataParallel(Distribution):
         self._num_process = distribution_lib.num_processes()
         self._process_id = distribution_lib.process_id()
         self._is_multi_process = self._num_process > 1
+
+    @property
+    def num_model_replicas(self):
+        return self.device_mesh.devices.size
 
     def _initialize_with_device_mesh(self, device_mesh, auto_shard_dataset):
         if not isinstance(device_mesh, DeviceMesh):
@@ -677,6 +708,13 @@ class ModelParallel(Distribution):
                 f"Got num_process={self._num_process}, "
                 f"num_model_replicas={num_model_replicas}."
             )
+
+    @property
+    def num_model_replicas(self):
+        mesh_batch_dim_index = self.device_mesh.axis_names.index(
+            self.batch_dim_name
+        )
+        return self.device_mesh.shape[mesh_batch_dim_index]
 
     def get_data_layout(self, data_shape):
         data_shard_spec = [None] * len(data_shape)
