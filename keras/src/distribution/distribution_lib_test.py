@@ -570,7 +570,68 @@ class DataShardingIntegrationTest(testing.TestCase):
 
         for replica_id in range(1, num_model_replicas):
             self.assertNotEqual(
-                shards[0],
-                shards[replica_id * processes_per_replica],
-                f"Replica groups should have different shards, got {shards}",
+            shards[0],
+            shards[replica_id * processes_per_replica],
+            f"Replica groups should have different shards, got {shards}",
             )
+
+
+            # @pytest.mark.skipif(
+            #     backend.backend() != "tensorflow",
+            #     reason="Backend specific test",
+            # )
+            # class TensorflowDistributionLibTest(testing.TestCase):
+            #     def setUp(self):
+            #         super().setUp()
+            #         # Config virtual devices for testing.
+            #         cpus = tf.config.list_physical_devices("cpu")
+            #         context._reset_context()
+            #         tf.config.set_logical_device_configuration(
+            #             cpus[0], [tf.config.LogicalDeviceConfiguration()] * 8
+            #         )
+            #
+            #         dtensor.initialize_accelerator_system("cpu")
+            #
+            #     def tearDown(self) -> None:
+            #         super().tearDown()
+            #         dtensor.shutdown_accelerator_system()
+            #
+            #     def test_list_devices(self):
+            #         self.assertEqual(len(distribution_lib.list_devices()), 8)
+            #         self.assertEqual(len(distribution_lib.list_devices("cpu")), 8)
+            #         self.assertEqual(len(distribution_lib.list_devices("cpu")), 8)
+            #
+            #     def test_to_dtensor_mesh(self):
+            #         devices = [f"cpu:{i}" for i in range(8)]
+            #         shape = (4, 2)
+            #         axis_names = ["batch", "model"]
+            #
+            #         mesh = distribution_lib.DeviceMesh(shape, axis_names, devices)
+            #         dtensor_mesh = backend_dlib._to_dtensor_mesh(mesh)
+            #
+            #         self.assertIsInstance(dtensor_mesh, dtensor.Mesh)
+            #         self.assertEqual(dtensor_mesh.shape(), list(shape))
+            #         self.assertEqual(dtensor_mesh.dim_names, axis_names)
+            #
+            #     def test_to_dtensor_layout(self):
+            #         axes = ["data", None]
+            #         mesh = distribution_lib.DeviceMesh(
+            #             (4, 2), ["data", "model"], [f"cpu:{i}" for i in range(8)]
+            #         )
+            #         layout = distribution_lib.TensorLayout(axes, mesh)
+            #         dtensor_layout = backend_dlib._to_dtensor_layout(layout)
+            #         dtensor_mesh = backend_dlib._to_dtensor_mesh(mesh)
+            #         self.assertEqual(
+            #             dtensor_layout,
+            #             dtensor.Layout(["data", dtensor.UNSHARDED], dtensor_mesh),
+            #         )
+            #
+            #     def test_validation_for_device_mesh(self):
+            #         axes = ["data", None]
+            #         layout = distribution_lib.TensorLayout(axes, device_mesh=None)
+            #
+            #         with self.assertRaisesRegex(
+            #             ValueError, "Cannot create sharding when device mesh is not set"
+            #         ):
+            #             backend_dlib._to_dtensor_layout(layout)
+
