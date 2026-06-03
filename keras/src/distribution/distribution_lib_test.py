@@ -270,13 +270,46 @@ class DataParallelDistributionTest(testing.TestCase):
         self.assertIsNone(tensor_layout)
 
     def test_distribute_dataset(self):
-        # We can only verify the single worker/process case in OSS for now.
-        dataset = tf.data.Dataset.range(8)
+        dataset = tf.data.Dataset.range(8).batch(2)
+        # Single process case
         distribution = distribution_lib.DataParallel(
             device_mesh=self.device_mesh
         )
         distributed_dataset = distribution.distribute_dataset(dataset)
         self.assertIs(dataset, distributed_dataset)
+
+        # Multi-process case
+        with (
+            mock.patch.object(backend_dlib, "num_processes", return_value=2),
+            mock.patch.object(backend_dlib, "process_id", return_value=0),
+        ):
+            distribution = distribution_lib.DataParallel(
+                device_mesh=self.device_mesh
+            )
+            distributed_dataset = distribution.distribute_dataset(dataset)
+
+            self.assertIsNot(dataset, distributed_dataset)
+
+            result = list(distributed_dataset.as_numpy_iterator())
+            # Rebatched to 2 (from batch(2) -> rebatch(2) is same), then AutoShard (index=0)
+            # Rebatching batch(2) to per_process_batch=4 (8/2)
+            # wait, if global_batch_size=2, num_processes=2, per_process_batch=1.
+            self.assertEqual(len(result), 4)
+            self.assertAllClose(result[0], [0])
+            self.assertAllClose(result[1], [2])
+
+        with (
+            mock.patch.object(backend_dlib, "num_processes", return_value=2),
+            mock.patch.object(backend_dlib, "process_id", return_value=1),
+        ):
+            distribution = distribution_lib.DataParallel(
+                device_mesh=self.device_mesh
+            )
+            distributed_dataset = distribution.distribute_dataset(dataset)
+            result = list(distributed_dataset.as_numpy_iterator())
+            self.assertEqual(len(result), 4)
+            self.assertAllClose(result[0], [1])
+            self.assertAllClose(result[1], [3])
 
 
 @pytest.mark.skipif(
@@ -361,14 +394,56 @@ class ModelParallelDistributionTest(testing.TestCase):
         self.assertEqual(variable_layout.axes, explicit_layout.axes)
 
     def test_distribute_dataset(self):
-        # We can only verify the single worker/process case in OSS for now.
-        dataset = tf.data.Dataset.range(8)
+        dataset = tf.data.Dataset.range(8).batch(2)
         layout_map = distribution_lib.LayoutMap(self.device_mesh)
+        # Single process case
         distribution = distribution_lib.ModelParallel(
             layout_map=layout_map, batch_dim_name="data"
         )
         distributed_dataset = distribution.distribute_dataset(dataset)
         self.assertIs(dataset, distributed_dataset)
+
+        # Multi-process case: num_model_replicas = 2 (data dimension)
+        # num_processes = 4. Each replica is sharded across 2 processes.
+        # Process 0 and 1 are replica 0. Process 2 and 3 are replica 1.
+        with (
+            mock.patch.object(backend_dlib, "num_processes", return_value=4),
+            mock.patch.object(backend_dlib, "process_id", return_value=0),
+        ):
+            distribution = distribution_lib.ModelParallel(
+                layout_map=layout_map, batch_dim_name="data"
+            )
+            distributed_dataset = distribution.distribute_dataset(dataset)
+            result = list(distributed_dataset.as_numpy_iterator())
+            # global_batch=2, num_model_replicas=2 -> per_replica_batch=1.
+            self.assertEqual(len(result), 4)
+            self.assertAllClose(result[0], [0])
+
+        with (
+            mock.patch.object(backend_dlib, "num_processes", return_value=4),
+            mock.patch.object(backend_dlib, "process_id", return_value=1),
+        ):
+            distribution = distribution_lib.ModelParallel(
+                layout_map=layout_map, batch_dim_name="data"
+            )
+            distributed_dataset = distribution.distribute_dataset(dataset)
+            result = list(distributed_dataset.as_numpy_iterator())
+            # Same as process 0 because they are in the same replica
+            self.assertEqual(len(result), 4)
+            self.assertAllClose(result[0], [0])
+
+        with (
+            mock.patch.object(backend_dlib, "num_processes", return_value=4),
+            mock.patch.object(backend_dlib, "process_id", return_value=2),
+        ):
+            distribution = distribution_lib.ModelParallel(
+                layout_map=layout_map, batch_dim_name="data"
+            )
+            distributed_dataset = distribution.distribute_dataset(dataset)
+            result = list(distributed_dataset.as_numpy_iterator())
+            # Replica 1
+            self.assertEqual(len(result), 4)
+            self.assertAllClose(result[0], [1])
 
     @mock.patch.object(backend_dlib, "num_processes", return_value=4)
     def test_num_process_validation(self, mock_backend_num_processes):
@@ -380,7 +455,7 @@ class ModelParallelDistributionTest(testing.TestCase):
         layout_map = distribution_lib.LayoutMap(device_mesh)
         with self.assertRaisesRegex(
             ValueError,
-            "`num_process` must be divisible by `num_model_replicas`",
+            "must be divisible by `num_model_replicas`",
         ):
             distribution_lib.ModelParallel(
                 layout_map=layout_map,
