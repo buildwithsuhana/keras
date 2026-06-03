@@ -427,22 +427,23 @@ class Distribution:
             If `auto_shard_dataset` is `True`, returns a sharded dataset that
             only produces data for the current local worker/process.  Otherwise,
             returns the original dataset.
-
-        Raises:
-            ValueError: if auto-sharding is requested in a multi-process
-            setting, but the dataset type is not supported.
         """
+        import torch
+
         from keras.src.utils.module_utils import tensorflow as tf
 
         if tf.available and isinstance(dataset, tf.data.Dataset):
             return self.distribute_tf_dataset(dataset)
 
+        if isinstance(dataset, torch.utils.data.DataLoader):
+            return self.distribute_torch_dataloader(dataset)
+
         if not self._is_multi_process or not self.auto_shard_dataset:
             return dataset
 
         raise ValueError(
-            "Only `tf.data.Dataset` is supported for auto-sharding, "
-            f"got {type(dataset)}"
+            "Only `tf.data.Dataset` and `torch.utils.data.DataLoader` "
+            f"are supported for auto-sharding, got {type(dataset)}"
         )
 
     def distribute_tf_dataset(self, dataset):
@@ -509,6 +510,35 @@ class Distribution:
                 index=data_shard_id,
             )
             return distributed_dataset.prefetch(tf.data.AUTOTUNE)
+
+    def distribute_torch_dataloader(self, dataloader):
+        """Create a distributed torch DataLoader from the original dataloader.
+
+        Args:
+            dataloader: the original global torch DataLoader instance.
+
+        Returns:
+            If `auto_shard_dataset` is `True`, returns a sharded dataloader that
+            only produces data for the current local worker/process. Otherwise,
+            returns the original dataloader.
+        """
+        if not self._is_multi_process or not self.auto_shard_dataset:
+            return dataloader
+
+        num_model_replicas = self.num_model_replicas
+        num_model_replicas_per_process = num_model_replicas / self.num_processes
+        if num_model_replicas_per_process >= 1:
+            num_replicas = self.num_processes
+            data_shard_id = self._process_id
+        else:
+            num_replicas = num_model_replicas
+            data_shard_id = self.data_shard_id
+
+        from keras.src.trainers.data_adapters import data_adapter_utils
+
+        return data_adapter_utils._add_torch_distributed_sampler(
+            dataloader, num_replicas, data_shard_id
+        )
 
     def __repr__(self):
         return f"<{self.__class__.__name__} device_mesh={self.device_mesh}>"
