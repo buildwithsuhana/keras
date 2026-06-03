@@ -288,17 +288,15 @@ class DataParallelDistributionTest(testing.TestCase):
         self.assertIsNone(tensor_layout)
 
     def test_distribute_dataset(self):
-        # We can only verify the single worker/process case in OSS for now.
-        dataset = tf.data.Dataset.range(8)
+        dataset = tf.data.Dataset.range(8).batch(2)
+        # Single process case
         distribution = distribution_lib.DataParallel(
             device_mesh=self.device_mesh
         )
         distributed_dataset = distribution.distribute_dataset(dataset)
         self.assertIs(dataset, distributed_dataset)
 
-    def test_distribute_dataset_tf_multi_process(self):
-        dataset = tf.data.Dataset.range(16).batch(4)
-
+        # Multi-process case
         with (
             mock.patch.object(backend_dlib, "num_processes", return_value=2),
             mock.patch.object(backend_dlib, "process_id", return_value=0),
@@ -306,12 +304,30 @@ class DataParallelDistributionTest(testing.TestCase):
             distribution = distribution_lib.DataParallel(
                 device_mesh=self.device_mesh
             )
-            self.assertTrue(distribution._is_multi_process)
-            self.assertEqual(distribution.num_processes, 2)
-
             distributed_dataset = distribution.distribute_dataset(dataset)
 
             self.assertIsNot(dataset, distributed_dataset)
+
+            result = list(distributed_dataset.as_numpy_iterator())
+            # Rebatched to 2 (from batch(2) -> rebatch(2) is same), then AutoShard (index=0)
+            # Rebatching batch(2) to per_process_batch=4 (8/2)
+            # wait, if global_batch_size=2, num_processes=2, per_process_batch=1.
+            self.assertEqual(len(result), 4)
+            self.assertAllClose(result[0], [0])
+            self.assertAllClose(result[1], [2])
+
+        with (
+            mock.patch.object(backend_dlib, "num_processes", return_value=2),
+            mock.patch.object(backend_dlib, "process_id", return_value=1),
+        ):
+            distribution = distribution_lib.DataParallel(
+                device_mesh=self.device_mesh
+            )
+            distributed_dataset = distribution.distribute_dataset(dataset)
+            result = list(distributed_dataset.as_numpy_iterator())
+            self.assertEqual(len(result), 4)
+            self.assertAllClose(result[0], [1])
+            self.assertAllClose(result[1], [3])
 
 
 @pytest.mark.skipif(
@@ -396,14 +412,56 @@ class ModelParallelDistributionTest(testing.TestCase):
         self.assertEqual(variable_layout.axes, explicit_layout.axes)
 
     def test_distribute_dataset(self):
-        # We can only verify the single worker/process case in OSS for now.
-        dataset = tf.data.Dataset.range(8)
+        dataset = tf.data.Dataset.range(8).batch(2)
         layout_map = distribution_lib.LayoutMap(self.device_mesh)
+        # Single process case
         distribution = distribution_lib.ModelParallel(
             layout_map=layout_map, batch_dim_name="data"
         )
         distributed_dataset = distribution.distribute_dataset(dataset)
         self.assertIs(dataset, distributed_dataset)
+
+        # Multi-process case: num_model_replicas = 2 (data dimension)
+        # num_processes = 4. Each replica is sharded across 2 processes.
+        # Process 0 and 1 are replica 0. Process 2 and 3 are replica 1.
+        with (
+            mock.patch.object(backend_dlib, "num_processes", return_value=4),
+            mock.patch.object(backend_dlib, "process_id", return_value=0),
+        ):
+            distribution = distribution_lib.ModelParallel(
+                layout_map=layout_map, batch_dim_name="data"
+            )
+            distributed_dataset = distribution.distribute_dataset(dataset)
+            result = list(distributed_dataset.as_numpy_iterator())
+            # global_batch=2, num_model_replicas=2 -> per_replica_batch=1.
+            self.assertEqual(len(result), 4)
+            self.assertAllClose(result[0], [0])
+
+        with (
+            mock.patch.object(backend_dlib, "num_processes", return_value=4),
+            mock.patch.object(backend_dlib, "process_id", return_value=1),
+        ):
+            distribution = distribution_lib.ModelParallel(
+                layout_map=layout_map, batch_dim_name="data"
+            )
+            distributed_dataset = distribution.distribute_dataset(dataset)
+            result = list(distributed_dataset.as_numpy_iterator())
+            # Same as process 0 because they are in the same replica
+            self.assertEqual(len(result), 4)
+            self.assertAllClose(result[0], [0])
+
+        with (
+            mock.patch.object(backend_dlib, "num_processes", return_value=4),
+            mock.patch.object(backend_dlib, "process_id", return_value=2),
+        ):
+            distribution = distribution_lib.ModelParallel(
+                layout_map=layout_map, batch_dim_name="data"
+            )
+            distributed_dataset = distribution.distribute_dataset(dataset)
+            result = list(distributed_dataset.as_numpy_iterator())
+            # Replica 1
+            self.assertEqual(len(result), 4)
+            self.assertAllClose(result[0], [1])
 
     @mock.patch.object(backend_dlib, "num_processes", return_value=4)
     def test_num_process_validation(self, mock_backend_num_processes):
@@ -415,7 +473,7 @@ class ModelParallelDistributionTest(testing.TestCase):
         layout_map = distribution_lib.LayoutMap(device_mesh)
         with self.assertRaisesRegex(
             ValueError,
-            "`num_process` must be divisible by `num_model_replicas`",
+            "must be divisible by `num_model_replicas`",
         ):
             distribution_lib.ModelParallel(
                 layout_map=layout_map,
@@ -650,3 +708,63 @@ class DataShardingIntegrationTest(testing.TestCase):
                 shards[replica_id * processes_per_replica],
                 f"Replica groups should have different shards, got {shards}",
             )
+
+
+# @pytest.mark.skipif(
+#     backend.backend() != "tensorflow",
+#     reason="Backend specific test",
+# )
+# class TensorflowDistributionLibTest(testing.TestCase):
+#     def setUp(self):
+#         super().setUp()
+#         # Config virtual devices for testing.
+#         cpus = tf.config.list_physical_devices("cpu")
+#         context._reset_context()
+#         tf.config.set_logical_device_configuration(
+#             cpus[0], [tf.config.LogicalDeviceConfiguration()] * 8
+#         )
+#
+#         dtensor.initialize_accelerator_system("cpu")
+#
+#     def tearDown(self) -> None:
+#         super().tearDown()
+#         dtensor.shutdown_accelerator_system()
+#
+#     def test_list_devices(self):
+#         self.assertEqual(len(distribution_lib.list_devices()), 8)
+#         self.assertEqual(len(distribution_lib.list_devices("cpu")), 8)
+#         self.assertEqual(len(distribution_lib.list_devices("cpu")), 8)
+#
+#     def test_to_dtensor_mesh(self):
+#         devices = [f"cpu:{i}" for i in range(8)]
+#         shape = (4, 2)
+#         axis_names = ["batch", "model"]
+#
+#         mesh = distribution_lib.DeviceMesh(shape, axis_names, devices)
+#         dtensor_mesh = backend_dlib._to_dtensor_mesh(mesh)
+#
+#         self.assertIsInstance(dtensor_mesh, dtensor.Mesh)
+#         self.assertEqual(dtensor_mesh.shape(), list(shape))
+#         self.assertEqual(dtensor_mesh.dim_names, axis_names)
+#
+#     def test_to_dtensor_layout(self):
+#         axes = ["data", None]
+#         mesh = distribution_lib.DeviceMesh(
+#             (4, 2), ["data", "model"], [f"cpu:{i}" for i in range(8)]
+#         )
+#         layout = distribution_lib.TensorLayout(axes, mesh)
+#         dtensor_layout = backend_dlib._to_dtensor_layout(layout)
+#         dtensor_mesh = backend_dlib._to_dtensor_mesh(mesh)
+#         self.assertEqual(
+#             dtensor_layout,
+#             dtensor.Layout(["data", dtensor.UNSHARDED], dtensor_mesh),
+#         )
+#
+#     def test_validation_for_device_mesh(self):
+#         axes = ["data", None]
+#         layout = distribution_lib.TensorLayout(axes, device_mesh=None)
+#
+#         with self.assertRaisesRegex(
+#             ValueError, "Cannot create sharding when device mesh is not set"
+#         ):
+#             backend_dlib._to_dtensor_layout(layout)
