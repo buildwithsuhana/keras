@@ -714,7 +714,8 @@ class ModelParallel(Distribution):
 
     def get_data_layout(self, data_shape):
         data_shard_spec = [None] * len(data_shape)
-        data_shard_spec[0] = self.batch_dim_name  # Shard on the first dim
+        if len(data_shard_spec) > 0:
+            data_shard_spec[0] = self.batch_dim_name  # Shard on the first dim
         return TensorLayout(data_shard_spec, self.device_mesh)
 
     def get_variable_layout(self, variable):
@@ -964,3 +965,5 @@ def set_distribution(value):
         value: a `Distribution` instance.
     """
     global_state.set_global_attribute(GLOBAL_ATTRIBUTE_NAME, value)
+    if hasattr(distribution_lib, "set_distribution"):
+        distribution_lib.set_distribution(value)
