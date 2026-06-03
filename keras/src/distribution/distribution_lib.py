@@ -477,9 +477,7 @@ class DataParallel(Distribution):
             self._initialize_mesh_from_list_devices(auto_shard_dataset)
 
         # Those following attributes might get convert to public methods.
-        self._num_process = distribution_lib.num_processes()
-        self._process_id = distribution_lib.process_id()
-        self._is_multi_process = self._num_process > 1
+        self._is_multi_process = self.num_processes > 1
 
     @property
     def num_model_replicas(self):
@@ -689,9 +687,7 @@ class ModelParallel(Distribution):
         self._layout_map = layout_map
 
         # Those following attributes might get convert to public methods.
-        self._num_process = distribution_lib.num_processes()
-        self._process_id = distribution_lib.process_id()
-        self._is_multi_process = self._num_process > 1
+        self._is_multi_process = self.num_processes > 1
 
         mesh_batch_dim_index = self.device_mesh.axis_names.index(
             self.batch_dim_name
@@ -699,13 +695,13 @@ class ModelParallel(Distribution):
         num_model_replicas = self.device_mesh.shape[mesh_batch_dim_index]
         if (
             self._is_multi_process
-            and self._num_process > num_model_replicas
-            and self._num_process % num_model_replicas != 0
+            and self.num_processes > num_model_replicas
+            and self.num_processes % num_model_replicas != 0
         ):
             raise ValueError(
                 "If `num_process` is greater than `num_model_replicas`, "
                 "`num_process` must be divisible by `num_model_replicas`. "
-                f"Got num_process={self._num_process}, "
+                f"Got num_process={self.num_processes}, "
                 f"num_model_replicas={num_model_replicas}."
             )
 
