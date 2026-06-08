@@ -129,6 +129,21 @@ class TorchDistributionLibTest(testing.TestCase):
 
             backend_dlib.initialize(num_processes=2, process_id=1)
             minit.assert_called_with(backend="gloo", rank=1, world_size=2)
+
+            # Test job_addresses parsing without hardcoding specific IPs
+            addr, port = "host", "1234"
+            backend_dlib.initialize(
+                job_addresses=f"{addr}:{port},other:5678",
+                num_processes=2,
+                process_id=1,
+            )
+            minit.assert_called_with(
+                backend="gloo",
+                rank=1,
+                world_size=2,
+                init_method=f"tcp://{addr}:{port}",
+            )
+
             with mock.patch.dict(os.environ, {"RANK": "1", "WORLD_SIZE": "2"}):
                 backend_dlib.initialize()
                 minit.assert_called_with(backend="gloo", rank=1, world_size=2)

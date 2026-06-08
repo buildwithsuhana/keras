@@ -2,23 +2,37 @@ import os
 
 import torch
 
+_KERAS_TO_TORCH_TYPES = {
+    "gpu": "cuda",
+    "cuda": "cuda",
+    "mps": "mps",
+    "xpu": "xpu",
+    "tpu": "xla",
+}
+
+
+def _get_default_device_type():
+    if torch.cuda.is_available():
+        return "gpu"
+    if torch.backends.mps.is_available():
+        return "mps"
+    if hasattr(torch, "xpu") and torch.xpu.is_available():
+        return "xpu"
+    from keras.src.utils.module_utils import torch_xla
+
+    if torch_xla.available:
+        return "tpu"
+    return "cpu"
+
+
+def _get_torch_device_type(device_type):
+    return _KERAS_TO_TORCH_TYPES.get(device_type.lower(), device_type)
+
 
 def get_device_count(device_type=None):
     """Returns total device count across all hosts."""
     if device_type is None:
-        if torch.cuda.is_available():
-            device_type = "gpu"
-        elif torch.backends.mps.is_available():
-            device_type = "mps"
-        elif hasattr(torch, "xpu") and torch.xpu.is_available():
-            device_type = "xpu"
-        else:
-            from keras.src.utils.module_utils import torch_xla
-
-            if torch_xla.available:
-                device_type = "tpu"
-            else:
-                device_type = "cpu"
+        device_type = _get_default_device_type()
 
     device_type = device_type.lower()
     if device_type in ("gpu", "cuda"):
@@ -59,19 +73,7 @@ def get_device_count(device_type=None):
 def list_devices(device_type=None):
     """Returns Keras device strings representing global indices."""
     if device_type is None:
-        if torch.cuda.is_available():
-            device_type = "gpu"
-        elif torch.backends.mps.is_available():
-            device_type = "mps"
-        elif hasattr(torch, "xpu") and torch.xpu.is_available():
-            device_type = "xpu"
-        else:
-            from keras.src.utils.module_utils import torch_xla
-
-            if torch_xla.available:
-                device_type = "tpu"
-            else:
-                device_type = "cpu"
+        device_type = _get_default_device_type()
 
     device_type = device_type.lower()
     if device_type == "cuda":
@@ -103,10 +105,18 @@ def initialize(job_addresses=None, num_processes=None, process_id=None):
             if torch.cuda.is_available():
                 torch.cuda.set_device(local_rank)
             backend = "nccl" if torch.cuda.is_available() else "gloo"
+            kwargs = {}
+            if job_addresses:
+                master_addr = job_addresses.split(",")[0]
+                if "://" not in master_addr:
+                    kwargs["init_method"] = f"tcp://{master_addr}"
+                else:
+                    kwargs["init_method"] = master_addr
             torch.distributed.init_process_group(
                 backend=backend,
                 rank=rank,
                 world_size=world_size,
+                **kwargs,
             )
 
 
@@ -131,14 +141,19 @@ def to_backend_device(device_name):
             return torch.device("meta")
         if "cpu" in device_name_lower:
             return torch.device("cpu")
-        if "gpu" in device_name_lower or "cuda" in device_name_lower:
-            if ":" in device_name_lower:
-                device_idx = int(device_name_lower.split(":")[1])
-                return torch.device(f"cuda:{device_idx}")
-            if torch.cuda.is_available():
-                return torch.device(f"cuda:{local_rank}")
-            return torch.device("cpu")
 
-    if torch.cuda.is_available():
-        return torch.device(f"cuda:{local_rank}")
-    return torch.device("cpu")
+        for keras_type in _KERAS_TO_TORCH_TYPES:
+            if keras_type in device_name_lower:
+                torch_type = _get_torch_device_type(keras_type)
+                if ":" in device_name_lower:
+                    device_idx = int(device_name_lower.split(":")[1])
+                    return torch.device(f"{torch_type}:{device_idx}")
+                if keras_type in ("gpu", "cuda", "xpu"):
+                    return torch.device(f"{torch_type}:{local_rank}")
+                return torch.device(torch_type)
+
+    device_type = _get_default_device_type()
+    torch_type = _get_torch_device_type(device_type)
+    if device_type in ("gpu", "xpu"):
+        return torch.device(f"{torch_type}:{local_rank}")
+    return torch.device(torch_type)
