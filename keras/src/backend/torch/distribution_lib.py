@@ -142,14 +142,22 @@ def to_backend_device(device_name):
         if "cpu" in device_name_lower:
             return torch.device("cpu")
 
-        for keras_type in _KERAS_TO_TORCH_TYPES:
+        for keras_type, torch_type in _KERAS_TO_TORCH_TYPES.items():
             if keras_type in device_name_lower:
-                torch_type = _get_torch_device_type(keras_type)
                 if ":" in device_name_lower:
                     device_idx = int(device_name_lower.split(":")[1])
                     return torch.device(f"{torch_type}:{device_idx}")
-                if keras_type in ("gpu", "cuda", "xpu"):
-                    return torch.device(f"{torch_type}:{local_rank}")
+
+                # Check availability for indexing types and fallback.
+                if keras_type in ("gpu", "cuda"):
+                    if torch.cuda.is_available():
+                        return torch.device(f"cuda:{local_rank}")
+                    return torch.device("cpu")
+                if keras_type == "xpu":
+                    if hasattr(torch, "xpu") and torch.xpu.is_available():
+                        return torch.device(f"xpu:{local_rank}")
+                    return torch.device("cpu")
+
                 return torch.device(torch_type)
 
     device_type = _get_default_device_type()
