@@ -113,7 +113,7 @@ def compute_output_spec(fn, *args, **kwargs):
                     for i, e in enumerate(shape):
                         if e is None:
                             shape[i] = fill_value
-                return np.empty(
+                return np.zeros(
                     shape=shape,
                     dtype=x.dtype,
                 )
