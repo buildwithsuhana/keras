@@ -728,6 +728,9 @@ def _walk_saveable(saveable):
     # models with extra attributes--the internal Keras state take precedence.
     if obj_type in ("Sequential", "Functional"):
         yield "layers", saveable.layers
+        if "layers" not in attr_skipset:
+            attr_skipset = attr_skipset.copy()
+            attr_skipset.add("layers")
 
     for child_attr in sorted(dir(saveable), key=lambda x: _name_key(x)):
         if child_attr.startswith("__") or child_attr in attr_skipset:
@@ -1022,19 +1025,12 @@ def _load_container_state(
                 weights_store, assets_store, nested_path
             ):
                 # The container's group is missing from the saved file.
-                # Try to load it recursively anyway with `skip_mismatch=True`,
-                # then warn only if doing so produced new failures — i.e. the
-                # container genuinely held an unvisited `KerasSaveable` that
-                # needed loading. This silently skips two benign cases:
-                #   - Containers of pure metadata (e.g. lists of strings in
-                #     `variable_serialization_spec`).
-                #   - Containers that mirror already-loaded saveables (e.g.
-                #     a Functional model's `_operations_by_depth` whose
-                #     items are also in the `layers` collection).
-                tracked_failures = (
-                    failed_saveables if failed_saveables is not None else set()
-                )
-                failed_before = len(tracked_failures)
+                # Try to load it recursively anyway with `skip_mismatch=True`.
+                # We use temporary failure/error collections to avoid
+                # polluting the main ones for these potentially missing
+                # legacy groups.
+                temp_failures = set()
+                temp_errors = {}
                 _load_container_state(
                     saveable,
                     weights_store,
@@ -1042,11 +1038,11 @@ def _load_container_state(
                     inner_path=nested_path,
                     skip_mismatch=True,
                     visited_saveables=visited_saveables,
-                    failed_saveables=tracked_failures,
-                    error_msgs=error_msgs,
+                    failed_saveables=temp_failures,
+                    error_msgs=temp_errors,
                     visited_containers=visited_containers,
                 )
-                if len(tracked_failures) > failed_before:
+                if temp_failures:
                     # Legacy files saved before PR #22362 didn't write the
                     # `container*` groups for nested containers — silently
                     # skip so the model still loads (sublayers keep their
