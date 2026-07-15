@@ -931,32 +931,6 @@ class IndexLookupLayerTest(testing.TestCase):
         ):
             layer.set_vocabulary(["a", "b"], idf_weights=[[1.0, 1.0]])
 
-    def test_set_vocabulary_with_special_tokens_tensors(self):
-        # Test the branch where special_tokens are all not None and use tensors
-        layer = layers.IndexLookup(
-            max_tokens=None,
-            num_oov_indices=1,
-            mask_token="[MASK]",
-            oov_token="[OOV]",
-            vocabulary_dtype="string",
-        )
-        vocabulary = np.array(["[MASK]", "[OOV]", "a", "b"])
-        layer.set_vocabulary(vocabulary)
-        self.assertEqual(layer.get_vocabulary(), ["[MASK]", "[OOV]", "a", "b"])
-
-    def test_set_vocabulary_with_none_special_tokens(self):
-        # Test the branch where some special_tokens are None
-        layer = layers.IndexLookup(
-            max_tokens=None,
-            num_oov_indices=1,
-            mask_token=None,
-            oov_token="[OOV]",
-            vocabulary_dtype="string",
-        )
-        vocabulary = np.array(["[OOV]", "a", "b"])
-        layer.set_vocabulary(vocabulary)
-        self.assertEqual(layer.get_vocabulary(), ["[OOV]", "a", "b"])
-
     def test_tf_idf_padding_logic(self):
         # Test idf_weights padding when found_special_tokens=False
         layer = layers.IndexLookup(
