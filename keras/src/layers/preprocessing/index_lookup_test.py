@@ -860,3 +860,137 @@ class IndexLookupLayerTest(testing.TestCase):
                 np.array_equal(out_farmhash, out_siphash),
                 msg=f"Expected different outputs for dtype={dtype}",
             )
+
+    def test_set_vocabulary_empty(self):
+        layer = layers.IndexLookup(
+            max_tokens=None,
+            num_oov_indices=1,
+            mask_token=None,
+            oov_token="[OOV]",
+            vocabulary_dtype="string",
+        )
+        with self.assertRaisesRegex(
+            ValueError, "Cannot set an empty vocabulary"
+        ):
+            layer.set_vocabulary([])
+
+    def test_oov_token_in_wrong_position(self):
+        with self.assertRaisesRegex(
+            ValueError,
+            "Found reserved OOV token at unexpected location in `vocabulary`.",
+        ):
+            layers.IndexLookup(
+                max_tokens=None,
+                num_oov_indices=1,
+                mask_token=None,
+                oov_token="oov",
+                vocabulary_dtype="string",
+                vocabulary=["token", "oov"],
+                invert=True,
+            )
+
+    def test_set_vocabulary_too_large(self):
+        layer = layers.IndexLookup(
+            max_tokens=3,
+            num_oov_indices=1,
+            mask_token="[MASK]",
+            oov_token="[OOV]",
+            vocabulary_dtype="string",
+        )
+        with self.assertRaisesRegex(
+            ValueError, "Attempted to set a vocabulary larger than the maximum"
+        ):
+            # 1 mask + 1 OOV + 2 tokens = 4 > 3
+            layer.set_vocabulary(["a", "b"])
+
+    def test_tf_idf_weights_length_mismatch(self):
+        layer = layers.IndexLookup(
+            max_tokens=None,
+            num_oov_indices=1,
+            mask_token=None,
+            oov_token="[OOV]",
+            output_mode="tf_idf",
+            vocabulary_dtype="string",
+        )
+        with self.assertRaisesRegex(
+            ValueError, "`idf_weights` must be the same length as vocabulary"
+        ):
+            layer.set_vocabulary(["a", "b"], idf_weights=[1.0, 1.0, 1.0])
+
+    def test_tf_idf_weights_rank_mismatch(self):
+        layer = layers.IndexLookup(
+            max_tokens=None,
+            num_oov_indices=1,
+            mask_token=None,
+            oov_token="[OOV]",
+            output_mode="tf_idf",
+            vocabulary_dtype="string",
+        )
+        with self.assertRaisesRegex(
+            ValueError, "TF-IDF data must be a 1-index array"
+        ):
+            layer.set_vocabulary(["a", "b"], idf_weights=[[1.0, 1.0]])
+
+    def test_set_vocabulary_with_special_tokens_tensors(self):
+        # Test the branch where special_tokens are all not None and use tensors
+        layer = layers.IndexLookup(
+            max_tokens=None,
+            num_oov_indices=1,
+            mask_token="[MASK]",
+            oov_token="[OOV]",
+            vocabulary_dtype="string",
+        )
+        vocabulary = np.array(["[MASK]", "[OOV]", "a", "b"])
+        layer.set_vocabulary(vocabulary)
+        self.assertEqual(layer.get_vocabulary(), ["[MASK]", "[OOV]", "a", "b"])
+
+    def test_set_vocabulary_with_none_special_tokens(self):
+        # Test the branch where some special_tokens are None
+        layer = layers.IndexLookup(
+            max_tokens=None,
+            num_oov_indices=1,
+            mask_token=None,
+            oov_token="[OOV]",
+            vocabulary_dtype="string",
+        )
+        vocabulary = np.array(["[OOV]", "a", "b"])
+        layer.set_vocabulary(vocabulary)
+        self.assertEqual(layer.get_vocabulary(), ["[OOV]", "a", "b"])
+
+    def test_tf_idf_padding_logic(self):
+        # Test idf_weights padding when found_special_tokens=False
+        layer = layers.IndexLookup(
+            max_tokens=None,
+            output_mode="tf_idf",
+            num_oov_indices=1,
+            mask_token="[MASK]",
+            oov_token="[OOV]",
+            vocabulary_dtype="string",
+        )
+        # Vocabulary without special tokens.
+        # In TF-IDF mode, mask_token is ignored for indexing.
+        # oov_start = 0, token_start = 0 + 1 = 1
+        layer.set_vocabulary(["a", "b"], idf_weights=[1.0, 3.0])
+        # idf_weights should be padded with average (2.0) at front
+        # Result: [2.0, 1.0, 3.0]
+        weights = backend.convert_to_numpy(layer.idf_weights)
+        self.assertAllClose(weights, [2.0, 1.0, 3.0])
+
+    def test_tf_idf_back_padding_logic(self):
+        # Test idf_weights back padding with pad_to_max_tokens=True
+        layer = layers.IndexLookup(
+            output_mode="tf_idf",
+            num_oov_indices=1,
+            mask_token=None,
+            oov_token="[OOV]",
+            max_tokens=5,
+            pad_to_max_tokens=True,
+            vocabulary_dtype="string",
+        )
+        # Vocab: [OOV], a, b (size 3)
+        # idf_weights provided for [OOV], a, b
+        layer.set_vocabulary(["[OOV]", "a", "b"], idf_weights=[1.0, 2.0, 3.0])
+        # max_tokens=5, so should pad 2 zeros at back.
+        # Result: [1.0, 2.0, 3.0, 0.0, 0.0]
+        weights = backend.convert_to_numpy(layer.idf_weights)
+        self.assertAllClose(weights, [1.0, 2.0, 3.0, 0.0, 0.0])
