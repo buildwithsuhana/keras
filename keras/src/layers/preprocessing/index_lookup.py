@@ -3,6 +3,7 @@ import collections
 import numpy as np
 
 from keras.src import backend
+from keras.src import ops
 from keras.src.layers.layer import Layer
 from keras.src.saving import serialization_lib
 from keras.src.utils import argument_validation
@@ -476,19 +477,15 @@ class IndexLookup(Layer):
                 "outside of any traced function."
             )
 
-        # TODO(mattdangerw): for better performance we should rewrite this
-        # entire function to operate on tensors and convert vocabulary to a
-        # tensor here.
-        if tf.is_tensor(vocabulary):
-            vocabulary = self._tensor_vocab_to_numpy(vocabulary)
-        elif isinstance(vocabulary, (list, tuple)):
-            vocabulary = np.array(vocabulary)
-        if tf.is_tensor(idf_weights):
-            idf_weights = idf_weights.numpy()
-        elif isinstance(idf_weights, (list, tuple)):
-            idf_weights = np.array(idf_weights)
+        vocabulary = tf_utils.ensure_tensor(
+            vocabulary, dtype=self.vocabulary_dtype
+        )
+        if idf_weights is not None:
+            idf_weights = tf_utils.ensure_tensor(
+                idf_weights, dtype=backend.floatx()
+            )
 
-        if vocabulary.size == 0:
+        if tf.size(vocabulary) == 0:
             raise ValueError(
                 "Cannot set an empty vocabulary. "
                 f"Received: vocabulary={vocabulary}"
@@ -499,73 +496,98 @@ class IndexLookup(Layer):
         special_tokens = [self.mask_token] * oov_start + [
             self.oov_token
         ] * self.num_oov_indices
-        found_special_tokens = np.array_equal(
-            special_tokens, vocabulary[:token_start]
-        )
+
+        found_special_tokens = False
+        if token_start > 0 and tf.size(vocabulary) >= token_start:
+            if all(t is not None for t in special_tokens):
+                special_tokens_tensor = tf_utils.ensure_tensor(
+                    special_tokens, dtype=self.vocabulary_dtype
+                )
+                found_special_tokens = tf.reduce_all(
+                    tf.equal(vocabulary[:token_start], special_tokens_tensor)
+                )
+            else:
+                # If there are None in special_tokens, we use numpy/python for
+                # this small check.
+                found_special_tokens = np.array_equal(
+                    special_tokens,
+                    backend.convert_to_numpy(vocabulary[:token_start]),
+                )
+
         if found_special_tokens:
             tokens = vocabulary[token_start:]
         else:
             tokens = vocabulary
 
-        repeated_tokens = self._find_repeated_tokens(tokens)
-        if repeated_tokens:
+        if tf.is_tensor(tokens):
+            unique_tokens, _ = tf.unique(tokens)
+        else:
+            unique_tokens = ops.unique(tokens)
+
+        if tf.size(unique_tokens) != tf.size(tokens):
+            repeated_tokens = self._find_repeated_tokens(
+                backend.convert_to_numpy(tokens)
+            )
             raise ValueError(
                 "The passed vocabulary has at least one repeated "
                 "term. Please uniquify your dataset. The repeated terms "
                 f"are: {repeated_tokens}"
             )
 
-        if self.mask_token is not None and self.mask_token in tokens:
-            mask_index = np.argwhere(vocabulary == self.mask_token)[-1]
-            raise ValueError(
-                "Found reserved mask token at unexpected location in "
-                "`vocabulary`. Note that passed `vocabulary` does not need to "
-                "include the OOV and mask tokens. Either remove all mask and "
-                "OOV tokens, or include them only at the start of the "
-                f"vocabulary in precisely this order: {special_tokens}. "
-                f"Received: mask_token={self.mask_token} at "
-                f"vocabulary index {mask_index}"
-            )
+        if self.mask_token is not None:
+            mask_matches = tf.equal(tokens, self.mask_token)
+            if tf.reduce_any(mask_matches):
+                mask_indices = tf.where(tf.equal(vocabulary, self.mask_token))
+                mask_index = int(mask_indices[-1][0])
+                raise ValueError(
+                    "Found reserved mask token at unexpected location in "
+                    "`vocabulary`. Note that passed `vocabulary` does not "
+                    "need to include the OOV and mask tokens. Either "
+                    "remove all mask and OOV tokens, or include them only "
+                    "at the start of the vocabulary in precisely this "
+                    f"order: {special_tokens}. "
+                    f"Received: mask_token={self.mask_token} at "
+                    f"vocabulary index {mask_index}"
+                )
         # Only error out for oov_token when invert=True. When invert=False,
         # oov_token is unused during lookup.
-        if (
-            self.oov_token is not None
-            and self.invert
-            and self.oov_token in tokens
-        ):
-            oov_index = np.argwhere(vocabulary == self.oov_token)[-1]
-            raise ValueError(
-                "Found reserved OOV token at unexpected location in "
-                "`vocabulary`. Note that passed `vocabulary` does not need to "
-                "include the OOV and mask tokens. Either remove all mask and "
-                "OOV tokens, or include them only at the start of the "
-                f"vocabulary in precisely this order: {special_tokens}. "
-                f"Received: oov_token={self.oov_token} at "
-                f"vocabulary index {oov_index}"
-            )
+        if self.oov_token is not None and self.invert:
+            oov_matches = tf.equal(tokens, self.oov_token)
+            if tf.reduce_any(oov_matches):
+                oov_indices = tf.where(tf.equal(vocabulary, self.oov_token))
+                oov_index = int(oov_indices[-1][0])
+                raise ValueError(
+                    "Found reserved OOV token at unexpected location in "
+                    "`vocabulary`. Note that passed `vocabulary` does not "
+                    "need to include the OOV and mask tokens. Either "
+                    "remove all mask and OOV tokens, or include them only "
+                    "at the start of the vocabulary in precisely this "
+                    f"order: {special_tokens}. "
+                    f"Received: oov_token={self.oov_token} at "
+                    f"vocabulary index {oov_index}"
+                )
 
-        new_vocab_size = token_start + len(tokens)
+        new_vocab_size = token_start + tf.size(tokens)
         if self.max_tokens is not None and (new_vocab_size > self.max_tokens):
             raise ValueError(
                 "Attempted to set a vocabulary larger than the maximum vocab "
-                f"size. Received vocabulary size is {new_vocab_size}; "
+                f"size. Received vocabulary size is {int(new_vocab_size)}; "
                 f"`max_tokens` is {self.max_tokens}."
             )
         self.lookup_table = self._lookup_table_from_tokens(tokens)
         self._record_vocabulary_size()
 
         if self.output_mode == "tf_idf" and idf_weights is not None:
-            if len(vocabulary) != len(idf_weights):
+            if tf.size(vocabulary) != tf.size(idf_weights):
                 raise ValueError(
                     "`idf_weights` must be the same length as vocabulary. "
-                    f"len(idf_weights) is {len(idf_weights)}; "
-                    f"len(vocabulary) is {len(vocabulary)}"
+                    f"len(idf_weights) is {int(tf.size(idf_weights))}; "
+                    f"len(vocabulary) is {int(tf.size(vocabulary))}"
                 )
-            idf_weights = self._convert_to_ndarray(idf_weights)
-            if idf_weights.ndim != 1:
+            if tf.rank(idf_weights) != 1:
                 raise ValueError(
                     "TF-IDF data must be a 1-index array. "
-                    f"Received: type(idf_weights)={type(idf_weights)}"
+                    f"Received: rank(idf_weights)={int(tf.rank(idf_weights))}"
                 )
 
             # If the passed vocabulary has no special tokens, we need to pad the
@@ -574,32 +596,35 @@ class IndexLookup(Layer):
             # in as a reasonable default.
             if found_special_tokens:
                 front_padding = 0
-                front_padding_value = 0
+                front_padding_value = 0.0
             else:
                 front_padding = token_start
-                front_padding_value = np.average(idf_weights)
+                front_padding_value = ops.mean(idf_weights)
             # If pad_to_max_tokens is true, and max_tokens is greater than our
             # total vocab size, we need to pad the back of idf_weights with
             # zeros as well.
-            back_padding_value = 0
             if self.pad_to_max_tokens and self.max_tokens is not None:
                 back_padding = (
-                    self.max_tokens - front_padding - len(idf_weights)
+                    self.max_tokens - front_padding - ops.size(idf_weights)
                 )
             else:
                 back_padding = 0
-            weights = np.pad(
-                idf_weights,
-                (front_padding, back_padding),
-                "constant",
-                constant_values=(front_padding_value, back_padding_value),
+
+            front_padding_tensor = ops.full(
+                (int(front_padding),),
+                ops.cast(front_padding_value, idf_weights.dtype),
             )
-            weights = tf.convert_to_tensor(weights, dtype=backend.floatx())
-            self.idf_weights = tf.Variable(
+            back_padding_tensor = ops.full(
+                (int(back_padding),), ops.cast(0.0, idf_weights.dtype)
+            )
+            weights = ops.concatenate(
+                [front_padding_tensor, idf_weights, back_padding_tensor], axis=0
+            )
+            self.idf_weights = backend.Variable(
                 weights,
                 trainable=False,
             )
-            self.idf_weights_const = self.idf_weights.value()
+            self.idf_weights_const = ops.convert_to_tensor(self.idf_weights)
 
     def get_build_config(self):
         return {}
