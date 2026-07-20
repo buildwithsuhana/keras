@@ -3,6 +3,7 @@ from keras.src.distribution.distribution_lib import DeviceMesh
 from keras.src.distribution.distribution_lib import Distribution
 from keras.src.distribution.distribution_lib import LayoutMap
 from keras.src.distribution.distribution_lib import ModelParallel
+from keras.src.distribution.distribution_lib import ParallaxDistribution
 from keras.src.distribution.distribution_lib import TensorLayout
 from keras.src.distribution.distribution_lib import distribute_tensor
 from keras.src.distribution.distribution_lib import distribution

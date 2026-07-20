@@ -349,6 +349,11 @@ class Distribution:
         raise NotImplementedError()
 
     @property
+    def num_data_shards(self):
+        """Total number of data shards."""
+        return min(self.num_model_replicas, self.num_processes)
+
+    @property
     def data_shard_id(self):
         """ID of the data shard for the current process."""
         num_model_replicas = self.num_model_replicas
@@ -803,6 +808,302 @@ class ModelParallel(Distribution):
             return distributed_dataset.prefetch(tf.data.AUTOTUNE)
 
 
+@keras_export("keras.distribution.ParallaxDistribution")
+class ParallaxDistribution(Distribution):
+    """Distribution strategy using Parallax.
+
+    Args:
+        strategy: string, one of `"fsdp"`, `"ddp"`, or `"auto"`.
+        model_builder: Callable that returns a Keras model.
+            Required for `"auto"` strategy.
+        sample_inputs: PyTree of sample inputs for the model.
+            Required for `"auto"` strategy.
+    """
+
+    def __init__(
+        self,
+        strategy="fsdp",
+        model_builder=None,
+        sample_inputs=None,
+        auto_shard_dataset=True,
+        **kwargs,
+    ):
+        try:
+            import parallax
+            from parallax.sharding import base as parallax_base
+        except ImportError:
+            raise ImportError(
+                "Parallax distribution requires the "
+                "`parallax` package to be installed."
+            )
+
+        self.strategy = strategy
+        self.model_builder = model_builder
+        self.sample_inputs = sample_inputs
+
+        # Create Parallax mesh
+        if "device_mesh" in kwargs:
+            keras_mesh = kwargs["device_mesh"]
+            self.parallax_mesh = keras_mesh.backend_mesh
+        elif "mesh" in kwargs:
+            keras_mesh = kwargs["mesh"]
+            self.parallax_mesh = keras_mesh.backend_mesh
+        else:
+            self.parallax_mesh = parallax.auto_mesh()
+
+            # Convert to Keras DeviceMesh
+            import collections.abc
+
+            mesh_shape = self.parallax_mesh.shape
+            if isinstance(mesh_shape, collections.abc.Mapping):
+                mesh_shape = tuple(mesh_shape.values())
+
+            keras_mesh = DeviceMesh(
+                shape=mesh_shape,
+                axis_names=self.parallax_mesh.axis_names,
+                devices=self.parallax_mesh.devices.flatten().tolist(),
+            )
+
+        # Validate mesh rank for 'auto' strategy
+        import collections.abc
+
+        mesh_shape = self.parallax_mesh.shape
+        if isinstance(mesh_shape, collections.abc.Mapping):
+            mesh_shape = tuple(mesh_shape.values())
+
+        if self.strategy == "auto" and len(mesh_shape) != 2:
+            raise ValueError(
+                "Parallax 'auto' strategy requires a rank 2 mesh. "
+                f"Current mesh shape is {mesh_shape}. "
+                "Please ensure you have enough devices (>=6 and even) "
+                "or configure a custom rank-2 mesh. "
+                "If you are using XLA flags to force device count, "
+                "ensure they are set before JAX/Keras initialization."
+            )
+
+        # Determine batch dimension name
+        batch_dim_name = "data"
+        if "data" not in self.parallax_mesh.axis_names:
+            batch_dim_name = self.parallax_mesh.axis_names[0]
+
+        super().__init__(
+            keras_mesh,
+            batch_dim_name=batch_dim_name,
+            auto_shard_dataset=auto_shard_dataset,
+        )
+
+        self.cached_shardings_dict = {}
+
+        if self.strategy == "auto":
+            if model_builder is None or sample_inputs is None:
+                raise ValueError(
+                    "model_builder and sample_inputs are required "
+                    "for 'auto' strategy."
+                )
+
+            # Trace to get shardings
+            temp_model = model_builder()
+
+            # Ensure it is an NNX module
+            if not isinstance(temp_model, parallax_base.nnx.Module):
+                raise ValueError(
+                    "Model must be an NNX Module for ParallaxDistribution"
+                )
+
+            state = parallax_base.nnx.state(temp_model)
+            graphdef = parallax_base.nnx.graphdef(temp_model)
+
+            def fn(state, inputs):
+                return parallax_base.nnx.merge(graphdef, state)(inputs)
+
+            strategy_enum = parallax.ShardingStrategy(self.strategy)
+            get_shardings_fn = parallax_base._pick_shardings_fn(strategy_enum)
+
+            if isinstance(self.sample_inputs, tuple):
+                inputs_for_trace = self.sample_inputs
+            else:
+                inputs_for_trace = (self.sample_inputs,)
+
+            import jax
+
+            with jax.set_mesh(self.parallax_mesh):
+                (params_shd, _), _ = get_shardings_fn(
+                    fn, state, *inputs_for_trace
+                )
+
+            # Map tensor IDs to Keras variable paths
+            val_to_keras_path = {}
+            if hasattr(temp_model, "variables"):
+                for v in temp_model.variables:
+                    if hasattr(v, "raw_value"):
+                        val_to_keras_path[id(v.raw_value)] = v.path
+                    if hasattr(v, "_value"):
+                        val_to_keras_path[id(v._value)] = v.path
+
+            # Map NNX paths to tensor values
+            flat_state, _ = jax.tree_util.tree_flatten_with_path(state)
+            nnx_path_to_val = {}
+            for path_tuple, val in flat_state:
+                path_str = "/".join(
+                    [
+                        str(k.key) if hasattr(k, "key") else str(k.name)
+                        for k in path_tuple
+                    ]
+                )
+                nnx_path_to_val[path_str] = val
+
+            # Flatten cached_shardings to dict
+            flattened, _ = jax.tree_util.tree_flatten_with_path(params_shd)
+            for path_tuple, sharding_spec in flattened:
+                # Convert path_tuple to string path
+                nnx_path_str = "/".join(
+                    [
+                        str(k.key) if hasattr(k, "key") else str(k.name)
+                        for k in path_tuple
+                    ]
+                )
+
+                # Map to Keras path
+                val = nnx_path_to_val.get(nnx_path_str)
+                if val is not None:
+                    keras_path = val_to_keras_path.get(id(val))
+                    if keras_path:
+                        self.cached_shardings_dict[keras_path] = sharding_spec
+
+                # Also cache under NNX path just in case
+                self.cached_shardings_dict[nnx_path_str] = sharding_spec
+
+            print(
+                "DEBUG AUTO SHARDING: cached_shardings_dict keys "
+                "(first 5 mapped):"
+            )
+            mapped_keys = [
+                k
+                for k in self.cached_shardings_dict.keys()
+                if not k.startswith("_")
+            ]
+            print(mapped_keys[:5])
+
+    def distribute_dataset(self, dataset):
+        from keras.src.utils.module_utils import tensorflow as tf
+
+        if not isinstance(dataset, tf.data.Dataset):
+            return dataset
+
+        # Try to get batch size from element_spec
+        global_batch_size = None
+        for spec in tf.nest.flatten(dataset.element_spec):
+            if hasattr(spec, "shape") and spec.shape.rank > 0:
+                if spec.shape[0] is not None:
+                    global_batch_size = spec.shape[0]
+                    break
+
+        if global_batch_size is None or global_batch_size == -1:
+            from tensorflow.python.data.experimental.ops import (
+                distribute as tf_data_distribute,
+            )
+
+            global_batch_size = int(
+                tf_data_distribute.compute_batch_size(dataset).numpy()
+            )
+
+        if global_batch_size is None or global_batch_size <= 0:
+            try:
+                # Fallback: Peek at the first batch to determine batch size
+                temp_iter = iter(dataset)
+                first_batch = next(temp_iter)
+                flat_batch = tf.nest.flatten(first_batch)
+                for item in flat_batch:
+                    if hasattr(item, "shape") and len(item.shape) > 0:
+                        batch_dim = int(item.shape[0])
+                        if batch_dim > 0:
+                            global_batch_size = batch_dim
+                            break
+            except Exception:
+                pass
+
+        if global_batch_size is None or global_batch_size <= 0:
+            raise ValueError(
+                "Cannot determine batch size of the dataset. "
+                "Please ensure it is batched or has a known "
+                "batch size in its element_spec."
+            )
+
+        num_shards = self.num_data_shards
+        if global_batch_size % num_shards != 0:
+            raise ValueError(
+                f"Global batch size ({global_batch_size}) must be "
+                f"divisible by number of shards ({num_shards})."
+            )
+
+        per_process_batch_size = global_batch_size // num_shards
+        dataset = dataset.rebatch(per_process_batch_size)
+        dataset = dataset.shard(num_shards=num_shards, index=self.data_shard_id)
+        return dataset.prefetch(tf.data.AUTOTUNE)
+
+    def get_data_layout(self, data_shape):
+        data_shard_spec = [None] * len(data_shape)
+        if len(data_shape) > 0:
+            data_shard_spec[0] = self.batch_dim_name
+        return TensorLayout(tuple(data_shard_spec), self.device_mesh)
+
+    def get_variable_layout(self, variable):
+        if self.strategy == "fsdp":
+            if variable.ndim == 0:
+                return TensorLayout((), self.device_mesh)
+
+            # Check if the last dimension is divisible by the 'model' axis size
+            model_axis_name = "model"
+            if model_axis_name in self.device_mesh.axis_names:
+                axis_idx = self.device_mesh.axis_names.index(model_axis_name)
+                axis_size = self.device_mesh.shape[axis_idx]
+                if variable.shape[-1] % axis_size == 0:
+                    axes = [None] * variable.ndim
+                    axes[-1] = model_axis_name
+                    return TensorLayout(tuple(axes), self.device_mesh)
+
+            # Fallback to replication if not divisible or axis not found
+            return TensorLayout((None,) * variable.ndim, self.device_mesh)
+
+        elif self.strategy == "ddp":
+            axes = (None,) * variable.ndim
+            return TensorLayout(axes, self.device_mesh)
+
+        elif self.strategy == "auto":
+            if variable.path in self.cached_shardings_dict:
+                pspec = self.cached_shardings_dict[variable.path]
+                axes = tuple(pspec)
+                # Print only a few to avoid spam
+                if "kernel" in variable.path or "embeddings" in variable.path:
+                    print(
+                        f"DEBUG AUTO LAYOUT: {variable.path} matched, "
+                        f"axes={axes}"
+                    )
+                return TensorLayout(axes, self.device_mesh)
+            else:
+                # Fallback to replication
+                if "kernel" in variable.path or "embeddings" in variable.path:
+                    print(
+                        f"DEBUG AUTO LAYOUT: {variable.path} NOT matched, "
+                        f"fallback to replication"
+                    )
+                axes = (None,) * variable.ndim
+                return TensorLayout(axes, self.device_mesh)
+
+        else:
+            raise ValueError(f"Unsupported strategy: {self.strategy}")
+
+    def get_tensor_layout(self, path):
+        return None
+
+    @property
+    def num_model_replicas(self):
+        mesh_batch_dim_index = self.device_mesh.axis_names.index(
+            self.batch_dim_name
+        )
+        return self.device_mesh.shape[mesh_batch_dim_index]
+
+
 @keras_export("keras.distribution.LayoutMap")
 class LayoutMap(collections.abc.MutableMapping):
     """A dict-like object that maps string to `TensorLayout` instances.
@@ -958,3 +1259,36 @@ def set_distribution(value):
         value: a `Distribution` instance.
     """
     global_state.set_global_attribute(GLOBAL_ATTRIBUTE_NAME, value)
+
+
+def estimate_local_variable_elements(variable):
+    """Estimate the number of elements in a sharded variable.
+
+    Args:
+        variable: A `Variable` instance.
+
+    Returns:
+        int: The number of elements in the sharded variable.
+    """
+    val = variable.value
+    sharding = getattr(val, "sharding", None)
+    if (
+        sharding is None
+        or hasattr(sharding, "is_fully_replicated")
+        and sharding.is_fully_replicated
+    ):
+        return np.prod(variable.shape)
+
+    # Simple estimation for common sharding cases
+    mesh = sharding.mesh
+    sharding_spec = sharding.spec
+
+    local_shape = list(variable.shape)
+    for i, axis_name in enumerate(sharding_spec):
+        if axis_name is not None:
+            # Find the size of the mesh axis
+            axis_idx = mesh.axis_names.index(axis_name)
+            axis_size = mesh.shape[axis_idx]
+            local_shape[i] = local_shape[i] // axis_size
+
+    return np.prod(local_shape)

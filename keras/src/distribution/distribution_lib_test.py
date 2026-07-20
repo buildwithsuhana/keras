@@ -443,6 +443,35 @@ class ModelParallelDistributionTest(testing.TestCase):
         self.assertEqual(distribution.num_processes, 2)
 
 
+class DistributionHelpersTest(testing.TestCase):
+    def test_estimate_local_variable_elements(self):
+        class FakeMesh:
+            axis_names = ("batch", "model")
+            shape = (4, 2)
+
+        class FakeSharding:
+            def __init__(self):
+                self.mesh = FakeMesh()
+                self.spec = (None, "model")
+                self.is_fully_replicated = False
+
+        class FakeValue:
+            def __init__(self, sharding):
+                self.sharding = sharding
+
+        class FakeVariable:
+            def __init__(self, shape, sharding):
+                self.shape = shape
+                self.value = FakeValue(sharding)
+
+        variable = FakeVariable((16, 32), FakeSharding())
+
+        self.assertEqual(
+            distribution_lib.estimate_local_variable_elements(variable),
+            256,
+        )
+
+
 class LayoutMapTest(testing.TestCase):
     def setUp(self):
         super().setUp()

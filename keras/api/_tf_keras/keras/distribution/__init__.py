@@ -10,6 +10,9 @@ from keras.src.distribution.distribution_lib import LayoutMap as LayoutMap
 from keras.src.distribution.distribution_lib import (
     ModelParallel as ModelParallel,
 )
+from keras.src.distribution.distribution_lib import (
+    ParallaxDistribution as ParallaxDistribution,
+)
 from keras.src.distribution.distribution_lib import TensorLayout as TensorLayout
 from keras.src.distribution.distribution_lib import (
     distribute_tensor as distribute_tensor,

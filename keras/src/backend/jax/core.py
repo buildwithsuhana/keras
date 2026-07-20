@@ -552,7 +552,12 @@ def slice(inputs, start_indices, shape):
         inputs.shape[i] - start_indices[i] if s == -1 else s
         for i, s in enumerate(shape)
     )
-    return jax.lax.dynamic_slice(inputs, start_indices, final_shape)
+    try:
+        static_starts = [int(i) for i in start_indices]
+        limit_indices = [s + f for s, f in zip(static_starts, final_shape)]
+        return jax.lax.slice(inputs, static_starts, limit_indices)
+    except Exception:
+        return jax.lax.dynamic_slice(inputs, start_indices, final_shape)
 
 
 def slice_update(inputs, start_indices, updates):
