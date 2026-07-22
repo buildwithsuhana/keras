@@ -108,7 +108,38 @@ def to_torch_dtype(dtype):
 
 
 class Variable(KerasVariable):
+    def _initialize_layout(self):
+        from keras.src.distribution.distribution_lib import distribution
+
+        dist = distribution()
+        if self._layout is None and dist is not None:
+            self._layout = dist.get_variable_layout(self)
+
     def _initialize(self, value):
+        from keras.src.backend.torch import distribution_lib
+        from keras.src.distribution.distribution_lib import ModelParallel
+
+        self._shape = self._validate_shape(value.shape)
+        self._initialize_layout()
+
+        if self._layout is not None:
+            distribution_obj = global_state.get_global_attribute("distribution")
+            if isinstance(distribution_obj, ModelParallel):
+                if isinstance(value, torch.nn.Parameter):
+                    self._value = distribution_lib.distribute_variable(
+                        value, self._layout
+                    )
+                else:
+                    tensor = convert_to_tensor(value, dtype=self._dtype)
+                    dtensor = distribution_lib.distribute_tensor(
+                        tensor, self._layout
+                    )
+                    self._value = torch.nn.Parameter(
+                        dtensor,
+                        requires_grad=self.trainable,
+                    )
+                return
+
         if isinstance(value, torch.nn.Parameter):
             # Reuse same parameter
             self._value = value
@@ -119,6 +150,17 @@ class Variable(KerasVariable):
             ).to(get_device())
 
     def _direct_assign(self, value):
+        from keras.src.backend.torch import distribution_lib
+        from keras.src.distribution.distribution_lib import ModelParallel
+
+        distribution_obj = global_state.get_global_attribute("distribution")
+        if self._layout is not None and isinstance(
+            distribution_obj, ModelParallel
+        ):
+            if not hasattr(value, "device_mesh"):
+                if value.requires_grad or value.grad_fn is not None:
+                    value = value.detach()
+                value = distribution_lib.distribute_tensor(value, self._layout)
         with torch.no_grad():
             self.value.copy_(value)
 
@@ -267,6 +309,18 @@ def convert_to_tensor(x, dtype=None, sparse=None, ragged=None):
 def convert_to_numpy(x):
     def transform(x):
         if is_tensor(x):
+            if hasattr(x, "to_local"):
+                # For DTensor, we need to gather the full tensor if it's sharded
+                # or partially sharded.
+                if hasattr(x, "placements"):
+                    from torch.distributed.tensor import Replicate
+
+                    if any(not isinstance(p, Replicate) for p in x.placements):
+                        x = x.redistribute(
+                            device_mesh=x.device_mesh,
+                            placements=[Replicate()] * len(x.placements),
+                        )
+                x = x.to_local()
             if x.requires_grad:
                 x = x.detach()
             # Tensor has to be moved to CPU before converting to numpy.
