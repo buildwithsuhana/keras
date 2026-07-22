@@ -4,22 +4,21 @@ from keras.src.api_export import keras_export
 from keras.src.optimizers import optimizer
 
 
-@keras_export(["keras.optimizers.ScheduleFreeAdamW"])
-class ScheduleFreeAdamW(optimizer.Optimizer):
-    """Optimizer that implements the Schedule-Free AdamW algorithm.
+@keras_export(["keras.optimizers.ScheduleFreeSGD"])
+class ScheduleFreeSGD(optimizer.Optimizer):
+    """Optimizer that implements the Schedule-Free SGD algorithm.
 
     Schedule-Free learning is a method that avoids the need for a learning rate
     schedule by maintaining a combination of interpolation and averaging.
     This approach eliminates the requirement to specify stopping time in advance
     and typically matches or outperforms cosine and linear decay schedules.
 
-    The optimizer maintains three sets of variables internally:
-    - `momentum`: The sequence where gradient updates are applied
-    - `velocity`: Exponential moving average of squared gradients (Adam)
-    - `averaged`: The averaged sequence used for evaluation
+    The optimizer maintains two sets of auxiliary variables internally:
+    - `momentum`: The sequence (z) where gradient updates are applied
+    - `averaged`: The averaged sequence (x) used for evaluation
 
-    During training, the model parameters are set to an interpolation between
-    `momentum` and `averaged`.
+    During training, the model parameters (y) are set to an interpolation
+    between `momentum` (z) and `averaged` (x).
 
     Args:
         learning_rate: A float, a
@@ -31,12 +30,6 @@ class ScheduleFreeAdamW(optimizer.Optimizer):
             exponential decay rate for the 1st moment estimates and controls
             the interpolation between `momentum` and `averaged`.
             Defaults to `0.9`.
-        beta_2: A float value or a constant float tensor, or a callable
-            that takes no arguments and returns the actual value to use. The
-            exponential decay rate for the 2nd moment estimates.
-            Defaults to `0.999`.
-        epsilon: A small constant for numerical stability.
-            Defaults to `1e-8`.
         warmup_steps: Number of warmup steps for learning rate warmup.
             During warmup, the learning rate linearly increases from 0 to the
             specified learning rate. Defaults to `0`.
@@ -50,7 +43,7 @@ class ScheduleFreeAdamW(optimizer.Optimizer):
 
     Example:
 
-    >>> optimizer = keras.optimizers.ScheduleFreeAdamW(learning_rate=0.0025)
+    >>> optimizer = keras.optimizers.ScheduleFreeSGD(learning_rate=0.0025)
     >>> model.compile(optimizer=optimizer, loss="mse")
     >>> model.fit(x_train, y_train)
 
@@ -60,8 +53,6 @@ class ScheduleFreeAdamW(optimizer.Optimizer):
         self,
         learning_rate=0.0025,
         beta_1=0.9,
-        beta_2=0.999,
-        epsilon=1e-8,
         warmup_steps=0,
         weight_decay=None,
         clipnorm=None,
@@ -90,16 +81,13 @@ class ScheduleFreeAdamW(optimizer.Optimizer):
             **kwargs,
         )
         self.beta_1 = beta_1
-        self.beta_2 = beta_2
-        self.epsilon = epsilon
         self.warmup_steps = warmup_steps
 
     def build(self, var_list):
         """Initialize optimizer variables.
 
-        ScheduleFreeAdamW optimizer has the following variables:
+        ScheduleFreeSGD optimizer has the following variables:
         - `momentum`: Auxiliary variable where gradient updates are applied
-        - `velocity`: Exponential moving average of squared gradients (Adam)
         - `averaged`: Auxiliary variable storing the averaged sequence (x)
 
         Args:
@@ -108,13 +96,8 @@ class ScheduleFreeAdamW(optimizer.Optimizer):
         if self.built:
             return
         super().build(var_list)
-        (
-            self._momentums,
-            self._velocities,
-            self._averageds,
-        ) = self.add_optimizer_variables(
-            var_list, ["momentum", "velocity", "averaged"]
-        )
+        self._momentums = self.add_optimizer_variables(var_list, "momentum")
+        self._averageds = self.add_optimizer_variables(var_list, "averaged")
 
         # Track sum of squared learning rates for weighted averaging
         self._sum_sq_lrs = self.add_variable(
@@ -151,8 +134,6 @@ class ScheduleFreeAdamW(optimizer.Optimizer):
         local_step = ops.cast(self.iterations + 1, variable.dtype)
 
         beta_1 = ops.cast(self.beta_1, variable.dtype)
-        beta_2 = ops.cast(self.beta_2, variable.dtype)
-        epsilon = ops.cast(self.epsilon, variable.dtype)
 
         # Apply warmup
         if self.warmup_steps > 0:
@@ -162,10 +143,11 @@ class ScheduleFreeAdamW(optimizer.Optimizer):
 
         var_index = self._get_variable_index(variable)
         momentum = self._momentums[var_index]
-        velocity = self._velocities[var_index]
         averaged = self._averageds[var_index]
 
         # Update sum of squared learning rates (once per iteration)
+        # We use a trick to update it only once per iteration across
+        # all variables
         last_iteration = ops.cast(self._last_iteration, "int")
         current_iteration = ops.cast(self.iterations, "int")
 
@@ -184,37 +166,21 @@ class ScheduleFreeAdamW(optimizer.Optimizer):
         # Compute weight for averaging: weight = lr^2 / sum_sq_lrs
         weight = ops.divide(ops.square(lr), sum_sq_lrs)
 
-        # Bias correction for Adam's second moment
-        bias_correction_2 = 1 - ops.power(beta_2, local_step)
-
-        # Update velocity (second moment estimate)
-        self.assign_add(
-            velocity,
-            ops.multiply(
-                ops.subtract(ops.square(gradient), velocity), 1 - beta_2
-            ),
-        )
-
-        # Compute the denominator (RMSprop-style with bias correction)
-        denom = ops.add(ops.sqrt(velocity / bias_correction_2), epsilon)
-
-        # Apply weight decay (decoupled)
+        # Apply weight decay
         if self.weight_decay is not None:
 
             def apply_wd():
                 wd = ops.cast(self.weight_decay, variable.dtype)
-                self.assign_sub(
-                    momentum, ops.multiply(ops.multiply(lr, wd), variable)
-                )
+                return ops.add(gradient, ops.multiply(wd, variable))
 
-            ops.cond(
+            gradient = ops.cond(
                 self._use_weight_decay(variable),
                 apply_wd,
-                lambda: None,
+                lambda: gradient,
             )
 
-        # Update momentum: momentum = momentum - lr * gradient / denom
-        self.assign_sub(momentum, ops.divide(ops.multiply(lr, gradient), denom))
+        # Update momentum: momentum = momentum - lr * gradient
+        self.assign_sub(momentum, ops.multiply(lr, gradient))
 
         # Update averaged sequence:
         # x_new = (1 - weight) * x_old + weight * momentum_new
@@ -230,6 +196,7 @@ class ScheduleFreeAdamW(optimizer.Optimizer):
             ops.multiply(1 - beta_1, momentum),
             ops.multiply(beta_1, new_averaged),
         )
+
         self.assign(variable, y_new)
 
     def finalize_variable_values(self, var_list):
@@ -244,15 +211,13 @@ class ScheduleFreeAdamW(optimizer.Optimizer):
         config.update(
             {
                 "beta_1": self.beta_1,
-                "beta_2": self.beta_2,
-                "epsilon": self.epsilon,
                 "warmup_steps": self.warmup_steps,
             }
         )
         return config
 
 
-if ScheduleFreeAdamW.__doc__ is not None:
-    ScheduleFreeAdamW.__doc__ = ScheduleFreeAdamW.__doc__.replace(
+if ScheduleFreeSGD.__doc__ is not None:
+    ScheduleFreeSGD.__doc__ = ScheduleFreeSGD.__doc__.replace(
         "{{base_optimizer_keyword_args}}", optimizer.base_optimizer_keyword_args
     )
