@@ -42,10 +42,11 @@ class TorchTrainer(base_trainer.Trainer):
         x, y, sample_weight = data_adapter_utils.unpack_x_y_sample_weight(data)
 
         # Compute predictions
+        model = getattr(self, "ddp_model", self)
         if self._call_has_training_arg:
-            y_pred = self(x, training=True)
+            y_pred = model(x, training=True)
         else:
-            y_pred = self(x)
+            y_pred = model(x)
 
         # Call torch.nn.Module.zero_grad() to clear the leftover gradients
         # for the weights from the previous train step.
@@ -86,10 +87,11 @@ class TorchTrainer(base_trainer.Trainer):
             y,
             sample_weight,
         ) = data_adapter_utils.unpack_x_y_sample_weight(data)
+        model = getattr(self, "ddp_model", self)
         if self._call_has_training_arg:
-            y_pred = self(x, training=False)
+            y_pred = model(x, training=False)
         else:
-            y_pred = self(x)
+            y_pred = model(x)
         loss = self._compute_loss(
             x=x, y=y, y_pred=y_pred, sample_weight=sample_weight, training=False
         )
@@ -103,15 +105,66 @@ class TorchTrainer(base_trainer.Trainer):
 
     def predict_step(self, data):
         x, _, _ = data_adapter_utils.unpack_x_y_sample_weight(data)
+        model = getattr(self, "ddp_model", self)
         if self._call_has_training_arg:
-            y_pred = self(x, training=False)
+            y_pred = model(x, training=False)
         else:
-            y_pred = self(x)
+            y_pred = model(x)
         return y_pred
 
     def make_train_function(self, force=False):
         if self.train_function is not None and not force:
             return self.train_function
+
+        if torch.distributed.is_initialized() and not hasattr(
+            self, "ddp_model"
+        ):
+            from torch.nn.parallel import DistributedDataParallel
+
+            from keras.src.backend.torch.core import get_device
+            from keras.src.distribution.distribution_lib import DataParallel
+            from keras.src.distribution.distribution_lib import distribution
+
+            active_distribution = distribution()
+
+            if active_distribution is None or isinstance(
+                active_distribution, DataParallel
+            ):
+                device = get_device()
+                if str(device).startswith("cuda"):
+                    if ":" in str(device):
+                        device_ids = [int(str(device).split(":")[-1])]
+                    else:
+                        device_ids = [torch.cuda.current_device()]
+                else:
+                    device_ids = None
+
+                process_group = None
+                if active_distribution is not None:
+                    from keras.src.backend.torch.distribution_lib import (
+                        _to_backend_mesh,
+                    )
+
+                    backend_mesh = _to_backend_mesh(
+                        active_distribution.device_mesh
+                    )
+                    # get_group expects the axis name
+                    process_group = backend_mesh.get_group(
+                        active_distribution.batch_dim_name
+                    )
+
+                # Set find_unused_parameters=False by default to avoid hangs
+                # and overhead. It can be made configurable if needed.
+                object.__setattr__(
+                    self,
+                    "ddp_model",
+                    DistributedDataParallel(
+                        self,
+                        device_ids=device_ids,
+                        process_group=process_group,
+                        find_unused_parameters=False,
+                    ),
+                )
 
         train_step = self.train_step
         if self._should_torch_compile():
@@ -143,6 +196,60 @@ class TorchTrainer(base_trainer.Trainer):
             return logs
 
         self.test_function = test_function
+
+    def _sync_metrics(self):
+        if torch.distributed.is_initialized():
+            import torch.distributed as dist
+
+            from keras.src.distribution.distribution_lib import distribution
+
+            active_distribution = distribution()
+            process_group = None
+            if active_distribution is not None:
+                from keras.src.backend.torch.distribution_lib import (
+                    _to_backend_mesh,
+                )
+
+                backend_mesh = _to_backend_mesh(active_distribution.device_mesh)
+                process_group = backend_mesh.get_group(
+                    active_distribution.batch_dim_name
+                )
+
+            with torch.no_grad():
+                for metric in self.metrics:
+                    for v in metric.variables:
+                        if hasattr(v, "_value") and v._value is not None:
+                            val = v._value
+                            dist.all_reduce(
+                                val,
+                                op=dist.ReduceOp.SUM,
+                                group=process_group,
+                            )
+
+    def get_metrics_result(self):
+        if torch.distributed.is_initialized():
+            with torch.no_grad():
+                all_vars = []
+                for metric in self.metrics:
+                    for v in metric.variables:
+                        if hasattr(v, "_value") and v._value is not None:
+                            all_vars.append(v)
+
+                if all_vars:
+                    # Save original values to avoid double-counting in
+                    # future steps.
+                    original_values = [v._value.clone() for v in all_vars]
+
+                    self._sync_metrics()
+                    results = super().get_metrics_result()
+
+                    # Restore original values.
+                    for v, original_val in zip(all_vars, original_values):
+                        v._value.copy_(original_val)
+
+                    return results
+
+        return super().get_metrics_result()
 
     def make_predict_function(self, force=False):
         if self.predict_function is not None and not force:

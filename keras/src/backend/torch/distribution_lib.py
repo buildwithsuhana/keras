@@ -151,25 +151,44 @@ def _to_backend_mesh(device_mesh):
     Returns:
         A `torch.distributed.DeviceMesh` instance.
     """
+    if hasattr(device_mesh, "_torch_mesh"):
+        return device_mesh._torch_mesh
+
     devices = device_mesh.devices
 
-    ranks = np.array(
-        [int(d.split(":")[-1]) for d in devices.flatten()]
-    ).reshape(devices.shape)
+    ranks = []
+    for i, d in enumerate(devices.flatten()):
+        if hasattr(d, "split"):
+            parts = d.split(":")
+            if len(parts) > 1:
+                ranks.append(int(parts[-1]))
+            else:
+                ranks.append(i)
+        elif hasattr(d, "index") and d.index is not None:
+            ranks.append(d.index)
+        else:
+            ranks.append(i)
+    ranks = np.array(ranks).reshape(devices.shape)
 
-    first_device = (
-        devices.flatten()[0].split(":")[0] if devices.size > 0 else "cpu"
-    )
+    first_device = devices.flatten()[0] if devices.size > 0 else "cpu"
+    if hasattr(first_device, "type"):
+        first_device_type = first_device.type
+    elif hasattr(first_device, "split"):
+        first_device_type = first_device.split(":")[0]
+    else:
+        first_device_type = "cpu"
 
     resolved_device_type = _parse_device_input(
-        first_device or get_device()
+        first_device_type or get_device()
     ).split(":")[0]
 
-    return torch.distributed.device_mesh.DeviceMesh(
+    torch_mesh = torch.distributed.device_mesh.DeviceMesh(
         resolved_device_type,
         ranks,
         mesh_dim_names=tuple(device_mesh.axis_names),
     )
+    device_mesh._torch_mesh = torch_mesh
+    return torch_mesh
 
 
 def _to_backend_device(device_name):
