@@ -228,6 +228,7 @@ class Model(Trainer, base_trainer.Trainer, Layer):
         expand_nested=False,
         show_trainable=False,
         layer_range=None,
+        format="text",
     ):
         """Prints a string summary of the network.
 
@@ -256,6 +257,9 @@ class Model(Trainer, base_trainer.Trainer, Layer):
                 and the end predicate will be the last element
                 that matches `layer_range[1]`.
                 By default `None` considers all layers of the model.
+            format: Output format of the summary.
+                Expected one of `'text'`, `'markdown'`, `'html'`, `'latex'`.
+                Defaults to `'text'`.
 
         Raises:
             ValueError: if `summary()` is called before the model is built.
@@ -268,6 +272,7 @@ class Model(Trainer, base_trainer.Trainer, Layer):
             expand_nested=expand_nested,
             show_trainable=show_trainable,
             layer_range=layer_range,
+            format=format,
         )
 
     @traceback_utils.filter_traceback

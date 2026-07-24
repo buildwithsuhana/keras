@@ -1,4 +1,5 @@
 import functools
+import html
 import math
 import re
 import shutil
@@ -10,6 +11,7 @@ import rich.markup
 # See https://github.com/keras-team/keras/issues/448
 # for below imports
 import rich.table
+import rich.text
 
 from keras.src import backend
 from keras.src import tree
@@ -119,6 +121,88 @@ def format_layer_shape(layer):
     return out
 
 
+def _escape_markdown(s):
+    """Escape characters that break Markdown tables."""
+    return s.replace("\\", "\\\\").replace("|", "\\|")
+
+
+def _escape_latex(s):
+    """Escape special characters for LaTeX."""
+    s = (
+        s.replace("\\", "\\textbackslash{}")
+        .replace("_", "\\_")
+        .replace("#", "\\#")
+        .replace("%", "\\%")
+        .replace("&", "\\&")
+        .replace("$", "\\$")
+        .replace("{", "\\{")
+        .replace("}", "\\}")
+        .replace("<", "\\textless{}")
+        .replace(">", "\\textgreater{}")
+        .replace("|", "\\textbar{}")
+    )
+    return s
+
+
+def _render_markdown(header, rows, model_name, footer_lines):
+    lines = []
+    lines.append(f"### Model: {model_name}")
+    lines.append("")
+    lines.append("| " + " | ".join(header) + " |")
+    lines.append("| " + " | ".join(["---"] * len(header)) + " |")
+    for row in rows:
+        lines.append("| " + " | ".join(row) + " |")
+    lines.append("")
+    for line in footer_lines:
+        lines.append(line)
+    return "\n".join(lines)
+
+
+def _render_html(header, rows, model_name, footer_lines):
+    lines = []
+    lines.append(f"<h3>Model: {model_name}</h3>")
+    lines.append("<table border='1'>")
+    lines.append("  <thead>")
+    lines.append(
+        "    <tr>" + "".join([f"<th>{h}</th>" for h in header]) + "</tr>"
+    )
+    lines.append("  </thead>")
+    lines.append("  <tbody>")
+    for row in rows:
+        lines.append(
+            "    <tr>" + "".join([f"<td>{f}</td>" for f in row]) + "</tr>"
+        )
+    lines.append("  </tbody>")
+    lines.append("</table>")
+    for line in footer_lines:
+        lines.append(f"<p>{line}</p>")
+    return "\n".join(lines)
+
+
+def _render_latex(header, rows, model_name, footer_lines, alignment):
+    lines = []
+    lines.append(f'\\textbf{{Model: "{model_name}"}} \\par')
+    align_str = "".join(
+        [
+            "l" if a == "left" else "r" if a == "right" else "c"
+            for a in alignment
+        ]
+    )
+    lines.append("\\noindent\\begin{tabular}{|" + "|".join(align_str) + "|}")
+    lines.append("\\hline")
+    lines.append(" & ".join(header) + " \\\\ \\hline")
+    for row in rows:
+        lines.append(" & ".join(row) + " \\\\ \\hline")
+    lines.append("\\end{tabular}")
+    lines.append("\\par\\noindent")
+    for i, line in enumerate(footer_lines):
+        if i < len(footer_lines) - 1:
+            lines.append(line + " \\newline")
+        else:
+            lines.append(line)
+    return "\n".join(lines)
+
+
 def print_summary(
     model,
     line_length=None,
@@ -127,6 +211,7 @@ def print_summary(
     expand_nested=False,
     show_trainable=False,
     layer_range=None,
+    format="text",
 ):
     """Prints a summary of a model.
 
@@ -154,6 +239,9 @@ def print_summary(
             `layer_range[0]` and the ending layer will be the last element that
             matches `layer_range[1]`. By default (`None`) all
             layers in the model are included in the summary.
+        format: Output format of the summary.
+            Expected one of `'text'`, `'markdown'`, `'html'`, `'latex'`.
+            Defaults to `'text'`.
     """
     from keras.src.models import Functional
     from keras.src.models import Sequential
@@ -315,9 +403,12 @@ def print_summary(
 
     # Render all layers to the rich table.
     layer_range = get_layer_index_bound_by_layer_name(layers, layer_range)
+    all_rows = []
     for layer in layers[layer_range[0] : layer_range[1]]:
         for row in print_layer(layer):
-            table.add_row(*row)
+            all_rows.append(row)
+            if format == "text":
+                table.add_row(*row)
 
     # After the table, append information about parameter count and size.
     if hasattr(model, "_collected_trainable_weights"):
@@ -349,45 +440,100 @@ def print_summary(
     )
 
     # Create a rich console for printing. Capture for non-interactive logging.
-    if print_fn:
-        console = rich.console.Console(
-            highlight=False, force_terminal=False, color_system=None
-        )
-        console.begin_capture()
-    else:
-        console = rich.console.Console(highlight=False)
-
-    # Print the to the console.
-    console.print(bold_text(f'Model: "{rich.markup.escape(model.name)}"'))
-    console.print(table)
-    console.print(
-        bold_text(" Total params: ")
-        + highlight_number(f"{total_count:,}")
-        + f" ({readable_memory_size(total_memory_size)})"
-    )
-    console.print(
-        bold_text(" Trainable params: ")
-        + highlight_number(f"{trainable_count:,}")
-        + f" ({readable_memory_size(trainable_memory_size)})"
-    )
-    console.print(
-        bold_text(" Non-trainable params: ")
-        + highlight_number(f"{non_trainable_count:,}")
-        + f" ({readable_memory_size(non_trainable_memory_size)})"
-    )
-    if optimizer_built:
-        console.print(
-            bold_text(" Optimizer params: ")
-            + highlight_number(f"{optimizer_weight_count:,}")
-            + f" ({readable_memory_size(optimizer_memory_size)})"
-        )
-
-    # Output captured summary for non-interactive logging.
-    if print_fn:
-        if print_fn is io_utils.print_msg:
-            print_fn(console.end_capture(), line_break=False)
+    if format == "text":
+        if print_fn:
+            console = rich.console.Console(
+                highlight=False, force_terminal=False, color_system=None
+            )
+            console.begin_capture()
         else:
-            print_fn(console.end_capture())
+            console = rich.console.Console(highlight=False)
+
+        # Print the to the console.
+        console.print(bold_text(f'Model: "{rich.markup.escape(model.name)}"'))
+        console.print(table)
+        console.print(
+            bold_text(" Total params: ")
+            + highlight_number(f"{total_count:,}")
+            + f" ({readable_memory_size(total_memory_size)})"
+        )
+        console.print(
+            bold_text(" Trainable params: ")
+            + highlight_number(f"{trainable_count:,}")
+            + f" ({readable_memory_size(trainable_memory_size)})"
+        )
+        console.print(
+            bold_text(" Non-trainable params: ")
+            + highlight_number(f"{non_trainable_count:,}")
+            + f" ({readable_memory_size(non_trainable_memory_size)})"
+        )
+        if optimizer_built:
+            console.print(
+                bold_text(" Optimizer params: ")
+                + highlight_number(f"{optimizer_weight_count:,}")
+                + f" ({readable_memory_size(optimizer_memory_size)})"
+            )
+
+        # Output captured summary for non-interactive logging.
+        if print_fn:
+            if print_fn is io_utils.print_msg:
+                print_fn(console.end_capture(), line_break=False)
+            else:
+                print_fn(console.end_capture())
+    else:
+        clean_header = [rich.text.Text.from_markup(h).plain for h in header]
+        clean_rows = [
+            [rich.text.Text.from_markup(f).plain for f in row]
+            for row in all_rows
+        ]
+
+        footer_lines = [
+            f"Total params: {total_count:,} "
+            f"({readable_memory_size(total_memory_size)})",
+            f"Trainable params: {trainable_count:,} "
+            f"({readable_memory_size(trainable_memory_size)})",
+            f"Non-trainable params: {non_trainable_count:,} "
+            f"({readable_memory_size(non_trainable_memory_size)})",
+        ]
+        if optimizer_built:
+            footer_lines.append(
+                f"Optimizer params: {optimizer_weight_count:,} "
+                f"({readable_memory_size(optimizer_memory_size)})"
+            )
+
+        if format == "markdown":
+            esc_header = [_escape_markdown(h) for h in clean_header]
+            esc_rows = [
+                [_escape_markdown(f) for f in row] for row in clean_rows
+            ]
+            esc_footer = [_escape_markdown(l) for l in footer_lines]
+            esc_model_name = _escape_markdown(model.name)
+            output = _render_markdown(
+                esc_header, esc_rows, esc_model_name, esc_footer
+            )
+        elif format == "html":
+            esc_header = [html.escape(h) for h in clean_header]
+            esc_rows = [[html.escape(f) for f in row] for row in clean_rows]
+            esc_footer = [html.escape(l) for l in footer_lines]
+            esc_model_name = html.escape(model.name)
+            output = _render_html(
+                esc_header, esc_rows, esc_model_name, esc_footer
+            )
+        elif format == "latex":
+            esc_header = [_escape_latex(h) for h in clean_header]
+            esc_rows = [[_escape_latex(f) for f in row] for row in clean_rows]
+            esc_footer = [_escape_latex(l) for l in footer_lines]
+            esc_model_name = _escape_latex(model.name)
+            output = _render_latex(
+                esc_header, esc_rows, esc_model_name, esc_footer, alignment
+            )
+        else:
+            raise ValueError(f"Unknown format: {format}")
+
+        if print_fn:
+            print_fn(output)
+        else:
+            print(output)
 
 
 def get_layer_index_bound_by_layer_name(layers, layer_range=None):
