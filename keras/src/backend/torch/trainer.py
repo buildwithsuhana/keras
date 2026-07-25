@@ -82,7 +82,19 @@ class TorchTrainer(base_trainer.Trainer):
                     )
 
                 if isinstance(active_distribution, FSDP):
+                    import functools
+
                     from torch.distributed.fsdp import ShardingStrategy
+                    from torch.distributed.fsdp.wrap import (
+                        size_based_auto_wrap_policy,
+                    )
+
+                    # Use a conservative wrap policy. Setting a high threshold
+                    # (10M) keeps small tensors (embeddings) replicated,
+                    # avoiding IndexErrors and tied-weight issues.
+                    auto_wrap_policy = functools.partial(
+                        size_based_auto_wrap_policy, min_num_params=10000000
+                    )
 
                     wrapper = FullyShardedDataParallel(
                         self,
@@ -90,7 +102,8 @@ class TorchTrainer(base_trainer.Trainer):
                         device_id=device_ids[0] if device_ids else None,
                         use_orig_params=True,
                         sync_module_states=True if device_ids else False,
-                        sharding_strategy=ShardingStrategy.SHARD_GRAD_OP,
+                        auto_wrap_policy=auto_wrap_policy,
+                        sharding_strategy=ShardingStrategy.FULL_SHARD,
                         limit_all_gathers=True,
                     )
                 else:
