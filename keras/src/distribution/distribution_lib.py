@@ -491,9 +491,9 @@ class DataParallel(Distribution):
             )
 
     def _initialize_mesh_from_devices(self, devices, auto_shard_dataset):
-        devices = np.array(devices)
+        devices = np.array(devices).flatten()
         device_mesh = DeviceMesh(
-            shape=devices.shape,
+            shape=(devices.size,),
             axis_names=[DEFAULT_BATCH_DIM_NAME],
             devices=devices,
         )
@@ -514,7 +514,8 @@ class DataParallel(Distribution):
 
     def get_data_layout(self, data_shape):
         data_shard_spec = [None] * len(data_shape)
-        data_shard_spec[0] = self.batch_dim_name  # Shard on the first dim
+        if len(data_shape) > 0:
+            data_shard_spec[0] = self.batch_dim_name  # Shard on the first dim
         return TensorLayout(data_shard_spec, self.device_mesh)
 
     def get_variable_layout(self, variable):
@@ -527,6 +528,141 @@ class DataParallel(Distribution):
 
     def get_tensor_layout(self, path):
         # For data parallel training, the intermediate state is not changed.
+        return None
+
+
+@keras_export("keras.distribution.FSDP")
+class FSDP(Distribution):
+    """Distribution for Fully Sharded Data Parallelism.
+
+    You can choose to create this instance by either specifying
+    the `device_mesh` or `devices` arguments (but not both).
+
+    By default, it shards variables on their largest divisible dimension across
+    the mesh devices, matching standard SPMD / FSDP behavior.
+    """
+
+    def __init__(self, device_mesh=None, devices=None, auto_shard_dataset=True):
+        """Initialize the FSDP distribution.
+
+        Args:
+            device_mesh: Optional `DeviceMesh` instance.
+            devices: Optional list of physical/virtual devices.
+            auto_shard_dataset: Automatically shard the dataset amongst
+                processes in a multi-process setting. Defaults to `True`.
+        """
+        if device_mesh is not None and devices is not None:
+            raise ValueError(
+                "Cannot pass both `device_mesh` and `devices`. Choose one."
+            )
+
+        if device_mesh:
+            self._initialize_with_device_mesh(device_mesh, auto_shard_dataset)
+        elif devices:
+            self._initialize_mesh_from_devices(devices, auto_shard_dataset)
+        else:
+            self._initialize_mesh_from_list_devices(auto_shard_dataset)
+
+    @property
+    def num_model_replicas(self):
+        return self.device_mesh.devices.size
+
+    def _initialize_with_device_mesh(self, device_mesh, auto_shard_dataset):
+        if not isinstance(device_mesh, DeviceMesh):
+            raise ValueError(
+                "Expect `device_mesh` to be an instance of `DeviceMesh`. "
+                f"Received: device_mesh={device_mesh} "
+                f"(type {type(device_mesh)})"
+            )
+        super().__init__(
+            device_mesh, device_mesh.axis_names[0], auto_shard_dataset
+        )
+        if self.device_mesh.devices.ndim != 1:
+            warnings.warn(
+                f"Expect the input mesh for FSDP to be 1D, but received "
+                f"mesh.devices.ndim={self.device_mesh.devices.ndim}. "
+                f"The first axis ('{self.batch_dim_name}') will be used "
+                f"for sharding.",
+                UserWarning,
+                stacklevel=2,
+            )
+
+    def _initialize_mesh_from_devices(self, devices, auto_shard_dataset):
+        devices_arr = np.array(devices).flatten()
+        device_mesh = DeviceMesh(
+            shape=(devices_arr.size,),
+            axis_names=[DEFAULT_BATCH_DIM_NAME],
+            devices=devices_arr,
+        )
+        super().__init__(
+            device_mesh, DEFAULT_BATCH_DIM_NAME, auto_shard_dataset
+        )
+
+    def _initialize_mesh_from_list_devices(self, auto_shard_dataset):
+        devices_arr = np.array(list_devices())
+        device_mesh = DeviceMesh(
+            shape=(devices_arr.size,),
+            axis_names=[DEFAULT_BATCH_DIM_NAME],
+            devices=devices_arr,
+        )
+        super().__init__(
+            device_mesh, DEFAULT_BATCH_DIM_NAME, auto_shard_dataset
+        )
+
+    def get_data_layout(self, data_shape):
+        """Maps input batches to shard across devices on the batch axis."""
+        data_shard_spec = [None] * len(data_shape)
+        if len(data_shape) > 0:
+            # Shard on the first (batch) dimension
+            data_shard_spec[0] = self.batch_dim_name
+        return TensorLayout(data_shard_spec, self.device_mesh)
+
+    def get_variable_layout(self, variable):
+        """Assigns sharding layouts to variables across devices."""
+        # 1. Return explicit manual layout if already configured
+        if getattr(variable, "_layout", None) is not None:
+            return variable._layout
+
+        variable_shape = getattr(variable, "shape", ())
+        variable_shard_spec = [None] * len(variable_shape)
+
+        # 2. Assign sharding layout for non-scalar variables
+        if len(variable_shape) > 0:
+            mesh_batch_dim_index = self.device_mesh.axis_names.index(
+                self.batch_dim_name
+            )
+            axis_size = self.device_mesh.shape[mesh_batch_dim_index]
+
+            # Sort variable axes by dimension size descending
+            dims_with_indices = sorted(
+                enumerate(variable_shape), key=lambda x: x[1], reverse=True
+            )
+
+            sharded = False
+            for idx, dim_size in dims_with_indices:
+                # Assign the shard axis to the largest dimension evenly
+                # divisible by device count
+                if dim_size % axis_size == 0 and dim_size >= axis_size:
+                    variable_shard_spec[idx] = self.batch_dim_name
+                    sharded = True
+                    break
+
+            # 3. Inform user if a weight matrix cannot be sharded
+            if not sharded:
+                var_name = getattr(variable, "name", "unnamed_variable")
+                warnings.warn(
+                    f"FSDP: Variable '{var_name}' with shape "
+                    f"{variable_shape} cannot be evenly sharded across "
+                    f"{axis_size} devices on axis '{self.batch_dim_name}'. "
+                    f"Variable will remain replicated.",
+                    UserWarning,
+                    stacklevel=2,
+                )
+
+        return TensorLayout(variable_shard_spec, self.device_mesh)
+
+    def get_tensor_layout(self, path):
+        """Allows backend runtime engine to infer dynamic execution layouts."""
         return None
 
 
@@ -658,7 +794,8 @@ class ModelParallel(Distribution):
 
     def get_data_layout(self, data_shape):
         data_shard_spec = [None] * len(data_shape)
-        data_shard_spec[0] = self.batch_dim_name  # Shard on the first dim
+        if len(data_shape) > 0:
+            data_shard_spec[0] = self.batch_dim_name  # Shard on the first dim
         return TensorLayout(data_shard_spec, self.device_mesh)
 
     def get_variable_layout(self, variable):

@@ -79,13 +79,21 @@ class Callback:
         if backend.backend() == "torch":
             from torch.nn.parallel import DistributedDataParallel
 
-            if isinstance(self._model, DistributedDataParallel):
+            try:
+                from torch.distributed.fsdp import FullyShardedDataParallel
+            except ImportError:
+                FullyShardedDataParallel = None
+
+            if isinstance(self._model, DistributedDataParallel) or (
+                FullyShardedDataParallel is not None
+                and isinstance(self._model, FullyShardedDataParallel)
+            ):
                 # Keras Callbacks expect to work with Keras models. e.g
                 # ModelCheckpoint and EarlyStopping both attempt to call
                 # keras-specific APIs on the value returned from this
-                # property. If this callback was created against a DDP
+                # property. If this callback was created against a DDP/FSDP
                 # wrapper instead of the underlying keras.Model, it is
-                # likely to fail. Return self._model.module for DDP
+                # likely to fail. Return self._model.module for DDP/FSDP
                 # instances instead.
                 return self._model.module
 

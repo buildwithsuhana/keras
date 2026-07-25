@@ -72,6 +72,23 @@ For more details about the model architecture, check out
 [config.json](./config.json)."""
 
 
+def _get_fsdp_context(model, writeback=False):
+    if backend.backend() == "torch":
+        ddp_model = getattr(model, "ddp_model", None)
+        try:
+            from torch.distributed.fsdp import FullyShardedDataParallel
+
+            if isinstance(ddp_model, FullyShardedDataParallel):
+                return FullyShardedDataParallel.summon_full_params(
+                    ddp_model, writeback=writeback, offload_to_cpu=True
+                )
+        except ImportError:
+            pass
+    import contextlib
+
+    return contextlib.nullcontext()
+
+
 def save_model(model, filepath, weights_format="h5", zipped=True):
     """Save a zip-archive representing a Keras model to the given file or path.
 
@@ -180,13 +197,14 @@ def _save_model_to_dir(model, dirpath, weights_format):
                 f"Received: weights_format={weights_format}"
             )
         asset_store = DiskIOStore(assert_dirpath, mode="w")
-        _save_state(
-            model,
-            weights_store=weights_store,
-            assets_store=asset_store,
-            inner_path="",
-            visited_saveables=set(),
-        )
+        with _get_fsdp_context(model, writeback=False):
+            _save_state(
+                model,
+                weights_store=weights_store,
+                assets_store=asset_store,
+                inner_path="",
+                visited_saveables=set(),
+            )
     finally:
         weights_store.close()
         asset_store.close()
@@ -245,13 +263,14 @@ def _save_model_to_fileobj(model, fileobj, weights_format):
 
             asset_store = DiskIOStore(_ASSETS_DIRNAME, archive=zf, mode="w")
 
-            _save_state(
-                model,
-                weights_store=weights_store,
-                assets_store=asset_store,
-                inner_path="",
-                visited_saveables=set(),
-            )
+            with _get_fsdp_context(model, writeback=False):
+                _save_state(
+                    model,
+                    weights_store=weights_store,
+                    assets_store=asset_store,
+                    inner_path="",
+                    visited_saveables=set(),
+                )
         except:
             # Skip the final `zf.write` if any exception is raised
             write_zf = False
@@ -619,13 +638,14 @@ def save_weights_only(
             visited_saveables = set(id(o) for o in objects_to_skip)
         else:
             visited_saveables = set()
-        _save_state(
-            model,
-            weights_store=weights_store,
-            assets_store=None,
-            inner_path="",
-            visited_saveables=visited_saveables,
-        )
+        with _get_fsdp_context(model, writeback=False):
+            _save_state(
+                model,
+                weights_store=weights_store,
+                assets_store=None,
+                inner_path="",
+                visited_saveables=visited_saveables,
+            )
         weights_store.close()
     finally:
         if tmp_dir is not None:
@@ -674,16 +694,17 @@ def load_weights_only(
         else:
             visited_saveables = set()
         error_msgs = {}
-        _load_state(
-            model,
-            weights_store=weights_store,
-            assets_store=None,
-            inner_path="",
-            skip_mismatch=skip_mismatch,
-            visited_saveables=visited_saveables,
-            failed_saveables=failed_saveables,
-            error_msgs=error_msgs,
-        )
+        with _get_fsdp_context(model, writeback=True):
+            _load_state(
+                model,
+                weights_store=weights_store,
+                assets_store=None,
+                inner_path="",
+                skip_mismatch=skip_mismatch,
+                visited_saveables=visited_saveables,
+                failed_saveables=failed_saveables,
+                error_msgs=error_msgs,
+            )
         weights_store.close()
         if archive:
             archive.close()
