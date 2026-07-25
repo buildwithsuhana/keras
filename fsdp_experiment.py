@@ -8,11 +8,11 @@ import time
 import numpy as np
 import psutil
 
-# Global MPS disable for macOS
+# Disable MPS only on macOS as a fallback, but allow CUDA
 try:
     import torch
 
-    if hasattr(torch.backends, "mps"):
+    if sys.platform == "darwin" and hasattr(torch.backends, "mps"):
         torch.backends.mps.is_available = lambda: False
 except ImportError:
     pass
@@ -84,6 +84,9 @@ def run_training(rank, world_size, mesh, backend):
     )
 
     with distribution.scope():
+        if backend == "torch":
+            time.sleep(rank * 0.1)
+
         # Use a model large enough to see sharding benefits
         model = keras_hub.models.OPTBackbone.from_preset(
             "opt_125m_en", dropout=0.0
@@ -117,6 +120,12 @@ def run_training(rank, world_size, mesh, backend):
         )
 
         if backend == "torch":
+            import torch
+
+            device = torch.device(
+                "cuda" if torch.cuda.is_available() else "cpu"
+            )
+
             indices = []
             # For FSDP, we shard across the whole world_size for data
             data_shard_index = rank
@@ -133,9 +142,6 @@ def run_training(rank, world_size, mesh, backend):
             }
             y = full_y[indices]
 
-            import torch
-
-            device = torch.device("cpu")
             x = {k: torch.from_numpy(v).to(device) for k, v in x.items()}
             y = torch.from_numpy(y).to(device)
             batch_size = local_batch_size
@@ -205,9 +211,8 @@ def run_training(rank, world_size, mesh, backend):
             if torch.cuda.is_available():
                 has_gpu = True
                 rank_peak_gpu = torch.cuda.max_memory_allocated()
-                device = torch.device(
-                    f"cuda:{int(os.environ.get('LOCAL_RANK', 0))}"
-                )
+                device_id = torch.cuda.current_device()
+                device = torch.device(f"cuda:{device_id}")
                 m_tensor = torch.tensor([float(rank_peak_gpu)], device=device)
                 torch.distributed.all_reduce(
                     m_tensor, op=torch.distributed.ReduceOp.MAX
@@ -259,18 +264,21 @@ def run_training(rank, world_size, mesh, backend):
                 json.dump(results, f, indent=2)
 
 
-def run_backend(backend, world_size=4):
+def run_backend(backend, world_size=None):
     os.environ["KERAS_BACKEND"] = backend
+
+    import torch
+
+    num_gpus = torch.cuda.device_count()
+
+    if world_size is None:
+        if backend == "torch" and num_gpus > 0:
+            world_size = num_gpus
+        else:
+            world_size = 4  # Default simulation
+
     if backend == "jax":
         os.environ["XLA_PYTHON_CLIENT_MEM_FRACTION"] = "0.9"
-        num_gpus = 0
-        try:
-            import torch
-
-            num_gpus = torch.cuda.device_count()
-        except:
-            pass
-
         if num_gpus < world_size:
             os.environ["XLA_FLAGS"] = (
                 f"--xla_force_host_platform_device_count={world_size}"
@@ -278,15 +286,10 @@ def run_backend(backend, world_size=4):
             os.environ["JAX_PLATFORMS"] = "cpu"
         _run_jax(world_size)
     elif backend == "torch":
-        # Force CPU and Gloo
-        os.environ["KERAS_TORCH_DEVICE"] = "cpu"
-        os.environ["CUDA_VISIBLE_DEVICES"] = ""
-        os.environ["PYTORCH_ENABLE_MPS_FALLBACK"] = "1"
-
-        import torch
-
-        if hasattr(torch.backends, "mps"):
-            torch.backends.mps.is_available = lambda: False
+        if num_gpus == 0:
+            print("Warning: No GPU detected. Torch FSDP requires a GPU.")
+            # We'll try to run on CPU anyway, but FSDP will likely fail
+            os.environ["KERAS_TORCH_DEVICE"] = "cpu"
 
         port = str(find_free_port())
         torch.multiprocessing.spawn(
@@ -312,14 +315,6 @@ def _run_jax(world_size):
 def _run_torch(rank, world_size, port):
     import torch
 
-    # Disable MPS in every process
-    if hasattr(torch.backends, "mps"):
-        torch.backends.mps.is_available = lambda: False
-
-    # Force Gloo backend for CPU-based distributed training
-    os.environ["CUDA_VISIBLE_DEVICES"] = ""
-    os.environ["PYTORCH_ENABLE_MPS_FALLBACK"] = "1"
-
     os.environ.update(
         {
             "RANK": str(rank),
@@ -330,19 +325,30 @@ def _run_torch(rank, world_size, port):
         }
     )
 
-    torch.set_num_threads(1)
-    torch.set_num_interop_threads(1)
-
-    if hasattr(torch, "set_default_device"):
-        torch.set_default_device("cpu")
-
     import keras
 
     keras.utils.set_random_seed(42)
+
+    if torch.cuda.is_available():
+        # Set device for this process
+        device_id = rank % torch.cuda.device_count()
+        torch.cuda.set_device(device_id)
+        # Force Keras to use the correct GPU device
+        # This is a bit of a hack to ensure the right device is picked up
+        os.environ["KERAS_TORCH_DEVICE"] = f"cuda:{device_id}"
+    else:
+        os.environ["KERAS_TORCH_DEVICE"] = "cpu"
+
     keras.distribution.initialize()
 
-    devices = [f"cpu:{i}" for i in range(world_size)]
-    print(f"Using Torch devices: {devices}")
+    if torch.cuda.is_available():
+        devices = [
+            f"cuda:{i % torch.cuda.device_count()}" for i in range(world_size)
+        ]
+    else:
+        devices = [f"cpu:{i}" for i in range(world_size)]
+
+    print(f"Process {rank}: Using Torch devices: {devices}")
 
     mesh = keras.distribution.DeviceMesh(
         shape=(world_size,), axis_names=("data",), devices=devices
@@ -355,7 +361,6 @@ def _run_torch(rank, world_size, port):
 
 
 if __name__ == "__main__":
-    if len(sys.argv) < 2:
-        print("Usage: python fsdp_experiment.py <backend>")
-        sys.exit(1)
-    run_backend(sys.argv[1])
+    backend = sys.argv[1]
+    world_size = int(sys.argv[2]) if len(sys.argv) > 2 else None
+    run_backend(backend, world_size)
