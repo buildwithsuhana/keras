@@ -1,3 +1,4 @@
+import functools
 import warnings
 
 import numpy as np
@@ -83,13 +84,24 @@ class TorchTrainer(base_trainer.Trainer):
                     )
 
                 if isinstance(active_distribution, FSDP):
+                    from torch.distributed.fsdp import ShardingStrategy
+
+                    # Use a more conservative wrap policy to avoid sharding
+                    # small tensors like position embeddings which can cause
+                    # IndexErrors in ops.slice
+                    auto_wrap_policy = functools.partial(
+                        size_based_auto_wrap_policy, min_num_params=100000
+                    )
+
                     wrapper = FullyShardedDataParallel(
                         self,
                         process_group=process_group,
                         device_id=device_ids[0] if device_ids else None,
                         use_orig_params=True,
                         sync_module_states=True if device_ids else False,
-                        auto_wrap_policy=size_based_auto_wrap_policy,
+                        auto_wrap_policy=auto_wrap_policy,
+                        sharding_strategy=ShardingStrategy.FULL_SHARD,
+                        limit_all_gathers=True,
                     )
                 else:
                     wrapper = DistributedDataParallel(
