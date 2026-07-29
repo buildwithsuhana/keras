@@ -3,7 +3,6 @@ import collections
 import numpy as np
 
 from keras.src import backend
-from keras.src import ops
 from keras.src.layers.layer import Layer
 from keras.src.saving import serialization_lib
 from keras.src.utils import argument_validation
@@ -496,24 +495,9 @@ class IndexLookup(Layer):
         special_tokens = [self.mask_token] * oov_start + [
             self.oov_token
         ] * self.num_oov_indices
-
-        found_special_tokens = False
-        if token_start > 0 and tf.size(vocabulary) >= token_start:
-            if all(t is not None for t in special_tokens):
-                special_tokens_tensor = tf_utils.ensure_tensor(
-                    special_tokens, dtype=self.vocabulary_dtype
-                )
-                found_special_tokens = tf.reduce_all(
-                    tf.equal(vocabulary[:token_start], special_tokens_tensor)
-                )
-            else:
-                # If there are None in special_tokens, we use numpy/python for
-                # this small check.
-                found_special_tokens = np.array_equal(
-                    special_tokens,
-                    backend.convert_to_numpy(vocabulary[:token_start]),
-                )
-
+        found_special_tokens = np.array_equal(
+            special_tokens, backend.convert_to_numpy(vocabulary[:token_start])
+        )
         if found_special_tokens:
             tokens = vocabulary[token_start:]
         else:
@@ -521,10 +505,11 @@ class IndexLookup(Layer):
 
         if tf.is_tensor(tokens):
             unique_tokens, _ = tf.unique(tokens)
+            is_unique = tf.size(unique_tokens) == tf.size(tokens)
         else:
-            unique_tokens = ops.unique(tokens)
+            is_unique = len(set(tokens)) == len(tokens)
 
-        if tf.size(unique_tokens) != tf.size(tokens):
+        if not is_unique:
             repeated_tokens = self._find_repeated_tokens(
                 backend.convert_to_numpy(tokens)
             )
@@ -599,32 +584,45 @@ class IndexLookup(Layer):
                 front_padding_value = 0.0
             else:
                 front_padding = token_start
-                front_padding_value = ops.mean(idf_weights)
+                front_padding_value = tf.reduce_mean(idf_weights)
             # If pad_to_max_tokens is true, and max_tokens is greater than our
             # total vocab size, we need to pad the back of idf_weights with
             # zeros as well.
             if self.pad_to_max_tokens and self.max_tokens is not None:
                 back_padding = (
-                    self.max_tokens - front_padding - ops.size(idf_weights)
+                    self.max_tokens - front_padding - tf.size(idf_weights)
                 )
             else:
                 back_padding = 0
 
-            front_padding_tensor = ops.full(
-                (int(front_padding),),
-                ops.cast(front_padding_value, idf_weights.dtype),
+            weights = tf.pad(
+                idf_weights,
+                [[int(front_padding), int(back_padding)]],
+                constant_values=front_padding_value,
             )
-            back_padding_tensor = ops.full(
-                (int(back_padding),), ops.cast(0.0, idf_weights.dtype)
-            )
-            weights = ops.concatenate(
-                [front_padding_tensor, idf_weights, back_padding_tensor], axis=0
-            )
-            self.idf_weights = backend.Variable(
+            # tf.pad with constant_values uses that value for both sides.
+            # But we want 0.0 for back_padding if it exists.
+            if back_padding > 0:
+                # We need to manually zero the back padding if it's not the
+                # same as front_padding_value.
+                # Actually, standard Keras behavior for tf-idf back padding
+                # is usually 0. Let's use tf.concat for safety and clarity.
+                weights = tf.concat(
+                    [
+                        tf.fill([int(front_padding)], front_padding_value),
+                        idf_weights,
+                        tf.fill([int(back_padding)], 0.0),
+                    ],
+                    axis=0,
+                )
+
+            self.idf_weights = tf.Variable(
                 weights,
                 trainable=False,
+                dtype=backend.floatx(),
             )
-            self.idf_weights_const = ops.convert_to_tensor(self.idf_weights)
+            self.idf_weights_const = self.idf_weights.value()
+            self.idf_weights_const = self.idf_weights.value()
 
     def get_build_config(self):
         return {}
