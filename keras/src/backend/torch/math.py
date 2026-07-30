@@ -38,6 +38,8 @@ def _segment_reduction_fn(data, segment_ids, reduction_method, num_segments):
         result = torch.ones(*shape, device=get_device()) * -float("Inf")
     elif reduction_method == "amin":
         result = torch.ones(*shape, device=get_device()) * float("Inf")
+    elif reduction_method == "prod":
+        result = torch.ones(*shape, device=get_device())
     else:
         result = torch.zeros(*shape, device=get_device())
 
@@ -69,6 +71,12 @@ def segment_min(data, segment_ids, num_segments=None, sorted=False):
     return _segment_reduction_fn(data, segment_ids, "amin", num_segments)
 
 
+def segment_prod(data, segment_ids, num_segments=None, sorted=False):
+    data = convert_to_tensor(data)
+    segment_ids = convert_to_tensor(segment_ids)
+    return _segment_reduction_fn(data, segment_ids, "prod", num_segments)
+
+
 def top_k(x, k, sorted=True):
     x = convert_to_tensor(x)
     return torch.topk(x, k, sorted=sorted)
@@ -76,7 +84,7 @@ def top_k(x, k, sorted=True):
 
 def in_top_k(targets, predictions, k):
     targets = convert_to_tensor(targets).type(torch.int64)
-    targets = targets[:, None]
+    targets = targets.unsqueeze(-1)
     predictions = convert_to_tensor(predictions)
     topk_values = top_k(predictions, k).values
     targets_values = torch.take_along_dim(predictions, targets, dim=-1)
@@ -88,6 +96,18 @@ def logsumexp(x, axis=None, keepdims=False):
     x = convert_to_tensor(x)
     axis = tuple(range(x.dim())) if axis is None else axis
     return torch.logsumexp(x, dim=axis, keepdim=keepdims)
+
+
+def cdist(x, y):
+    x = convert_to_tensor(x)
+    y = convert_to_tensor(y)
+    if x.ndim < 2 or y.ndim < 2:
+        raise ValueError("`cdist` inputs must have rank >= 2")
+    if x.shape[-1] != y.shape[-1]:
+        raise ValueError("Last dimension of inputs to `cdist` must match")
+    # torch.cdist exists but does NOT broadcast batch dims the same way
+    diff = x.unsqueeze(-2) - y.unsqueeze(-3)
+    return torch.sqrt(torch.sum(diff * diff, dim=-1))
 
 
 def extract_sequences(x, sequence_length, sequence_stride):
@@ -313,7 +333,12 @@ def istft(
                 f"Received: window shape={win.shape}"
             )
 
-    if sequence_length == fft_length and center is True and win is not None:
+    if (
+        sequence_length == fft_length
+        and center is True
+        and win is not None
+        and fft_length > 1
+    ):
         # can be fallen back to torch.istft
         need_unpack = False
         *batch_shape, num_sequences, fft_unique_bins = complex_input.shape
@@ -370,7 +395,7 @@ def istft(
     if length is not None:
         end = start + length
     elif center is True:
-        end = -(fft_length // 2)
+        end = expected_output_len - (fft_length // 2)
     else:
         end = expected_output_len
     return x[..., start:end]
@@ -384,6 +409,11 @@ def rsqrt(x):
 def erf(x):
     x = convert_to_tensor(x)
     return torch.erf(x)
+
+
+def erfc(x):
+    x = convert_to_tensor(x)
+    return torch.erfc(x)
 
 
 def erfinv(x):

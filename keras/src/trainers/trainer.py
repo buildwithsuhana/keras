@@ -134,6 +134,17 @@ class Trainer:
                 For `torch` backend, `"auto"` will default to eager
                 execution and `jit_compile=True` will run with `torch.compile`
                 with the `"inductor"` backend.
+                On the JAX backend, compilation happens on the first step and
+                can take several seconds. JAX can persist the compiled result
+                to disk and reuse it across runs and processes, so the same
+                model only pays that cost once. Enable it before the first
+                step with:
+                ```python
+                import jax
+                jax.config.update("jax_compilation_cache_dir", "/path/to/cache")
+                ```
+                See the JAX persistent compilation cache docs for the
+                available thresholds.
             auto_scale_loss: Bool. If `True` and the model dtype policy is
                 `"mixed_float16"`, the passed optimizer will be automatically
                 wrapped in a `LossScaleOptimizer`, which will dynamically
@@ -163,14 +174,19 @@ class Trainer:
             in the transfer learning guide.
         """
         optimizer = optimizers.get(optimizer)
-        
+
         # AutoTP integration: Wrap optimizer if AutoTPDistribution is active
-        from keras.src.distribution.distribution_lib import distribution, AutoTPDistribution
-        from keras.src.distribution.tensor_parallel.coordinated_optimizer import TensorParallelOptimizer
-        
+        from keras.src.distribution.distribution_lib import AutoTPDistribution
+        from keras.src.distribution.distribution_lib import distribution
+        from keras.src.distribution.tensor_parallel.coordinated_optimizer import (
+            TensorParallelOptimizer,
+        )
+
         current_dist = distribution()
         if isinstance(current_dist, AutoTPDistribution):
-            if optimizer is not None and not isinstance(optimizer, TensorParallelOptimizer):
+            if optimizer is not None and not isinstance(
+                optimizer, TensorParallelOptimizer
+            ):
                 optimizer = TensorParallelOptimizer(
                     optimizer,
                     device_count=current_dist.model.device_count,
@@ -216,6 +232,9 @@ class Trainer:
         self.jit_compile = jit_compile
         self.run_eagerly = run_eagerly
         self.stop_training = False
+        self._compiled_trainable_state = {
+            layer: layer.trainable for layer in self._flatten_layers()
+        }
         self.compiled = True
         self._loss_tracker = metrics_module.Mean(name="loss")
         self.steps_per_execution = steps_per_execution
@@ -1084,6 +1103,34 @@ class Trainer:
             return results[0]
         return results
 
+    def _warn_if_trainable_state_changed(self):
+        if not self.compiled or not hasattr(self, "_compiled_trainable_state"):
+            return
+
+        current_state = {
+            layer: layer.trainable for layer in self._flatten_layers()
+        }
+        changed_layers = []
+        for layer, trainable in current_state.items():
+            if layer not in self._compiled_trainable_state:
+                changed_layers.append(layer.name)
+            elif trainable != self._compiled_trainable_state[layer]:
+                changed_layers.append(layer.name)
+
+        if changed_layers:
+            warnings.warn(
+                "A layer's `trainable` state has changed since the model was "
+                "compiled. This can result in unexpected behavior, as the "
+                "compiled optimizer and loss functions may not track the "
+                "correct variables. Please recompile your model "
+                "(e.g. `model.compile(...)`) before calling `fit()` or "
+                "`evaluate()` so the change takes effect. "
+                f"Changed layers: {changed_layers}",
+                stacklevel=2,
+            )
+            # Update the state so we only warn once per compile
+            self._compiled_trainable_state = current_state
+
     def _assert_compile_called(self, method_name=None):
         if not self.compiled:
             msg = "You must call `compile()` before "
@@ -1092,6 +1139,7 @@ class Trainer:
             else:
                 msg += f"calling `{method_name}()`."
             raise ValueError(msg)
+            self._warn_if_trainable_state_changed()
 
     def _symbolic_build(self, iterator=None, data_batch=None):
         model_unbuilt = not all(layer.built for layer in self._flatten_layers())

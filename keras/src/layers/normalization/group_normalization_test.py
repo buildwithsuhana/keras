@@ -1,10 +1,9 @@
-import warnings
-
 import numpy as np
-import pytest
 
+from keras.src import backend
 from keras.src import constraints
 from keras.src import layers
+from keras.src import ops
 from keras.src import regularizers
 from keras.src import testing
 
@@ -71,6 +70,13 @@ class GroupNormalizationTest(testing.TestCase):
             "must be a multiple of the number of channels",
         ):
             _ = layer(inputs)
+
+    def test_groups_rejects_invalid_values(self):
+        for bad in (0, -2, 1.5, "32"):
+            with self.assertRaisesRegex(ValueError, "argument `groups`"):
+                layers.GroupNormalization(groups=bad)
+        # `-1` is the documented sentinel for instance normalization.
+        layers.GroupNormalization(groups=-1)
 
     def test_groups_instance_norm(self):
         # GroupNormalization with groups=-1 will become InstanceNormalization
@@ -179,25 +185,19 @@ class GroupNormalizationTest(testing.TestCase):
             atol=1e-3,
         )
 
-    def test_warns_when_epsilon_too_small_for_compute_dtype(self):
-        with pytest.warns(UserWarning, match="epsilon"):
-            layers.GroupNormalization(
-                groups=2,
-                axis=-1,
-                scale=False,
-                center=False,
-                epsilon=1e-4,
-                dtype="mixed_bfloat16",
-            )
+    def test_large_value_within_autocast_scope(self):
+        layer = layers.GroupNormalization(groups=2)
+        layer.build((1, 2, 4))
+        # Use 70000 to trigger overflow for float16
+        large_value = ops.full(layer.gamma.shape, 70000)
+        with backend.AutocastScope("float16"):
+            layer.gamma.assign(large_value)
+            self.assertAllClose(layer.gamma.value, large_value)
 
-        with warnings.catch_warnings(record=True) as w:
-            warnings.simplefilter("always")
-            layers.GroupNormalization(
-                groups=2,
-                axis=-1,
-                scale=False,
-                center=False,
-                epsilon=1e-2,
-                dtype="mixed_bfloat16",
-            )
-            self.assertFalse(any("epsilon" in str(x.message) for x in w))
+    def test_mixed_precision_large_input_no_nan(self):
+        # Inputs above the float16 max (~65504) must not overflow to inf/nan
+        # before the float32 normalization runs. See issue #22586.
+        x = ops.full((2, 4, 8), 70000.0)
+        layer = layers.GroupNormalization(groups=2, dtype="mixed_float16")
+        out = ops.convert_to_numpy(layer(x))
+        self.assertFalse(np.any(np.isnan(out)))

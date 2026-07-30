@@ -162,9 +162,16 @@ class TorchTrainerTest(testing.TestCase):
             object.__setattr__(model, "_ddp_model", model)
             model._in_ddp_context = True
 
-            with mock.patch.object(model, "_setup_ddp"), \
-                 mock.patch("torch.distributed.all_reduce") as mock_all_reduce:
-                model.fit(np.ones((4, 4), "f"), np.ones((4, 1), "f"), epochs=1, verbose=0)
+            with (
+                mock.patch.object(model, "_setup_ddp"),
+                mock.patch("torch.distributed.all_reduce") as mock_all_reduce,
+            ):
+                model.fit(
+                    np.ones((4, 4), "f"),
+                    np.ones((4, 1), "f"),
+                    epochs=1,
+                    verbose=0,
+                )
 
                 mock_all_reduce.reset_mock()
 
@@ -173,7 +180,9 @@ class TorchTrainerTest(testing.TestCase):
 
                 for call in mock_all_reduce.call_args_list:
                     args, kwargs = call
-                    self.assertEqual(kwargs.get("op"), torch.distributed.ReduceOp.SUM)
+                    self.assertEqual(
+                        kwargs.get("op"), torch.distributed.ReduceOp.SUM
+                    )
 
     def test_gradient_accumulation_no_sync(self):
         if not torch.distributed.is_initialized():
@@ -190,7 +199,9 @@ class TorchTrainerTest(testing.TestCase):
         distribution = distribution_lib.DataParallel(device_mesh=mesh)
 
         with distribution.scope():
-            model.no_sync = mock.MagicMock(return_value=contextlib.nullcontext())
+            model.no_sync = mock.MagicMock(
+                return_value=contextlib.nullcontext()
+            )
             object.__setattr__(model, "_ddp_model", model)
             model._in_ddp_context = True
 
@@ -215,7 +226,10 @@ class TorchTrainerTest(testing.TestCase):
 
         temp_filepath = os.path.join(self.get_temp_dir(), "model.weights.h5")
 
-        with mock.patch("keras.src.backend.torch.distribution_lib.process_id", return_value=0):
+        with mock.patch(
+            "keras.src.backend.torch.distribution_lib.process_id",
+            return_value=0,
+        ):
             model.save_weights(temp_filepath)
             self.assertTrue(os.path.exists(temp_filepath))
 
@@ -223,7 +237,10 @@ class TorchTrainerTest(testing.TestCase):
         new_model.compile(optimizer="adam", loss="mse")
         new_model(torch.ones((1, 4)))
 
-        with mock.patch("keras.src.backend.torch.distribution_lib.process_id", return_value=1):
+        with mock.patch(
+            "keras.src.backend.torch.distribution_lib.process_id",
+            return_value=1,
+        ):
             new_model.load_weights(temp_filepath)
 
         for ref_w, new_w in zip(model.get_weights(), new_model.get_weights()):

@@ -534,7 +534,10 @@ class CosineSimilarityTest(testing.TestCase):
         self.assertEqual(cosine_obj.name, "cosine_loss")
         self.assertEqual(cosine_obj.reduction, "sum")
         config = cosine_obj.get_config()
-        self.assertEqual(config, {"name": "cosine_loss", "reduction": "sum"})
+        self.assertEqual(
+            config, {"name": "cosine_loss", "reduction": "sum", "axis": 2}
+        )
+        self.run_class_serialization_test(cosine_obj)
 
     def test_unweighted(self):
         self.setup()
@@ -622,11 +625,14 @@ class HuberLossTest(testing.TestCase):
         self.y_true = self.np_y_true
 
     def test_config(self):
-        h_obj = losses.Huber(reduction="sum", name="huber")
+        h_obj = losses.Huber(delta=2.0, reduction="sum", name="huber")
         self.assertEqual(h_obj.name, "huber")
         self.assertEqual(h_obj.reduction, "sum")
         config = h_obj.get_config()
-        self.assertEqual(config, {"name": "huber", "reduction": "sum"})
+        self.assertEqual(
+            config, {"name": "huber", "reduction": "sum", "delta": 2.0}
+        )
+        self.run_class_serialization_test(h_obj)
 
     def test_all_correct(self):
         self.setup()
@@ -1233,6 +1239,14 @@ class SparseCategoricalCrossentropyTest(testing.TestCase):
         self.run_class_serialization_test(
             losses.SparseCategoricalCrossentropy(name="scce")
         )
+        scce_obj = losses.SparseCategoricalCrossentropy(
+            from_logits=True, ignore_class=3, axis=0, name="scce"
+        )
+        config = scce_obj.get_config()
+        self.assertEqual(config["from_logits"], True)
+        self.assertEqual(config["ignore_class"], 3)
+        self.assertEqual(config["axis"], 0)
+        self.run_class_serialization_test(scce_obj)
 
     def test_all_correct_unweighted(self):
         y_true = np.array([[0], [1], [2]], dtype="int64")
@@ -1426,6 +1440,16 @@ class SparseCategoricalCrossentropyTest(testing.TestCase):
                 y_true, y_pred_reshaped
             )
             self.assertAllClose(output, expected.sum() / 16.0)
+
+    @pytest.mark.skipif(
+        backend.backend() != "torch",
+        reason="Channels-first axis only supported on Torch.",
+    )
+    def test_squeezes_singleton_class_dim_on_user_axis(self):
+        y_true = np.random.randint(0, 2, size=(2, 1, 4, 4)).astype("float32")
+        y_pred = np.random.random((2, 2, 4, 4)).astype("float32")
+        loss = losses.sparse_categorical_crossentropy(y_true, y_pred, axis=1)
+        self.assertEqual(loss.shape, (2, 4, 4))
 
     def test_multi_class_segmentation(self):
         y_true = np.array(

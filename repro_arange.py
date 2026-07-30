@@ -1,11 +1,11 @@
-
 import os
 
 os.environ["KERAS_BACKEND"] = "torch"
 
-import keras
-import torch
 import numpy as np
+import torch
+
+import keras
 
 print(f"Keras floatx: {keras.config.floatx()}")
 

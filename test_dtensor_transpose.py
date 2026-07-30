@@ -1,7 +1,9 @@
 import os
+
 import torch
 from torch.distributed.device_mesh import init_device_mesh
-from torch.distributed.tensor import distribute_tensor, Shard, Replicate, DTensor
+from torch.distributed.tensor import Shard
+from torch.distributed.tensor import distribute_tensor
 
 # Mock environment for DTensor
 os.environ["MASTER_ADDR"] = "localhost"

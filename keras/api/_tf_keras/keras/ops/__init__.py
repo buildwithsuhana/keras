@@ -40,6 +40,7 @@ from keras.src.ops.linalg import inv as inv
 from keras.src.ops.linalg import jvp as jvp
 from keras.src.ops.linalg import lstsq as lstsq
 from keras.src.ops.linalg import lu_factor as lu_factor
+from keras.src.ops.linalg import matrix_power as matrix_power
 from keras.src.ops.linalg import matrix_rank as matrix_rank
 from keras.src.ops.linalg import norm as norm
 from keras.src.ops.linalg import pinv as pinv
@@ -47,7 +48,9 @@ from keras.src.ops.linalg import qr as qr
 from keras.src.ops.linalg import solve as solve
 from keras.src.ops.linalg import solve_triangular as solve_triangular
 from keras.src.ops.linalg import svd as svd
+from keras.src.ops.math import cdist as cdist
 from keras.src.ops.math import erf as erf
+from keras.src.ops.math import erfc as erfc
 from keras.src.ops.math import erfinv as erfinv
 from keras.src.ops.math import extract_sequences as extract_sequences
 from keras.src.ops.math import fft as fft
@@ -62,6 +65,7 @@ from keras.src.ops.math import rfft as rfft
 from keras.src.ops.math import rsqrt as rsqrt
 from keras.src.ops.math import segment_max as segment_max
 from keras.src.ops.math import segment_min as segment_min
+from keras.src.ops.math import segment_prod as segment_prod
 from keras.src.ops.math import segment_sum as segment_sum
 from keras.src.ops.math import stft as stft
 from keras.src.ops.math import top_k as top_k
@@ -165,6 +169,7 @@ from keras.src.ops.numpy import broadcast_to as broadcast_to
 from keras.src.ops.numpy import cbrt as cbrt
 from keras.src.ops.numpy import ceil as ceil
 from keras.src.ops.numpy import clip as clip
+from keras.src.ops.numpy import column_stack as column_stack
 from keras.src.ops.numpy import concatenate as concatenate
 from keras.src.ops.numpy import conj as conj
 from keras.src.ops.numpy import conjugate as conjugate
@@ -186,6 +191,7 @@ from keras.src.ops.numpy import digitize as digitize
 from keras.src.ops.numpy import divide as divide
 from keras.src.ops.numpy import divide_no_nan as divide_no_nan
 from keras.src.ops.numpy import dot as dot
+from keras.src.ops.numpy import dsplit as dsplit
 from keras.src.ops.numpy import dstack as dstack
 from keras.src.ops.numpy import einsum as einsum
 from keras.src.ops.numpy import empty as empty
@@ -196,11 +202,14 @@ from keras.src.ops.numpy import exp2 as exp2
 from keras.src.ops.numpy import expand_dims as expand_dims
 from keras.src.ops.numpy import expm1 as expm1
 from keras.src.ops.numpy import eye as eye
+from keras.src.ops.numpy import fabs as fabs
 from keras.src.ops.numpy import flip as flip
 from keras.src.ops.numpy import fliplr as fliplr
 from keras.src.ops.numpy import flipud as flipud
 from keras.src.ops.numpy import floor as floor
 from keras.src.ops.numpy import floor_divide as floor_divide
+from keras.src.ops.numpy import fmax as fmax
+from keras.src.ops.numpy import fmin as fmin
 from keras.src.ops.numpy import fmod as fmod
 from keras.src.ops.numpy import full as full
 from keras.src.ops.numpy import full_like as full_like

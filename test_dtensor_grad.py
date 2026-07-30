@@ -1,7 +1,11 @@
 import os
+
 import torch
 from torch.distributed.device_mesh import init_device_mesh
-from torch.distributed.tensor import distribute_tensor, Shard, Replicate, DTensor
+from torch.distributed.tensor import DTensor
+from torch.distributed.tensor import Shard
+from torch.distributed.tensor import distribute_tensor
+
 
 class SDPA_DTensor_Full(torch.autograd.Function):
     @staticmethod
@@ -17,7 +21,14 @@ class SDPA_DTensor_Full(torch.autograd.Function):
         # grad_output is a DTensor
         query, key, value = ctx.saved_tensors
         ql = grad_output._local_tensor
-        return DTensor.from_local(ql, grad_output.device_mesh, grad_output.placements), None, None
+        return (
+            DTensor.from_local(
+                ql, grad_output.device_mesh, grad_output.placements
+            ),
+            None,
+            None,
+        )
+
 
 def test_full_custom_grad():
     os.environ["MASTER_ADDR"] = "localhost"
@@ -30,13 +41,14 @@ def test_full_custom_grad():
 
     x = torch.randn(2, 4, requires_grad=True)
     dx = distribute_tensor(x, mesh, [Shard(0)])
-    
+
     dy = SDPA_DTensor_Full.apply(dx, None, None)
-    
+
     dy.sum().backward()
     print(f"dx.grad type: {type(dx.grad)}")
     print(f"dx.grad: {dx.grad}")
     torch.distributed.destroy_process_group()
+
 
 if __name__ == "__main__":
     test_full_custom_grad()

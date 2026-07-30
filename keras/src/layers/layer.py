@@ -19,7 +19,6 @@ And some more magic:
 import collections
 import functools
 import inspect
-import math
 import warnings
 from functools import wraps
 
@@ -40,6 +39,7 @@ from keras.src.backend.common.name_scope import current_path
 from keras.src.backend.common.remat import get_current_remat_mode
 from keras.src.backend.common.symbolic_scope import in_symbolic_scope
 from keras.src.backend.config import is_nnx_enabled
+
 # from keras.src.distribution import distribution_lib
 from keras.src.dtype_policies import DTypePolicyMap
 from keras.src.layers import input_spec
@@ -342,7 +342,6 @@ class Layer(BackendLayer, Operation):
         self._build_shapes_dict = None
         # Parent path
         self._parent_path = None
-        self._remat_mode = get_current_remat_mode()
         self._initialize_tracker()
 
     @tracking.no_automatic_dependency_tracking
@@ -1006,6 +1005,7 @@ class Layer(BackendLayer, Operation):
                 # This is useful for relayout intermediate tensor in the model
                 # to achieve the optimal performance.
                 from keras.src.distribution import distribution_lib
+
                 distribution = distribution_lib.distribution()
                 if distribution is not None:
                     current_layer_path = current_path()
@@ -1071,17 +1071,19 @@ class Layer(BackendLayer, Operation):
         # 1) user explicitly passed it?
         if arg_name in call_spec.user_arguments_dict:
             value = call_spec.user_arguments_dict[arg_name]
+            call_context.set_value(arg_name, value)
         # 2) else: inherited from outer layer call?
         elif call_context.get_value(arg_name) is not None:
             value = call_context.get_value(arg_name)
-        # 3) else: default from the call() signature
+        # 3) else: default from the call() signature. This stays local: the
+        # call context is shared across the whole call tree, so propagating
+        # it would let a non-None default (e.g. a preprocessing layer's
+        # `training=True`) leak to sibling and downstream layers. The bound
+        # `call()` still applies its own default, so there is nothing
+        # further to do here.
         else:
-            value = call_spec.arguments_dict.get(arg_name, None)
+            return
 
-        # stash it for downstream layers
-        call_context.set_value(arg_name, value)
-
-        # only inject it if this layer actually accepts it and it's not None
         if (
             self._call_has_context_arg.get(arg_name, False)
             and value is not None
@@ -1770,36 +1772,9 @@ class Layer(BackendLayer, Operation):
         Returns:
             Rematerialized layer's `call` method.
         """
-
-        def compute_size(x):
-            return (
-                math.prod([d or 1 for d in x.shape])
-                if isinstance(x, KerasTensor)
-                else 0
-            )
-
-        # Full rematerialization
-        if self._remat_mode.mode == "full":
-            return remat.remat(layer_call)
-
-        # Apply rematerialization to specific layers
-        elif self._remat_mode.mode == "list_of_layers" and (
-            self.name in self._remat_mode.layer_names
-        ):
-            return remat.remat(layer_call)
-
-        # Apply rematerialization based on output size threshold
-        elif self._remat_mode.mode == "larger_than":
-            output_spec = self.compute_output_spec(*args, **kwargs)
-            output_size = sum(
-                tree.flatten(tree.map_structure(compute_size, output_spec))
-            )
-            if (
-                output_size
-                and output_size > self._remat_mode.output_size_threshold
-            ):
-                return remat.remat(layer_call)
-        elif self._remat_mode.mode == "activations":
+        if not self._remat_mode:
+            return layer_call
+        if self._remat_mode.mode == "activations":
             has_activation = (
                 hasattr(self, "activation") and self.activation is not None
             )
@@ -1815,7 +1790,11 @@ class Layer(BackendLayer, Operation):
                         self.activation = original_activation
 
                 return rematerialized_activation_call_wrapper
-        return layer_call
+        elif self._remat_mode.mode == "list_of_layers" and (
+            self.name in self._remat_mode.layer_names
+        ):
+            return remat.remat(layer_call)
+        return super().rematerialized_call(layer_call, *args, **kwargs)
 
     def _register_call_context_args(self, *names):
         """Registers call-context args for this layer.

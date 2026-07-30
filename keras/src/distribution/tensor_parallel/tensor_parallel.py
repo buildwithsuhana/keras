@@ -5,21 +5,20 @@ Port of the PyTorch tensor_parallel library
 
 import logging
 import re
-from typing import Collection, Optional, Sequence, Union
+from typing import Optional
+from typing import Sequence
+from typing import Union
 
 import numpy as np
-import tensorflow as tf
+
 import keras
 from keras import ops
-from keras.src.distribution.tensor_parallel.autoconfig import (
-    get_default_config,
-)
+from keras.src.backend import distribution_lib
+from keras.src.distribution import list_devices
+from keras.src.distribution.tensor_parallel.autoconfig import get_default_config
 from keras.src.distribution.tensor_parallel.parameter_sharding import (
     make_parameter_sharded_model,
 )
-
-from keras.src.backend import distribution_lib
-from keras.src.distribution import list_devices
 
 logger = logging.getLogger(__file__)
 
@@ -50,7 +49,7 @@ class TensorParallelKeras(Model):
         self.device_count = device_count
         self.device_ids = device_ids
         self.sharding_strategy = "auto"
-        
+
         self.tensor_parallel_config = None
         self.distributed = True
 
@@ -69,7 +68,9 @@ class TensorParallelKeras(Model):
             print(f"🔍 Devices: {[str(d) for d in accel_devices]}")
 
             if num_processes > 1:
-                print(f"✅ Multi-process environment detected ({num_processes} processes). Trusting global device_count={device_count}.")
+                print(
+                    f"✅ Multi-process environment detected ({num_processes} processes). Trusting global device_count={device_count}."
+                )
                 # In multi-process, device_ids should probably stay as requested/configured
             elif len(accel_devices) >= device_count:
                 print(
@@ -87,7 +88,7 @@ class TensorParallelKeras(Model):
                 device_ids = accel_devices[:device_count]
         else:
             print(
-                f"⚠️  Could not discover accelerator devices. Falling back to configuration."
+                "⚠️  Could not discover accelerator devices. Falling back to configuration."
             )
 
         if not device_ids:
@@ -107,13 +108,13 @@ class TensorParallelKeras(Model):
 
                 with device(self.devices[0]):
                     self.model_shards[0] = model
-            
+
             self.assembled_model = self._original_model
 
             if hasattr(self._original_model, "inputs"):
                 self._inputs = self._original_model.inputs
                 self._outputs = self._original_model.outputs
-            
+
             self.built = True
             return
 
@@ -161,7 +162,6 @@ class TensorParallelKeras(Model):
             )
             self.model_shards.append(shard)
             self.modified_parameters_names.update(modified_parameters_names)
-            
 
             logger.info(f"   ✅ Created shard {rank} for device {device_id}")
 
@@ -221,9 +221,7 @@ class TensorParallelKeras(Model):
     @property
     def weights(self):
         unique_vars = {
-            id(var): var
-            for shard in self.model_shards
-            for var in shard.weights
+            id(var): var for shard in self.model_shards for var in shard.weights
         }
         return list(unique_vars.values())
 
@@ -337,10 +335,10 @@ class TensorParallelKeras(Model):
                     f"Calling shard '{getattr(shard, 'name', '<shard>')}' with inputs: {list(shard_inputs.keys())}"
                 )
                 partial_outputs.append(shard(shard_inputs))
-            except Exception as e:
+            except Exception:
                 logger.exception(
                     "Exception when calling shard %s with inputs=%s",
-                    getattr(shard, 'name', '<shard>'),
+                    getattr(shard, "name", "<shard>"),
                     list(shard_inputs.keys()),
                 )
                 raise
@@ -354,7 +352,9 @@ class TensorParallelKeras(Model):
             )
 
         for pattern, action in self.tensor_parallel_config.state_rules.items():
-            if isinstance(pattern, str) and re.search(pattern, final_kernel_name):
+            if isinstance(pattern, str) and re.search(
+                pattern, final_kernel_name
+            ):
                 if hasattr(action, "sharding_type"):
                     sharding_type = action.sharding_type
                 break
@@ -412,7 +412,14 @@ class TensorParallelKeras(Model):
         """
         return self.assembled_model(inputs, training=training, **kwargs)
 
-    def compile(self, optimizer=None, loss=None, metrics=None, loss_weights=None, **kwargs):
+    def compile(
+        self,
+        optimizer=None,
+        loss=None,
+        metrics=None,
+        loss_weights=None,
+        **kwargs,
+    ):
         """
         Compile the tensor parallel model.
         """
@@ -423,7 +430,9 @@ class TensorParallelKeras(Model):
         if optimizer is not None and not isinstance(
             optimizer, TensorParallelOptimizer
         ):
-            print("🔧 Automatically wrapping optimizer in TensorParallelOptimizer")
+            print(
+                "🔧 Automatically wrapping optimizer in TensorParallelOptimizer"
+            )
             optimizer = TensorParallelOptimizer(
                 optimizer,
                 device_count=self.device_count,
@@ -435,13 +444,22 @@ class TensorParallelKeras(Model):
             loss=loss,
             metrics=metrics,
             loss_weights=loss_weights,
-            **kwargs
+            **kwargs,
         )
         logger.info(
             "Compiled TensorParallelKeras model with native Keras distribution logic."
         )
 
-    def summary(self, line_length=None, positions=None, print_fn=None, expand_nested=False, show_trainable=False, layer_range=None, show_sharding=False):
+    def summary(
+        self,
+        line_length=None,
+        positions=None,
+        print_fn=None,
+        expand_nested=False,
+        show_trainable=False,
+        layer_range=None,
+        show_sharding=False,
+    ):
         """Prints a string summary of the network."""
         if not show_sharding:
             return super().summary(
@@ -450,21 +468,24 @@ class TensorParallelKeras(Model):
                 print_fn=print_fn,
                 expand_nested=expand_nested,
                 show_trainable=show_trainable,
-                layer_range=layer_range
+                layer_range=layer_range,
             )
-        
+
         if print_fn is None:
             print_fn = print
 
         print_fn("-" * 80)
-        print_fn(f"Model: \"{self.name}\" (Tensor Parallel Sharded)")
+        print_fn(f'Model: "{self.name}" (Tensor Parallel Sharded)')
         print_fn("-" * 80)
         print_fn(f"{'Variable Path':<50} | {'Sharding Strategy':<20}")
         print_fn("-" * 80)
 
         sharded_params = set()
         if self.tensor_parallel_config:
-            for pattern, rule in self.tensor_parallel_config.state_rules.items():
+            for (
+                pattern,
+                rule,
+            ) in self.tensor_parallel_config.state_rules.items():
                 # This is a bit simplified, ideally we match patterns to actual weights
                 print_fn(f"{str(pattern):<50} | {str(rule):<20}")
                 sharded_params.add(pattern)
@@ -472,9 +493,9 @@ class TensorParallelKeras(Model):
         # Also list non-sharded (replicated) parameters
         replicated_count = 0
         for w in self.weights:
-             if w.path not in sharded_params and id(w) not in sharded_params:
-                 replicated_count += 1
-        
+            if w.path not in sharded_params and id(w) not in sharded_params:
+                replicated_count += 1
+
         print_fn("-" * 80)
         print_fn(f"Total sharded parameters: {len(sharded_params)}")
         print_fn(f"Total replicated parameters: {replicated_count}")

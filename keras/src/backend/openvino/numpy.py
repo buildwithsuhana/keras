@@ -1,12 +1,15 @@
+import math
+
 import numpy as np
 import openvino as ov
-import openvino.opset15 as ov_opset
+import openvino.opset16 as ov_opset
 from openvino import Type
 
 from keras.src.backend import config
 from keras.src.backend.common import KerasVariable
 from keras.src.backend.common import dtypes
 from keras.src.backend.common.backend_utils import canonicalize_axis
+from keras.src.backend.common.backend_utils import normalize_shift_and_axis
 from keras.src.backend.common.variables import standardize_dtype
 from keras.src.backend.openvino.core import DTYPES_MAX
 from keras.src.backend.openvino.core import DTYPES_MIN
@@ -227,6 +230,17 @@ def absolute(x):
 
 def abs(x):
     x = get_ov_output(x)
+    return OpenVINOKerasTensor(ov_opset.absolute(x).output(0))
+
+
+def fabs(x):
+    x = get_ov_output(x)
+    x_type = x.get_element_type()
+
+    if x_type.is_integral() or x_type == Type.boolean:
+        ov_type = OPENVINO_DTYPES[config.floatx()]
+        x = ov_opset.convert(x, ov_type).output(0)
+
     return OpenVINOKerasTensor(ov_opset.absolute(x).output(0))
 
 
@@ -806,9 +820,49 @@ def _view_int_contract(x, new_ov_type, old_itemsize, new_itemsize):
 
 
 def average(x, axis=None, weights=None):
+    x_keras = x
+    weights_keras = weights
     x = get_ov_output(x)
     if weights is not None:
         weights = get_ov_output(weights)
+
+    if weights_keras is not None:
+        x_shape = (
+            x_keras.shape
+            if hasattr(x_keras, "shape")
+            else x.get_partial_shape()
+        )
+        weights_shape = (
+            weights_keras.shape
+            if hasattr(weights_keras, "shape")
+            else weights.get_partial_shape()
+        )
+        if len(weights_shape) == 1 and len(x_shape) > 1:
+            if axis is None or (
+                isinstance(axis, (list, tuple)) and len(axis) != 1
+            ):
+                raise ValueError(
+                    "Axis must be specified when shapes of a and weights "
+                    "differ."
+                )
+            axis_val = axis[0] if isinstance(axis, (list, tuple)) else axis
+            axis_val = canonicalize_axis(axis_val, len(x_shape))
+            if weights_shape[0] != x_shape[axis_val]:
+                raise ValueError(
+                    "Shape of weights must be consistent with shape of a "
+                    "along specified axis."
+                )
+        elif x_shape != weights_shape:
+            if axis is None:
+                raise ValueError(
+                    "Axis must be specified when shapes of a and weights "
+                    "differ."
+                )
+            raise ValueError(
+                "Shape of weights must be consistent with shape of a "
+                "along specified axis."
+            )
+
     if axis is None:
         flatten_shape = ov_opset.constant([-1], Type.i32).output(0)
         x = ov_opset.reshape(x, flatten_shape, False).output(0)
@@ -824,8 +878,47 @@ def average(x, axis=None, weights=None):
         ):
             x = ov_opset.convert(x, Type.f32).output(0)
             weights = ov_opset.convert(weights, Type.f32).output(0)
+
+        # Reshape 1D weights
+        x_shape = x.get_partial_shape()
+        w_shape_ov = weights.get_partial_shape()
+        if (
+            w_shape_ov.rank.is_static
+            and w_shape_ov.rank.get_length() == 1
+            and x_shape.rank.is_static
+            and x_shape.rank.get_length() > 1
+            and axis is not None
+        ):
+            rank = x_shape.rank.get_length()
+            a = axis[0] if isinstance(axis, (tuple, list)) else axis
+            if isinstance(a, int):
+                if a < 0:
+                    a += rank
+                w_target_shape = [1] * rank
+                w_target_shape[a] = -1
+                target_shape_const = ov_opset.constant(
+                    w_target_shape, Type.i32
+                ).output(0)
+                weights = ov_opset.reshape(
+                    weights, target_shape_const, False
+                ).output(0)
+
         x, weights = _align_operand_types(x, weights, "multiply()")
-        x = ov_opset.multiply(x, weights)
+        x_weighted = ov_opset.multiply(x, weights)
+
+        if isinstance(axis, tuple):
+            axis = list(axis)
+        if axis == []:
+            return OpenVINOKerasTensor(x)
+
+        axis_const = ov_opset.constant(axis, dtype=Type.i32).output(0)
+
+        sum_weighted = ov_opset.reduce_sum(
+            x_weighted, axis_const, False
+        ).output(0)
+        sum_weights = ov_opset.reduce_sum(weights, axis_const, False).output(0)
+        result = ov_opset.divide(sum_weighted, sum_weights).output(0)
+        return OpenVINOKerasTensor(result)
 
     if isinstance(axis, tuple):
         axis = list(axis)
@@ -1075,10 +1168,10 @@ def bincount(x, weights=None, minlength=0, sparse=False):
     rank_x = ov_opset.reshape(rank_x, scalar_shape, False).output(0)
     const_minus_one = ov_opset.constant(-1, x_type).output(0)
     rank_minus_one = ov_opset.add(rank_x, const_minus_one).output(0)
-    minlength = get_ov_output(minlength)
-    minlength = ov_opset.convert(minlength, x_type).output(0)
     const_one = ov_opset.constant(1, x_type).output(0)
     const_zero = ov_opset.constant(0, x_type).output(0)
+    minlength = get_ov_output(minlength)
+    minlength = ov_opset.convert(minlength, x_type).output(0)
     max_element = ov_opset.reduce_max(x, const_zero, keep_dims=False).output(0)
     depth = ov_opset.add(max_element, const_one).output(0)
     depth = ov_opset.maximum(depth, minlength).output(0)
@@ -1106,37 +1199,18 @@ def bincount(x, weights=None, minlength=0, sparse=False):
         return OpenVINOKerasTensor(final_output)
 
 
-def _bitwise_op_i8u8(ov_op, x, y):
-    """Apply an OV bitwise op, working around a SIMD bug in 8-bit kernels.
-
-    OpenVINO's int8/uint8 bitwise kernels have a vectorization bug: when the
-    last dimension is >= 32, elements at non-stride-4 positions (0..31 range)
-    receive wrong values.  Casting to int32/uint32 avoids the buggy kernel.
-    """
-    elem_type = x.get_element_type()
-    if elem_type in (Type.i8, Type.u8):
-        cast_type = Type.i32 if elem_type == Type.i8 else Type.u32
-        x = ov_opset.convert(x, cast_type).output(0)
-        y = ov_opset.convert(y, cast_type).output(0)
-        result = ov_op(x, y).output(0)
-        return OpenVINOKerasTensor(
-            ov_opset.convert(result, elem_type).output(0)
-        )
-    return OpenVINOKerasTensor(ov_op(x, y).output(0))
-
-
 def bitwise_and(x, y):
     x = get_ov_output(x)
     y = get_ov_output(y)
     x, y = _align_operand_types(x, y, "bitwise_and()")
-    return _bitwise_op_i8u8(ov_opset.bitwise_and, x, y)
+    return OpenVINOKerasTensor(ov_opset.bitwise_and(x, y).output(0))
 
 
 def bitwise_xor(x, y):
     x = get_ov_output(x)
     y = get_ov_output(y)
     x, y = _align_operand_types(x, y, "bitwise_xor()")
-    return _bitwise_op_i8u8(ov_opset.bitwise_xor, x, y)
+    return OpenVINOKerasTensor(ov_opset.bitwise_xor(x, y).output(0))
 
 
 def bitwise_invert(x):
@@ -1152,7 +1226,7 @@ def bitwise_or(x, y):
     x = get_ov_output(x)
     y = get_ov_output(y)
     x, y = _align_operand_types(x, y, "bitwise_or()")
-    return _bitwise_op_i8u8(ov_opset.bitwise_or, x, y)
+    return OpenVINOKerasTensor(ov_opset.bitwise_or(x, y).output(0))
 
 
 def blackman(x):
@@ -1807,9 +1881,16 @@ def dot(x1, x2):
     x1 = get_ov_output(x1, element_type)
     x2 = get_ov_output(x2, element_type)
     x1, x2 = _align_operand_types(x1, x2, "dot()")
-    if x1.get_partial_shape().rank == 0 or x2.get_partial_shape().rank == 0:
+
+    rank1 = x1.get_partial_shape().rank.get_length()
+    rank2 = x2.get_partial_shape().rank.get_length()
+
+    if rank1 == 0 or rank2 == 0:
         return OpenVINOKerasTensor(ov_opset.multiply(x1, x2).output(0))
-    return OpenVINOKerasTensor(ov_opset.matmul(x1, x2, False, False).output(0))
+
+    if rank2 == 1:
+        return tensordot(x1, x2, axes=[[rank1 - 1], [0]])
+    return tensordot(x1, x2, axes=[[rank1 - 1], [rank2 - 2]])
 
 
 def dstack(xs):
@@ -2236,7 +2317,19 @@ def hypot(x1, x2):
         max_val,
         ov_opset.sqrt(ov_opset.add(one, ov_opset.multiply(ratio, ratio))),
     )
-    return OpenVINOKerasTensor(result.output(0))
+    is_inf_mask = ov_opset.logical_or(
+        get_ov_output(isinf(x1_abs.output(0))),
+        get_ov_output(isinf(x2_abs.output(0))),
+    )
+    result_output = result.output(0)
+    result = ov_opset.select(
+        is_inf_mask,
+        ov_opset.divide(
+            one, ov_opset.constant(0, result_output.get_element_type())
+        ),
+        result_output,
+    ).output(0)
+    return OpenVINOKerasTensor(result)
 
 
 def identity(n, dtype=None):
@@ -2337,20 +2430,30 @@ def inner(x1, x2):
 def isclose(x1, x2, rtol=1e-5, atol=1e-8, equal_nan=False):
     dtype = OPENVINO_DTYPES[config.floatx()]
 
-    x1 = ov_opset.convert(get_ov_output(x1), dtype)
-    x2 = ov_opset.convert(get_ov_output(x2), dtype)
-    rtol = ov_opset.convert(get_ov_output(rtol), dtype)
-    atol = ov_opset.convert(get_ov_output(atol), dtype)
+    x1 = ov_opset.convert(get_ov_output(x1), dtype).output(0)
+    x2 = ov_opset.convert(get_ov_output(x2), dtype).output(0)
+    rtol = ov_opset.convert(get_ov_output(rtol), dtype).output(0)
+    atol = ov_opset.convert(get_ov_output(atol), dtype).output(0)
 
-    abs_diff = ov_opset.abs(ov_opset.subtract(x1, x2))
-    abs_x2 = ov_opset.abs(x2)
-    total_tolerance = ov_opset.add(atol, ov_opset.multiply(rtol, abs_x2))
-    is_close = ov_opset.less_equal(abs_diff, total_tolerance)
+    abs_diff = ov_opset.abs(ov_opset.subtract(x1, x2)).output(0)
+    abs_x2 = ov_opset.abs(x2).output(0)
+    total_tolerance = ov_opset.add(
+        atol, ov_opset.multiply(rtol, abs_x2)
+    ).output(0)
+    is_close = ov_opset.less_equal(abs_diff, total_tolerance).output(0)
+    finite = ov_opset.logical_and(
+        isfinite(x1).output, isfinite(x2).output
+    ).output(0)
+    is_close = ov_opset.logical_and(finite, is_close).output(0)
+    equal = ov_opset.equal(x1, x2).output(0)
+    is_close = ov_opset.logical_or(is_close, equal).output(0)
     if equal_nan:
-        both_nan = ov_opset.logical_and(ov_opset.isnan(x1), ov_opset.isnan(x2))
-        is_close = ov_opset.logical_or(is_close, both_nan)
+        both_nan = ov_opset.logical_and(
+            ov_opset.isnan(x1).output(0), ov_opset.isnan(x2).output(0)
+        ).output(0)
+        is_close = ov_opset.logical_or(is_close, both_nan).output(0)
 
-    return OpenVINOKerasTensor(is_close.output(0))
+    return OpenVINOKerasTensor(is_close)
 
 
 def isfinite(x):
@@ -2906,6 +3009,24 @@ def maximum(x1, x2):
     return OpenVINOKerasTensor(ov_opset.maximum(x1, x2).output(0))
 
 
+def fmax(x1, x2):
+    x1, x2 = _promote_binary_op_types(x1, x2)
+    x1, x2 = _align_operand_types(x1, x2, "fmax()")
+    x_type = x1.get_element_type()
+
+    if x_type.is_integral() or x_type == Type.boolean:
+        return OpenVINOKerasTensor(ov_opset.maximum(x1, x2).output(0))
+
+    nan_x1 = ov_opset.is_nan(x1)
+    nan_x2 = ov_opset.is_nan(x2)
+
+    res = ov_opset.maximum(x1, x2)
+    res = ov_opset.select(nan_x2, x1, res)
+    res = ov_opset.select(nan_x1, x2, res)
+
+    return OpenVINOKerasTensor(res.output(0))
+
+
 def median(x, axis=None, keepdims=False):
     x = get_ov_output(x)
     x_shape = x.get_partial_shape()
@@ -3095,6 +3216,24 @@ def minimum(x1, x2):
     return OpenVINOKerasTensor(ov_opset.minimum(x1, x2).output(0))
 
 
+def fmin(x1, x2):
+    x1, x2 = _promote_binary_op_types(x1, x2)
+    x1, x2 = _align_operand_types(x1, x2, "fmin()")
+    x_type = x1.get_element_type()
+
+    if x_type.is_integral() or x_type == Type.boolean:
+        return OpenVINOKerasTensor(ov_opset.minimum(x1, x2).output(0))
+
+    nan_x1 = ov_opset.is_nan(x1)
+    nan_x2 = ov_opset.is_nan(x2)
+
+    res = ov_opset.minimum(x1, x2)
+    res = ov_opset.select(nan_x2, x1, res)
+    res = ov_opset.select(nan_x1, x2, res)
+
+    return OpenVINOKerasTensor(res.output(0))
+
+
 def mod(x1, x2):
     x1 = get_ov_output(x1)
     x2 = get_ov_output(x2)
@@ -3218,11 +3357,23 @@ def nanargmin(x, axis=None, keepdims=False):
 
 
 def nancumsum(x, axis=None, dtype=None):
-    return cumsum(nan_to_num(x, nan=0.0), axis=axis, dtype=dtype)
+    x = get_ov_output(x)
+    x_type = x.get_element_type()
+    if not (x_type.is_integral() or x_type == Type.boolean):
+        nan_mask = ov_opset.is_nan(x).output(0)
+        zero = ov_opset.constant(0.0, x_type).output(0)
+        x = ov_opset.select(nan_mask, zero, x).output(0)
+    return cumsum(x, axis=axis, dtype=dtype)
 
 
 def nancumprod(x, axis=None, dtype=None):
-    return cumprod(nan_to_num(x, nan=1.0), axis=axis, dtype=dtype)
+    x = get_ov_output(x)
+    x_type = x.get_element_type()
+    if not (x_type.is_integral() or x_type == Type.boolean):
+        nan_mask = ov_opset.is_nan(x).output(0)
+        one = ov_opset.constant(1.0, x_type).output(0)
+        x = ov_opset.select(nan_mask, one, x).output(0)
+    return cumprod(x, axis=axis, dtype=dtype)
 
 
 def nanmax(x, axis=None, keepdims=False):
@@ -4078,7 +4229,10 @@ def reshape(x, newshape):
 def roll(x, shift, axis=None):
     x = get_ov_output(x)
     if axis is not None:
-        result = ov_opset.roll(x, shift, axis).output(0)
+        # The Roll operation requires `shift` and `axis` to have the same
+        # length, while numpy broadcasts them against each other.
+        shifts, axes = normalize_shift_and_axis(shift, axis)
+        result = ov_opset.roll(x, shifts, axes).output(0)
     else:
         output_shape = ov_opset.shape_of(x).output(0)
         flattened = ov_opset.reshape(
@@ -5010,7 +5164,7 @@ def unravel_index(indices, shape):
         shape = list(shape)
 
     # Handle negative indices
-    total_size = np.prod(shape)
+    total_size = math.prod(shape)
     total_size_const = ov_opset.constant(total_size, indices_dtype).output(0)
 
     zero = ov_opset.constant(0, indices_dtype).output(0)
@@ -5468,6 +5622,13 @@ def slogdet(x):
 
 def argpartition(x, kth, axis=-1):
     x = get_ov_output(x)
+    if axis is None:
+        x = ov_opset.reshape(
+            x,
+            ov_opset.constant([-1], dtype="int64"),
+            False,
+        ).output(0)
+        axis = 0
     x_shape = x.get_partial_shape()
     rank = x_shape.rank.get_length()
     axis = canonicalize_axis(axis, rank)
@@ -5899,3 +6060,41 @@ def unique(
         outputs.append(OpenVINOKerasTensor(counts))
 
     return outputs[0] if len(outputs) == 1 else tuple(outputs)
+
+
+def dsplit(x, indices_or_sections):
+    return split(x, indices_or_sections, axis=2)
+
+
+def column_stack(xs):
+    if not isinstance(xs, (list, tuple)):
+        xs = (xs,)
+
+    elems = [convert_to_tensor(x) for x in xs]
+    elems = [get_ov_output(x) for x in elems]
+
+    processed_elems = []
+    for elem in elems:
+        rank = elem.get_partial_shape().rank.get_length()
+
+        if rank == 0:
+            elem = ov_opset.unsqueeze(
+                elem, ov_opset.constant(0, Type.i32)
+            ).output(0)
+            rank = 1
+
+        if rank == 1:
+            elem = ov_opset.unsqueeze(
+                elem, ov_opset.constant(1, Type.i32)
+            ).output(0)
+
+        processed_elems.append(elem)
+
+    base = processed_elems[0]
+    for i in range(1, len(processed_elems)):
+        base, processed_elems[i] = _align_operand_types(
+            base, processed_elems[i], "column_stack()"
+        )
+    processed_elems[0] = base
+
+    return OpenVINOKerasTensor(ov_opset.concat(processed_elems, 1).output(0))

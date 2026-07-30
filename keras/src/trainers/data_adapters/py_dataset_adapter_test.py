@@ -1,6 +1,5 @@
 import math
 import time
-from unittest.mock import patch
 
 import jax
 import numpy as np
@@ -457,58 +456,130 @@ class PyDatasetAdapterTest(testing.TestCase):
                 break
 
     @parameterized.named_parameters(
-        ("dataparallel", "dp", 4, 1, 4, 1),
-        ("modelparallel", "mp", 8, 5, 8, 5),
+        named_product(
+            [
+                {
+                    "testcase_name": "dataparallel",
+                    "dist_type": "dp",
+                    "num_processes": 4,
+                    "process_id": 1,
+                    "mesh_shape": (4,),
+                },
+                {
+                    "testcase_name": "modelparallel",
+                    "dist_type": "mp",
+                    "num_processes": 8,
+                    "process_id": 5,
+                    "mesh_shape": (2, 4),
+                },
+                {
+                    "testcase_name": "modelparallel_large_mesh",
+                    "dist_type": "mp",
+                    "num_processes": 4,
+                    "process_id": 2,
+                    "mesh_shape": (8, 2),
+                },
+            ],
+            shuffle=[False, True],
+        )
     )
-    @patch("keras.src.distribution.distribution_lib.distribution")
     def test_sharding(
         self,
         dist_type,
-        world_size,
-        rank,
-        expected_num_processes,
-        expected_process_id,
-        mock_distribution,
+        num_processes,
+        process_id,
+        mesh_shape,
+        shuffle,
     ):
-        if backend.backend() not in ("torch", "jax"):
-            pytest.skip(
-                "Distribution support is only available for torch and jax."
+        if dist_type == "dp":
+            dist = dist_lib.DataParallel(devices=["cpu:0"] * num_processes)
+        else:
+            device_mesh = dist_lib.DeviceMesh(
+                shape=mesh_shape,
+                axis_names=("data", "model"),
+                devices=["cpu:0"] * np.prod(mesh_shape),
             )
-        from keras.src.backend import distribution_lib as backend_dist_lib
+            dist = dist_lib.ModelParallel(
+                device_mesh=device_mesh,
+                layout_map=dist_lib.LayoutMap(device_mesh),
+                batch_dim_name="data",
+            )
+        dist._num_processes = num_processes
+        dist._process_id = process_id
+        dist.auto_shard_dataset = True
 
-        with (
-            patch.object(
-                backend_dist_lib, "num_processes", return_value=world_size
-            ),
-            patch.object(backend_dist_lib, "process_id", return_value=rank),
-        ):
-            if dist_type == "dp":
-                dist = dist_lib.DataParallel(devices=["cpu:0"] * world_size)
-            else:
-                device_mesh = dist_lib.DeviceMesh(
-                    shape=(world_size,),
-                    axis_names=("data",),
-                    devices=["cpu:0"] * world_size,
-                )
-                dist = dist_lib.ModelParallel(
-                    device_mesh=device_mesh,
-                    layout_map=dist_lib.LayoutMap(device_mesh),
-                    batch_dim_name="data",
-                )
-            dist.auto_shard_dataset = True
-            mock_distribution.return_value = dist
+        expected_num_replicas = min(dist.num_model_replicas, num_processes)
+        expected_shard_id = dist.data_shard_id
 
-            x = np.random.random((16, 4)).astype("float32")
-            y = np.random.random((16, 2)).astype("float32")
-            py_dataset = ExamplePyDataset(x, y, batch_size=2)
+        x = np.array([[i] * 10 for i in range(100)], dtype="float32")
+        y = np.array([[i] for i in range(100)], dtype="float32")
+        py_dataset = ExamplePyDataset(x, y, batch_size=10)
+
+        with dist.scope():
             adapter = py_dataset_adapter.PyDatasetAdapter(
-                py_dataset, shuffle=False
+                py_dataset, shuffle=shuffle
             )
 
-            self.assertEqual(adapter._num_processes, expected_num_processes)
-            self.assertEqual(adapter._process_id, expected_process_id)
+            it_methods = ["get_numpy_iterator"]
+            backend_it_method = {
+                "tensorflow": "get_tf_dataset",
+                "jax": "get_jax_iterator",
+                "torch": "get_torch_dataloader",
+            }.get(backend.backend())
+            if backend_it_method:
+                it_methods.append(backend_it_method)
 
-            it = adapter._get_iterator()
-            batches = list(it)
-            expected_num_batches = 8 // expected_num_processes
-            self.assertEqual(len(batches), expected_num_batches)
+        self.assertEqual(adapter._num_data_shards, expected_num_replicas)
+        self.assertEqual(adapter._data_shard_id, expected_shard_id)
+
+        def get_order(it_fn):
+            order = []
+            for batch in it_fn():
+                bx = batch[0]
+                bx = backend.convert_to_numpy(bx)
+                order.extend(bx[:, 0].tolist())
+            return order
+
+        for it_method in it_methods:
+            it_fn = getattr(adapter, it_method)
+            if not shuffle:
+                batches = list(it_fn())
+                expected_num_batches = (
+                    10 - expected_shard_id + expected_num_replicas - 1
+                ) // expected_num_replicas
+                self.assertEqual(len(batches), expected_num_batches)
+
+                for i, batch in enumerate(batches):
+                    bx, by = batch
+                    bx = backend.convert_to_numpy(bx)
+                    by = backend.convert_to_numpy(by)
+                    expected_batch_index = (
+                        expected_shard_id + i * expected_num_replicas
+                    )
+                    expected_first_sample_value = expected_batch_index * 10
+                    self.assertAllClose(
+                        bx[:, 0],
+                        np.arange(
+                            expected_first_sample_value,
+                            expected_first_sample_value + 10,
+                        ),
+                    )
+                    self.assertAllClose(
+                        by[:, 0],
+                        np.arange(
+                            expected_first_sample_value,
+                            expected_first_sample_value + 10,
+                        ),
+                    )
+            else:
+                # Same epoch should have same shuffle
+                adapter._epoch = 1
+                order1 = get_order(it_fn)
+                adapter._epoch = 1
+                order2 = get_order(it_fn)
+                self.assertAllClose(order1, order2)
+
+                # Different epochs should have different shuffle
+                adapter._epoch = 2
+                order3 = get_order(it_fn)
+                self.assertNotAllClose(order1, order3)

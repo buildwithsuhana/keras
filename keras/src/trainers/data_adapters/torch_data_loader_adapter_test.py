@@ -1,5 +1,4 @@
 import math
-from unittest.mock import patch
 
 import numpy as np
 import tensorflow as tf
@@ -13,6 +12,12 @@ from keras.src.testing.test_utils import named_product
 from keras.src.trainers.data_adapters.torch_data_loader_adapter import (
     TorchDataLoaderAdapter,
 )
+
+
+class TestIterableDataset(torch.utils.data.IterableDataset):
+    def __iter__(self):
+        for i in range(100):
+            yield torch.tensor([float(i)]), torch.tensor([float(i)])
 
 
 class TestTorchDataLoaderAdapter(testing.TestCase):
@@ -54,6 +59,61 @@ class TestTorchDataLoaderAdapter(testing.TestCase):
             else:
                 self.assertEqual(bx.shape, (2, 4))
                 self.assertEqual(by.shape, (2, 2))
+
+    def test_dict_batch_preserves_structure(self):
+        class DictDataset(torch.utils.data.Dataset):
+            def __len__(self):
+                return 2
+
+            def __getitem__(self, idx):
+                return {
+                    "x": torch.tensor([idx, idx + 1], dtype=torch.float32),
+                    "y": torch.tensor(idx, dtype=torch.float32),
+                }
+
+        dataloader = torch.utils.data.DataLoader(DictDataset(), batch_size=2)
+        adapter = TorchDataLoaderAdapter(dataloader)
+
+        batch = next(adapter.get_numpy_iterator())
+        self.assertIsInstance(batch, dict)
+        self.assertEqual(set(batch), {"x", "y"})
+        self.assertIsInstance(batch["x"], np.ndarray)
+        self.assertIsInstance(batch["y"], np.ndarray)
+        self.assertEqual(batch["x"].shape, (2, 2))
+        self.assertEqual(batch["y"].shape, (2,))
+
+        if backend.backend() == "tensorflow":
+            ds = TorchDataLoaderAdapter(dataloader).get_tf_dataset()
+            self.assertIsInstance(ds.element_spec, dict)
+            self.assertEqual(set(ds.element_spec), {"x", "y"})
+            self.assertIsInstance(ds.element_spec["x"], tf.TensorSpec)
+            self.assertIsInstance(ds.element_spec["y"], tf.TensorSpec)
+            self.assertEqual(ds.element_spec["x"].shape, (None, 2))
+            self.assertEqual(ds.element_spec["y"].shape, (None,))
+
+    def test_single_tensor_batch_preserves_structure(self):
+        class TensorOnlyDataset(torch.utils.data.Dataset):
+            def __len__(self):
+                return 4
+
+            def __getitem__(self, idx):
+                return torch.tensor(
+                    [idx, idx + 1, idx + 2], dtype=torch.float32
+                )
+
+        dataloader = torch.utils.data.DataLoader(
+            TensorOnlyDataset(), batch_size=2
+        )
+        adapter = TorchDataLoaderAdapter(dataloader)
+
+        batch = next(adapter.get_numpy_iterator())
+        self.assertIsInstance(batch, np.ndarray)
+        self.assertEqual(batch.shape, (2, 3))
+
+        if backend.backend() == "tensorflow":
+            ds = TorchDataLoaderAdapter(dataloader).get_tf_dataset()
+            self.assertIsInstance(ds.element_spec, tf.TensorSpec)
+            self.assertEqual(ds.element_spec.shape, (None, 3))
 
     @parameterized.named_parameters(
         named_product(batch_size=[None, 3], implements_len=[True, False])
@@ -175,37 +235,65 @@ class TestTorchDataLoaderAdapter(testing.TestCase):
                 self.assertEqual(by.shape, (2, 2))
 
     @parameterized.named_parameters(
-        ("dataparallel", "dp", 4, 1, (4,), 4, 1),
-        ("modelparallel", "mp", 8, 5, (2, 4), 2, 1),
-        ("modelparallel_large_mesh", "mp", 4, 2, (8, 2), 4, 2),
+        named_product(
+            [
+                {
+                    "testcase_name": "dataparallel",
+                    "dist_type": "dp",
+                    "num_processes": 4,
+                    "process_id": 1,
+                    "mesh_shape": (4,),
+                },
+                {
+                    "testcase_name": "modelparallel",
+                    "dist_type": "mp",
+                    "num_processes": 8,
+                    "process_id": 5,
+                    "mesh_shape": (2, 4),
+                },
+                {
+                    "testcase_name": "modelparallel_large_mesh",
+                    "dist_type": "mp",
+                    "num_processes": 4,
+                    "process_id": 2,
+                    "mesh_shape": (2, 2),
+                },
+            ],
+            [
+                {
+                    "testcase_name": "map_no_shuffle",
+                    "dataset_type": "map",
+                    "shuffle": False,
+                },
+                {
+                    "testcase_name": "map_shuffle",
+                    "dataset_type": "map",
+                    "shuffle": True,
+                },
+                {
+                    "testcase_name": "iterable",
+                    "dataset_type": "iterable",
+                    "shuffle": False,
+                },
+                {
+                    "testcase_name": "iterable_no_len",
+                    "dataset_type": "iterable_no_len",
+                    "shuffle": False,
+                },
+            ],
+        )
     )
-    @patch("torch.distributed.is_available")
-    @patch("torch.distributed.get_world_size")
-    @patch("torch.distributed.get_rank")
-    @patch("keras.src.distribution.distribution_lib.distribution_lib")
-    @patch("keras.src.distribution.distribution_lib.distribution")
     def test_sharding(
         self,
         dist_type,
-        world_size,
-        rank,
+        num_processes,
+        process_id,
         mesh_shape,
-        expected_num_replicas,
-        expected_rank,
-        mock_distribution,
-        mock_backend_dist_lib,
-        mock_get_rank,
-        mock_get_world_size,
-        mock_is_available,
+        dataset_type,
+        shuffle,
     ):
-        mock_is_available.return_value = True
-        mock_get_world_size.return_value = world_size
-        mock_get_rank.return_value = rank
-        mock_backend_dist_lib.num_processes.return_value = world_size
-        mock_backend_dist_lib.process_id.return_value = rank
-
         if dist_type == "dp":
-            dist = dist_lib.DataParallel(devices=["cpu:0"] * world_size)
+            dist = dist_lib.DataParallel(devices=["cpu:0"] * num_processes)
         else:
             device_mesh = dist_lib.DeviceMesh(
                 shape=mesh_shape,
@@ -217,99 +305,106 @@ class TestTorchDataLoaderAdapter(testing.TestCase):
                 layout_map=dist_lib.LayoutMap(device_mesh),
                 batch_dim_name="data",
             )
+        dist._num_processes = num_processes
+        dist._process_id = process_id
+        dist._is_multi_process = num_processes > 1
         dist.auto_shard_dataset = True
-        mock_distribution.return_value = dist
 
-        x = torch.randn(100, 10)
-        y = torch.randn(100, 1)
-        dataset = torch.utils.data.TensorDataset(x, y)
-        dataloader = torch.utils.data.DataLoader(dataset, batch_size=10)
+        expected_num_replicas = dist.num_model_replicas
+        expected_shard_id = dist.data_shard_id
 
-        adapter = TorchDataLoaderAdapter(dataloader)
-        new_dataloader = adapter.get_torch_dataloader()
-
-        self.assertIsInstance(
-            new_dataloader.sampler,
-            torch.utils.data.distributed.DistributedSampler,
-        )
-        self.assertEqual(
-            new_dataloader.sampler.num_replicas, expected_num_replicas
-        )
-        self.assertEqual(new_dataloader.sampler.rank, expected_rank)
-
-    @parameterized.named_parameters(
-        ("dataparallel", "dp", 4, 1, (4,), 4, 1),
-        ("modelparallel", "mp", 8, 5, (2, 4), 2, 1),
-    )
-    @patch("torch.distributed.is_available")
-    @patch("torch.distributed.get_world_size")
-    @patch("torch.distributed.get_rank")
-    @patch("keras.src.distribution.distribution_lib.distribution_lib")
-    @patch("keras.src.distribution.distribution_lib.distribution")
-    def test_sharding_iterable_dataset(
-        self,
-        dist_type,
-        world_size,
-        rank,
-        mesh_shape,
-        expected_num_replicas,
-        expected_rank,
-        mock_distribution,
-        mock_backend_dist_lib,
-        mock_get_rank,
-        mock_get_world_size,
-        mock_is_available,
-    ):
-        mock_is_available.return_value = True
-        mock_get_world_size.return_value = world_size
-        mock_get_rank.return_value = rank
-        mock_backend_dist_lib.num_processes.return_value = world_size
-        mock_backend_dist_lib.process_id.return_value = rank
-
-        if dist_type == "dp":
-            dist = dist_lib.DataParallel(devices=["cpu:0"] * world_size)
+        if dataset_type == "map":
+            x = torch.arange(100).float().reshape((100, 1))
+            dataset = torch.utils.data.TensorDataset(x, x)
+        elif dataset_type == "iterable":
+            dataset = type(
+                "DS", (TestIterableDataset,), {"__len__": lambda s: 100}
+            )()
         else:
-            device_mesh = dist_lib.DeviceMesh(
-                shape=mesh_shape,
-                axis_names=("data", "model"),
-                devices=["cpu:0"] * np.prod(mesh_shape),
-            )
-            dist = dist_lib.ModelParallel(
-                device_mesh=device_mesh,
-                layout_map=dist_lib.LayoutMap(device_mesh),
-                batch_dim_name="data",
-            )
-        dist.auto_shard_dataset = True
-        mock_distribution.return_value = dist
+            dataset = TestIterableDataset()
 
-        class TestIterableDataset(torch.utils.data.IterableDataset):
-            def __iter__(self):
-                for i in range(100):
-                    yield torch.tensor([i])
-
-            def __len__(self):
-                return 100
-
-        dataset = TestIterableDataset()
-        dataloader = torch.utils.data.DataLoader(dataset, batch_size=10)
-
-        adapter = TorchDataLoaderAdapter(dataloader)
-        new_dataloader = adapter.get_torch_dataloader()
-
-        self.assertTrue(
-            "ShardedIterableDataset" in str(type(new_dataloader.dataset))
+        dataloader = torch.utils.data.DataLoader(
+            dataset, batch_size=10, shuffle=shuffle
         )
-        self.assertEqual(
-            new_dataloader.dataset.num_replicas, expected_num_replicas
-        )
-        self.assertEqual(new_dataloader.dataset.rank, expected_rank)
 
-        items = list(new_dataloader)
-        # 100 items total, 10 items per batch.
-        # Each replica should get 100 / expected_num_replicas items.
-        expected_items = 100 // expected_num_replicas
-        self.assertEqual(sum(len(b) for b in items), expected_items)
+        with dist.scope():
+            adapter = TorchDataLoaderAdapter(dataloader)
 
-        # Check that we are getting the correct items (interleaved sharding)
-        first_item = next(iter(new_dataloader))[0]
-        self.assertEqual(first_item.item(), expected_rank)
+            it_methods = ["get_numpy_iterator"]
+            backend_it_method = {
+                "tensorflow": "get_tf_dataset",
+                "jax": "get_jax_iterator",
+                "torch": "get_torch_dataloader",
+            }.get(backend.backend())
+            if backend_it_method:
+                it_methods.append(backend_it_method)
+
+        if dataset_type == "map":
+            self.assertEqual(
+                adapter._dataloader.sampler.num_replicas, expected_num_replicas
+            )
+            self.assertEqual(
+                adapter._dataloader.sampler.rank, expected_shard_id
+            )
+        else:
+            self.assertEqual(
+                adapter._dataloader.dataset.num_data_shards,
+                expected_num_replicas,
+            )
+            self.assertEqual(
+                adapter._dataloader.dataset.data_shard_id, expected_shard_id
+            )
+
+        def get_order(it_fn):
+            order = []
+            for batch in it_fn():
+                by = batch[1]
+                by = backend.convert_to_numpy(by)
+                order.extend(by[:, 0].tolist())
+            return order
+
+        for it_method in it_methods:
+            it_fn = getattr(adapter, it_method)
+            if not shuffle:
+                batches = list(it_fn())
+                # For map dataset, DistributedSampler behavior might pad.
+                # But for our simple formula, it should match.
+                expected_num_batches = (
+                    10 - expected_shard_id + expected_num_replicas - 1
+                ) // expected_num_replicas
+                self.assertEqual(len(batches), expected_num_batches)
+
+                for i, batch in enumerate(batches):
+                    bx, by = batch
+                    bx = backend.convert_to_numpy(bx)
+                    by = backend.convert_to_numpy(by)
+                    # DistributedSampler and ShardedIterableDataset both use
+                    # interleaved sharding.
+                    # Each replica gets samples: [rank, rank + num_replicas,
+                    # rank + 2*num_replicas, ...]
+                    # So batch i on this replica starts at index:
+                    # (rank + i * num_replicas * batch_size)
+                    expected_first_sample_value = (
+                        expected_shard_id + i * expected_num_replicas * 10
+                    )
+                    self.assertAllClose(
+                        bx[0, 0],
+                        expected_first_sample_value,
+                    )
+                    self.assertAllClose(
+                        by[0, 0],
+                        expected_first_sample_value,
+                    )
+            else:
+                # Same epoch should have same shuffle
+                # DistributedSampler uses its own internal epoch
+                adapter._dataloader.sampler.set_epoch(1)
+                order1 = get_order(it_fn)
+                adapter._dataloader.sampler.set_epoch(1)
+                order2 = get_order(it_fn)
+                self.assertAllClose(order1, order2)
+
+                # Different epochs should have different shuffle
+                adapter._dataloader.sampler.set_epoch(2)
+                order3 = get_order(it_fn)
+                self.assertNotAllClose(order1, order3)

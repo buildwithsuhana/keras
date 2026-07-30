@@ -1,17 +1,20 @@
-import os
-import sys
-import numpy as np
-import json
-import time
-import psutil
-import threading
 import contextlib
 import gc
+import json
+import os
+import sys
+import threading
+import time
+
+import keras_hub
+import numpy as np
+import psutil
 
 # Pre-import heavy libraries in the parent process to enable memory sharing via 'fork'
 import torch
+
 import keras
-import keras_hub
+
 
 class MemoryTracker:
     def __init__(self):
@@ -39,7 +42,8 @@ class MemoryTracker:
         self.running = False
         if self.thread:
             self.thread.join()
-        return self.peak_memory / (1024 * 1024) # MB
+        return self.peak_memory / (1024 * 1024)  # MB
+
 
 def get_weights_summary(model):
     summary = {}
@@ -54,11 +58,9 @@ def get_weights_summary(model):
             if target in v.path:
                 if v.path not in summary:
                     w = v.numpy()
-                    summary[v.path] = {
-                        "mean": float(np.mean(w)),
-                        "val": w
-                    }
+                    summary[v.path] = {"mean": float(np.mean(w)), "val": w}
     return summary
+
 
 def run_backend(backend, world_size=2):
     os.environ["KERAS_BACKEND"] = backend
@@ -68,9 +70,11 @@ def run_backend(backend, world_size=2):
             num_gpus = torch.cuda.device_count()
         except:
             pass
-        
+
         if num_gpus < world_size:
-            os.environ["XLA_FLAGS"] = f"--xla_force_host_platform_device_count={world_size}"
+            os.environ["XLA_FLAGS"] = (
+                f"--xla_force_host_platform_device_count={world_size}"
+            )
             # Force JAX to CPU if we are simulating to avoid using a single GPU if present
             os.environ["JAX_PLATFORMS"] = "cpu"
         _run_jax(world_size)
@@ -86,10 +90,10 @@ def run_backend(backend, world_size=2):
         for p in processes:
             p.join()
 
+
 def _run_jax(world_size):
-    import jax
     keras.utils.set_random_seed(42)
-    
+
     tracker = MemoryTracker()
     tracker.start()
 
@@ -97,51 +101,97 @@ def _run_jax(world_size):
     if len(devices) > world_size:
         devices = devices[:world_size]
     print(f"Using JAX devices: {devices}")
-    
-    if len(devices) < world_size:
-        raise ValueError(f"Not enough devices found. Expected {world_size}, got {len(devices)}.")
 
-    mesh = keras.distribution.DeviceMesh(shape=(world_size,), axis_names=("model",), devices=devices)
+    if len(devices) < world_size:
+        raise ValueError(
+            f"Not enough devices found. Expected {world_size}, got {len(devices)}."
+        )
+
+    mesh = keras.distribution.DeviceMesh(
+        shape=(world_size,), axis_names=("model",), devices=devices
+    )
     layout_map = keras.distribution.LayoutMap(mesh)
-    
+
     # Sharding strategy
-    layout_map[".*token_embedding/embeddings"] = keras.distribution.TensorLayout(("model", None), mesh)
-    layout_map[".*position_embedding/embeddings"] = keras.distribution.TensorLayout((None, "model"), mesh)
-    layout_map[".*self_attention/query/kernel"] = keras.distribution.TensorLayout((None, "model", None), mesh)
-    layout_map[".*self_attention/key/kernel"] = keras.distribution.TensorLayout((None, "model", None), mesh)
-    layout_map[".*self_attention/value/kernel"] = keras.distribution.TensorLayout((None, "model", None), mesh)
-    layout_map[".*self_attention/attention_output/kernel"] = keras.distribution.TensorLayout(("model", None), mesh)
-    layout_map[".*feedforward_intermediate_dense/kernel"] = keras.distribution.TensorLayout((None, "model"), mesh)
-    layout_map[".*feedforward_output_dense/kernel"] = keras.distribution.TensorLayout(("model", None), mesh)
-    
+    layout_map[".*token_embedding/embeddings"] = (
+        keras.distribution.TensorLayout(("model", None), mesh)
+    )
+    layout_map[".*position_embedding/embeddings"] = (
+        keras.distribution.TensorLayout((None, "model"), mesh)
+    )
+    layout_map[".*self_attention/query/kernel"] = (
+        keras.distribution.TensorLayout((None, "model", None), mesh)
+    )
+    layout_map[".*self_attention/key/kernel"] = keras.distribution.TensorLayout(
+        (None, "model", None), mesh
+    )
+    layout_map[".*self_attention/value/kernel"] = (
+        keras.distribution.TensorLayout((None, "model", None), mesh)
+    )
+    layout_map[".*self_attention/attention_output/kernel"] = (
+        keras.distribution.TensorLayout(("model", None), mesh)
+    )
+    layout_map[".*feedforward_intermediate_dense/kernel"] = (
+        keras.distribution.TensorLayout((None, "model"), mesh)
+    )
+    layout_map[".*feedforward_output_dense/kernel"] = (
+        keras.distribution.TensorLayout(("model", None), mesh)
+    )
+
     if world_size > 1:
-        distribution = keras.distribution.ModelParallel(layout_map=layout_map, batch_dim_name="model", auto_shard_dataset=False)
+        distribution = keras.distribution.ModelParallel(
+            layout_map=layout_map,
+            batch_dim_name="model",
+            auto_shard_dataset=False,
+        )
         scope = distribution.scope()
     else:
         scope = contextlib.nullcontext()
 
     with scope:
-        model = keras_hub.models.OPTBackbone.from_preset("opt_125m_en", dropout=0.0)
-        model.compile(optimizer=keras.optimizers.Adam(learning_rate=1e-5), loss="mse", jit_compile=False)
-        
+        model = keras_hub.models.OPTBackbone.from_preset(
+            "opt_125m_en", dropout=0.0
+        )
+        model.compile(
+            optimizer=keras.optimizers.Adam(learning_rate=1e-5),
+            loss="mse",
+            jit_compile=False,
+        )
+
         initial = get_weights_summary(model)
         np.random.seed(42)
         x_full = {
             "token_ids": np.random.randint(0, 50272, (40, 32)).astype("int32"),
-            "padding_mask": np.ones((40, 32), dtype="int32")
+            "padding_mask": np.ones((40, 32), dtype="int32"),
         }
         y_full = np.random.normal(size=(40, 32, 768)).astype("float32")
 
         # Compilation Warmup
         start_comp = time.time()
-        model.fit(x_full, y_full, batch_size=4, epochs=1, steps_per_epoch=1, verbose=1, shuffle=False)
+        model.fit(
+            x_full,
+            y_full,
+            batch_size=4,
+            epochs=1,
+            steps_per_epoch=1,
+            verbose=1,
+            shuffle=False,
+        )
         compilation_time = time.time() - start_comp
-        
+
         start_time = time.time()
-        history = model.fit(x_full, y_full, batch_size=4, epochs=5, steps_per_epoch=1, verbose=1, shuffle=False)
+        history = model.fit(
+            x_full,
+            y_full,
+            batch_size=4,
+            epochs=5,
+            steps_per_epoch=1,
+            verbose=1,
+            shuffle=False,
+        )
         end_time = time.time()
         training_time = end_time - start_time
-        
+
         step_1_loss = float(history.history["loss"][0])
         step_5_loss = float(history.history["loss"][4])
         throughput = (4 * 5) / training_time
@@ -159,20 +209,33 @@ def _run_jax(world_size):
         "training_time": training_time,
         "compilation_time": compilation_time,
         "peak_memory": peak_memory,
-        "step_1_updates": {path: {"mean": float(np.mean(after_step_1[path]["val"] - initial[path]["val"])), "samples": (after_step_1[path]["val"] - initial[path]["val"]).flatten()[:5].tolist()} for path in initial if path in after_step_1},
+        "step_1_updates": {
+            path: {
+                "mean": float(
+                    np.mean(after_step_1[path]["val"] - initial[path]["val"])
+                ),
+                "samples": (after_step_1[path]["val"] - initial[path]["val"])
+                .flatten()[:5]
+                .tolist(),
+            }
+            for path in initial
+            if path in after_step_1
+        },
     }
-    with open("results_jax.json", "w") as f: json.dump(results, f, indent=2)
+    with open("results_jax.json", "w") as f:
+        json.dump(results, f, indent=2)
+
 
 def _run_torch(rank, world_size):
     # Performance Optimization: Limit intra-op threads
     torch.set_num_threads(1)
-    
+
     os.environ["RANK"] = str(rank)
     os.environ["WORLD_SIZE"] = str(world_size)
     os.environ["LOCAL_RANK"] = str(rank)
     os.environ["MASTER_ADDR"] = "localhost"
     os.environ["MASTER_PORT"] = "29560"
-    
+
     # Check device availability
     num_gpus = torch.cuda.device_count()
     if num_gpus >= world_size:
@@ -181,100 +244,175 @@ def _run_torch(rank, world_size):
     else:
         os.environ["KERAS_TORCH_DEVICE"] = "cpu"
         device_type = "cpu"
-    
+
     keras.utils.set_random_seed(42)
     keras.distribution.initialize()
-    
+
     tracker = MemoryTracker()
     tracker.start()
 
     devices = keras.distribution.list_devices(device_type)[:world_size]
-    mesh = keras.distribution.DeviceMesh(shape=(world_size,), axis_names=("model",), devices=devices)
+    mesh = keras.distribution.DeviceMesh(
+        shape=(world_size,), axis_names=("model",), devices=devices
+    )
     layout_map = keras.distribution.LayoutMap(mesh)
-    
+
     # Sharding strategy
-    layout_map[".*token_embedding/embeddings"] = keras.distribution.TensorLayout(("model", None), mesh)
-    layout_map[".*position_embedding/embeddings"] = keras.distribution.TensorLayout((None, "model"), mesh)
-    layout_map[".*self_attention/query/kernel"] = keras.distribution.TensorLayout((None, "model", None), mesh)
-    layout_map[".*self_attention/key/kernel"] = keras.distribution.TensorLayout((None, "model", None), mesh)
-    layout_map[".*self_attention/value/kernel"] = keras.distribution.TensorLayout((None, "model", None), mesh)
-    layout_map[".*self_attention/attention_output/kernel"] = keras.distribution.TensorLayout(("model", None), mesh)
-    layout_map[".*feedforward_intermediate_dense/kernel"] = keras.distribution.TensorLayout((None, "model"), mesh)
-    layout_map[".*feedforward_output_dense/kernel"] = keras.distribution.TensorLayout(("model", None), mesh)
+    layout_map[".*token_embedding/embeddings"] = (
+        keras.distribution.TensorLayout(("model", None), mesh)
+    )
+    layout_map[".*position_embedding/embeddings"] = (
+        keras.distribution.TensorLayout((None, "model"), mesh)
+    )
+    layout_map[".*self_attention/query/kernel"] = (
+        keras.distribution.TensorLayout((None, "model", None), mesh)
+    )
+    layout_map[".*self_attention/key/kernel"] = keras.distribution.TensorLayout(
+        (None, "model", None), mesh
+    )
+    layout_map[".*self_attention/value/kernel"] = (
+        keras.distribution.TensorLayout((None, "model", None), mesh)
+    )
+    layout_map[".*self_attention/attention_output/kernel"] = (
+        keras.distribution.TensorLayout(("model", None), mesh)
+    )
+    layout_map[".*feedforward_intermediate_dense/kernel"] = (
+        keras.distribution.TensorLayout((None, "model"), mesh)
+    )
+    layout_map[".*feedforward_output_dense/kernel"] = (
+        keras.distribution.TensorLayout(("model", None), mesh)
+    )
 
     if world_size > 1:
-        distribution = keras.distribution.ModelParallel(layout_map=layout_map, batch_dim_name="model", auto_shard_dataset=False)
+        distribution = keras.distribution.ModelParallel(
+            layout_map=layout_map,
+            batch_dim_name="model",
+            auto_shard_dataset=False,
+        )
         scope = distribution.scope()
     else:
         scope = contextlib.nullcontext()
 
     with scope:
-        model = keras_hub.models.OPTBackbone.from_preset("opt_125m_en", dropout=0.0)
-        
+        model = keras_hub.models.OPTBackbone.from_preset(
+            "opt_125m_en", dropout=0.0
+        )
+
         # Memory Optimization: Force GC after model creation but before compilation
         gc.collect()
         if device_type == "cuda":
             torch.cuda.empty_cache()
 
-        model.compile(optimizer=keras.optimizers.Adam(learning_rate=1e-5), loss="mse", jit_compile=False)
-        
+        model.compile(
+            optimizer=keras.optimizers.Adam(learning_rate=1e-5),
+            loss="mse",
+            jit_compile=False,
+        )
+
         initial = get_weights_summary(model)
         np.random.seed(42)
         x_full = {
             "token_ids": np.random.randint(0, 50272, (40, 32)).astype("int32"),
-            "padding_mask": np.ones((40, 32), dtype="int32")
+            "padding_mask": np.ones((40, 32), dtype="int32"),
         }
         y_full = np.random.normal(size=(40, 32, 768)).astype("float32")
-        
+
         for i in range(10):
             base = i * 4
-            x_full["token_ids"][base+2:base+4] = x_full["token_ids"][base:base+2]
-            y_full[base+2:base+4] = y_full[base:base+2]
+            x_full["token_ids"][base + 2 : base + 4] = x_full["token_ids"][
+                base : base + 2
+            ]
+            y_full[base + 2 : base + 4] = y_full[base : base + 2]
 
         indices = []
         for i in range(10):
-             base = i * 4
-             if rank == 0: indices.extend([base, base + 1])
-             else: indices.extend([base + 2, base + 3])
+            base = i * 4
+            if rank == 0:
+                indices.extend([base, base + 1])
+            else:
+                indices.extend([base + 2, base + 3])
         x = {k: v[indices] for k, v in x_full.items()}
         y = y_full[indices]
-        
+
         # Compilation Warmup
         start_comp = time.time()
-        model.fit(x, y, batch_size=2, epochs=1, steps_per_epoch=1, verbose=1 if rank == 0 else 0, shuffle=False)
+        model.fit(
+            x,
+            y,
+            batch_size=2,
+            epochs=1,
+            steps_per_epoch=1,
+            verbose=1 if rank == 0 else 0,
+            shuffle=False,
+        )
         compilation_time = time.time() - start_comp
-        
+
         start_time = time.time()
-        history = model.fit(x, y, batch_size=2, epochs=5, steps_per_epoch=1, verbose=1 if rank == 0 else 0, shuffle=False)
+        history = model.fit(
+            x,
+            y,
+            batch_size=2,
+            epochs=5,
+            steps_per_epoch=1,
+            verbose=1 if rank == 0 else 0,
+            shuffle=False,
+        )
         end_time = time.time()
         training_time = end_time - start_time
-        
+
         after_step_1 = get_weights_summary(model)
 
     peak_memory = tracker.stop()
-    
+
     # Collective peak memory (max across ranks)
-    peak_mem_tensor = torch.tensor([peak_memory], device='cpu')
-    torch.distributed.all_reduce(peak_mem_tensor, op=torch.distributed.ReduceOp.MAX)
+    peak_mem_tensor = torch.tensor([peak_memory], device="cpu")
+    torch.distributed.all_reduce(
+        peak_mem_tensor, op=torch.distributed.ReduceOp.MAX
+    )
     global_peak_memory = peak_mem_tensor.item()
 
     if rank == 0:
         results = {
-            "initial_weights": {k: {"mean": v["mean"]} for k, v in initial.items()},
-            "step_1_loss": float(history.history["loss"][0]) if rank == 0 else 0.0,
-            "step_5_loss": float(history.history["loss"][4]) if rank == 0 else 0.0,
-            "perplexity": float(np.exp(history.history["loss"][4])) if rank == 0 else 0.0,
+            "initial_weights": {
+                k: {"mean": v["mean"]} for k, v in initial.items()
+            },
+            "step_1_loss": float(history.history["loss"][0])
+            if rank == 0
+            else 0.0,
+            "step_5_loss": float(history.history["loss"][4])
+            if rank == 0
+            else 0.0,
+            "perplexity": float(np.exp(history.history["loss"][4]))
+            if rank == 0
+            else 0.0,
             "throughput": (4 * 5) / training_time,
             "training_time": training_time,
             "compilation_time": compilation_time,
             "peak_memory": global_peak_memory,
-            "step_1_updates": {path: {"mean": float(np.mean(after_step_1[path]["val"] - initial[path]["val"])), "samples": (after_step_1[path]["val"] - initial[path]["val"]).flatten()[:5].tolist()} for path in initial if path in after_step_1},
+            "step_1_updates": {
+                path: {
+                    "mean": float(
+                        np.mean(
+                            after_step_1[path]["val"] - initial[path]["val"]
+                        )
+                    ),
+                    "samples": (
+                        after_step_1[path]["val"] - initial[path]["val"]
+                    )
+                    .flatten()[:5]
+                    .tolist(),
+                }
+                for path in initial
+                if path in after_step_1
+            },
         }
-        with open("results_torch.json", "w") as f: json.dump(results, f, indent=2)
-    
+        with open("results_torch.json", "w") as f:
+            json.dump(results, f, indent=2)
+
     if torch.distributed.is_initialized():
         torch.distributed.barrier()
         torch.distributed.destroy_process_group()
+
 
 if __name__ == "__main__":
     backend = sys.argv[1]

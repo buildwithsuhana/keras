@@ -1,5 +1,6 @@
 import collections
 import json
+import math
 import os.path
 import pprint
 import zipfile
@@ -473,6 +474,16 @@ class KerasFileEditor:
             # IMPORTANT:
             # Never mutate inner_path; use local variable.
             current_inner_path = f"{inner_path}/{key}"
+
+            # Reject HDF5 `ExternalLink`/`SoftLink`.
+            child_class = data.get(
+                key, default=None, getclass=True, getlink=True
+            )
+            if child_class in (h5py.ExternalLink, h5py.SoftLink):
+                raise ValueError(
+                    f"Not allowed: H5 file with {child_class.__name__}"
+                )
+
             value = data[key]
 
             # ------------------------------------------------------
@@ -483,14 +494,14 @@ class KerasFileEditor:
                 if len(value) == 0:
                     continue
 
-                # Skip empty "vars" groups
-                if "vars" in value.keys() and len(value["vars"]) == 0:
-                    continue
-
                 # Recurse into "vars" subgroup when present
                 if "vars" in value.keys():
+                    vars_group = saving_lib.safe_get_h5_group(value, "vars")
+                    # Skip empty "vars" groups
+                    if len(vars_group) == 0:
+                        continue
                     result[key], metadata = self._extract_weights_from_store(
-                        value["vars"],
+                        vars_group,
                         metadata=metadata,
                         inner_path=current_inner_path,
                     )
@@ -518,6 +529,12 @@ class KerasFileEditor:
                     f"{value.external}"
                 )
 
+            if value.is_virtual:
+                raise ValueError(
+                    "Not allowed: H5 file with virtual Dataset at "
+                    f"{current_inner_path}"
+                )
+
             shape = value.shape
             dtype = value.dtype
 
@@ -540,7 +557,7 @@ class KerasFileEditor:
                 )
 
             # Safe product computation (Python int is unbounded)
-            num_elems = int(np.prod(shape))
+            num_elems = math.prod(shape)
 
             # ------------------------------------------------------
             # Validate TOTAL memory size

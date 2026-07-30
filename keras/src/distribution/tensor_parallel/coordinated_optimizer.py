@@ -224,7 +224,9 @@ class TensorParallelOptimizer(optimizers.Optimizer):
             new_grads_and_vars = []
             for g, v in gradients_and_vars:
                 if g is not None and not self._is_sharded_variable(v):
-                    g = distribution_lib.all_reduce(g, op="mean", axis_name="model")
+                    g = distribution_lib.all_reduce(
+                        g, op="mean", axis_name="model"
+                    )
                 new_grads_and_vars.append((g, v))
             return new_grads_and_vars
 
@@ -241,10 +243,12 @@ class TensorParallelOptimizer(optimizers.Optimizer):
 
             # Mean across local shards
             reduced_grad = ops.mean(ops.stack(grads), axis=0)
-            
+
             # Mean across processes (if applicable)
-            reduced_grad = distribution_lib.all_reduce(reduced_grad, op="mean", axis_name="model")
-            
+            reduced_grad = distribution_lib.all_reduce(
+                reduced_grad, op="mean", axis_name="model"
+            )
+
             return [(reduced_grad, v) for _, v in shards_for_this_var]
 
         return [
@@ -258,19 +262,22 @@ class TensorParallelOptimizer(optimizers.Optimizer):
         """Checks if a variable is sharded according to the TP config."""
         if not self.tensor_parallel_config:
             return False
-        
+
         # Check by ID
-        ref = variable.experimental_ref() if hasattr(variable, "experimental_ref") else variable
+        ref = (
+            variable.experimental_ref()
+            if hasattr(variable, "experimental_ref")
+            else variable
+        )
         if id(ref) in self.tensor_parallel_config.state_rules:
             return True
-            
+
         # Check by path
         path = getattr(variable, "path", None)
         if path and path in self.tensor_parallel_config.state_rules:
             return True
-            
-        return False
 
+        return False
 
     def get_config(self):
         """Returns the configuration of the optimizer for serialization.

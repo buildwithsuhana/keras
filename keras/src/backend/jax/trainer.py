@@ -212,14 +212,14 @@ class JAXTrainer(base_trainer.Trainer):
             if concatenate_outputs:
 
                 def concatenate(outputs):
-                    output = outputs[0]
-                    for next_output in outputs[1:]:
-                        output = tree.map_structure(
-                            lambda t1, t2: jax.numpy.concatenate([t1, t2]),
-                            output,
-                            next_output,
-                        )
-                    return output
+                    if not outputs:
+                        return []
+                    if len(outputs) == 1:
+                        return outputs[0]
+                    return tree.map_structure(
+                        lambda *args: jax.numpy.concatenate(args, axis=0),
+                        *outputs,
+                    )
 
                 if not self.run_eagerly and self.jit_compile:
                     concatenate = jit(concatenate)
@@ -1068,10 +1068,13 @@ def _distribute_data(data, layouts=None):
 
     if distribution is not None:
         if layouts is None:
-            layouts = tree.map_structure(
-                lambda d: distribution.get_data_layout(d.shape),
-                data,
-            )
+
+            def get_layout(d):
+                if d is None:
+                    return None
+                return distribution.get_data_layout(d.shape)
+
+            layouts = tree.map_structure(get_layout, data)
         jax_dist_data_input = partial(
             jax_distribution_lib.distribute_data_input,
             batch_dim_name=distribution.batch_dim_name,
@@ -1090,21 +1093,24 @@ class JAXEpochIterator(EpochIterator):
         if distribution is not None:
             return self._get_distributed_iterator(distribution)
         else:
-            return self._one_batch_ahead_iterator(
-                self.data_adapter.get_jax_iterator()
-            )
+            iterator = self.data_adapter.get_jax_iterator()
+            # No benefit from look-ahead on CPU — avoid the overhead
+            if jax.default_backend() == "cpu":
+                return iterator
+            return self._one_batch_ahead_iterator(iterator)
 
     def _get_distributed_iterator(self, distribution):
         """Lazily compute layouts to reduce host to device transfer latency."""
         layouts = None
         for data in self.data_adapter.get_jax_iterator():
             if layouts is None:
-                layouts = tree.map_structure(
-                    lambda d: (
-                        distribution.get_data_layout(d.shape).backend_layout
-                    ),
-                    data,
-                )
+
+                def get_layout(d):
+                    if d is None:
+                        return None
+                    return distribution.get_data_layout(d.shape).backend_layout
+
+                layouts = tree.map_structure(get_layout, data)
             yield _distribute_data(data, layouts)
 
     def _one_batch_ahead_iterator(self, numpy_iterator):

@@ -1,14 +1,18 @@
 import os
 import sys
+
 import numpy as np
+
 
 def run_jax():
     os.environ["KERAS_BACKEND"] = "jax"
-    import keras
     import keras_hub
+
+    import keras
+
     keras.utils.set_random_seed(42)
     model = keras_hub.models.OPTBackbone.from_preset("opt_125m_en", dropout=0.0)
-    
+
     x = {
         "token_ids": np.ones((1, 32), dtype="int32"),
         "padding_mask": np.ones((1, 32), dtype="int32"),
@@ -16,19 +20,23 @@ def run_jax():
     out = model.predict(x, verbose=0)
     np.save("jax_out.npy", out)
 
+
 def run_torch():
     os.environ["KERAS_BACKEND"] = "torch"
-    import keras
     import keras_hub
+
+    import keras
+
     keras.utils.set_random_seed(42)
     model = keras_hub.models.OPTBackbone.from_preset("opt_125m_en", dropout=0.0)
-    
+
     x = {
         "token_ids": np.ones((1, 32), dtype="int32"),
         "padding_mask": np.ones((1, 32), dtype="int32"),
     }
     out = model.predict(x, verbose=0)
     np.save("torch_out.npy", out)
+
 
 if __name__ == "__main__":
     if sys.argv[1] == "jax":

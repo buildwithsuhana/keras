@@ -291,13 +291,12 @@ class TensorFlowTrainer(base_trainer.Trainer):
 
         @tf.autograph.experimental.do_not_convert
         def multi_step_on_data(data):
-            outputs = one_step_on_data_distributed(data[:1])
-            for single_step_data in data[1:]:
-                step_outputs = one_step_on_data_distributed([single_step_data])
-                outputs = tree.map_structure(
-                    lambda t1, t2: concat([t1, t2]), outputs, step_outputs
-                )
-            return outputs
+            if len(data) == 1:
+                return one_step_on_data_distributed(data[:1])
+            all_outputs = [one_step_on_data_distributed([d]) for d in data]
+            return tree.map_structure(
+                lambda *args: concat(list(args), axis=0), *all_outputs
+            )
 
         if self.steps_per_execution > 1:
             predict_function = multi_step_on_data
@@ -337,7 +336,7 @@ class TensorFlowTrainer(base_trainer.Trainer):
         if max_epochs and max_epochs < epochs:
             warnings.warn("Limiting epochs to %d" % max_epochs)
             epochs = max_epochs
-        # TODO: respect compiled trainable state
+
         self._eval_epoch_iterator = None
         if validation_split and validation_data is None:
             # Create the validation data using the training data. Only supported
@@ -466,7 +465,6 @@ class TensorFlowTrainer(base_trainer.Trainer):
         **kwargs,
     ):
         self._assert_compile_called("evaluate")
-        # TODO: respect compiled trainable state
         use_cached_eval_dataset = kwargs.pop("_use_cached_eval_dataset", False)
         if kwargs:
             raise ValueError(f"Arguments not recognized: {kwargs}")

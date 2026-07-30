@@ -6,6 +6,7 @@ from keras.src import tree
 from keras.src.api_export import keras_export
 from keras.src.backend import KerasTensor
 from keras.src.backend import any_symbolic_tensors
+from keras.src.backend.common.backend_utils import canonicalize_axis
 from keras.src.backend.common.backend_utils import slice_along_axis
 from keras.src.ops.operation import Operation
 from keras.src.saving import serialization_lib
@@ -754,9 +755,7 @@ class Unstack(Operation):
         return backend.core.unstack(x, self.num, self.axis)
 
     def compute_output_spec(self, x):
-        axis = self.axis
-        if axis < 0:
-            axis = len(x.shape) + axis
+        axis = canonicalize_axis(self.axis, len(x.shape))
         output_shapes = x.shape[:axis] + x.shape[axis + 1 :]
         num = self.num
         if num is None:
@@ -989,22 +988,15 @@ def _saturate_cast(x, dtype, backend_module=None):
 
 
 class ConvertToTensor(Operation):
-    def __init__(
-        self, dtype=None, sparse=None, ragged=None, layout="auto", *, name=None
-    ):
+    def __init__(self, dtype=None, sparse=None, ragged=None, *, name=None):
         super().__init__(name=name)
         self.dtype = dtype
         self.sparse = sparse
         self.ragged = ragged
-        self.layout = layout
 
     def call(self, x):
         return backend.core.convert_to_tensor(
-            x,
-            dtype=self.dtype,
-            sparse=self.sparse,
-            ragged=self.ragged,
-            layout=self.layout,
+            x, dtype=self.dtype, sparse=self.sparse, ragged=self.ragged
         )
 
     def compute_output_spec(self, x):
@@ -1025,7 +1017,7 @@ class ConvertToTensor(Operation):
 
 
 @keras_export("keras.ops.convert_to_tensor")
-def convert_to_tensor(x, dtype=None, sparse=None, ragged=None, layout="auto"):
+def convert_to_tensor(x, dtype=None, sparse=None, ragged=None):
     """Convert a NumPy array or Python array to a tensor.
 
     Native tensors for the current backend or left unchanged unless the `dtype`,
@@ -1040,8 +1032,6 @@ def convert_to_tensor(x, dtype=None, sparse=None, ragged=None, layout="auto"):
         ragged: Whether to keep ragged tensors. `False` will cause ragged
             tensors to be densified. The default value of `None` means that
             ragged tensors are kept only if the backend supports them.
-        layout: Optional `TensorLayout` to use for the output tensor.
-            Only supported by the torch backend for now.
 
     Returns:
         A backend tensor of the specified `dtype` and sparseness.
@@ -1053,11 +1043,9 @@ def convert_to_tensor(x, dtype=None, sparse=None, ragged=None, layout="auto"):
     """
     dtype = None if dtype is None else backend.standardize_dtype(dtype)
     if any_symbolic_tensors((x,)):
-        return ConvertToTensor(
-            dtype=dtype, sparse=sparse, ragged=ragged, layout=layout
-        )(x)
+        return ConvertToTensor(dtype=dtype, sparse=sparse, ragged=ragged)(x)
     return backend.core.convert_to_tensor(
-        x, dtype=dtype, sparse=sparse, ragged=ragged, layout=layout
+        x, dtype=dtype, sparse=sparse, ragged=ragged
     )
 
 

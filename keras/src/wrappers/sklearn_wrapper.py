@@ -142,7 +142,11 @@ class SKLBase(BaseEstimator):
         return self
 
     def _get_model(self, X, y):
+        if self.warm_start and hasattr(self, "model_"):
+            return self.model_
         if isinstance(self.model, Model):
+            if self.warm_start:
+                return self.model
             return clone_model(self.model)
         else:
             args = self.model_kwargs or {}
@@ -277,6 +281,15 @@ class SKLearnClassifier(ClassifierMixin, SKLBase):
     est.fit(X, y, epochs=5)
     ```
     """
+
+    def decision_function(self, X):
+        """Get raw model outputs."""
+        from sklearn.utils.validation import check_is_fitted
+
+        check_is_fitted(self)
+
+        X = _validate_data(self, X, reset=False)
+        return self.model_.predict(X)
 
     def _process_target(self, y, reset=False):
         """Classifiers do OHE."""

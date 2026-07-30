@@ -1,6 +1,7 @@
 import numpy as np
 
 from keras.src.backend import standardize_dtype
+from keras.src.backend.common import dtypes
 from keras.src.backend.jax.math import fft as jax_fft
 from keras.src.backend.jax.math import fft2 as jax_fft2
 from keras.src.backend.numpy.core import convert_to_tensor
@@ -26,6 +27,8 @@ def _segment_reduction_fn(
         result = np.ones(data_shape, dtype=valid_data.dtype) * -np.inf
     elif reduction_method == np.minimum:
         result = np.ones(data_shape, dtype=valid_data.dtype) * np.inf
+    elif reduction_method == np.multiply:
+        result = np.ones(data_shape, dtype=valid_data.dtype)
     else:
         result = np.zeros(data_shape, dtype=valid_data.dtype)
 
@@ -59,6 +62,12 @@ def segment_min(data, segment_ids, num_segments=None, sorted=False):
     )
 
 
+def segment_prod(data, segment_ids, num_segments=None, sorted=False):
+    return _segment_reduction_fn(
+        data, segment_ids, np.multiply, num_segments, sorted
+    )
+
+
 def top_k(x, k, sorted=True):
     if sorted:
         # Take the k largest values.
@@ -75,7 +84,7 @@ def top_k(x, k, sorted=True):
 
 
 def in_top_k(targets, predictions, k):
-    targets = targets[:, None]
+    targets = targets[..., None]
     topk_values = top_k(predictions, k)[0]
     targets_values = np.take_along_axis(predictions, targets, axis=-1)
     mask = targets_values >= topk_values
@@ -83,7 +92,25 @@ def in_top_k(targets, predictions, k):
 
 
 def logsumexp(x, axis=None, keepdims=False):
-    return scipy.special.logsumexp(x, axis=axis, keepdims=keepdims)
+    x = convert_to_tensor(x)
+    dtype = dtypes.result_type(x.dtype, float)
+    return scipy.special.logsumexp(x, axis=axis, keepdims=keepdims).astype(
+        dtype
+    )
+
+
+def cdist(x, y):
+    x = np.asarray(x)
+    y = np.asarray(y)
+    dtype = dtypes.result_type(x.dtype, y.dtype, float)
+    x = x.astype(dtype)
+    y = y.astype(dtype)
+    if x.ndim < 2 or y.ndim < 2:
+        raise ValueError("`cdist` inputs must have rank >= 2")
+    if x.shape[-1] != y.shape[-1]:
+        raise ValueError("Last dimension of inputs to `cdist` must match")
+    diff = x[..., :, None, :] - y[..., None, :, :]
+    return np.sqrt(np.sum(diff * diff, axis=-1))
 
 
 def extract_sequences(x, sequence_length, sequence_stride):
@@ -277,22 +304,31 @@ def istft(
     if length is not None:
         end = start + length
     elif center is True:
-        end = -(fft_length // 2)
+        end = expected_output_len - (fft_length // 2)
     else:
         end = expected_output_len
     return x[..., start:end]
 
 
 def rsqrt(x):
-    return 1.0 / np.sqrt(x)
+    dtype = dtypes.result_type(x.dtype)
+    return (1.0 / np.sqrt(x)).astype(dtype)
 
 
 def erf(x):
-    return np.array(scipy.special.erf(x))
+    dtype = dtypes.result_type(x.dtype)
+    return scipy.special.erf(x).astype(dtype)
+
+
+def erfc(x):
+    dtype = dtypes.result_type(x.dtype, float)
+    return scipy.special.erfc(x).astype(dtype)
 
 
 def erfinv(x):
-    return np.array(scipy.special.erfinv(x))
+    x = convert_to_tensor(x)
+    dtype = dtypes.result_type(x.dtype, float)
+    return scipy.special.erfinv(x).astype(dtype)
 
 
 def logdet(x):

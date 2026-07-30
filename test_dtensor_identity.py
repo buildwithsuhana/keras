@@ -1,7 +1,10 @@
 import os
+
 import torch
 from torch.distributed.device_mesh import init_device_mesh
-from torch.distributed.tensor import distribute_tensor, Shard, Replicate, DTensor
+from torch.distributed.tensor import Shard
+from torch.distributed.tensor import distribute_tensor
+
 
 def test_identity():
     os.environ["MASTER_ADDR"] = "localhost"
@@ -13,14 +16,15 @@ def test_identity():
 
     x = torch.randn(2, 4, requires_grad=True)
     dx = distribute_tensor(x, mesh, [Shard(0)])
-    
+
     dy = dx * 1.0
     dy.sum().backward()
-    
+
     print(f"dx.grad: {dx.grad}")
     print(f"x.grad: {x.grad}")
 
     torch.distributed.destroy_process_group()
+
 
 if __name__ == "__main__":
     test_identity()

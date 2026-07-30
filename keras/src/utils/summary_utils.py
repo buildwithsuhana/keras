@@ -302,18 +302,24 @@ def print_summary(
                 )
             else:
                 fields.append(bold_text("-"))
-        
+
         if show_sharding:
             config = getattr(model, "_tensor_parallel_config", None)
             if config:
                 rules = []
                 for pat, rule in config.state_rules.items():
-                    if str(pat) in layer.name or (hasattr(layer, "path") and str(pat) in layer.path):
-                         sharding_type = getattr(rule, "sharding_type", "sharded")
-                         rules.append(sharding_type)
+                    if str(pat) in layer.name or (
+                        hasattr(layer, "path") and str(pat) in layer.path
+                    ):
+                        sharding_type = getattr(
+                            rule, "sharding_type", "sharded"
+                        )
+                        rules.append(sharding_type)
                 for pat, rule in config.output_rules.items():
-                    if str(pat) in layer.name or (hasattr(layer, "path") and str(pat) in layer.path):
-                         rules.append("comm")
+                    if str(pat) in layer.name or (
+                        hasattr(layer, "path") and str(pat) in layer.path
+                    ):
+                        rules.append("comm")
                 if rules:
                     fields.append(", ".join(set(rules)))
                 else:

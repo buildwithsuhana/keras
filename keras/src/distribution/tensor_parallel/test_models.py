@@ -25,6 +25,7 @@ os.environ["XLA_FLAGS"] = "--xla_force_host_platform_device_count=12"
 
 import jax
 import keras_hub
+
 # import matplotlib.pyplot as plt
 import tensorflow as tf
 import tensorflow_datasets as tfds
@@ -87,6 +88,7 @@ MODEL_MAPPING = {
 # --- Dataset and Model Helpers ---
 # ----------------------------------------------------------------------
 
+
 def load_shakespeare_dataset(model_preset):
     """Loads and preprocesses the Tiny Shakespeare dataset."""
     logger.info(
@@ -146,6 +148,7 @@ def get_model_from_preset(preset_name, model_class):
 # --- Plotting Function (MODIFIED) ---
 # ----------------------------------------------------------------------
 
+
 def plot_training_graphs(tp_history, preset_name):
     """Plots and saves the loss and perplexity graphs for the TP run."""
     # fig, (ax1, ax2) = plt.subplots(2, 1, figsize=(12, 10))
@@ -189,6 +192,7 @@ def plot_training_graphs(tp_history, preset_name):
 # ----------------------------------------------------------------------
 # --- Main Verification Function (MODIFIED) ---
 # ----------------------------------------------------------------------
+
 
 def run_model_verification(preset_name, model_class):
     """

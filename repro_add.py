@@ -3,9 +3,9 @@ import os
 os.environ["KERAS_BACKEND"] = "torch"
 os.environ["KERAS_TORCH_DEVICE"] = "cpu"
 
-import keras
 import torch
-import numpy as np
+
+import keras
 
 print(f"Keras floatx: {keras.config.floatx()}")
 

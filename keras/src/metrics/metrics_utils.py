@@ -1,3 +1,4 @@
+import math
 from enum import Enum
 
 import numpy as np
@@ -508,7 +509,7 @@ def update_confusion_matrix_variables(
         if len(y_pred.shape) == 1:
             num_labels = 1
         else:
-            num_labels = np.prod(pred_shape[1:], axis=0).astype("int32")
+            num_labels = math.prod(pred_shape[1:])
         thresh_label_tile = np.where(one_thresh, num_labels, 1)
 
     # Reshape predictions and labels, adding a dim for thresholding.
@@ -565,10 +566,16 @@ def update_confusion_matrix_variables(
             weights_tiled = ops.multiply(weights_tiled, label_weights_tiled)
 
     def weighted_assign_add(label, pred, weights, var):
-        label_and_pred = ops.cast(ops.logical_and(label, pred), dtype=var.dtype)
+        label_and_pred = ops.logical_and(label, pred)
         if weights is not None:
-            label_and_pred *= ops.cast(weights, dtype=var.dtype)
-        var.assign(var + ops.sum(label_and_pred, 1))
+            result = ops.where(
+                label_and_pred,
+                ops.cast(weights, dtype=var.dtype),
+                0,
+            )
+        else:
+            result = ops.cast(label_and_pred, dtype=var.dtype)
+        var.assign(var + ops.sum(result, 1))
 
     loop_vars = {
         ConfusionMatrix.TRUE_POSITIVES: (label_is_pos, pred_is_pos),

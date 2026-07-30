@@ -39,15 +39,13 @@ def get_data_adapter(
         and getattr(distribution, "_is_multi_process", False)
         and getattr(distribution, "auto_shard_dataset", False)
         and not (
-            is_tf_dataset(x)
-            or is_torch_dataloader(x)
-            or isinstance(x, py_dataset_adapter.PyDataset)
+            is_tf_dataset(x) or isinstance(x, py_dataset_adapter.PyDataset)
         )
     ):
         raise ValueError(
             "When using a multi-worker distribution with auto-sharding enabled, "
-            "the data must be provided as a `tf.data.Dataset` instance. "
-            f"Received: type(x)={type(x)}. "
+            "the data must be provided as a `tf.data.Dataset` or a "
+            f"`keras.utils.PyDataset` instance. Received: type(x)={type(x)}. "
             "If the dataset is already sharded across workers, then set "
             "`distribution.auto_shard_dataset = False`."
         )
@@ -91,17 +89,13 @@ def get_data_adapter(
             )
         if getattr(x, "num_batches", None) is None and shuffle:
             warnings.warn(
-                "shuffle=True was passed, but will be ignored since the "
-                "data x was provided as an infinite PyDataset. The "
+                "`shuffle=True` was passed, but will be ignored since the "
+                "data `x` was provided as an infinite PyDataset. The "
                 "PyDataset is expected to already be shuffled.",
                 stacklevel=2,
             )
-        return PyDatasetAdapter(
-            x,
-            class_weight=class_weight,
-            shuffle=shuffle,
-            distribution=distribution,
-        )
+        return PyDatasetAdapter(x, class_weight=class_weight, shuffle=shuffle)
+
     elif is_torch_dataloader(x):
         if y is not None:
             raise_unsupported_arg("y", "the targets", "torch DataLoader")

@@ -2,12 +2,14 @@ import os
 import pathlib
 import unittest.mock as mock
 
+import h5py
 import numpy as np
 from absl import logging
 from absl.testing import parameterized
 
 from keras.src import layers
 from keras.src.legacy.saving.legacy_h5_format import save_model_to_hdf5
+from keras.src.models import Model
 from keras.src.models import Sequential
 from keras.src.saving import saving_api
 from keras.src.testing import test_case
@@ -114,6 +116,45 @@ class SaveModelTests(test_case.TestCase):
             new_model.layers[0].get_weights()[1],
             model.layers[0].get_weights()[1],
         )
+
+    def test_objects_to_skip_with_functional_subclass_attribute_layer(self):
+        class Backbone(Model):
+            def __init__(self):
+                # Simulate a layer owned by a Functional subclass, but not
+                # part of the Functional graph. This matches e.g. a decoder
+                # attached to a backbone but called by a task model.
+                decoder = layers.Dense(2, name="decoder")
+
+                encoder = layers.Dense(4, name="encoder")
+                inputs = layers.Input((3,))
+                outputs = encoder(inputs)
+                super().__init__(inputs, outputs)
+                self.decoder = decoder
+
+        class Task(Model):
+            def __init__(self, backbone):
+                inputs = backbone.input
+                outputs = backbone.decoder(backbone(inputs))
+                super().__init__(inputs, outputs)
+                self.backbone = backbone
+
+        legacy_task = Task(Backbone())
+        legacy_task(np.ones((1, 3)))
+        filepath = os.path.join(self.get_temp_dir(), "legacy_task.weights.h5")
+        # This simulates a legacy task weight file that contains the full task,
+        # while modern task loading skips backbone-owned objects.
+        saving_api.save_weights(legacy_task, filepath)
+
+        new_task = Task(Backbone())
+        new_task(np.ones((1, 3)))
+        decoder_kernel = np.array(new_task.backbone.decoder.kernel)
+        objects_to_skip = list(new_task.backbone._flatten_layers())
+
+        self.assertIn(new_task.backbone.decoder, objects_to_skip)
+        saving_api.load_weights(
+            new_task, filepath, objects_to_skip=objects_to_skip
+        )
+        self.assertAllClose(new_task.backbone.decoder.kernel, decoder_kernel)
 
 
 class LoadModelTests(test_case.TestCase):
@@ -295,6 +336,34 @@ class LoadWeightsTests(test_case.TestCase):
         model = self.get_model()
         with self.assertRaisesRegex(ValueError, "File format not supported"):
             model.load_weights("invalid_extension.pkl")
+
+    def test_load_weights_rejects_h5_external_link(self):
+        target_fpath = os.path.join(self.get_temp_dir(), "target.h5")
+        src_model = self.get_model()
+        save_model_to_hdf5(src_model, target_fpath)
+
+        attacker_fpath = os.path.join(self.get_temp_dir(), "attacker.h5")
+        with h5py.File(attacker_fpath, "w") as f:
+            f["model_weights"] = h5py.ExternalLink(
+                target_fpath, "/model_weights"
+            )
+
+        dest_model = self.get_model()
+        with self.assertRaisesRegex(ValueError, "ExternalLink"):
+            dest_model.load_weights(attacker_fpath)
+
+    def test_load_weights_rejects_h5_soft_link(self):
+        attacker_fpath = os.path.join(
+            self.get_temp_dir(), "softlink_attacker.h5"
+        )
+        with h5py.File(attacker_fpath, "w") as f:
+            real = f.create_group("real_weights")
+            real.create_dataset("inner", data=np.zeros((1,)))
+            f["model_weights"] = h5py.SoftLink("/real_weights")
+
+        dest_model = self.get_model()
+        with self.assertRaisesRegex(ValueError, "SoftLink"):
+            dest_model.load_weights(attacker_fpath)
 
     def test_load_sharded_weights(self):
         src_model = self.get_model()

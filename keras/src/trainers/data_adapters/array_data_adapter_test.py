@@ -1,9 +1,7 @@
-from unittest.mock import patch
-
 import jax
 import jax.experimental.sparse as jax_sparse
 import numpy as np
-import pandas
+import pytest
 import scipy
 import tensorflow as tf
 import torch
@@ -34,8 +32,12 @@ class TestArrayDataAdapter(testing.TestCase):
         elif array_type == "torch":
             return torch.as_tensor(x)
         elif array_type == "pandas_data_frame":
+            import pandas  # Import pandas after tf, fixes deadlock on MacOS
+
             return pandas.DataFrame(x)
         elif array_type == "pandas_series":
+            import pandas  # Import pandas after tf, fixes deadlock on MacOS
+
             return pandas.Series(x[:, 0])
         elif array_type == "scipy_sparse":
             return scipy.sparse.coo_matrix(x)
@@ -140,6 +142,33 @@ class TestArrayDataAdapter(testing.TestCase):
             self.assertNotAllClose(x_order, list(range(34)))
         else:
             self.assertAllClose(x_order, list(range(34)))
+
+    @pytest.mark.skipif(backend.backend() != "tensorflow", reason="tf only")
+    def test_tf_sparse_trailing_empty_rows(self):
+        x = tf.SparseTensor(
+            indices=[[0, 0], [1, 2]],
+            values=[1.0, 2.0],
+            dense_shape=(4, 3),
+        )
+
+        adapter = array_data_adapter.ArrayDataAdapter(
+            x,
+            batch_size=4,
+            shuffle=False,
+        )
+        batch = next(iter(adapter.get_tf_dataset()))
+
+        self.assertIsInstance(batch, tf.SparseTensor)
+        self.assertEqual(batch.shape, (4, 3))
+        self.assertAllClose(
+            tf.sparse.to_dense(batch),
+            [
+                [1.0, 0.0, 0.0],
+                [0.0, 0.0, 2.0],
+                [0.0, 0.0, 0.0],
+                [0.0, 0.0, 0.0],
+            ],
+        )
 
     def test_multi_inputs_and_outputs(self):
         x1 = np.random.random((34, 1))
@@ -319,34 +348,43 @@ class TestArrayDataAdapter(testing.TestCase):
         self.assertEqual(batch[1].shape, (5, 3))
 
     @parameterized.named_parameters(
-        ("dataparallel", "dp", 4, 1, (4,), 4, 1),
-        ("modelparallel", "mp", 8, 5, (2, 4), 2, 1),
-        ("modelparallel_large_mesh", "mp", 4, 2, (8, 2), 4, 2),
+        named_product(
+            [
+                {
+                    "testcase_name": "dataparallel",
+                    "dist_type": "dp",
+                    "num_processes": 4,
+                    "process_id": 1,
+                    "mesh_shape": (4,),
+                },
+                {
+                    "testcase_name": "modelparallel",
+                    "dist_type": "mp",
+                    "num_processes": 8,
+                    "process_id": 5,
+                    "mesh_shape": (2, 4),
+                },
+                {
+                    "testcase_name": "modelparallel_large_mesh",
+                    "dist_type": "mp",
+                    "num_processes": 4,
+                    "process_id": 2,
+                    "mesh_shape": (8, 2),
+                },
+            ],
+            shuffle=[False, True],
+        )
     )
-    @patch("torch.distributed.get_world_size")
-    @patch("torch.distributed.get_rank")
-    @patch("keras.src.distribution.distribution_lib.distribution_lib")
-    @patch("keras.src.distribution.distribution_lib.distribution")
     def test_sharding(
         self,
         dist_type,
-        world_size,
-        rank,
+        num_processes,
+        process_id,
         mesh_shape,
-        expected_num_replicas,
-        expected_rank,
-        mock_distribution,
-        mock_backend_dist_lib,
-        mock_get_rank,
-        mock_get_world_size,
+        shuffle,
     ):
-        mock_get_world_size.return_value = world_size
-        mock_get_rank.return_value = rank
-        mock_backend_dist_lib.num_processes.return_value = world_size
-        mock_backend_dist_lib.process_id.return_value = rank
-
         if dist_type == "dp":
-            dist = dist_lib.DataParallel(devices=["cpu:0"] * world_size)
+            dist = dist_lib.DataParallel(devices=["cpu:0"] * num_processes)
         else:
             device_mesh = dist_lib.DeviceMesh(
                 shape=mesh_shape,
@@ -358,24 +396,80 @@ class TestArrayDataAdapter(testing.TestCase):
                 layout_map=dist_lib.LayoutMap(device_mesh),
                 batch_dim_name="data",
             )
+        dist._num_processes = num_processes
+        dist._process_id = process_id
         dist.auto_shard_dataset = True
-        mock_distribution.return_value = dist
 
-        x = np.ones((100, 10))
-        y = np.ones((100, 1))
-        adapter = array_data_adapter.ArrayDataAdapter(
-            x, y, batch_size=10, shuffle=False
-        )
-        new_dataloader = adapter.get_torch_dataloader()
+        expected_num_replicas = min(dist.num_model_replicas, num_processes)
+        expected_shard_id = dist.data_shard_id
 
-        self.assertIsInstance(
-            new_dataloader.batch_sampler.sampler,
-            torch.utils.data.distributed.DistributedSampler,
-        )
-        self.assertEqual(
-            new_dataloader.batch_sampler.sampler.num_replicas,
-            expected_num_replicas,
-        )
-        self.assertEqual(
-            new_dataloader.batch_sampler.sampler.rank, expected_rank
-        )
+        x = self.make_array("np", (100, 10), "float32")
+        y = self.make_array("np", (100, 1), "float32")
+        with dist.scope():
+            adapter = array_data_adapter.ArrayDataAdapter(
+                x, y, batch_size=10, shuffle=shuffle
+            )
+
+            it_methods = ["get_numpy_iterator"]
+            backend_it_method = {
+                "tensorflow": "get_tf_dataset",
+                "jax": "get_jax_iterator",
+                "torch": "get_torch_dataloader",
+            }.get(backend.backend())
+            if backend_it_method:
+                it_methods.append(backend_it_method)
+
+        self.assertEqual(adapter._num_data_shards, expected_num_replicas)
+        self.assertEqual(adapter._data_shard_id, expected_shard_id)
+
+        def get_order(it_fn):
+            order = []
+            for batch in it_fn():
+                bx = batch[0]
+                bx = backend.convert_to_numpy(bx)
+                order.extend(bx[:, 0].tolist())
+            return order
+
+        for it_method in it_methods:
+            it_fn = getattr(adapter, it_method)
+            if not shuffle:
+                batches = list(it_fn())
+                expected_num_batches = (
+                    10 - expected_shard_id + expected_num_replicas - 1
+                ) // expected_num_replicas
+                self.assertEqual(len(batches), expected_num_batches)
+
+                for i, batch in enumerate(batches):
+                    bx, by = batch
+                    bx = backend.convert_to_numpy(bx)
+                    by = backend.convert_to_numpy(by)
+                    expected_batch_index = (
+                        expected_shard_id + i * expected_num_replicas
+                    )
+                    expected_first_sample_value = expected_batch_index * 10
+                    self.assertAllClose(
+                        bx[:, 0],
+                        np.arange(
+                            expected_first_sample_value,
+                            expected_first_sample_value + 10,
+                        ),
+                    )
+                    self.assertAllClose(
+                        by[:, 0],
+                        np.arange(
+                            expected_first_sample_value,
+                            expected_first_sample_value + 10,
+                        ),
+                    )
+            else:
+                # Same epoch should have same shuffle
+                adapter._epoch = 1
+                order1 = get_order(it_fn)
+                adapter._epoch = 1
+                order2 = get_order(it_fn)
+                self.assertAllClose(order1, order2)
+
+                # Different epochs should have different shuffle
+                adapter._epoch = 2
+                order3 = get_order(it_fn)
+                self.assertNotAllClose(order1, order3)

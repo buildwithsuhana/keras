@@ -134,7 +134,7 @@ def _apply_layer_sharding_rules(layer, device_count, state_rules, output_rules):
         if "attention_output" in layer.name:
             state_rules[id(layer.kernel)] = split_rule(dim=0)
             output_rules[layer_path] = _reduce_sum
-        elif "h" in layer.equation.split("->")[1]:
+        elif "h" in layer.equation.split("->")[1] or "attention" in layer.name:
             # This looks like MHA projections (query, key, value)
             state_rules[id(layer.kernel)] = split_rule(dim=1)
             if hasattr(layer, "bias") and layer.bias is not None:

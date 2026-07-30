@@ -1,17 +1,23 @@
-import contextlib
 import warnings
 
 import numpy as np
 import torch
+import torch.distributed as dist
 from packaging.version import parse
+from torch.nn.parallel import DistributedDataParallel
 
 from keras.src import backend
 from keras.src import callbacks as callbacks_module
 from keras.src import optimizers as optimizers_module
 from keras.src import tree
 from keras.src.backend import config
-from keras.src.backend.torch import distribution_lib as torch_dist_lib
-from keras.src.distribution import distribution_lib as dist_lib
+from keras.src.backend.torch.core import convert_to_tensor
+from keras.src.backend.torch.core import get_device
+from keras.src.backend.torch.distribution_lib import _to_backend_mesh
+from keras.src.backend.torch.distribution_lib import distribute_data_input
+from keras.src.distribution.distribution_lib import DataParallel
+from keras.src.distribution.distribution_lib import ModelParallel
+from keras.src.distribution.distribution_lib import distribution
 from keras.src.trainers import trainer as base_trainer
 from keras.src.trainers.data_adapters import array_slicing
 from keras.src.trainers.data_adapters import data_adapter_utils
@@ -26,8 +32,6 @@ class TorchTrainer(base_trainer.Trainer):
         self.train_function = None
         self.test_function = None
         self.predict_function = None
-        self._in_ddp_context = False
-        self._current_dist = None
 
     def _should_torch_compile(self):
         # require torch>=2.1.0 to enable dynamo since it
@@ -41,198 +45,65 @@ class TorchTrainer(base_trainer.Trainer):
             )
             self.jit_compile = False
 
-        if self.jit_compile:
-            try:
-                from torch.distributed.tensor import DTensor
-            except (ImportError, ModuleNotFoundError):
-                DTensor = None
-
-            if DTensor is not None:
-                for variable in getattr(self, "variables", []):
-                    if isinstance(getattr(variable, "value", None), DTensor):
-                        # warnings.warn(
-                        #     "Disabling torch.compile for models containing DTensor "
-                        #     "variables because torch.compile does not currently "
-                        #     "support DTensor-backed operations."
-                        # )
-                        return False
-
         return self.jit_compile
 
-    def _setup_ddp(self):
-        dist = dist_lib.distribution()
-        if dist is not self._current_dist:
-            self.train_function = None
-            self.test_function = None
-            self.predict_function = None
-            self._current_dist = dist
+    def _initialize_ddp(self):
+        if torch.distributed.is_initialized() and not hasattr(
+            self, "ddp_model"
+        ):
+            active_distribution = distribution()
 
-        if dist is not None and isinstance(dist, dist_lib.DataParallel):
-            if not hasattr(self, "_ddp_model"):
-                if torch.cuda.is_available():
-                    device = torch.device(f"cuda:{torch.cuda.current_device()}")
-                    device_ids = [torch.cuda.current_device()]
+            if active_distribution is None or isinstance(
+                active_distribution, DataParallel
+            ):
+                device = get_device()
+                device_str = str(device)
+                if device_str.startswith("cuda") or device_str.startswith(
+                    "xpu"
+                ):
+                    if ":" in device_str:
+                        device_ids = [int(device_str.split(":")[-1])]
+                    else:
+                        if device_str.startswith("cuda"):
+                            device_ids = [torch.cuda.current_device()]
+                        else:
+                            device_ids = [torch.xpu.current_device()]
                 else:
-                    device = torch.device("cpu")
                     device_ids = None
 
-                # Check for mixed placement
-                device_types = set()
-                for v in self.variables:
-                    device_types.add(v.value.device.type)
-                if len(device_types) > 1:
-                    warnings.warn(
-                        "Mixed device placement detected before DDP setup. "
-                        f"Devices found: {device_types}. The model will be "
-                        f"moved to {device}."
+                process_group = None
+                if active_distribution is not None:
+                    backend_mesh = _to_backend_mesh(
+                        active_distribution.device_mesh
+                    )
+                    process_group = backend_mesh.get_group(
+                        active_distribution.batch_dim_name
                     )
 
-                # Move model to the target device before DDP wrapping.
-                # DDP requires all parameters to be on the same device.
-                self.to(device)
-
-                # Explicitly move Variables that might not be tracked by
-                # TorchLayer or have DTensor issues.
-                for v in self.variables:
-                    if v.value.device != device:
-                        v.assign(v.value.to(device))
-
-                # Move optimizer state.
-                if self.optimizer is not None:
-                    for v in self.optimizer.variables:
-                        if v.value.device != device:
-                            v.assign(v.value.to(device))
-
-                ddp_model = torch.nn.parallel.DistributedDataParallel(
+                object.__setattr__(
                     self,
-                    device_ids=device_ids,
+                    "ddp_model",
+                    DistributedDataParallel(
+                        self,
+                        device_ids=device_ids,
+                        process_group=process_group,
+                        find_unused_parameters=False,
+                    ),
                 )
-                object.__setattr__(self, "_ddp_model", ddp_model)
-            self._in_ddp_context = True
-        else:
-            if hasattr(self, "_ddp_model"):
-                object.__delattr__(self, "_ddp_model")
-            self._in_ddp_context = False
-
-    def _distribute_data(self, data, replicate=False):
-        from keras.src.distribution import distribution_lib
-
-        dist = distribution_lib.distribution()
-        if dist is not None:
-
-            def _distribute_if_tensor(t):
-                if (
-                    backend.is_tensor(t) or isinstance(t, np.ndarray)
-                ) and hasattr(t, "shape"):
-                    layout = dist.get_data_layout(t.shape)
-                    if replicate and isinstance(
-                        dist, distribution_lib.ModelParallel
-                    ):
-                        from keras.src.distribution import TensorLayout
-
-                        layout = TensorLayout(
-                            [None] * len(t.shape), dist.device_mesh
-                        )
-                    return torch_dist_lib.distribute_data_input(
-                        t, layout, dist.batch_dim_name
-                    )
-                return t
-
-            return tree.map_structure(
-                _distribute_if_tensor, data, none_is_leaf=False
-            )
-        return tree.map_structure(
-            backend.convert_to_tensor, data, none_is_leaf=False
-        )
-
-    def _unpack_and_distribute_data(self, data):
-        from keras.src.distribution import distribution_lib as dist_lib
-
-        dist = dist_lib.distribution()
-        data = self._distribute_data(data)
-        x, y, sample_weight = data_adapter_utils.unpack_x_y_sample_weight(data)
-        return dist_lib, dist, x, y, sample_weight
-
-    def _forward(self, dist, x, training=False):
-        from keras.src.distribution import distribution_lib as dist_lib
-
-        if dist is not None and isinstance(dist, dist_lib.DataParallel):
-            return self._ddp_model(x, training=training)
-        if self._call_has_training_arg:
-            return self(x, training=training)
-        return self(x)
-
-    def _sync_ddp_buffers(self, dist):
-        from keras.src.distribution import distribution_lib as dist_lib
-
-        if dist is not None and isinstance(dist, dist_lib.DataParallel):
-            module = getattr(self._ddp_model, "module", None)
-            if module is not None:
-                aggregation_to_op = {
-                    "sum": torch.distributed.ReduceOp.SUM,
-                    "mean": torch.distributed.ReduceOp.SUM,
-                    "max": torch.distributed.ReduceOp.MAX,
-                    "min": torch.distributed.ReduceOp.MIN,
-                }
-                for name, buf in module.named_buffers(recurse=False):
-                    if buf is None:
-                        continue
-                    if not buf.requires_grad:
-                        if torch.distributed.is_initialized():
-                            aggregation = module._buffer_aggregations.get(name)
-                            if aggregation in (None, "none"):
-                                # Unknown aggregation — broadcast from rank 0
-                                # (safe default).
-                                torch.distributed.broadcast(buf, src=0)
-                                continue
-                            if aggregation not in aggregation_to_op:
-                                continue
-                            reduce_op = aggregation_to_op[aggregation]
-                            torch.distributed.all_reduce(buf, op=reduce_op)
-                            if aggregation == "mean":
-                                buf.div_(torch.distributed.get_world_size())
-
-    def _get_ddp_sync_context(self, dist, dist_lib):
-        if dist is not None and isinstance(dist, dist_lib.DataParallel):
-            is_update_step = True
-            if (
-                self.optimizer is not None
-                and self.optimizer.gradient_accumulation_steps
-            ):
-                is_update_step = (
-                    self.optimizer._iterations.value + 1
-                ) % self.optimizer.gradient_accumulation_steps == 0
-
-            if not is_update_step:
-                return self._ddp_model.no_sync()
-        return contextlib.nullcontext()
-
-    def _set_train_mode(self, training=True):
-        if training:
-            if self._in_ddp_context:
-                self._ddp_model.train()
-            else:
-                self.train()
-        else:
-            if self._in_ddp_context:
-                self._ddp_model.eval()
-            else:
-                self.eval()
 
     def train_step(self, data):
-        (
-            dist_lib,
-            dist,
-            x,
-            y,
-            sample_weight,
-        ) = self._unpack_and_distribute_data(data)
+        x, y, sample_weight = data_adapter_utils.unpack_x_y_sample_weight(data)
+
+        # Compute predictions
+        model = getattr(self, "ddp_model", self)
+        if self._call_has_training_arg:
+            y_pred = model(x, training=True)
+        else:
+            y_pred = model(x)
 
         # Call torch.nn.Module.zero_grad() to clear the leftover gradients
         # for the weights from the previous train step.
-        self.zero_grad()
-        y_pred = self._forward(dist, x, training=True)
-        self._sync_ddp_buffers(dist)
+        model.zero_grad()
 
         loss = self._compute_loss(
             x=x, y=y, y_pred=y_pred, sample_weight=sample_weight, training=True
@@ -250,10 +121,7 @@ class TorchTrainer(base_trainer.Trainer):
         if self.trainable_weights:
             # Call torch.Tensor.backward() on the loss to compute gradients
             # for the weights.
-            context = self._get_ddp_sync_context(dist, dist_lib)
-
-            with context:
-                loss.backward()
+            loss.backward()
 
             trainable_weights = self.trainable_weights[:]
             gradients = [v.value.grad for v in trainable_weights]
@@ -268,16 +136,15 @@ class TorchTrainer(base_trainer.Trainer):
 
     def test_step(self, data):
         (
-            dist_lib,
-            dist,
             x,
             y,
             sample_weight,
-        ) = self._unpack_and_distribute_data(data)
-
-        y_pred = self._forward(dist, x, training=False)
-        self._sync_ddp_buffers(dist)
-
+        ) = data_adapter_utils.unpack_x_y_sample_weight(data)
+        model = getattr(self, "ddp_model", self)
+        if self._call_has_training_arg:
+            y_pred = model(x, training=False)
+        else:
+            y_pred = model(x)
         loss = self._compute_loss(
             x=x, y=y, y_pred=y_pred, sample_weight=sample_weight, training=False
         )
@@ -290,116 +157,151 @@ class TorchTrainer(base_trainer.Trainer):
         return self.compute_metrics(x, y, y_pred, sample_weight=sample_weight)
 
     def predict_step(self, data):
-        (
-            dist_lib,
-            dist,
-            x,
-            _,
-            _,
-        ) = self._unpack_and_distribute_data(data)
-
-        y_pred = self._forward(dist, x, training=False)
-        self._sync_ddp_buffers(dist)
+        x, _, _ = data_adapter_utils.unpack_x_y_sample_weight(data)
+        model = getattr(self, "ddp_model", self)
+        if self._call_has_training_arg:
+            y_pred = model(x, training=False)
+        else:
+            y_pred = model(x)
         return y_pred
 
-    def _sync_metrics(self):
-        dist_obj = dist_lib.distribution()
-        if dist_obj is not None and torch.distributed.is_initialized():
-            aggregation_to_op = {
-                "sum": torch.distributed.ReduceOp.SUM,
-                "mean": torch.distributed.ReduceOp.SUM,
-                "max": torch.distributed.ReduceOp.MAX,
-                "min": torch.distributed.ReduceOp.MIN,
-            }
-            from torch.distributed.tensor import DTensor
-
-            for metric in self.metrics:
-                for variable in metric.variables:
-                    if variable.aggregation in (None, "none"):
-                        continue
-                    is_dtensor = DTensor is not None and isinstance(
-                        variable.value, DTensor
-                    )
-                    v = variable.value
-                    if is_dtensor:
-                        v = v.to_local()
-                    if variable.aggregation == "only_first_replica":
-                        torch.distributed.broadcast(v, src=0)
-                    else:
-                        reduce_op = aggregation_to_op.get(
-                            variable.aggregation, torch.distributed.ReduceOp.SUM
-                        )
-                        torch.distributed.all_reduce(v, op=reduce_op)
-                        if variable.aggregation == "mean":
-                            v = v / torch.distributed.get_world_size()
-                    variable.assign(v)
-
     def make_train_function(self, force=False):
-        self._setup_ddp()
         if self.train_function is not None and not force:
             return self.train_function
 
-        if self.steps_per_execution > 1:
-            raise ValueError(
-                "`steps_per_execution` must be 1 with the PyTorch backend. "
-                f"Received: steps_per_execution={self.steps_per_execution}"
-            )
+        self._initialize_ddp()
 
-        def one_step_on_data(data):
-            """Runs a single training step on a batch of data."""
-            data = data[0]
-            return self.train_step(data)
-
+        train_step = self.train_step
         if self._should_torch_compile():
-            self.train_function = torch.compile(one_step_on_data)
-        else:
-            self.train_function = one_step_on_data
+            train_step = torch.compile(train_step)
+
+        def train_function(data):
+            """Runs training steps on a list of batches of data."""
+            logs = {}
+            for step_data in data:
+                logs = train_step(step_data)
+            return logs
+
+        self.train_function = train_function
 
     def make_test_function(self, force=False):
         if self.test_function is not None and not force:
             return self.test_function
 
-        if self.steps_per_execution > 1:
-            raise ValueError(
-                "`steps_per_execution` must be 1 with the PyTorch backend. "
-                f"Received: steps_per_execution={self.steps_per_execution}"
-            )
+        self._initialize_ddp()
 
-        self._setup_ddp()
-
-        def one_step_on_data(data):
-            """Runs a single test step on a batch of data."""
-            data = data[0]
-            with torch.no_grad():
-                return self.test_step(data)
-
+        test_step = self.test_step
         if self._should_torch_compile():
-            self.test_function = torch.compile(one_step_on_data)
-        else:
-            self.test_function = one_step_on_data
+            test_step = torch.compile(test_step)
+
+        def test_function(data):
+            """Runs test steps on a list of batches of data."""
+            logs = {}
+            with torch.no_grad():
+                for step_data in data:
+                    logs = test_step(step_data)
+            return logs
+
+        self.test_function = test_function
+
+    def get_metrics_result(self):
+        if torch.distributed.is_initialized():
+            with torch.no_grad():
+                all_vars = []
+                for metric in self.metrics:
+                    for v in metric.variables:
+                        if hasattr(v, "_value") and v._value is not None:
+                            all_vars.append(v)
+
+                if all_vars:
+                    # Save original values/references conditionally
+                    original_values = []
+                    for v in all_vars:
+                        val = v._value
+                        if hasattr(val, "placements"):
+                            original_values.append(val)
+                        else:
+                            # DP: Save clone to prevent in-place corruption
+                            original_values.append(val.clone())
+
+                    active_distribution = distribution()
+                    process_group = None
+                    if active_distribution is not None:
+                        backend_mesh = _to_backend_mesh(
+                            active_distribution.device_mesh
+                        )
+                        process_group = backend_mesh.get_group(
+                            active_distribution.batch_dim_name
+                        )
+
+                    from torch.distributed.tensor import Replicate
+
+                    for v in all_vars:
+                        val = v._value
+                        if hasattr(val, "placements"):
+                            # --- MP Branch (DTensor) ---
+                            placements = [Replicate()] * len(val.placements)
+                            v._value = val.redistribute(
+                                val.device_mesh, placements
+                            )
+                        else:
+                            # --- DP Branch (Standard Tensor) ---
+                            dist.all_reduce(
+                                val,
+                                op=dist.ReduceOp.SUM,
+                                group=process_group,
+                            )
+
+                    results = super().get_metrics_result()
+
+                    results = {
+                        k: val.clone() if isinstance(val, torch.Tensor) else val
+                        for k, val in results.items()
+                    }
+
+                    # Restore original state conditionally
+                    for v, original_val in zip(all_vars, original_values):
+                        if hasattr(original_val, "placements"):
+                            # MP: Restore reference
+                            v._value = original_val
+                        else:
+                            # DP: Keep memory binding, copy back
+                            v._value.copy_(original_val)
+
+                    return results
+
+        return super().get_metrics_result()
 
     def make_predict_function(self, force=False):
         if self.predict_function is not None and not force:
             return self.predict_function
 
-        if self.steps_per_execution > 1:
-            raise ValueError(
-                "`steps_per_execution` must be 1 with the PyTorch backend. "
-                f"Received: steps_per_execution={self.steps_per_execution}"
-            )
+        self._initialize_ddp()
 
-        self._setup_ddp()
-
-        def one_step_on_data(data):
-            """Runs a predict test step on a batch of data."""
-            data = data[0]
-            with torch.no_grad():
-                return self.predict_step(data)
-
+        predict_step = self.predict_step
         if self._should_torch_compile():
-            self.predict_function = torch.compile(one_step_on_data)
-        else:
-            self.predict_function = one_step_on_data
+            predict_step = torch.compile(predict_step)
+
+        def predict_function(data):
+            """Runs predict steps on a list of batches of data."""
+            outputs = []
+            with torch.no_grad():
+                for step_data in data:
+                    outputs.append(predict_step(step_data))
+
+            def concat_outputs(outputs):
+                if not outputs:
+                    return []
+                if len(outputs) == 1:
+                    return outputs[0]
+                return tree.map_structure(
+                    lambda *args: torch.cat(args, dim=0),
+                    *outputs,
+                )
+
+            return concat_outputs(outputs)
+
+        self.predict_function = predict_function
 
     @traceback_utils.filter_traceback
     def fit(
@@ -421,10 +323,7 @@ class TorchTrainer(base_trainer.Trainer):
         validation_batch_size=None,
         validation_freq=1,
     ):
-        if not self.compiled:
-            raise ValueError(
-                "You must call `compile()` before calling `fit()`."
-            )
+        self._assert_compile_called("fit")
         # Possibly cap epochs for debugging runs.
         max_epochs = config.max_epochs()
         if max_epochs and max_epochs < epochs:
@@ -490,7 +389,7 @@ class TorchTrainer(base_trainer.Trainer):
             # Switch the torch Module to training mode. Inform torch layers to
             # do training behavior in case the user did not use `self.training`
             # when implementing a custom layer with torch layers.
-            self._set_train_mode(True)
+            self.train()
 
             logs = {}
             for begin_step, end_step, data in epoch_iterator:
@@ -505,11 +404,10 @@ class TorchTrainer(base_trainer.Trainer):
                     break
 
             # Override with model metrics instead of last step logs if needed.
-            self._sync_metrics()
             epoch_logs = dict(self._get_metrics_result_or_logs(logs))
 
             # Switch the torch Module back to testing mode.
-            self._set_train_mode(False)
+            self.eval()
 
             # Run validation.
             if validation_data is not None and self._should_eval(
@@ -605,7 +503,7 @@ class TorchTrainer(base_trainer.Trainer):
             )
 
         # Switch the torch Module back to testing mode.
-        self._set_train_mode(False)
+        self.eval()
 
         self.make_test_function()
         self.stop_evaluating = False
@@ -618,7 +516,6 @@ class TorchTrainer(base_trainer.Trainer):
             callbacks.on_test_batch_end(end_step, logs)
             if self.stop_evaluating:
                 break
-        self._sync_metrics()
         logs = pythonify_logs(self._get_metrics_result_or_logs(logs))
         callbacks.on_test_end(logs)
 
@@ -666,7 +563,7 @@ class TorchTrainer(base_trainer.Trainer):
             return outputs
 
         # Switch the torch Module back to testing mode.
-        self._set_train_mode(False)
+        self.eval()
 
         self.make_predict_function()
         self.stop_predicting = False
@@ -705,13 +602,12 @@ class TorchTrainer(base_trainer.Trainer):
             )
 
         data = (x, y, sample_weight)
+        data = _distribute_data(data)
 
         # Maybe build model
         self._symbolic_build(data_batch=data)
         self.make_train_function()
         self.reset_metrics()
-
-        self._set_train_mode(True)
 
         logs = self.train_function([data])
         logs = pythonify_logs(logs)
@@ -729,13 +625,12 @@ class TorchTrainer(base_trainer.Trainer):
         self._assert_compile_called("test_on_batch")
 
         data = (x, y, sample_weight)
+        data = _distribute_data(data)
 
         # Maybe build model
         self._symbolic_build(data_batch=data)
         self.make_test_function()
         self.reset_metrics()
-
-        self._set_train_mode(False)
 
         logs = self.test_function([data])
         logs = pythonify_logs(logs)
@@ -745,9 +640,7 @@ class TorchTrainer(base_trainer.Trainer):
 
     def predict_on_batch(self, x):
         self.make_predict_function()
-
-        self._set_train_mode(False)
-
+        x = _distribute_data(x)
         batch_outputs = self.predict_function([(x,)])
         batch_outputs = tree.map_structure(
             backend.convert_to_numpy, batch_outputs
@@ -755,6 +648,72 @@ class TorchTrainer(base_trainer.Trainer):
         return batch_outputs
 
 
+def _distribute_data(data, layouts=None):
+    active_distribution = distribution()
+    if active_distribution is not None and isinstance(
+        active_distribution, ModelParallel
+    ):
+        if layouts is None:
+
+            def get_layout(d):
+                if d is None:
+                    return None
+                return active_distribution.get_data_layout(d.shape)
+
+            layouts = tree.map_structure(get_layout, data)
+        return tree.map_structure(
+            lambda d, l: distribute_data_input(
+                d, l, batch_dim_name=active_distribution.batch_dim_name
+            ),
+            data,
+            layouts,
+        )
+    return tree.map_structure(
+        lambda x: convert_to_tensor(x) if x is not None else None, data
+    )
+
+
 class TorchEpochIterator(EpochIterator):
     def _get_iterator(self):
-        return self.data_adapter.get_torch_dataloader()
+        active_distribution = distribution()
+        if active_distribution is not None and isinstance(
+            active_distribution, ModelParallel
+        ):
+            return self._get_distributed_iterator(active_distribution)
+        else:
+            iterator = self.data_adapter.get_numpy_iterator()
+            return self._one_batch_ahead_iterator(iterator)
+
+    def _get_distributed_iterator(self, active_distribution):
+        layouts = None
+        for data in self.data_adapter.get_numpy_iterator():
+            if layouts is None:
+
+                def get_layout(d):
+                    if d is None:
+                        return None
+                    return active_distribution.get_data_layout(d.shape)
+
+                layouts = tree.map_structure(get_layout, data)
+            yield _distribute_data(data, layouts)
+
+    def _one_batch_ahead_iterator(self, numpy_iterator):
+        """Initiate transfers to the device one batch ahead.
+
+        This utility takes an iterator and returns a new iterator which
+        initiates the transfer to device one step ahead. This can improve the
+        performance of training loops significantly by overlapping compute and
+        data transfer.
+        """
+        next_batch = None
+        for batch in numpy_iterator:
+            batch = _distribute_data(batch)
+            if next_batch is None:
+                next_batch = batch
+            else:
+                current_batch = next_batch
+                next_batch = batch
+                yield current_batch
+
+        if next_batch is not None:
+            yield next_batch

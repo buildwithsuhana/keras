@@ -1,65 +1,106 @@
-import ml_dtypes
-import numpy as np
+"""Tests for PyTorch backend core utilities."""
+
 import pytest
 import torch
-from torch.distributed.tensor import DTensor
-from torch.distributed.tensor import Replicate
 
-import keras
 from keras.src import backend
 from keras.src import testing
-from keras.src.backend.torch import core
+from keras.src.backend.torch.core import convert_to_tensor
+from keras.src.backend.torch.core import slice as torch_slice
+
+
+def _get_backed_symint(hint=2):
+    """Create a backed SymInt via torch.export dynamic shapes."""
+
+    class _M(torch.nn.Module):
+        def forward(self, x):
+            return x + x.shape[0]
+
+    ep = torch.export.export(
+        _M(),
+        (torch.randn(hint, 3),),
+        dynamic_shapes={"x": {0: torch.export.Dim("batch")}},
+    )
+    for node in ep.graph.nodes:
+        if node.op == "placeholder":
+            return node.meta["val"].shape[0]
+    raise RuntimeError("Could not extract SymInt from exported program")
+
+
+def _get_backed_symfloat(hint=2):
+    """Create a backed SymFloat from a backed SymInt."""
+    return torch.sym_float(_get_backed_symint(hint))
 
 
 @pytest.mark.skipif(
-    backend.backend() != "torch", reason="Torch specific tests."
+    backend.backend() != "torch", reason="Requires torch backend"
 )
 class TorchCoreTest(testing.TestCase):
-    def setUp(self):
-        super().setUp()
-        if not torch.distributed.is_initialized():
-            torch.distributed.init_process_group(
-                "gloo", rank=0, world_size=1, init_method="tcp://127.0.0.1:0"
-            )
+    def _assert_sym_convert(
+        self,
+        value,
+        expected_dtype,
+        expected_item=None,
+        expected_shape=None,
+        expected_values=None,
+        dtype=None,
+    ):
+        result = convert_to_tensor(value, dtype=dtype)
+        self.assertIsInstance(result, torch.Tensor)
+        self.assertEqual(result.dtype, expected_dtype)
+        if expected_item is not None:
+            self.assertEqual(result.item(), expected_item)
+        if expected_shape is not None:
+            self.assertEqual(tuple(result.shape), expected_shape)
+        if expected_values is not None:
+            self.assertListEqual(result.tolist(), expected_values)
 
-    def test_variable_with_distributed_tensor(self):
-        mesh = keras.distribution.DeviceMesh((1,), ["data"], ["cpu:0"])
-        dt = torch.distributed.tensor.distribute_tensor(
-            torch.ones(2, 2, dtype=torch.float32),
-            mesh.backend_mesh,
-            [Replicate()],
+    def test_convert_to_tensor_symint_scalar(self):
+        self._assert_sym_convert(
+            _get_backed_symint(5), torch.int64, expected_item=5
         )
-        v = backend.Variable(dt)
-        self.assertNotIsInstance(v.value.data, DTensor)
-        self.assertAllClose(v.value, torch.ones(2, 2))
 
-    def test_convert_to_tensor_basics(self):
-        for arg in [{"sparse": True}, {"ragged": True}]:
-            with self.assertRaises(ValueError):
-                backend.convert_to_tensor([1], **arg)
-        self.assertAllClose(
-            backend.convert_to_tensor(backend.Variable([1.0, 2.0])), [1.0, 2.0]
+    def test_convert_to_tensor_symfloat_scalar(self):
+        self._assert_sym_convert(
+            _get_backed_symfloat(5), torch.float32, expected_item=5.0
         )
-        t = backend.convert_to_tensor(
-            torch.empty(2, 2, device="meta", dtype=torch.float32)
-        )
-        self.assertEqual(str(t.device.type), core.get_device())
 
-    def test_convert_to_numpy_basics(self):
-        self.assertEqual(
-            backend.convert_to_numpy(
-                torch.tensor([1.0], dtype=torch.bfloat16)
-            ).dtype,
-            ml_dtypes.bfloat16,
+    def test_convert_to_tensor_list_of_symint(self):
+        self._assert_sym_convert(
+            [_get_backed_symint(3), _get_backed_symint(4)],
+            torch.int64,
+            expected_shape=(2,),
+            expected_values=[3, 4],
         )
-        self.assertAllClose(
-            backend.convert_to_numpy([torch.tensor(1.0), torch.tensor(2.0)]),
-            [1.0, 2.0],
+
+    def test_convert_to_tensor_tuple_of_symfloat(self):
+        self._assert_sym_convert(
+            (_get_backed_symfloat(3), _get_backed_symfloat(4)),
+            torch.float32,
+            expected_shape=(2,),
+            expected_values=[3.0, 4.0],
         )
-        mesh = keras.distribution.DeviceMesh((1,), ["data"], ["cpu:0"])
-        dt = torch.distributed.tensor.distribute_tensor(
-            torch.ones(2, 2, dtype=torch.float32),
-            mesh.backend_mesh,
-            [Replicate()],
+
+    def test_convert_to_tensor_nested_list_of_symint(self):
+        self._assert_sym_convert(
+            [[_get_backed_symint(3), _get_backed_symint(4)]],
+            torch.int64,
+            expected_shape=(1, 2),
+            expected_values=[[3, 4]],
         )
-        self.assertAllClose(backend.convert_to_numpy(dt), np.ones((2, 2)))
+
+    def test_convert_to_tensor_explicit_dtype_for_symint(self):
+        self._assert_sym_convert(
+            _get_backed_symint(5),
+            torch.float32,
+            dtype="float32",
+        )
+
+    def test_slice_fast_path_accepts_symint(self):
+        """slice fast path should accept SymInt without crashing."""
+        x = torch.arange(24).reshape(2, 3, 4)
+        batch = _get_backed_symint(2)
+        start_indices = [0, 0, 0]
+        shape = [batch, 2, 2]
+        result = torch_slice(x, start_indices, shape)
+        self.assertEqual(tuple(result.shape), (2, 2, 2))

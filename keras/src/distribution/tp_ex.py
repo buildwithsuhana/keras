@@ -3,7 +3,9 @@ import sys
 import time
 
 # Ensure we use the local keras source
-sys.path.insert(0, os.path.abspath(os.path.join(os.path.dirname(__file__), "../../..")))
+sys.path.insert(
+    0, os.path.abspath(os.path.join(os.path.dirname(__file__), "../../.."))
+)
 
 # --- Force CPU and Simulate 2 Devices ---
 # This block MUST come before any tensorflow or keras imports.
@@ -14,6 +16,7 @@ os.environ["XLA_FLAGS"] = "--xla_force_host_platform_device_count=2"
 
 import keras_nlp
 import tensorflow as tf
+
 import keras
 
 # Set seeds for reproducibility

@@ -1,6 +1,7 @@
 import tensorflow as tf
 
 from keras.src.backend import standardize_dtype
+from keras.src.backend.common import dtypes
 from keras.src.backend.tensorflow.core import cast
 from keras.src.backend.tensorflow.core import convert_to_tensor
 
@@ -51,16 +52,53 @@ def segment_min(data, segment_ids, num_segments=None, sorted=False):
         return tf.math.unsorted_segment_min(data, segment_ids, num_segments)
 
 
+def segment_prod(data, segment_ids, num_segments=None, sorted=False):
+    if sorted:
+        if num_segments is not None:
+            raise ValueError(
+                "Argument `num_segments` cannot be set when sorted is True "
+                "when using the tensorflow backend."
+                f"Received: num_segments={num_segments}, sorted={sorted}."
+            )
+        return tf.math.segment_prod(data, segment_ids)
+    else:
+        if num_segments is None:
+            num_segments = tf.cast(tf.reduce_max(segment_ids) + 1, tf.int32)
+        return tf.math.unsorted_segment_prod(data, segment_ids, num_segments)
+
+
 def top_k(x, k, sorted=True):
     return tf.math.top_k(x, k, sorted=sorted)
 
 
 def in_top_k(targets, predictions, k):
+    if len(predictions.shape) > 2:
+        targets = convert_to_tensor(targets)
+        predictions = convert_to_tensor(predictions)
+        original_shape = tf.shape(targets)
+        predictions = tf.reshape(predictions, [-1, tf.shape(predictions)[-1]])
+        targets = tf.reshape(targets, [-1])
+        result = tf.math.in_top_k(targets, predictions, k)
+        return tf.reshape(result, original_shape)
     return tf.math.in_top_k(targets, predictions, k)
 
 
 def logsumexp(x, axis=None, keepdims=False):
     return tf.math.reduce_logsumexp(x, axis=axis, keepdims=keepdims)
+
+
+def cdist(x, y):
+    x = convert_to_tensor(x)
+    y = convert_to_tensor(y)
+    dtype = dtypes.result_type(x.dtype, y.dtype, float)
+    x = cast(x, dtype)
+    y = cast(y, dtype)
+    if x.shape.rank < 2 or y.shape.rank < 2:
+        raise ValueError("`cdist` inputs must have rank >= 2")
+    if x.shape[-1] != y.shape[-1]:
+        raise ValueError("Last dimension of inputs to `cdist` must match")
+    diff = tf.expand_dims(x, -2) - tf.expand_dims(y, -3)
+    return tf.sqrt(tf.reduce_sum(tf.square(diff), axis=-1))
 
 
 def extract_sequences(x, sequence_length, sequence_stride):
@@ -255,13 +293,14 @@ def istft(
     if length is not None:
         end = start + length
     elif center is True:
-        end = -(fft_length // 2)
+        end = expected_output_len - (fft_length // 2)
     else:
         end = expected_output_len
     return x[..., start:end]
 
 
 def rsqrt(x):
+    x = convert_to_tensor(x)
     return tf.math.rsqrt(x)
 
 
@@ -269,7 +308,21 @@ def erf(x):
     return tf.math.erf(x)
 
 
+def erfc(x):
+    x = convert_to_tensor(x)
+    return tf.math.erfc(x)
+
+
 def erfinv(x):
+    x = convert_to_tensor(x)
+    dtype = standardize_dtype(x.dtype)
+
+    if dtype in ["bfloat16", "float16"]:
+        return tf.cast(
+            tf.math.erfinv(tf.cast(x, tf.float32)),
+            dtype,
+        )
+
     return tf.math.erfinv(x)
 
 

@@ -75,6 +75,7 @@ class Attention(Layer):
         self.use_scale = use_scale
         self.score_mode = score_mode
         self.dropout = dropout
+        self.seed = seed
         if self.dropout > 0:
             self.seed_generator = backend.random.SeedGenerator(seed=seed)
 
@@ -117,7 +118,7 @@ class Attention(Layer):
             Tensor of shape `(batch_size, Tq, Tv)`.
         """
         if self.score_mode == "dot":
-            scores = ops.matmul(query, ops.transpose(key, axes=[0, 2, 1]))
+            scores = ops.matmul(query, ops.swapaxes(key, -2, -1))
             if self.scale is not None:
                 scores = ops.multiply(scores, self.scale)
         elif self.score_mode == "concat":
@@ -176,7 +177,7 @@ class Attention(Layer):
             max_value = 65504.0 if scores.dtype == "float16" else 1.0e9
             if len(padding_mask.shape) == 2:
                 padding_mask = ops.expand_dims(padding_mask, axis=-2)
-            scores -= max_value * ops.cast(padding_mask, dtype=scores.dtype)
+            scores = ops.where(padding_mask, scores - max_value, scores)
 
         weights = ops.softmax(scores, axis=-1)
         if training and self.dropout > 0:
@@ -234,7 +235,7 @@ class Attention(Layer):
         if q_mask is not None:
             # Mask of shape [batch_size, Tq, 1].
             q_mask = ops.expand_dims(q_mask, axis=-1)
-            attention_output *= ops.cast(q_mask, dtype=attention_output.dtype)
+            attention_output = ops.where(q_mask, attention_output, 0)
         if return_attention_scores:
             return (attention_output, attention_scores)
         else:
@@ -271,10 +272,9 @@ class Attention(Layer):
 
         if return_attention_scores:
             scores_shape = (
-                query.shape[0],
-                query.shape[1],
-                key.shape[1],
-            )  # (batch_size, Tq, Tv)
+                *query.shape[:-1],
+                key.shape[-2],
+            )  # (*batch_dims, Tq, Tv)
             return output_spec, KerasTensor(
                 scores_shape, dtype=self.compute_dtype
             )
@@ -314,5 +314,6 @@ class Attention(Layer):
             "use_scale": self.use_scale,
             "score_mode": self.score_mode,
             "dropout": self.dropout,
+            "seed": self.seed,
         }
         return {**base_config, **config}

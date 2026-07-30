@@ -4,7 +4,6 @@ import jax
 import jax.lax as lax
 import numpy as np
 
-from keras.src.backend.common import global_state
 from keras.src.random import seed_generator
 from keras.src.utils import jax_utils
 from keras.src.utils import rng_utils

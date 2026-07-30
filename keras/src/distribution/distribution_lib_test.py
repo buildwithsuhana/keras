@@ -1,41 +1,21 @@
 """Test for distribution_lib.py."""
 
 import os
-
-# FILE: keras/src/distribution/distribution_lib_test.py
-
-
-# --- TOP-LEVEL ENVIRONMENT SETUP ---
-# This MUST be at the top of the file, before any Keras/TF imports.
-# It configures the environment for all tests in this file.
-os.environ["KERAS_BACKEND"] = "jax"
-os.environ["CUDA_VISIBLE_DEVICES"] = "-1"
-os.environ["XLA_FLAGS"] = "--xla_force_host_platform_device_count=2"
-
-# --- Now continue with the rest of the imports ---
-# ... and so on
 from unittest import mock
 
 import numpy as np
 import pytest
 import tensorflow as tf
 
-import keras
 from keras.src import backend
 from keras.src import testing
 from keras.src.backend import distribution_lib as backend_dlib
 from keras.src.distribution import distribution_lib
-from keras.src.distribution.distribution_lib import AutoTPDistribution
-
-try:
-    import keras_hub
-except ImportError:
-    keras_hub = None
 
 
 @pytest.mark.skipif(
-    backend.backend() not in ("jax", "torch"),
-    reason="Only JAX and Torch have the backend to mock at the moment",
+    backend.backend() != "jax",
+    reason="Only JAX has the backend to mock at the moment",
 )
 @mock.patch.object(
     backend_dlib,
@@ -154,10 +134,6 @@ class TensorLayoutTest(testing.TestCase):
             layout.device_mesh = self.mesh
 
 
-@pytest.mark.skipif(
-    backend.backend() not in ("jax", "torch"),
-    reason="Only JAX and Torch have the backend to mock at the moment",
-)
 class DistributionTest(testing.TestCase):
     def setUp(self):
         super().setUp()
@@ -187,10 +163,54 @@ class DistributionTest(testing.TestCase):
 
         self.assertIsNone(distribution_lib.distribution())
 
+    def test_data_shard_id(self):
+        # Case 1: num_model_replicas >= num_processes
+        # data_shard_id should be process_id
+        distribution = distribution_lib.Distribution(self.device_mesh)
+        with (
+            mock.patch.object(
+                distribution.__class__,
+                "num_model_replicas",
+                new_callable=mock.PropertyMock,
+                return_value=8,
+            ),
+            mock.patch.object(
+                distribution.__class__,
+                "num_processes",
+                new_callable=mock.PropertyMock,
+                return_value=4,
+            ),
+        ):
+            for process_id in range(4):
+                with mock.patch.object(distribution, "_process_id", process_id):
+                    self.assertEqual(distribution.data_shard_id, process_id)
+
+        # Case 2: num_model_replicas < num_processes
+        # data_shard_id should be process_id //
+        # (num_processes // num_model_replicas)
+        with (
+            mock.patch.object(
+                distribution.__class__,
+                "num_model_replicas",
+                new_callable=mock.PropertyMock,
+                return_value=2,
+            ),
+            mock.patch.object(
+                distribution.__class__,
+                "num_processes",
+                new_callable=mock.PropertyMock,
+                return_value=4,
+            ),
+        ):
+            expected_data_shard_ids = [0, 0, 1, 1]
+            for process_id, expected in enumerate(expected_data_shard_ids):
+                with mock.patch.object(distribution, "_process_id", process_id):
+                    self.assertEqual(distribution.data_shard_id, expected)
+
 
 @pytest.mark.skipif(
-    backend.backend() not in ("jax", "torch"),
-    reason="Only JAX and Torch have the proper backend distribution lib",
+    backend.backend() != "jax",
+    reason="Only JAX has the proper backend distribution lib",
 )
 class DataParallelDistributionTest(testing.TestCase):
     def setUp(self):
@@ -272,6 +292,14 @@ class DataParallelDistributionTest(testing.TestCase):
         self.assertIs(variable_layout.device_mesh, explicit_mesh)
         self.assertEqual(variable_layout.axes, explicit_layout.axes)
 
+    @mock.patch.object(backend_dlib, "num_processes", return_value=2)
+    def test_num_model_replicas(self, mock_backend_num_processes):
+        distribution = distribution_lib.DataParallel(
+            device_mesh=self.device_mesh
+        )
+        self.assertEqual(distribution.num_model_replicas, 8)
+        self.assertEqual(distribution.num_processes, 2)
+
     def test_get_tensor_layout(self):
         distribution = distribution_lib.DataParallel(
             device_mesh=self.device_mesh
@@ -281,23 +309,10 @@ class DataParallelDistributionTest(testing.TestCase):
         tensor_layout = distribution.get_tensor_layout(path)
         self.assertIsNone(tensor_layout)
 
-    def test_distribute_dataset(self):
-        # We can only verify the single worker/process case in OSS for now.
-        dataset = tf.data.Dataset.range(8)
-        distribution = distribution_lib.DataParallel(
-            device_mesh=self.device_mesh
-        )
-        distributed_dataset = distribution.distribute_tf_dataset(dataset)
-        self.assertIs(dataset, distributed_dataset)
-
-        # Test alias
-        distributed_dataset_alias = distribution.distribute_dataset(dataset)
-        self.assertIs(dataset, distributed_dataset_alias)
-
 
 @pytest.mark.skipif(
-    backend.backend() not in ("jax", "torch"),
-    reason="Only JAX and Torch have the proper backend distribution lib",
+    backend.backend() != "jax",
+    reason="Only JAX has the proper backend distribution lib",
 )
 class ModelParallelDistributionTest(testing.TestCase):
     def setUp(self):
@@ -376,18 +391,8 @@ class ModelParallelDistributionTest(testing.TestCase):
         self.assertIs(variable_layout.device_mesh, explicit_mesh)
         self.assertEqual(variable_layout.axes, explicit_layout.axes)
 
-    def test_distribute_dataset(self):
-        # We can only verify the single worker/process case in OSS for now.
-        dataset = tf.data.Dataset.range(8)
-        layout_map = distribution_lib.LayoutMap(self.device_mesh)
-        distribution = distribution_lib.ModelParallel(
-            layout_map=layout_map, batch_dim_name="data"
-        )
-        distributed_dataset = distribution.distribute_tf_dataset(dataset)
-        self.assertIs(dataset, distributed_dataset)
-
     @mock.patch.object(backend_dlib, "num_processes", return_value=4)
-    def test_num_process_validation(self, mock_backend_num_processes):
+    def test_num_processes_validation(self, mock_backend_num_processes):
         device_mesh = distribution_lib.DeviceMesh(
             (3, 2),
             ["data", "model"],
@@ -396,13 +401,27 @@ class ModelParallelDistributionTest(testing.TestCase):
         layout_map = distribution_lib.LayoutMap(device_mesh)
         with self.assertRaisesRegex(
             ValueError,
-            "`num_process` must be divisible by `num_model_replicas`",
+            "`num_processes` must be divisible by `num_model_replicas`",
         ):
             distribution_lib.ModelParallel(
                 layout_map=layout_map,
                 batch_dim_name="data",
                 auto_shard_dataset=True,
             )
+
+    @mock.patch.object(backend_dlib, "num_processes", return_value=2)
+    def test_num_model_replicas(self, mock_backend_num_processes):
+        device_mesh = distribution_lib.DeviceMesh(
+            (4, 2),
+            ["data", "model"],
+            [f"cpu:{i}" for i in range(8)],
+        )
+        layout_map = distribution_lib.LayoutMap(device_mesh)
+        distribution = distribution_lib.ModelParallel(
+            layout_map=layout_map, batch_dim_name="data"
+        )
+        self.assertEqual(distribution.num_model_replicas, 4)
+        self.assertEqual(distribution.num_processes, 2)
 
 
 class LayoutMapTest(testing.TestCase):
@@ -555,9 +574,14 @@ class DataShardingIntegrationTest(testing.TestCase):
         distribution._num_processes = num_devices
         distribution._is_multi_process = True
 
+        from keras.src.trainers.data_adapters import tf_dataset_adapter
+
         for process_id in range(num_devices):
             distribution._process_id = process_id
-            ds = distribution.distribute_tf_dataset(global_dataset)
+            adapter = tf_dataset_adapter.TFDatasetAdapter(
+                global_dataset, distribution=distribution
+            )
+            ds = adapter.get_tf_dataset()
             shards.append(list(ds.unbatch().as_numpy_iterator()))
 
         processes_per_replica = num_devices // num_model_replicas
@@ -637,119 +661,3 @@ class DataShardingIntegrationTest(testing.TestCase):
 #             ValueError, "Cannot create sharding when device mesh is not set"
 #         ):
 #             backend_dlib._to_dtensor_layout(layout)
-
-class AutoTPDistributionTest(testing.TestCase):
-
-    def setUp(self):
-        super().setUp()
-        self.devices = distribution_lib.list_devices()
-        if len(self.devices) < 2:
-            self.skipTest("This test requires at least 2 devices.")
-
-        # --- CORRECTED CODE ---
-        # Give the input layer a stable name
-        inputs = keras.Input(shape=(4,), name="input_layer")
-        x = keras.layers.Dense(8, name="dense_1")(inputs)
-        outputs = keras.layers.Dense(2, name="dense_2")(x)
-        self.model = keras.Model(inputs, outputs)
-
-    def test_init_with_explicit_device_mesh(self):
-        """Tests initialization with a user-provided DeviceMesh."""
-        device_mesh = distribution_lib.DeviceMesh(
-            shape=(1, 2), axis_names=["data", "model"], devices=self.devices
-        )
-        distribution = AutoTPDistribution(self.model, device_mesh=device_mesh)
-
-        self.assertIs(distribution.device_mesh, device_mesh)
-        self.assertEqual(distribution.batch_dim_name, "data")
-        # Verify that the internal model is the TensorParallelKeras wrapper
-        self.assertIsInstance(
-            distribution.model,
-            keras.src.distribution.tensor_parallel.tensor_parallel_keras.TensorParallelKeras,
-        )
-        # Verify the world size was correctly passed to the internal model
-        self.assertEqual(distribution.model.device_count, 2)
-
-    @mock.patch.object(
-        distribution_lib,
-        "list_devices",
-        return_value=[f"cpu:{i}" for i in range(2)],
-    )
-    def test_init_without_device_mesh_for_auto_creation(self, mock_list_devices):
-        """Tests the automatic creation of the DeviceMesh when none is provided."""
-        distribution = AutoTPDistribution(self.model, device_mesh=None)
-        mock_list_devices.assert_called_once()
-
-        # Check the properties of the auto-created mesh
-        device_mesh = distribution.device_mesh
-        self.assertEqual(device_mesh.shape, (1, 2))
-        self.assertEqual(device_mesh.axis_names, ("data", "model"))
-        self.assertEqual(distribution.batch_dim_name, "data")
-        self.assertEqual(distribution.model.device_count, 2)
-
-    def test_init_raises_error_on_missing_data_axis(self):
-        """Ensures an error is raised if the DeviceMesh lacks a 'data' axis."""
-        device_mesh = distribution_lib.DeviceMesh(
-            shape=(2,), axis_names=["model"], devices=self.devices
-        )
-        with self.assertRaisesRegex(
-            ValueError, "must have a 'data' axis"
-        ):
-            AutoTPDistribution(self.model, device_mesh=device_mesh)
-
-    def test_get_data_layout(self):
-        """Verifies the layout for input data sharding."""
-        distribution = AutoTPDistribution(self.model)
-        data_shape = (16, 4)  # Example: batch size 16, 4 features
-        layout = distribution.get_data_layout(data_shape)
-
-        self.assertEqual(layout.axes, ("data", None))
-        self.assertIs(layout.device_mesh, distribution.device_mesh)
-
-    def test_get_variable_layout_warns_and_returns_replicated(self):
-        """Verifies that variable layout is handled internally and returns a replicated layout."""
-        distribution = AutoTPDistribution(self.model)
-        dummy_variable = backend.Variable(initializer=np.zeros((8, 2)))
-
-        with self.assertWarns(UserWarning) as w:
-            layout = distribution.get_variable_layout(dummy_variable)
-
-        self.assertIn("Variable layout is determined automatically", str(w.warnings[0].message))
-        
-        self.assertEqual(layout.axes, (None, None))
-
-    def test_distribute_dataset_in_single_process_mode(self):
-        """Tests dataset distribution in a single-process environment (the default for this test file)."""
-        distribution = AutoTPDistribution(self.model)
-        dataset = tf.data.Dataset.from_tensor_slices((np.zeros((16, 4)), np.zeros((16, 1))))
-        
-        distributed_dataset = distribution.distribute_dataset(dataset)
-        self.assertIs(dataset, distributed_dataset)
-
-    def test_full_compile_and_fit_integration(self):
-        """An end-to-end test to ensure the distributed model can compile and train."""
-        distribution = AutoTPDistribution(self.model)
-
-        x_train = np.random.rand(16, 4).astype("float32")
-        y_train = np.random.randint(0, 2, size=(16, 1))
-
-        dist_model = distribution.model
-
-        with distribution.scope():
-            dist_model.compile(
-                optimizer=keras.optimizers.Adam(0.01),
-                loss=keras.losses.SparseCategoricalCrossentropy(from_logits=True),
-                metrics=["accuracy"],
-            )
-
-        self.assertEqual(self.model.count_params(), dist_model.count_params())
-
-        history = dist_model.fit(
-            x_train,
-            y_train,
-            epochs=1,
-            batch_size=4,
-            verbose=0,
-        )
-        self.assertIn("loss", history.history)
-        self.assertIn("accuracy", history.history)

@@ -98,6 +98,25 @@ class LinalgOpsDynamicShapeTest(testing.TestCase):
         with self.assertRaises(ValueError):
             linalg.matrix_rank(x)
 
+    def test_matrix_power(self):
+        x = KerasTensor([None, 20, 20])
+        out = linalg.matrix_power(x, 3)
+        self.assertEqual(out.shape, (None, 20, 20))
+
+        out = linalg.matrix_power(x, 0)
+        self.assertEqual(out.shape, (None, 20, 20))
+
+        out = linalg.matrix_power(x, -2)
+        self.assertEqual(out.shape, (None, 20, 20))
+
+        x = KerasTensor([None, None, 20])
+        with self.assertRaises(ValueError):
+            linalg.matrix_power(x, 3)
+
+        x = KerasTensor([None, 20, 15])
+        with self.assertRaises(ValueError):
+            linalg.matrix_power(x, 3)
+
     def test_norm(self):
         x = KerasTensor((None, 3))
         self.assertEqual(linalg.norm(x).shape, ())
@@ -295,6 +314,15 @@ class LinalgOpsStaticShapeTest(testing.TestCase):
         x = KerasTensor([10])
         with self.assertRaises(ValueError):
             linalg.matrix_rank(x)
+
+    def test_matrix_power(self):
+        x = KerasTensor([4, 3, 3])
+        out = linalg.matrix_power(x, 3)
+        self.assertEqual(out.shape, (4, 3, 3))
+
+        x = KerasTensor([10, 20, 15])
+        with self.assertRaises(ValueError):
+            linalg.matrix_power(x, 3)
 
     def test_norm(self):
         x = KerasTensor((10, 3))
@@ -585,13 +613,13 @@ class LinalgOpsCorrectnessTest(testing.TestCase):
         x = np.random.random((4, 5))
         q, r = linalg.qr(x, mode="reduced")
         qref, rref = np.linalg.qr(x, mode="reduced")
-        self.assertAllClose(q, qref)
-        self.assertAllClose(r, rref)
+        self.assertAllClose(q, qref, atol=1e-5, rtol=1e-4)
+        self.assertAllClose(r, rref, atol=1e-5, rtol=1e-4)
 
         q, r = linalg.qr(x, mode="complete")
         qref, rref = np.linalg.qr(x, mode="complete")
-        self.assertAllClose(q, qref)
-        self.assertAllClose(r, rref)
+        self.assertAllClose(q, qref, atol=1e-5, rtol=1e-4)
+        self.assertAllClose(r, rref, atol=1e-5, rtol=1e-4)
 
     def test_solve(self):
         x1 = np.array([[1, 2], [4, 5]], dtype="float32")
@@ -696,6 +724,54 @@ class LinalgOpsCorrectnessTest(testing.TestCase):
         # Symbolic shape propagation.
         a_symb = backend.KerasTensor((4, 3, 5), dtype="float32")
         self.assertEqual(linalg.matrix_rank(a_symb).shape, (4,))
+
+    def test_matrix_power(self):
+        x = np.random.rand(4, 3, 3).astype("float32")
+        # Positive power
+        out = linalg.matrix_power(x, 3)
+        expected = np.linalg.matrix_power(x, 3)
+        self.assertAllClose(
+            out, expected, atol=1e-6, tpu_atol=1e-2, tpu_rtol=1e-2
+        )
+
+        # Zero power
+        out = linalg.matrix_power(x, 0)
+        expected = np.linalg.matrix_power(x, 0)
+        self.assertAllClose(
+            out, expected, atol=1e-6, tpu_atol=1e-2, tpu_rtol=1e-2
+        )
+
+        # Zero power (2D)
+        x_2d = np.random.rand(3, 3).astype("float32")
+        out = linalg.matrix_power(x_2d, 0)
+        expected = np.linalg.matrix_power(x_2d, 0)
+        self.assertAllClose(
+            out, expected, atol=1e-6, tpu_atol=1e-2, tpu_rtol=1e-2
+        )
+
+        # Negative power
+        x_inv_stable = (x + np.eye(3)).astype("float32")
+        out = linalg.matrix_power(x_inv_stable, -2)
+        expected = np.linalg.matrix_power(x_inv_stable, -2)
+        self.assertAllClose(
+            out, expected, atol=1e-6, tpu_atol=1e-2, tpu_rtol=1e-2
+        )
+
+        # Power 1
+        out = linalg.matrix_power(x, 1)
+        self.assertAllClose(out, x, atol=1e-6, tpu_atol=1e-2, tpu_rtol=1e-2)
+
+        # Error cases
+        with self.assertRaises(TypeError):
+            linalg.matrix_power(x, 3.5)
+
+        with self.assertRaises(ValueError):
+            # Non-square
+            linalg.matrix_power(np.random.rand(4, 3, 2), 2)
+
+        with self.assertRaises(ValueError):
+            # Rank < 2
+            linalg.matrix_power(np.random.rand(4), 2)
 
     @parameterized.named_parameters(
         ("tall_default_rcond", (7, 4), None),

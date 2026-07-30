@@ -1,12 +1,15 @@
 import torch
 import torch.nn.functional as tnn
+from torch.distributed.tensor import DTensor
+from torch.distributed.tensor import Replicate
 
 from keras.src import backend
+from keras.src.backend.common.backend_utils import check_conv_input_channels
 from keras.src.backend.common.backend_utils import (
-    check_depthwise_conv_input_channels,
+    check_conv_transpose_input_channels,
 )
 from keras.src.backend.common.backend_utils import (
-    compute_conv_transpose_padding_args_for_torch,
+    compute_conv_transpose_output_crops_for_torch,
 )
 from keras.src.backend.torch.core import cast
 from keras.src.backend.torch.core import convert_to_tensor
@@ -221,15 +224,12 @@ def _compute_padding_length(
     """Compute padding length along one dimension with support
     for asymmetric padding."""
     effective_k_size = (kernel_length - 1) * dilation_rate + 1
-    if stride == 1:
-        # total padding is kernel_size - 1
-        total_padding = effective_k_size - 1
-    else:
-        # calc. needed padding for case with stride involved
-        output_size = (input_length + stride - 1) // stride
-        total_padding = max(
-            0, (output_size - 1) * stride + effective_k_size - input_length
-        )
+
+    # calc. needed padding for case with stride involved
+    output_size = (input_length + stride - 1) // stride
+    total_padding = max(
+        0, (output_size - 1) * stride + effective_k_size - input_length
+    )
 
     # divide padding evenly, with extra pixel going at the end if needed
     left_padding = total_padding // 2
@@ -238,7 +238,12 @@ def _compute_padding_length(
 
 
 def _apply_same_padding(
-    inputs, kernel_size, strides, data_format, operation_type, dilation_rate=1
+    inputs,
+    kernel_size,
+    strides,
+    data_format,
+    padding_mode="constant",
+    dilation_rate=1,
 ):
     """Apply same padding to the input tensor.
 
@@ -257,15 +262,13 @@ def _apply_same_padding(
     num_spatial_dims = len(spatial_shape)
     padding = []
 
-    if operation_type != "pooling":
-        dilation_rate = standardize_tuple(
-            dilation_rate, num_spatial_dims, "dilation_rate"
-        )
+    dilation_rate = standardize_tuple(
+        dilation_rate, num_spatial_dims, "dilation_rate"
+    )
 
     for i in range(num_spatial_dims):
-        dil = 1 if operation_type == "pooling" else dilation_rate[i]
         pad = _compute_padding_length(
-            spatial_shape[i], kernel_size[i], strides[i], dil
+            spatial_shape[i], kernel_size[i], strides[i], dilation_rate[i]
         )
         padding.append(pad)
 
@@ -278,8 +281,7 @@ def _apply_same_padding(
     for pad in reversed(padding):
         flattened_padding.extend(pad)
 
-    mode = "replicate" if operation_type == "pooling" else "constant"
-    return tnn.pad(inputs, pad=tuple(flattened_padding), mode=mode), 0
+    return tnn.pad(inputs, pad=tuple(flattened_padding), mode=padding_mode), 0
 
 
 def _transpose_spatial_inputs(inputs):
@@ -344,6 +346,18 @@ def _maybe_convert_to_channels_last(tensor):
     return tensor
 
 
+def _is_pointwise_kernel(kernel):
+    return all(dim == 1 for dim in kernel.shape[:-2])
+
+
+def _conv_pointwise_channels_last(inputs, kernel, strides):
+    if any(stride != 1 for stride in strides):
+        spatial_slices = tuple(slice(None, None, stride) for stride in strides)
+        inputs = inputs[(slice(None), *spatial_slices, slice(None))]
+    kernel = torch.reshape(kernel, (kernel.shape[-2], kernel.shape[-1]))
+    return torch.matmul(inputs, kernel)
+
+
 def max_pool(
     inputs,
     pool_size,
@@ -368,7 +382,7 @@ def max_pool(
         # Torch does not natively support `"same"` padding, we need to manually
         # apply the right amount of padding to `inputs`.
         inputs, padding = _apply_same_padding(
-            inputs, pool_size, strides, data_format, "pooling"
+            inputs, pool_size, strides, data_format, padding_mode="replicate"
         )
     else:
         padding = 0
@@ -429,6 +443,9 @@ def average_pool(
     if data_format == "channels_last":
         inputs = _transpose_spatial_inputs(inputs)
 
+    orig_inputs = inputs
+    manual_padded = False
+
     if padding == "same":
         # Torch does not natively support `"same"` padding, we need to manually
         # apply the right amount of padding to `inputs`.
@@ -437,8 +454,16 @@ def average_pool(
             pool_size,
             strides,
             "channels_first",  # we're in channels_first here
-            "pooling",
         )
+        if padding == 0:
+            manual_padded = True
+            ones = torch.ones_like(orig_inputs)
+            ones_padded, _ = _apply_same_padding(
+                ones,
+                pool_size,
+                strides,
+                "channels_first",
+            )
     else:
         padding = 0
 
@@ -451,6 +476,14 @@ def average_pool(
             padding=padding,
             count_include_pad=False,
         )
+        if manual_padded:
+            outputs_ones = tnn.avg_pool1d(
+                ones_padded,
+                kernel_size=pool_size,
+                stride=strides,
+                padding=padding,
+                count_include_pad=False,
+            )
     elif num_spatial_dims == 2:
         outputs = tnn.avg_pool2d(
             inputs,
@@ -459,6 +492,14 @@ def average_pool(
             padding=padding,
             count_include_pad=False,
         )
+        if manual_padded:
+            outputs_ones = tnn.avg_pool2d(
+                ones_padded,
+                kernel_size=pool_size,
+                stride=strides,
+                padding=padding,
+                count_include_pad=False,
+            )
     elif num_spatial_dims == 3:
         outputs = tnn.avg_pool3d(
             inputs,
@@ -467,12 +508,23 @@ def average_pool(
             padding=padding,
             count_include_pad=False,
         )
+        if manual_padded:
+            outputs_ones = tnn.avg_pool3d(
+                ones_padded,
+                kernel_size=pool_size,
+                stride=strides,
+                padding=padding,
+                count_include_pad=False,
+            )
     else:
         raise ValueError(
             "Inputs to pooling op must have ndim=3, 4 or 5, "
             "corresponding to 1D, 2D and 3D inputs. "
             f"Received input shape: {inputs.shape}."
         )
+
+    if manual_padded:
+        outputs = outputs / outputs_ones
 
     if orig_format == "channels_last":
         outputs = _transpose_spatial_outputs(outputs)
@@ -583,6 +635,16 @@ def conv(
     strides = standardize_tuple(strides, num_spatial_dims, "strides")
 
     data_format = backend.standardize_data_format(data_format)
+    # Fast path for pointwise channels_last conv: matmul avoids the
+    # channels_first transpose and torch conv dispatch.
+    if (
+        data_format == "channels_last"
+        and padding in {"valid", "same"}
+        and _is_pointwise_kernel(kernel)
+        and inputs.shape[-1] == kernel.shape[-2]
+    ):
+        return _conv_pointwise_channels_last(inputs, kernel, strides)
+
     if data_format == "channels_last":
         inputs = _transpose_spatial_inputs(inputs)
 
@@ -609,8 +671,8 @@ def conv(
             kernel.shape[2:],
             strides,
             data_format,
-            "conv",
-            dilation_rate,
+            padding_mode="constant",
+            dilation_rate=dilation_rate,
         )
     else:
         padding = 0
@@ -666,7 +728,7 @@ def depthwise_conv(
     data_format = backend.standardize_data_format(data_format)
     inputs = convert_to_tensor(inputs)
     kernel = convert_to_tensor(kernel)
-    check_depthwise_conv_input_channels(inputs, kernel, data_format)
+    check_conv_input_channels(inputs, kernel, data_format)
     kernel = torch.reshape(
         kernel, kernel.shape[:-2] + (1, kernel.shape[-2] * kernel.shape[-1])
     )
@@ -686,7 +748,7 @@ def separable_conv(
     inputs = convert_to_tensor(inputs)
     depthwise_kernel = convert_to_tensor(depthwise_kernel)
     pointwise_kernel = convert_to_tensor(pointwise_kernel)
-    check_depthwise_conv_input_channels(inputs, depthwise_kernel, data_format)
+    check_conv_input_channels(inputs, depthwise_kernel, data_format)
     depthwise_conv_output = depthwise_conv(
         inputs,
         depthwise_kernel,
@@ -720,10 +782,16 @@ def conv_transpose(
     strides = standardize_tuple(strides, num_spatial_dims, "strides")
 
     data_format = backend.standardize_data_format(data_format)
-    (
-        torch_padding,
-        torch_output_padding,
-    ) = compute_conv_transpose_padding_args_for_torch(
+    check_conv_transpose_input_channels(inputs, kernel, data_format)
+
+    # Torch's `conv_transpose*d` only takes a symmetric `padding` plus a
+    # right-side `output_padding`, which cannot reproduce the asymmetric
+    # padding Keras's "same" mode requires when stride > 1 with an odd
+    # kernel. We call torch with `padding=0, output_padding=0` (giving the
+    # largest "natural" output) and asymmetrically slice the spatial dims to
+    # the same window JAX would compute. Negative crops mean we extend with
+    # zero-padding to match JAX's left/right pad semantics.
+    crops = compute_conv_transpose_output_crops_for_torch(
         input_shape=inputs.shape,
         kernel_shape=kernel.shape,
         strides=strides,
@@ -731,26 +799,22 @@ def conv_transpose(
         output_padding=output_padding,
         dilation_rate=dilation_rate,
     )
+
     if data_format == "channels_last":
         inputs = _transpose_spatial_inputs(inputs)
     # Transpose kernel from keras format to torch format.
     kernel = _transpose_conv_kernel(kernel)
 
-    if data_format == "channels_last":
-        inputs = _maybe_convert_to_channels_last(inputs)
-        kernel = _maybe_convert_to_channels_last(kernel)
-
-    kernel_spatial_shape = kernel.shape[2:]
     if isinstance(dilation_rate, int):
-        dilation_rate = [dilation_rate] * len(kernel_spatial_shape)
+        dilation_rate = [dilation_rate] * num_spatial_dims
 
     if num_spatial_dims == 1:
         outputs = tnn.conv_transpose1d(
             inputs,
             kernel,
             stride=strides,
-            padding=torch_padding,
-            output_padding=torch_output_padding,
+            padding=0,
+            output_padding=0,
             dilation=dilation_rate,
         )
     elif num_spatial_dims == 2:
@@ -758,8 +822,8 @@ def conv_transpose(
             inputs,
             kernel,
             stride=strides,
-            padding=torch_padding,
-            output_padding=torch_output_padding,
+            padding=0,
+            output_padding=0,
             dilation=dilation_rate,
         )
     elif num_spatial_dims == 3:
@@ -767,8 +831,8 @@ def conv_transpose(
             inputs,
             kernel,
             stride=strides,
-            padding=torch_padding,
-            output_padding=torch_output_padding,
+            padding=0,
+            output_padding=0,
             dilation=dilation_rate,
         )
     else:
@@ -777,6 +841,29 @@ def conv_transpose(
             "corresponding to 1D, 2D and 3D inputs. Received input "
             f"shape: {inputs.shape}."
         )
+
+    # Apply asymmetric crop (or zero-pad if a crop amount is negative) to
+    # each spatial dim. `outputs` is NCHW-style here; spatial dims start at
+    # axis 2.
+    slices = [slice(None), slice(None)]
+    needs_zero_pad = any(cl < 0 or cr < 0 for cl, cr in crops)
+    for crop_left, crop_right in crops:
+        start = max(0, crop_left)
+        end = -crop_right if crop_right > 0 else None
+        slices.append(slice(start, end))
+    outputs = outputs[tuple(slices)]
+    if needs_zero_pad:
+        # torch's F.pad takes pads in REVERSE spatial order: last dim first.
+        pads = []
+        for crop_left, crop_right in reversed(crops):
+            pads.extend(
+                [
+                    -crop_left if crop_left < 0 else 0,
+                    -crop_right if crop_right < 0 else 0,
+                ]
+            )
+        outputs = tnn.pad(outputs, pads)
+
     if data_format == "channels_last":
         outputs = _transpose_spatial_outputs(outputs)
     return outputs
@@ -850,8 +937,8 @@ def sparse_categorical_crossentropy(target, output, from_logits=False, axis=-1):
     target = convert_to_tensor(target, dtype=torch.long)
     output = convert_to_tensor(output)
 
-    if len(target.shape) == len(output.shape) and target.shape[-1] == 1:
-        target = torch.squeeze(target, dim=-1)
+    if len(target.shape) == len(output.shape) and target.shape[axis] == 1:
+        target = torch.squeeze(target, dim=axis)
 
     if len(output.shape) < 1:
         raise ValueError(
@@ -1404,33 +1491,6 @@ def _can_use_flash_attention(
     return can_use_flash_attention(spda_params, False)
 
 
-def _scaled_dot_product_attention(
-    query, key, value, mask, is_causal, scale, flash_attention
-):
-    if flash_attention:
-        with torch.nn.attention.sdpa_kernel(
-            backends=[torch.nn.attention.SDPBackend.FLASH_ATTENTION],
-        ):
-            return torch.nn.functional.scaled_dot_product_attention(
-                query,
-                key,
-                value,
-                attn_mask=mask,
-                is_causal=is_causal,
-                scale=scale,
-            )
-    if mask is not None:
-        mask = mask.contiguous()
-    return torch.nn.functional.scaled_dot_product_attention(
-        query.contiguous(),
-        key.contiguous(),
-        value.contiguous(),
-        attn_mask=mask,
-        is_causal=is_causal,
-        scale=scale,
-    )
-
-
 def dot_product_attention(
     query,
     key,
@@ -1462,7 +1522,25 @@ def dot_product_attention(
 
     mask = mask if mask is None else convert_to_tensor(mask, dtype="bool")
     if mask is not None:
-        # Explicit set `is_causal` to `False` when `mask` is not `None`.
+        if is_causal:
+            # `scaled_dot_product_attention` treats `attn_mask` and
+            # `is_causal` as mutually exclusive, so a caller-provided mask
+            # would otherwise silently drop the causal constraint. Fold the
+            # causal mask into the explicit mask to honor both.
+            q_len, kv_len = query.shape[-2], key.shape[-2]
+            causal_mask = torch.tril(
+                torch.ones(
+                    (q_len, kv_len), dtype=torch.bool, device=mask.device
+                )
+            )
+            if hasattr(mask, "device_mesh"):
+                causal_mask = DTensor.from_local(
+                    causal_mask,
+                    mask.device_mesh,
+                    [Replicate()] * len(mask.placements),
+                )
+            mask = torch.logical_and(mask, causal_mask)
+        # Explicitly set `is_causal` to `False` when `mask` is not `None`.
         is_causal = False
         mask = torch.where(mask, 0.0, _get_large_negative(query.dtype))
     if bias is not None:
@@ -1474,38 +1552,62 @@ def dot_product_attention(
     key = torch.transpose(key, axis0, axis1)
     value = torch.transpose(value, axis0, axis1)
 
+    num_query_heads = query.shape[1]
+    num_kv_heads = key.shape[1]
+    if num_query_heads > num_kv_heads and num_kv_heads > 1:
+        groups = num_query_heads // num_kv_heads
+        key = torch.repeat_interleave(key, repeats=groups, dim=1)
+        value = torch.repeat_interleave(value, repeats=groups, dim=1)
+
     is_dtensor = hasattr(query, "to_local")
+    if is_dtensor:
+        device_mesh = query.device_mesh
+        placements = query.placements
+        query = query.to_local()
+        key = key.to_local()
+        value = value.to_local()
+        if mask is not None:
+            mask = mask.to_local()
 
     if flash_attention is None:
-        q_l = query.to_local() if is_dtensor else query
-        k_l = key.to_local() if is_dtensor else key
-        v_l = value.to_local() if is_dtensor else value
-        m_l = mask.to_local() if is_dtensor and mask is not None else mask
-        flash_attention = _can_use_flash_attention(q_l, k_l, v_l, m_l, is_causal)
+        flash_attention = _can_use_flash_attention(
+            query, key, value, mask, is_causal
+        )
     elif flash_attention is True:
-        q_l = query.to_local() if is_dtensor else query
-        k_l = key.to_local() if is_dtensor else key
-        v_l = value.to_local() if is_dtensor else value
-        m_l = mask.to_local() if is_dtensor and mask is not None else mask
-        _can_use_flash_attention(q_l, k_l, v_l, m_l, is_causal, raise_error=True)
+        # Use `raise_error=True` to provide more details if the inputs failed to
+        # use flash attention
+        _can_use_flash_attention(
+            query, key, value, mask, is_causal, raise_error=True
+        )
+    if flash_attention:
+        with torch.nn.attention.sdpa_kernel(
+            backends=[torch.nn.attention.SDPBackend.FLASH_ATTENTION],
+        ):
+            attention_output = torch.nn.functional.scaled_dot_product_attention(
+                query,
+                key,
+                value,
+                attn_mask=mask,
+                is_causal=is_causal,
+                scale=scale,
+            )
+    else:
+        if mask is not None:
+            mask = mask.contiguous()
+        attention_output = torch.nn.functional.scaled_dot_product_attention(
+            query.contiguous(),
+            key.contiguous(),
+            value.contiguous(),
+            attn_mask=mask,
+            is_causal=is_causal,
+            scale=scale,
+        )
 
     if is_dtensor:
-        from torch.distributed.tensor import DTensor
-
-        q_l = query.to_local()
-        k_l = key.to_local()
-        v_l = value.to_local()
-        m_l = mask.to_local() if mask is not None else None
-        output_local = _scaled_dot_product_attention(
-            q_l, k_l, v_l, m_l, is_causal, scale, flash_attention
-        )
         attention_output = DTensor.from_local(
-            output_local, query.device_mesh, query.placements
+            attention_output, device_mesh, placements
         )
-    else:
-        attention_output = _scaled_dot_product_attention(
-            query, key, value, mask, is_causal, scale, flash_attention
-        )
+
     return torch.transpose(attention_output, axis1, axis0)
 
 
