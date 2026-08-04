@@ -6,7 +6,7 @@ import os
 import ml_dtypes
 import numpy as np
 import torch
-import torch.distributed.tensor as torch_tensor
+import torch.distributed.tensor as torch_distributed_tensor
 
 from keras.src import tree
 from keras.src.backend.common import KerasVariable
@@ -131,11 +131,11 @@ def _promote_tensor_args(args=(), kwargs=None):
         return args, kwargs
 
     mesh = dtensor_arg.device_mesh
-    placements = [torch_tensor.Replicate()] * len(mesh.shape)
+    placements = [torch_distributed_tensor.Replicate()] * len(mesh.shape)
 
     def maybe_promote(value):
         if isinstance(value, torch.Tensor) and not _is_dtensor(value):
-            return torch_tensor.DTensor.from_local(
+            return torch_distributed_tensor.DTensor.from_local(
                 value, device_mesh=mesh, placements=placements
             )
         return value
@@ -151,7 +151,9 @@ def _maybe_promote_to_dtensor(x):
     return x
 
 
-_original_dtensor_torch_function = torch_tensor.DTensor.__torch_function__
+_original_dtensor_torch_function = (
+    torch_distributed_tensor.DTensor.__torch_function__
+)
 
 
 @classmethod
@@ -168,7 +170,7 @@ def _dtensor_torch_function(cls, func, types, args=(), kwargs=None):
     return _original_dtensor_torch_function(func, types, args, kwargs)
 
 
-torch_tensor.DTensor.__torch_function__ = _dtensor_torch_function
+torch_distributed_tensor.DTensor.__torch_function__ = _dtensor_torch_function
 
 
 class Variable(KerasVariable):
@@ -204,7 +206,7 @@ class Variable(KerasVariable):
             if hasattr(local_tensor, "to_local"):
                 local_tensor = local_tensor.to_local()
 
-            actual_dtensor = torch_tensor.DTensor.from_local(
+            actual_dtensor = torch_distributed_tensor.DTensor.from_local(
                 local_tensor,
                 device_mesh=meta_dtensor.device_mesh,
                 placements=meta_dtensor.placements,
@@ -232,8 +234,11 @@ class Variable(KerasVariable):
                 if isinstance(value, torch.nn.Parameter):
                     if value.requires_grad or value.grad_fn is not None:
                         value = value.detach()
-                    self._value = distribution_lib.distribute_variable(
-                        value, self._layout
+                    dtensor = distribution_lib.distribute_tensor(
+                        value.data, self._layout
+                    )
+                    self._value = torch.nn.Parameter(
+                        dtensor, requires_grad=self.trainable
                     )
                 else:
                     if hasattr(value, "is_meta") and value.is_meta:
@@ -246,10 +251,12 @@ class Variable(KerasVariable):
                             local_meta, device=device
                         )
 
-                        actual_dtensor = torch_tensor.DTensor.from_local(
-                            local_tensor,
-                            device_mesh=meta_dtensor.device_mesh,
-                            placements=meta_dtensor.placements,
+                        actual_dtensor = (
+                            torch_distributed_tensor.DTensor.from_local(
+                                local_tensor,
+                                device_mesh=meta_dtensor.device_mesh,
+                                placements=meta_dtensor.placements,
+                            )
                         )
                         self._value = torch.nn.Parameter(
                             actual_dtensor,

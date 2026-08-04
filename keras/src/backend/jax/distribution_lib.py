@@ -83,7 +83,7 @@ def distribute_tensor(tensor, layout):
     return jax.device_put(tensor, layout)
 
 
-def distribute_data_input(per_process_batch, layout, batch_dim_name):
+def distribute_data_input(per_process_batch, layout):
     """Distribute the input data with the corresponding layout.
 
     Note that the inputs here is a local worker batch. Within the local worker,

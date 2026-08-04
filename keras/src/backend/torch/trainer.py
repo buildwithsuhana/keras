@@ -642,9 +642,7 @@ def _distribute_data(data, layouts=None):
 
             layouts = tree.map_structure(get_layout, data)
         return tree.map_structure(
-            lambda d, l: distribute_data_input(
-                d, l, batch_dim_name=active_distribution.batch_dim_name
-            ),
+            lambda d, l: distribute_data_input(d, l),
             data,
             layouts,
         )

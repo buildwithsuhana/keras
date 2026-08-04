@@ -3,7 +3,7 @@ import os
 import numpy as np
 import torch
 import torch.distributed
-from torch.distributed import tensor as torch_tensor
+from torch.distributed import tensor as torch_distributed_tensor
 
 from keras.src.backend.torch.core import _parse_device_input
 from keras.src.backend.torch.core import convert_to_tensor
@@ -204,17 +204,16 @@ def _to_backend_layout(tensor_layout):
 
     from keras.src.distribution.distribution_lib import TensorLayout
 
-    if isinstance(tensor_layout, TensorLayout):
-        keras_mesh = tensor_layout.device_mesh
-    else:
-        # If it's already a backend layout
+    if not isinstance(tensor_layout, TensorLayout):
+        # It's already a backend layout
         return tensor_layout
 
+    keras_mesh = tensor_layout.device_mesh
     if keras_mesh is None:
         raise ValueError(
             "Cannot convert TensorLayout to PyTorch DTensor layout because "
-            "the device_mesh is not specified. Please ensure the layout "
-            "has a valid device_mesh."
+            "the 'device_mesh' is not specified. Please ensure the layout "
+            "has a valid 'device_mesh'."
         )
     torch_mesh = _to_backend_mesh(keras_mesh)
 
@@ -238,9 +237,9 @@ def _to_backend_layout(tensor_layout):
     for mesh_dim_name in keras_mesh.axis_names:
         shard_dim = mesh_axis_to_tensor_dim.get(mesh_dim_name)
         if shard_dim is not None:
-            placements.append(torch_tensor.Shard(shard_dim))
+            placements.append(torch_distributed_tensor.Shard(shard_dim))
         else:
-            placements.append(torch_tensor.Replicate())
+            placements.append(torch_distributed_tensor.Replicate())
 
     return DTensorLayout(torch_mesh, tuple(placements))
 
@@ -248,96 +247,52 @@ def _to_backend_layout(tensor_layout):
 def distribute_tensor(tensor, layout):
     """Scatters or replicates a tensor across devices according to the
     layout."""
+    if layout is None:
+        return tensor
+
     from keras.src.distribution.distribution_lib import TensorLayout
 
     if isinstance(layout, TensorLayout):
         layout = _to_backend_layout(layout)
 
-    if layout is None:
-        return tensor
-
-    if isinstance(tensor, torch_tensor.DTensor):
-        return tensor
+    if isinstance(tensor, torch_distributed_tensor.DTensor):
+        if (
+            tensor.device_mesh == layout.device_mesh
+            and tensor.placements == layout.placements
+        ):
+            return tensor
 
     if not isinstance(tensor, torch.Tensor):
         tensor = convert_to_tensor(tensor)
 
-    target_device = torch.device(get_device())
-
-    if tensor.device != target_device:
-        if tensor.device.type == "meta" and target_device.type != "meta":
-            tensor = torch.empty_like(tensor, device=target_device)
-        else:
-            tensor = tensor.to(target_device)
-
-    return torch_tensor.distribute_tensor(
+    return torch_distributed_tensor.distribute_tensor(
         tensor, device_mesh=layout.device_mesh, placements=layout.placements
     )
 
 
-def distribute_variable(value, layout):
-    """Same as distribute_tensor, but wraps the result back in
-    torch.nn.Parameter if needed."""
-    from keras.src.distribution.distribution_lib import TensorLayout
-
-    if isinstance(layout, TensorLayout):
-        layout = _to_backend_layout(layout)
-
-    if layout is None:
-        return value
-
-    # Check if the underlying tensor inside Parameter or the tensor itself is
-    # a DTensor.
-    tensor_to_check = (
-        value.data if isinstance(value, torch.nn.Parameter) else value
-    )
-    if isinstance(tensor_to_check, torch_tensor.DTensor):
-        return value
-
-    is_param = isinstance(value, torch.nn.Parameter)
-    requires_grad = (
-        value.requires_grad
-        if is_param
-        else getattr(value, "requires_grad", False)
-    )
-
-    # If it's a Parameter, unwrap its data to distribute it as a leaf tensor,
-    # then re-wrap it to ensure the Parameter's Autograd behavior is preserved.
-    tensor_to_distribute = value.data if is_param else value
-    dtensor = distribute_tensor(tensor_to_distribute, layout)
-
-    if is_param:
-        return torch.nn.Parameter(dtensor, requires_grad=requires_grad)
-    return dtensor
-
-
-def distribute_data_input(per_process_batch, layout, batch_dim_name=None):
+def distribute_data_input(per_process_batch, layout):
     """Distribute a local data tensor according to a TensorLayout."""
     if layout is None:
         return per_process_batch
 
-    if isinstance(per_process_batch, torch_tensor.DTensor):
-        return per_process_batch
-
     from keras.src.distribution.distribution_lib import TensorLayout
 
     if isinstance(layout, TensorLayout):
         layout = _to_backend_layout(layout)
 
-    if layout is None:
-        return per_process_batch
+    if isinstance(per_process_batch, torch_distributed_tensor.DTensor):
+        if (
+            per_process_batch.device_mesh == layout.device_mesh
+            and per_process_batch.placements == layout.placements
+        ):
+            return per_process_batch
 
-    del batch_dim_name
-
-    target_device = torch.device(get_device())
     if not isinstance(per_process_batch, torch.Tensor):
-        per_process_batch = torch.as_tensor(
-            per_process_batch, device=target_device
-        )
-    elif per_process_batch.device != target_device:
-        per_process_batch = per_process_batch.to(target_device)
+        per_process_batch = torch.as_tensor(per_process_batch, device="cpu")
+    elif per_process_batch.device.type != "cpu":
+        per_process_batch = per_process_batch.cpu()
 
-    return torch_tensor.DTensor.from_local(
+    return torch_distributed_tensor.DTensor.from_local(
         per_process_batch,
         device_mesh=layout.device_mesh,
         placements=layout.placements,

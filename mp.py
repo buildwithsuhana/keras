@@ -49,12 +49,11 @@ def find_free_port():
         try:
             with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as s:
                 s.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
-                s.bind(("127.0.0.1", 0))
+                s.bind(("localhost", 0))
                 return s.getsockname()[1]
         except OSError:
-            time.sleep(1)
-    return 29500
-
+            time.sleep(0.1)
+            continue
     return 29500 + np.random.randint(0, 1000)
 
 
@@ -390,7 +389,7 @@ def _run_torch(rank, world_size, port):
             "RANK": str(rank),
             "WORLD_SIZE": str(world_size),
             "LOCAL_RANK": str(rank),
-            "MASTER_ADDR": "localhost",
+            "MASTER_ADDR": "127.0.0.1",
             "MASTER_PORT": port,
         }
     )

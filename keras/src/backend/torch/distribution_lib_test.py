@@ -4,7 +4,7 @@ import numpy as np
 import pytest
 import torch
 from absl.testing import parameterized
-from torch.distributed import tensor as torch_tensor
+from torch.distributed import tensor as torch_distributed_tensor
 from torch.distributed.device_mesh import DeviceMesh as TorchDeviceMesh
 
 from keras.src import backend
@@ -258,8 +258,8 @@ class TorchDistributionLibTest(testing.TestCase):
         self.assertEqual(backend_mesh.mesh_dim_names, ("x",))
 
     @parameterized.parameters(
-        (("x", None), torch_tensor.Shard),
-        ((None, None), torch_tensor.Replicate),
+        (("x", None), torch_distributed_tensor.Shard),
+        ((None, None), torch_distributed_tensor.Replicate),
         (None, None),
     )
     def test_to_backend_layout(self, axes, expected_placement_type):
@@ -279,11 +279,11 @@ class TorchDistributionLibTest(testing.TestCase):
         self.assertIsInstance(
             backend_layout.placements[0], expected_placement_type
         )
-        if expected_placement_type == torch_tensor.Shard:
+        if expected_placement_type == torch_distributed_tensor.Shard:
             self.assertEqual(backend_layout.placements[0].dim, 0)
 
     @parameterized.parameters(
-        (None, "device_mesh is not specified"),
+        (None, "'device_mesh' is not specified"),
         ("invalid", "Invalid axis name 'invalid'"),
     )
     def test_to_backend_layout_errors(self, axis_name, error_msg):
@@ -341,40 +341,7 @@ class TorchDistributionLibTest(testing.TestCase):
         if layout_is_none or input_is_dtensor:
             self.assertIs(dtensor, tensor)
         else:
-            self.assertIsInstance(dtensor, torch_tensor.DTensor)
-
-    @parameterized.parameters(
-        (lambda: torch.ones((2, 2)), torch_tensor.DTensor, False, False),
-        (
-            lambda: torch.nn.Parameter(torch.ones((2, 2))),
-            torch.nn.Parameter,
-            False,
-            False,
-        ),
-        (lambda: torch.ones((2, 2)), torch.Tensor, True, False),
-        (lambda: torch.ones((2, 2)), torch_tensor.DTensor, False, True),
-    )
-    def test_distribute_variable(
-        self, tensor_fn, expected_type, layout_is_none, input_is_dtensor
-    ):
-        self._ensure_distributed_initialized(port="29512")
-        mesh = DeviceMesh(
-            shape=(1,), axis_names=["x"], devices=np.array(["cpu:0"])
-        )
-        layout = TensorLayout(axes=("x", None), device_mesh=mesh)
-
-        if input_is_dtensor:
-            value = distribution_lib.distribute_tensor(tensor_fn(), layout)
-        else:
-            value = tensor_fn()
-
-        actual_layout = None if layout_is_none else layout
-        dvalue = distribution_lib.distribute_variable(value, actual_layout)
-
-        if layout_is_none or input_is_dtensor:
-            self.assertIs(dvalue, value)
-        else:
-            self.assertIsInstance(dvalue, expected_type)
+            self.assertIsInstance(dtensor, torch_distributed_tensor.DTensor)
 
     @parameterized.parameters(
         ("tensor", False),
@@ -403,9 +370,9 @@ class TorchDistributionLibTest(testing.TestCase):
 
         if layout_is_none:
             self.assertIsInstance(res, torch.Tensor)
-            self.assertNotIsInstance(res, torch_tensor.DTensor)
+            self.assertNotIsInstance(res, torch_distributed_tensor.DTensor)
         else:
-            self.assertIsInstance(res, torch_tensor.DTensor)
+            self.assertIsInstance(res, torch_distributed_tensor.DTensor)
             self.assertEqual(res.shape, (2, 2))
             if input_type == "dtensor":
                 self.assertIs(res, inp)

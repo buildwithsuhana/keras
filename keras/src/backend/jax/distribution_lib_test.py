@@ -335,9 +335,7 @@ class JaxDistributionLibTest(testing.TestCase):
         )
         layout = jax.sharding.NamedSharding(mesh, P("batch", None))
 
-        result = backend_dlib.distribute_data_input(
-            per_process_batch, layout, "batch"
-        )
+        result = backend_dlib.distribute_data_input(per_process_batch, layout)
 
         # Check the shape of the global batch array
         self.assertEqual(
