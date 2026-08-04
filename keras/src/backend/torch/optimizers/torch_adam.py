@@ -36,9 +36,10 @@ class Adam(torch_parallel_optimizer.TorchParallelOptimizer, optimizers.Adam):
         torch._foreach_add_(m_list, grads, alpha=1 - self.beta_1)
 
         torch._foreach_mul_(v_list, self.beta_2)
-        torch._foreach_add_(
-            v_list, torch._foreach_mul(grads, grads), alpha=1 - self.beta_2
-        )
+        # Use a temporary list for grads * grads to avoid multiple temps
+        grads_sq = torch._foreach_mul(grads, grads)
+        torch._foreach_add_(v_list, grads_sq, alpha=1 - self.beta_2)
+        del grads_sq
 
         if self.amsgrad:
             v_hat_list = [
@@ -48,11 +49,16 @@ class Adam(torch_parallel_optimizer.TorchParallelOptimizer, optimizers.Adam):
             torch._foreach_maximum_(v_hat_list, v_list)
             v_list = v_hat_list
 
-        torch._foreach_add_(
-            variables,
-            torch._foreach_div(
-                torch._foreach_mul(m_list, alpha),
-                torch._foreach_add(torch._foreach_sqrt(v_list), self.epsilon),
-            ),
-            alpha=-1,
-        )
+        # Optimize the final update to use fewer temporary lists
+        # denom = sqrt(v) + epsilon
+        denom = torch._foreach_sqrt(v_list)
+        torch._foreach_add_(denom, self.epsilon)
+
+        # ratio = (m * alpha) / denom
+        ratio = torch._foreach_mul(m_list, alpha)
+        torch._foreach_div_(ratio, denom)
+        del denom
+
+        # var = var - ratio
+        torch._foreach_add_(variables, ratio, alpha=-1)
+        del ratio

@@ -1,12 +1,22 @@
 """Tests for PyTorch backend core utilities."""
 
+import os
+
+import numpy as np
 import pytest
 import torch
+from torch.distributed.device_mesh import init_device_mesh
+from torch.distributed.tensor import DTensor
+from torch.distributed.tensor import Shard
 
 from keras.src import backend
 from keras.src import testing
+from keras.src.backend.torch import distribution_lib
+from keras.src.backend.torch import nn
+from keras.src.backend.torch.core import Variable
 from keras.src.backend.torch.core import convert_to_tensor
 from keras.src.backend.torch.core import slice as torch_slice
+from keras.src.distribution import distribution_lib as dist_lib
 
 
 def _get_backed_symint(hint=2):
@@ -104,3 +114,154 @@ class TorchCoreTest(testing.TestCase):
         shape = [batch, 2, 2]
         result = torch_slice(x, start_indices, shape)
         self.assertEqual(tuple(result.shape), (2, 2, 2))
+
+    def test_variable_with_layout(self):
+        if not torch.distributed.is_initialized():
+            os.environ["MASTER_ADDR"] = "localhost"
+            os.environ["MASTER_PORT"] = "29516"
+            distribution_lib.initialize(num_processes=1, process_id=0)
+            self.addCleanup(
+                lambda: (
+                    torch.distributed.destroy_process_group()
+                    if torch.distributed.is_initialized()
+                    else None
+                )
+            )
+
+        mesh = dist_lib.DeviceMesh(
+            shape=(1,), axis_names=["x"], devices=np.array(["cpu:0"])
+        )
+        # Replicated layout just to avoid sharding complexity in single process
+        layout = dist_lib.TensorLayout(axes=(None, None), device_mesh=mesh)
+
+        # Test initialization with layout
+        v = Variable(
+            initializer=np.ones((2, 2), dtype="float32"), layout=layout
+        )
+        self.assertTrue(hasattr(v, "_layout"))
+        self.assertEqual(v._layout, layout)
+
+        # Test initialization with layout from Parameter
+        param = torch.nn.Parameter(torch.ones((2, 2), dtype=torch.float32))
+        v2 = Variable(initializer=param, layout=layout)
+        self.assertTrue(hasattr(v2, "_layout"))
+        self.assertEqual(v2._layout, layout)
+
+        # Test direct assignment with layout
+        v.assign(np.zeros((2, 2), dtype="float32"))
+        self.assertEqual(v.numpy().sum(), 0)
+
+    def test_dot_product_attention_with_3d_mask_and_dtensor_inputs(self):
+        if not torch.distributed.is_initialized():
+            os.environ["MASTER_ADDR"] = "localhost"
+            os.environ["MASTER_PORT"] = "29518"
+            distribution_lib.initialize(num_processes=1, process_id=0)
+            self.addCleanup(
+                lambda: (
+                    torch.distributed.destroy_process_group()
+                    if torch.distributed.is_initialized()
+                    else None
+                )
+            )
+
+        mesh = init_device_mesh("cpu", (1,))
+        query = DTensor.from_local(torch.randn(2, 2, 4, 8), mesh, [Shard(0)])
+        key = DTensor.from_local(torch.randn(2, 2, 4, 8), mesh, [Shard(0)])
+        value = DTensor.from_local(torch.randn(2, 2, 4, 8), mesh, [Shard(0)])
+        mask = torch.ones((2, 2, 4), dtype=torch.bool)
+
+        output = nn.dot_product_attention(query, key, value, mask=mask)
+
+        self.assertEqual(tuple(output.shape), (2, 2, 4, 8))
+
+    def test_local_tensor_mixed_with_dtensor_operators(self):
+        if not torch.distributed.is_initialized():
+            os.environ["MASTER_ADDR"] = "localhost"
+            os.environ["MASTER_PORT"] = "29519"
+            distribution_lib.initialize(num_processes=1, process_id=0)
+            self.addCleanup(
+                lambda: (
+                    torch.distributed.destroy_process_group()
+                    if torch.distributed.is_initialized()
+                    else None
+                )
+            )
+
+        mesh = init_device_mesh("cpu", (1,))
+        local_tensor = torch.randn(2, 2)
+        dtensor = DTensor.from_local(torch.randn(2, 2), mesh, [Shard(0)])
+
+        multiplied = local_tensor * dtensor
+        added = local_tensor + dtensor
+
+        self.assertIsInstance(multiplied, DTensor)
+        self.assertEqual(tuple(multiplied.shape), (2, 2))
+        self.assertIsInstance(added, DTensor)
+        self.assertEqual(tuple(added.shape), (2, 2))
+
+    def test_variable_model_parallel_initialization(self):
+        if not torch.distributed.is_initialized():
+            os.environ["MASTER_ADDR"] = "localhost"
+            os.environ["MASTER_PORT"] = "29517"
+            distribution_lib.initialize(num_processes=1, process_id=0)
+            self.addCleanup(
+                lambda: (
+                    torch.distributed.destroy_process_group()
+                    if torch.distributed.is_initialized()
+                    else None
+                )
+            )
+
+        mesh = dist_lib.DeviceMesh(
+            shape=(1,), axis_names=["x"], devices=np.array(["cpu:0"])
+        )
+        layout = dist_lib.TensorLayout(axes=("x", None), device_mesh=mesh)
+
+        layout_map = dist_lib.LayoutMap(mesh)
+        layout_map[".*"] = layout
+
+        dist = dist_lib.ModelParallel(
+            device_mesh=mesh, layout_map=layout_map, batch_dim_name="batch"
+        )
+
+        dist_lib.set_distribution(dist)
+        self.addCleanup(lambda: dist_lib.set_distribution(None))
+
+        # 1. Test initialization with numpy array (hits the 'else' branch)
+        v1 = Variable(initializer=np.ones((2, 2), dtype="float32"))
+        self.assertTrue(hasattr(v1.value, "placements"))
+        self.assertEqual(v1._layout, layout)
+
+        # 2. Test initialization with torch.nn.Parameter
+        param = torch.nn.Parameter(torch.ones((2, 2), dtype=torch.float32))
+        v2 = Variable(initializer=param)
+        self.assertTrue(hasattr(v2.value, "placements"))
+        self.assertEqual(v2._layout, layout)
+
+        # 3. Test _initialize_with_initializer (callable)
+        def my_initializer(shape, dtype=None):
+            return torch.ones(shape, dtype=torch.float32)
+
+        v3 = Variable(initializer=my_initializer, shape=(4, 4), dtype="float32")
+        self.assertTrue(hasattr(v3.value, "placements"))
+        self.assertEqual(v3.value.shape, (4, 4))
+        self.assertEqual(v3.numpy().sum(), 16)
+
+        # 4. Test _initialize with meta tensor
+        meta_tensor = torch.empty((4, 4), device="meta")
+        v4 = Variable(initializer=meta_tensor, dtype="float32")
+        self.assertTrue(hasattr(v4.value, "placements"))
+        self.assertEqual(v4.value.shape, (4, 4))
+        # It should have been moved to real device (CPU in this test)
+        self.assertEqual(v4.value.to_local().device.type, "cpu")
+
+        # 5. Test assign with numpy array
+        v1.assign(np.zeros((2, 2), dtype="float32"))
+        self.assertTrue(hasattr(v1.value, "placements"))
+        self.assertEqual(v1.numpy().sum(), 0)
+
+        # 6. Test assign with torch tensor requiring grad
+        new_value = torch.ones((2, 2), requires_grad=True)
+        v1.assign(new_value)
+        self.assertTrue(hasattr(v1.value, "placements"))
+        self.assertEqual(v1.numpy().sum(), 4)
