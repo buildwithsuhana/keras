@@ -107,11 +107,154 @@ def to_torch_dtype(dtype):
     return standardized_dtype
 
 
+def _is_dtensor(x):
+    return hasattr(x, "device_mesh") and hasattr(x, "placements")
+
+
+def _promote_tensor_args(args=(), kwargs=None):
+    if kwargs is None:
+        kwargs = {}
+    if not args and not kwargs:
+        return args, kwargs
+
+    dtensor_arg = None
+    from keras.src import tree
+
+    for arg in tree.flatten((args, kwargs)):
+        if _is_dtensor(arg):
+            dtensor_arg = arg
+            break
+
+    if dtensor_arg is None:
+        return args, kwargs
+
+    from torch.distributed import tensor as torch_distributed_tensor
+
+    mesh = dtensor_arg.device_mesh
+    placements = [torch_distributed_tensor.Replicate()] * len(mesh.shape)
+
+    def maybe_promote(value):
+        if isinstance(value, torch.Tensor) and not _is_dtensor(value):
+            return torch_distributed_tensor.DTensor.from_local(
+                value, device_mesh=mesh, placements=placements
+            )
+        return value
+
+    return tree.map_structure(maybe_promote, (args, kwargs))
+
+
+class KerasDTensorPromotionMode(torch.utils._python_dispatch.TorchDispatchMode):
+    def __torch_dispatch__(self, func, types, args=(), kwargs=None):
+        if kwargs is None:
+            kwargs = {}
+        if any(_is_dtensor(arg) for arg in tree.flatten((args, kwargs))):
+            if not all(
+                _is_dtensor(arg)
+                for arg in tree.flatten((args, kwargs))
+                if isinstance(arg, torch.Tensor)
+            ):
+                args, kwargs = _promote_tensor_args(args, kwargs)
+        return func(*args, **kwargs)
+
+
+_dtensor_patched = False
+
+
+def _patch_dtensor_torch_function():
+    global _dtensor_patched
+    if _dtensor_patched:
+        return
+
+    from torch.utils._python_dispatch import _push_mode
+
+    _push_mode(KerasDTensorPromotionMode())
+    _dtensor_patched = True
+
+
+def _prepare_for_numpy(x):
+    if _is_dtensor(x):
+        if hasattr(x, "placements"):
+            from torch.distributed.tensor import Replicate
+
+            if any(not isinstance(p, Replicate) for p in x.placements):
+                x = x.redistribute(
+                    device_mesh=x.device_mesh,
+                    placements=[Replicate()] * len(x.placements),
+                )
+        return x.to_local()
+    return x
+
+
+def _initialize_variable(variable, initializer, callable_initializer=False):
+    from keras.src.backend.common import global_state
+    from keras.src.backend.torch import distribution_lib
+    from keras.src.distribution.distribution_lib import ModelParallel
+    from keras.src.distribution.distribution_lib import distribution
+
+    dist = distribution()
+    if variable._layout is None and dist is not None:
+        variable._layout = dist.get_variable_layout(variable)
+
+    dist = global_state.get_global_attribute("distribution")
+    if variable._layout is not None and isinstance(dist, ModelParallel):
+        from torch.distributed import tensor as torch_distributed_tensor
+
+        if callable_initializer:
+            with device_scope("meta"):
+                meta_tensor = convert_to_tensor(
+                    initializer(variable._shape, dtype=variable._dtype),
+                    dtype=variable._dtype,
+                )
+            meta_dtensor = distribution_lib.distribute_tensor(
+                meta_tensor, variable._layout
+            )
+            local_shape = meta_dtensor.to_local().shape
+
+            local_tensor = convert_to_tensor(
+                initializer(local_shape, dtype=variable._dtype),
+                dtype=variable._dtype,
+            ).to(get_device())
+
+            _patch_dtensor_torch_function()
+            return torch.nn.Parameter(
+                torch_distributed_tensor.DTensor.from_local(
+                    local_tensor,
+                    device_mesh=meta_dtensor.device_mesh,
+                    placements=meta_dtensor.placements,
+                ),
+                requires_grad=variable.trainable,
+            )
+        else:
+            value = initializer
+            if isinstance(value, torch.nn.Parameter):
+                value = value.data
+            if value.requires_grad or (
+                hasattr(value, "grad_fn") and value.grad_fn is not None
+            ):
+                value = value.detach()
+
+            dtensor = distribution_lib.distribute_tensor(
+                value, variable._layout
+            )
+            if dtensor.is_meta:
+                device = get_device()
+                local_tensor = torch.empty_like(
+                    dtensor.to_local(), device=device
+                )
+                dtensor = torch_distributed_tensor.DTensor.from_local(
+                    local_tensor,
+                    device_mesh=dtensor.device_mesh,
+                    placements=dtensor.placements,
+                )
+
+            _patch_dtensor_torch_function()
+            return torch.nn.Parameter(dtensor, requires_grad=variable.trainable)
+    return None
+
+
 class Variable(KerasVariable):
     def _initialize_with_initializer(self, initializer):
-        from keras.src.backend.torch import distribution_lib
-
-        value = distribution_lib._initialize_variable(
+        value = _initialize_variable(
             self, initializer, callable_initializer=True
         )
         if value is not None:
@@ -120,10 +263,8 @@ class Variable(KerasVariable):
             super()._initialize_with_initializer(initializer)
 
     def _initialize(self, value):
-        from keras.src.backend.torch import distribution_lib
-
         self._shape = self._validate_shape(value.shape)
-        new_value = distribution_lib._initialize_variable(
+        new_value = _initialize_variable(
             self, value, callable_initializer=False
         )
         if new_value is not None:
@@ -295,9 +436,7 @@ def convert_to_tensor(x, dtype=None, sparse=None, ragged=None):
 def convert_to_numpy(x):
     def transform(x):
         if is_tensor(x):
-            from keras.src.backend.torch import distribution_lib
-
-            x = distribution_lib._prepare_for_numpy(x)
+            x = _prepare_for_numpy(x)
             if x.requires_grad:
                 x = x.detach()
             # Tensor has to be moved to CPU before converting to numpy.

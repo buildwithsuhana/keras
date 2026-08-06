@@ -244,149 +244,6 @@ def _to_backend_layout(tensor_layout):
     return DTensorLayout(torch_mesh, tuple(placements))
 
 
-def _is_dtensor(x):
-    return hasattr(x, "device_mesh") and hasattr(x, "placements")
-
-
-def _promote_tensor_args(args=(), kwargs=None):
-    if kwargs is None:
-        kwargs = {}
-    if not args and not kwargs:
-        return args, kwargs
-
-    dtensor_arg = None
-    from keras.src import tree
-
-    for arg in tree.flatten((args, kwargs)):
-        if _is_dtensor(arg):
-            dtensor_arg = arg
-            break
-
-    if dtensor_arg is None:
-        return args, kwargs
-
-    mesh = dtensor_arg.device_mesh
-    placements = [torch_distributed_tensor.Replicate()] * len(mesh.shape)
-
-    def maybe_promote(value):
-        if isinstance(value, torch.Tensor) and not _is_dtensor(value):
-            return torch_distributed_tensor.DTensor.from_local(
-                value, device_mesh=mesh, placements=placements
-            )
-        return value
-
-    return tree.map_structure(maybe_promote, (args, kwargs))
-
-
-_dtensor_patched = False
-
-
-def _patch_dtensor_torch_function():
-    global _dtensor_patched
-    if _dtensor_patched:
-        return
-
-    original_dtensor_torch_function = (
-        torch_distributed_tensor.DTensor.__torch_function__
-    )
-
-    @classmethod
-    def _dtensor_torch_function(cls, func, types, args=(), kwargs=None):
-        if kwargs is None:
-            kwargs = {}
-        if not all(
-            _is_dtensor(arg) for arg in args if isinstance(arg, torch.Tensor)
-        ) or not all(
-            _is_dtensor(v)
-            for v in kwargs.values()
-            if isinstance(v, torch.Tensor)
-        ):
-            promoted_args, promoted_kwargs = _promote_tensor_args(args, kwargs)
-            return func(*promoted_args, **promoted_kwargs)
-        return original_dtensor_torch_function(func, types, args, kwargs)
-
-    torch_distributed_tensor.DTensor.__torch_function__ = (
-        _dtensor_torch_function
-    )
-    _dtensor_patched = True
-
-
-def _prepare_for_numpy(x):
-    if _is_dtensor(x):
-        if hasattr(x, "placements"):
-            from torch.distributed.tensor import Replicate
-
-            if any(not isinstance(p, Replicate) for p in x.placements):
-                x = x.redistribute(
-                    device_mesh=x.device_mesh,
-                    placements=[Replicate()] * len(x.placements),
-                )
-        return x.to_local()
-    return x
-
-
-def _initialize_variable(variable, initializer, callable_initializer=False):
-    from keras.src.backend.common import global_state
-    from keras.src.distribution.distribution_lib import ModelParallel
-    from keras.src.distribution.distribution_lib import distribution
-
-    dist = distribution()
-    if variable._layout is None and dist is not None:
-        variable._layout = dist.get_variable_layout(variable)
-
-    dist = global_state.get_global_attribute("distribution")
-    if variable._layout is not None and isinstance(dist, ModelParallel):
-        if callable_initializer:
-            from keras.src.backend.torch.core import device_scope
-
-            with device_scope("meta"):
-                meta_tensor = convert_to_tensor(
-                    initializer(variable._shape, dtype=variable._dtype),
-                    dtype=variable._dtype,
-                )
-            meta_dtensor = distribute_tensor(meta_tensor, variable._layout)
-            local_shape = meta_dtensor.to_local().shape
-
-            local_tensor = convert_to_tensor(
-                initializer(local_shape, dtype=variable._dtype),
-                dtype=variable._dtype,
-            ).to(get_device())
-
-            _patch_dtensor_torch_function()
-            return torch.nn.Parameter(
-                torch_distributed_tensor.DTensor.from_local(
-                    local_tensor,
-                    device_mesh=meta_dtensor.device_mesh,
-                    placements=meta_dtensor.placements,
-                ),
-                requires_grad=variable.trainable,
-            )
-        else:
-            value = initializer
-            if isinstance(value, torch.nn.Parameter):
-                value = value.data
-            if value.requires_grad or (
-                hasattr(value, "grad_fn") and value.grad_fn is not None
-            ):
-                value = value.detach()
-
-            dtensor = distribute_tensor(value, variable._layout)
-            if dtensor.is_meta:
-                device = get_device()
-                local_tensor = torch.empty_like(
-                    dtensor.to_local(), device=device
-                )
-                dtensor = torch_distributed_tensor.DTensor.from_local(
-                    local_tensor,
-                    device_mesh=dtensor.device_mesh,
-                    placements=dtensor.placements,
-                )
-
-            _patch_dtensor_torch_function()
-            return torch.nn.Parameter(dtensor, requires_grad=variable.trainable)
-    return None
-
-
 def distribute_tensor(tensor, layout):
     """Scatters or replicates a tensor across devices according to the
     layout."""
@@ -403,13 +260,11 @@ def distribute_tensor(tensor, layout):
             tensor.device_mesh == layout.device_mesh
             and tensor.placements == layout.placements
         ):
-            _patch_dtensor_torch_function()
             return tensor
 
     if not isinstance(tensor, torch.Tensor):
         tensor = convert_to_tensor(tensor)
 
-    _patch_dtensor_torch_function()
     return torch_distributed_tensor.distribute_tensor(
         tensor, device_mesh=layout.device_mesh, placements=layout.placements
     )
@@ -430,7 +285,6 @@ def distribute_data_input(per_process_batch, layout):
             per_process_batch.device_mesh == layout.device_mesh
             and per_process_batch.placements == layout.placements
         ):
-            _patch_dtensor_torch_function()
             return per_process_batch
 
     if not isinstance(per_process_batch, torch.Tensor):
@@ -438,7 +292,6 @@ def distribute_data_input(per_process_batch, layout):
     elif per_process_batch.device.type != "cpu":
         per_process_batch = per_process_batch.cpu()
 
-    _patch_dtensor_torch_function()
     return torch_distributed_tensor.DTensor.from_local(
         per_process_batch,
         device_mesh=layout.device_mesh,
