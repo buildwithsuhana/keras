@@ -110,22 +110,14 @@ def _is_dtensor(x):
 def _promote_tensor_args(args=(), kwargs=None):
     if kwargs is None:
         kwargs = {}
-
-    args = tuple(args)
-    kwargs = dict(kwargs)
     if not args and not kwargs:
         return args, kwargs
 
     dtensor_arg = None
-    for arg in args:
+    for arg in tree.flatten((args, kwargs)):
         if _is_dtensor(arg):
             dtensor_arg = arg
             break
-    if dtensor_arg is None:
-        for value in kwargs.values():
-            if _is_dtensor(value):
-                dtensor_arg = value
-                break
 
     if dtensor_arg is None:
         return args, kwargs
@@ -140,37 +132,46 @@ def _promote_tensor_args(args=(), kwargs=None):
             )
         return value
 
-    promoted_args = tuple(maybe_promote(arg) for arg in args)
-    promoted_kwargs = {
-        key: maybe_promote(value) for key, value in kwargs.items()
-    }
-    return promoted_args, promoted_kwargs
+    return tree.map_structure(maybe_promote, (args, kwargs))
+
+
+_dtensor_patched = False
+
+
+def _patch_dtensor_torch_function():
+    global _dtensor_patched
+    if _dtensor_patched:
+        return
+
+    original_dtensor_torch_function = (
+        torch_distributed_tensor.DTensor.__torch_function__
+    )
+
+    @classmethod
+    def _dtensor_torch_function(cls, func, types, args=(), kwargs=None):
+        if kwargs is None:
+            kwargs = {}
+        if not all(
+            _is_dtensor(arg) for arg in args if isinstance(arg, torch.Tensor)
+        ) or not all(
+            _is_dtensor(v)
+            for v in kwargs.values()
+            if isinstance(v, torch.Tensor)
+        ):
+            promoted_args, promoted_kwargs = _promote_tensor_args(args, kwargs)
+            return func(*promoted_args, **promoted_kwargs)
+        return original_dtensor_torch_function(func, types, args, kwargs)
+
+    torch_distributed_tensor.DTensor.__torch_function__ = (
+        _dtensor_torch_function
+    )
+    _dtensor_patched = True
 
 
 def _maybe_promote_to_dtensor(x):
+    if _is_dtensor(x):
+        _patch_dtensor_torch_function()
     return x
-
-
-_original_dtensor_torch_function = (
-    torch_distributed_tensor.DTensor.__torch_function__
-)
-
-
-@classmethod
-def _dtensor_torch_function(cls, func, types, args=(), kwargs=None):
-    if kwargs is None:
-        kwargs = {}
-    if not all(
-        _is_dtensor(arg) for arg in args if isinstance(arg, torch.Tensor)
-    ) or not all(
-        _is_dtensor(v) for v in kwargs.values() if isinstance(v, torch.Tensor)
-    ):
-        promoted_args, promoted_kwargs = _promote_tensor_args(args, kwargs)
-        return func(*promoted_args, **promoted_kwargs)
-    return _original_dtensor_torch_function(func, types, args, kwargs)
-
-
-torch_distributed_tensor.DTensor.__torch_function__ = _dtensor_torch_function
 
 
 class Variable(KerasVariable):
@@ -182,38 +183,36 @@ class Variable(KerasVariable):
             self._layout = dist.get_variable_layout(self)
 
     def _initialize_with_initializer(self, initializer):
-        from keras.src.backend.torch import distribution_lib
+        self._initialize_layout()
         from keras.src.distribution.distribution_lib import ModelParallel
 
-        self._initialize_layout()
-        distribution = global_state.get_global_attribute("distribution")
+        dist = global_state.get_global_attribute("distribution")
+        if self._layout is not None and isinstance(dist, ModelParallel):
+            from keras.src.backend.torch import distribution_lib
 
-        if self._layout is not None and isinstance(distribution, ModelParallel):
+            # 1. Distribute a meta-tensor to get the local shape
             with device_scope("meta"):
-                meta_value = initializer(self._shape, dtype=self._dtype)
-                meta_tensor = convert_to_tensor(meta_value, dtype=self._dtype)
-
+                meta_tensor = convert_to_tensor(
+                    initializer(self._shape, dtype=self._dtype),
+                    dtype=self._dtype,
+                )
             meta_dtensor = distribution_lib.distribute_tensor(
                 meta_tensor, self._layout
             )
-            local_meta = meta_dtensor.to_local()
+            local_shape = meta_dtensor.to_local().shape
 
-            device = get_device()
-            local_value = initializer(local_meta.shape, dtype=self._dtype)
-            local_tensor = convert_to_tensor(local_value, dtype=self._dtype).to(
-                device
-            )
-            if hasattr(local_tensor, "to_local"):
-                local_tensor = local_tensor.to_local()
-
-            actual_dtensor = torch_distributed_tensor.DTensor.from_local(
-                local_tensor,
-                device_mesh=meta_dtensor.device_mesh,
-                placements=meta_dtensor.placements,
-            )
+            # 2. Initialize locally on the actual device
+            local_tensor = convert_to_tensor(
+                initializer(local_shape, dtype=self._dtype),
+                dtype=self._dtype,
+            ).to(get_device())
 
             self._value = torch.nn.Parameter(
-                actual_dtensor,
+                torch_distributed_tensor.DTensor.from_local(
+                    local_tensor,
+                    device_mesh=meta_dtensor.device_mesh,
+                    placements=meta_dtensor.placements,
+                ),
                 requires_grad=self.trainable,
             )
             return
@@ -222,59 +221,37 @@ class Variable(KerasVariable):
 
     def _initialize(self, value):
         from keras.src.backend.torch import distribution_lib
+        from keras.src.distribution.distribution_lib import ModelParallel
 
         self._shape = self._validate_shape(value.shape)
         self._initialize_layout()
 
-        if self._layout is not None:
-            from keras.src.distribution.distribution_lib import ModelParallel
+        dist = global_state.get_global_attribute("distribution")
+        if self._layout is not None and isinstance(dist, ModelParallel):
+            if isinstance(value, torch.nn.Parameter):
+                value = value.data
+            if value.requires_grad or (
+                hasattr(value, "grad_fn") and value.grad_fn is not None
+            ):
+                value = value.detach()
 
-            distribution = global_state.get_global_attribute("distribution")
-            if isinstance(distribution, ModelParallel):
-                if isinstance(value, torch.nn.Parameter):
-                    if value.requires_grad or value.grad_fn is not None:
-                        value = value.detach()
-                    dtensor = distribution_lib.distribute_tensor(
-                        value.data, self._layout
-                    )
-                    self._value = torch.nn.Parameter(
-                        dtensor, requires_grad=self.trainable
-                    )
-                else:
-                    if hasattr(value, "is_meta") and value.is_meta:
-                        meta_dtensor = distribution_lib.distribute_tensor(
-                            value, self._layout
-                        )
-                        local_meta = meta_dtensor.to_local()
-                        device = get_device()
-                        local_tensor = torch.empty_like(
-                            local_meta, device=device
-                        )
+            dtensor = distribution_lib.distribute_tensor(value, self._layout)
+            if dtensor.is_meta:
+                # Meta -> Actual device transition
+                device = get_device()
+                local_tensor = torch.empty_like(
+                    dtensor.to_local(), device=device
+                )
+                dtensor = torch_distributed_tensor.DTensor.from_local(
+                    local_tensor,
+                    device_mesh=dtensor.device_mesh,
+                    placements=dtensor.placements,
+                )
 
-                        actual_dtensor = (
-                            torch_distributed_tensor.DTensor.from_local(
-                                local_tensor,
-                                device_mesh=meta_dtensor.device_mesh,
-                                placements=meta_dtensor.placements,
-                            )
-                        )
-                        self._value = torch.nn.Parameter(
-                            actual_dtensor,
-                            requires_grad=self.trainable,
-                        )
-                        return
-
-                    tensor = convert_to_tensor(value, dtype=self._dtype)
-                    if tensor.requires_grad or tensor.grad_fn is not None:
-                        tensor = tensor.detach()
-                    dtensor = distribution_lib.distribute_tensor(
-                        tensor, self._layout
-                    )
-                    self._value = torch.nn.Parameter(
-                        dtensor,
-                        requires_grad=self.trainable,
-                    )
-                return
+            self._value = torch.nn.Parameter(
+                dtensor, requires_grad=self.trainable
+            )
+            return
 
         if isinstance(value, torch.nn.Parameter):
             # Reuse same parameter
@@ -287,14 +264,8 @@ class Variable(KerasVariable):
 
     def _direct_assign(self, value):
         from keras.src.backend.torch import distribution_lib
-        from keras.src.distribution.distribution_lib import ModelParallel
 
-        distribution = global_state.get_global_attribute("distribution")
-        if self._layout is not None and isinstance(distribution, ModelParallel):
-            if not hasattr(value, "device_mesh"):  # Not a DTensor
-                if value.requires_grad or value.grad_fn is not None:
-                    value = value.detach()
-                value = distribution_lib.distribute_tensor(value, self._layout)
+        value = distribution_lib.distribute_tensor(value, self._layout)
         with torch.no_grad():
             self.value.copy_(value)
 
@@ -304,13 +275,15 @@ class Variable(KerasVariable):
     # Overload native accessor.
     @classmethod
     def __torch_function__(cls, func, types, args=(), kwargs=None):
-        args = [arg.value if isinstance(arg, Variable) else arg for arg in args]
+        _patch_dtensor_torch_function()
         if kwargs is None:
             kwargs = {}
-        kwargs = {
-            key: value.value if isinstance(value, Variable) else value
-            for key, value in kwargs.items()
-        }
+        args = tree.map_structure(
+            lambda x: x.value if isinstance(x, Variable) else x, args
+        )
+        kwargs = tree.map_structure(
+            lambda x: x.value if isinstance(x, Variable) else x, kwargs
+        )
         promoted_args, promoted_kwargs = _promote_tensor_args(args, kwargs)
         return func(*promoted_args, **promoted_kwargs)
 
