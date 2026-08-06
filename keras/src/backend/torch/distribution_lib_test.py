@@ -225,14 +225,7 @@ class TorchDistributionLibTest(testing.TestCase):
         for k, v in env.items():
             self.set_env(k, v)
 
-        if (
-            isinstance(inp, torch.device)
-            and inp.type == "cuda"
-            and not torch.cuda.is_available()
-        ):
-            self.skipTest("No CUDA")
-
-        if inp == "gpu" and not torch.cuda.is_available():
+        if etype == "cuda" and not torch.cuda.is_available():
             self.skipTest("No CUDA")
 
         dev = distribution_lib._to_backend_device(inp)
