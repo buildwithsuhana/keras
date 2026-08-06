@@ -336,7 +336,6 @@ def convert_to_tensor(x, dtype=None, sparse=None, ragged=None):
     if isinstance(x, Variable) or is_tensor(x):
         if isinstance(x, Variable):
             x = x.value
-
         if isinstance(x, DTensor):
             pushed = False
             try:
@@ -356,7 +355,6 @@ def convert_to_tensor(x, dtype=None, sparse=None, ragged=None):
                 x = x.to(device)
         if dtype is not None:
             x = x.to(to_torch_dtype(dtype))
-
         return x
     if isinstance(x, (bool, int, float, complex)):
         if dtype is not None:
