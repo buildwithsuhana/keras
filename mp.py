@@ -43,18 +43,7 @@ class MemoryTracker:
 
 
 def find_free_port():
-    import socket
-
-    for _ in range(5):
-        try:
-            with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as s:
-                s.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
-                s.bind(("localhost", 0))
-                return s.getsockname()[1]
-        except OSError:
-            time.sleep(0.1)
-            continue
-    return 29500 + np.random.randint(0, 1000)
+    return "29507"
 
 
 def get_layout_map(mesh):
@@ -142,6 +131,7 @@ def run_training(rank, world_size, layout_map, backend):
 
     import keras
 
+    print(f"[Rank {rank}] Entering run_training")
     keras.backend.set_floatx("float32")
 
     gc.collect()
@@ -149,32 +139,40 @@ def run_training(rank, world_size, layout_map, backend):
     base_cpu = psutil.Process(os.getpid()).memory_info().rss
     tracker.start()
 
+    print(f"[Rank {rank}] Creating ModelParallel distribution")
     distribution = keras.distribution.ModelParallel(
         layout_map=layout_map, batch_dim_name="data", auto_shard_dataset=False
     )
 
     with distribution.scope():
+        print(f"[Rank {rank}] Entered distribution.scope()")
         if backend == "torch":
             time.sleep(rank * 1)
 
+        print(f"[Rank {rank}] Creating model from preset")
         model = keras_hub.models.OPTBackbone.from_preset(
             "opt_125m_en", dropout=0.0
         )
+        print(f"[Rank {rank}] Model created")
         gc.collect()
 
         is_jit = True if backend == "jax" else False
+        print(f"[Rank {rank}] Compiling model")
         model.compile(
             optimizer=keras.optimizers.Adam(learning_rate=1e-5),
             loss="mse",
             jit_compile=is_jit,
         )
+        print(f"[Rank {rank}] Model compiled")
         gc.collect()
 
         if backend == "torch":
             import torch
 
             if torch.distributed.is_initialized():
+                print(f"[Rank {rank}] Waiting at barrier 1")
                 torch.distributed.barrier()
+                print(f"[Rank {rank}] Passed barrier 1")
 
         np.random.seed(42)
         global_batch_size = 32
@@ -190,10 +188,10 @@ def run_training(rank, world_size, layout_map, backend):
 
         if backend == "torch":
             indices = []
-            # mesh is (2, 2), axis_names=("data", "model")
-            # data_axis_size = 2, model_axis_size = 2
-            data_shard_index = rank // 2
-            local_batch_size = global_batch_size // 2  # 16
+            # mesh is (world_size, 1), axis_names=("data", "model")
+            # data_axis_size = world_size, model_axis_size = 1
+            data_shard_index = rank
+            local_batch_size = global_batch_size // world_size
             for i in range(10):
                 base = i * global_batch_size
                 start = base + data_shard_index * local_batch_size
@@ -226,6 +224,7 @@ def run_training(rank, world_size, layout_map, backend):
         gc.collect()
 
         # Warmup
+        print(f"[Rank {rank}] Starting warmup fit")
         warmup_history = model.fit(
             {k: v[:batch_size] for k, v in x.items()},
             y[:batch_size],
@@ -235,6 +234,7 @@ def run_training(rank, world_size, layout_map, backend):
             verbose=1 if rank == 0 else 0,
             shuffle=False,
         )
+        print(f"[Rank {rank}] Finished warmup fit")
 
         if backend == "torch" and torch.distributed.is_initialized():
             torch.distributed.barrier()
@@ -245,6 +245,7 @@ def run_training(rank, world_size, layout_map, backend):
         x_train = {k: v[batch_size:] for k, v in x.items()}
         y_train = y[batch_size:]
 
+        print(f"[Rank {rank}] Starting training fit")
         history = model.fit(
             x_train,
             y_train,
@@ -254,6 +255,7 @@ def run_training(rank, world_size, layout_map, backend):
             verbose=1 if rank == 0 else 0,
             shuffle=False,
         )
+        print(f"[Rank {rank}] Finished training fit")
 
         if backend == "torch" and torch.distributed.is_initialized():
             torch.distributed.barrier()
@@ -332,7 +334,7 @@ def run_training(rank, world_size, layout_map, backend):
                 json.dump(results, f, indent=2)
 
 
-def run_backend(backend, world_size=4):
+def run_backend(backend, world_size=2):
     os.environ["KERAS_BACKEND"] = backend
     if backend == "jax":
         os.environ["XLA_PYTHON_CLIENT_MEM_FRACTION"] = "0.9"
@@ -354,6 +356,7 @@ def run_backend(backend, world_size=4):
         os.environ["KERAS_TORCH_DEVICE"] = "cpu"
         os.environ["CUDA_VISIBLE_DEVICES"] = ""
         os.environ["PYTORCH_ENABLE_MPS_FALLBACK"] = "0"
+        os.environ["TORCH_DISTRIBUTED_DEBUG"] = "DETAIL"
 
         import torch
 
@@ -373,7 +376,7 @@ def _run_jax(world_size):
     print(f"Using JAX devices: {devices}")
 
     mesh = keras.distribution.DeviceMesh(
-        shape=(2, 2), axis_names=("data", "model"), devices=devices
+        shape=(world_size, 1), axis_names=("data", "model"), devices=devices
     )
     run_training(0, world_size, get_layout_map(mesh), "jax")
 
@@ -407,7 +410,7 @@ def _run_torch(rank, world_size, port):
     print(f"Using Torch devices: {devices}")
 
     mesh = keras.distribution.DeviceMesh(
-        shape=(2, 2), axis_names=("data", "model"), devices=devices
+        shape=(world_size, 1), axis_names=("data", "model"), devices=devices
     )
     run_training(rank, world_size, get_layout_map(mesh), "torch")
 
