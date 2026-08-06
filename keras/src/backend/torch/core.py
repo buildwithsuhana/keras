@@ -107,21 +107,17 @@ def to_torch_dtype(dtype):
     return standardized_dtype
 
 
-def _is_dtensor(x):
-    return hasattr(x, "device_mesh") and hasattr(x, "placements")
-
-
 def _promote_tensor_args(args=(), kwargs=None):
     if kwargs is None:
         kwargs = {}
     if not args and not kwargs:
         return args, kwargs
 
-    dtensor_arg = None
-    from keras.src import tree
+    from torch.distributed.tensor import DTensor
 
+    dtensor_arg = None
     for arg in tree.flatten((args, kwargs)):
-        if _is_dtensor(arg):
+        if isinstance(arg, DTensor):
             dtensor_arg = arg
             break
 
@@ -134,7 +130,7 @@ def _promote_tensor_args(args=(), kwargs=None):
     placements = [torch_distributed_tensor.Replicate()] * len(mesh.shape)
 
     def maybe_promote(value):
-        if isinstance(value, torch.Tensor) and not _is_dtensor(value):
+        if isinstance(value, torch.Tensor) and not isinstance(value, DTensor):
             return torch_distributed_tensor.DTensor.from_local(
                 value, device_mesh=mesh, placements=placements
             )
@@ -147,42 +143,19 @@ class KerasDTensorPromotionMode(torch.utils._python_dispatch.TorchDispatchMode):
     def __torch_dispatch__(self, func, types, args=(), kwargs=None):
         if kwargs is None:
             kwargs = {}
-        if any(_is_dtensor(arg) for arg in tree.flatten((args, kwargs))):
+
+        from torch.distributed.tensor import DTensor
+
+        if any(
+            isinstance(arg, DTensor) for arg in tree.flatten((args, kwargs))
+        ):
             if not all(
-                _is_dtensor(arg)
+                isinstance(arg, DTensor)
                 for arg in tree.flatten((args, kwargs))
                 if isinstance(arg, torch.Tensor)
             ):
                 args, kwargs = _promote_tensor_args(args, kwargs)
         return func(*args, **kwargs)
-
-
-_dtensor_patched = False
-
-
-def _patch_dtensor_torch_function():
-    global _dtensor_patched
-    if _dtensor_patched:
-        return
-
-    from torch.utils._python_dispatch import _push_mode
-
-    _push_mode(KerasDTensorPromotionMode())
-    _dtensor_patched = True
-
-
-def _prepare_for_numpy(x):
-    if _is_dtensor(x):
-        if hasattr(x, "placements"):
-            from torch.distributed.tensor import Replicate
-
-            if any(not isinstance(p, Replicate) for p in x.placements):
-                x = x.redistribute(
-                    device_mesh=x.device_mesh,
-                    placements=[Replicate()] * len(x.placements),
-                )
-        return x.to_local()
-    return x
 
 
 def _initialize_variable(variable, initializer, callable_initializer=False):
@@ -215,7 +188,6 @@ def _initialize_variable(variable, initializer, callable_initializer=False):
                 dtype=variable._dtype,
             ).to(get_device())
 
-            _patch_dtensor_torch_function()
             return torch.nn.Parameter(
                 torch_distributed_tensor.DTensor.from_local(
                     local_tensor,
@@ -247,7 +219,6 @@ def _initialize_variable(variable, initializer, callable_initializer=False):
                     placements=dtensor.placements,
                 )
 
-            _patch_dtensor_torch_function()
             return torch.nn.Parameter(dtensor, requires_grad=variable.trainable)
     return None
 
@@ -289,7 +260,9 @@ class Variable(KerasVariable):
             value = value.detach()
 
         value = distribution_lib.distribute_tensor(value, self._layout)
-        if hasattr(value, "device_mesh"):
+        from torch.distributed.tensor import DTensor
+
+        if isinstance(value, DTensor):
             self._value = torch.nn.Parameter(
                 value, requires_grad=self.trainable
             )
@@ -371,6 +344,16 @@ def convert_to_tensor(x, dtype=None, sparse=None, ragged=None):
     if isinstance(x, Variable) or is_tensor(x):
         if isinstance(x, Variable):
             x = x.value
+
+        from torch.distributed.tensor import DTensor
+
+        if isinstance(x, DTensor):
+            if not getattr(torch, "_keras_dtensor_mode_pushed", False):
+                from torch.utils._python_dispatch import _push_mode
+
+                _push_mode(KerasDTensorPromotionMode())
+                torch._keras_dtensor_mode_pushed = True
+
         device = get_device()
         if x.device != device:
             if x.is_meta:
@@ -436,7 +419,18 @@ def convert_to_tensor(x, dtype=None, sparse=None, ragged=None):
 def convert_to_numpy(x):
     def transform(x):
         if is_tensor(x):
-            x = _prepare_for_numpy(x)
+            from torch.distributed.tensor import DTensor
+
+            if isinstance(x, DTensor):
+                if hasattr(x, "placements"):
+                    from torch.distributed.tensor import Replicate
+
+                    if any(not isinstance(p, Replicate) for p in x.placements):
+                        x = x.redistribute(
+                            device_mesh=x.device_mesh,
+                            placements=[Replicate()] * len(x.placements),
+                        )
+                x = x.to_local()
             if x.requires_grad:
                 x = x.detach()
             # Tensor has to be moved to CPU before converting to numpy.
