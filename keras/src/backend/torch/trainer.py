@@ -104,7 +104,7 @@ class TorchTrainer(base_trainer.Trainer):
 
         # Call torch.nn.Module.zero_grad() to clear the leftover gradients
         # for the weights from the previous train step.
-        model.zero_grad(set_to_none=True)
+        model.zero_grad()
 
         loss = self._compute_loss(
             x=x, y=y, y_pred=y_pred, sample_weight=sample_weight, training=True
@@ -130,9 +130,6 @@ class TorchTrainer(base_trainer.Trainer):
             # Update weights
             with torch.no_grad():
                 self.optimizer.apply(gradients, trainable_weights)
-
-            # Free gradients immediately to reduce peak memory
-            model.zero_grad(set_to_none=True)
         else:
             warnings.warn("The model does not have any trainable weights.")
 
@@ -231,7 +228,9 @@ class TorchTrainer(base_trainer.Trainer):
                         from torch.distributed.tensor import Replicate
 
                         placements = [Replicate()] * len(val.placements)
-                        val = val.redistribute(val.device_mesh, placements)
+                        val = val.redistribute(
+                            val.device_mesh, placements
+                        ).to_local()
                     else:
                         # --- DP Branch (Standard Tensor) ---
                         dist.all_reduce(
@@ -661,9 +660,7 @@ class TorchEpochIterator(EpochIterator):
             active_distribution, ModelParallel
         ):
             return self._get_distributed_iterator(active_distribution)
-        else:
-            iterator = self.data_adapter.get_numpy_iterator()
-            return self._one_batch_ahead_iterator(iterator)
+        return self.data_adapter.get_torch_dataloader()
 
     def _get_distributed_iterator(self, active_distribution):
         layouts = None

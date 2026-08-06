@@ -8,7 +8,6 @@ import numpy as np
 import torch
 from torch.distributed.tensor import DTensor
 from torch.distributed.tensor import Replicate
-from torch.utils._python_dispatch import _push_mode
 
 from keras.src import tree
 from keras.src.backend.common import KerasVariable
@@ -27,7 +26,7 @@ SUPPORTS_SPARSE_TENSORS = False
 SUPPORTS_RAGGED_TENSORS = False
 SUPPORTS_COMPLEX_DTYPES = True
 IS_THREAD_SAFE = True
-_DTENSOR_MODE_PUSHED = False
+_GLOBAL_DTENSOR_PROMOTION_MODE = None
 
 
 # Some operators such as 'aten::_foreach_mul_.Scalar'
@@ -163,20 +162,22 @@ class KerasDTensorPromotionMode(torch.utils._python_dispatch.TorchDispatchMode):
 
 class Variable(KerasVariable):
     def _initialize_distributed(self, initializer):
-        from keras.src.backend.torch import distribution_lib
         from keras.src.distribution.distribution_lib import ModelParallel
-        from keras.src.distribution.distribution_lib import TensorLayout
         from keras.src.distribution.distribution_lib import distribution
 
         dist = distribution()
         if not isinstance(dist, ModelParallel):
             return None
 
+        from keras.src.backend.torch import distribution_lib
+
         if self._layout is None:
             self._layout = dist.get_variable_layout(self)
 
         if self._layout is None:
             return None
+
+        from keras.src.distribution.distribution_lib import TensorLayout
 
         if isinstance(self._layout, TensorLayout):
             self._layout = self._layout.backend_layout
@@ -342,10 +343,10 @@ def convert_to_tensor(x, dtype=None, sparse=None, ragged=None):
         if isinstance(x, Variable):
             x = x.value
         if isinstance(x, DTensor):
-            global _DTENSOR_MODE_PUSHED
-            if not _DTENSOR_MODE_PUSHED:
-                _push_mode(KerasDTensorPromotionMode())
-                _DTENSOR_MODE_PUSHED = True
+            global _GLOBAL_DTENSOR_PROMOTION_MODE
+            if _GLOBAL_DTENSOR_PROMOTION_MODE is None:
+                _GLOBAL_DTENSOR_PROMOTION_MODE = KerasDTensorPromotionMode()
+                _GLOBAL_DTENSOR_PROMOTION_MODE.__enter__()
         else:
             device = get_device()
             if x.device != device:
@@ -410,6 +411,8 @@ def convert_to_tensor(x, dtype=None, sparse=None, ragged=None):
 
 def convert_to_numpy(x):
     def transform(x):
+        if isinstance(x, Variable):
+            x = x.value
         if is_tensor(x):
             if isinstance(x, DTensor):
                 if any(not isinstance(p, Replicate) for p in x.placements):
