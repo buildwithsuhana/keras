@@ -27,6 +27,8 @@ SUPPORTS_SPARSE_TENSORS = False
 SUPPORTS_RAGGED_TENSORS = False
 SUPPORTS_COMPLEX_DTYPES = True
 IS_THREAD_SAFE = True
+_DTENSOR_MODE_PUSHED = False
+
 
 # Some operators such as 'aten::_foreach_mul_.Scalar'
 # are not currently implemented for the MPS device.
@@ -37,15 +39,25 @@ elif torch.backends.mps.is_available():
     DEFAULT_DEVICE = "mps"
 elif torch.cuda.is_available():
     DEFAULT_DEVICE = "cuda"
-elif hasattr(torch, "xpu") and torch.xpu.is_available():
-    DEFAULT_DEVICE = "xpu"
 else:
-    from keras.src.utils.module_utils import torch_xla
+    xpu_available = False
+    try:
+        xpu_available = torch.xpu.is_available()
+    except AttributeError:
+        pass
 
-    if torch_xla.available and torch_xla.core.xla_model.xla_device_count() > 0:
-        DEFAULT_DEVICE = "tpu"
+    if xpu_available:
+        DEFAULT_DEVICE = "xpu"
     else:
-        DEFAULT_DEVICE = "cpu"
+        from keras.src.utils.module_utils import torch_xla
+
+        if (
+            torch_xla.available
+            and torch_xla.core.xla_model.xla_device_count() > 0
+        ):
+            DEFAULT_DEVICE = "tpu"
+        else:
+            DEFAULT_DEVICE = "cpu"
 
 TORCH_DTYPES = {
     "float16": torch.float16,
@@ -110,22 +122,8 @@ def to_torch_dtype(dtype):
     return standardized_dtype
 
 
-def _promote_tensor_args(args=(), kwargs=None):
-    """Promotes plain tensors to DTensors if any DTensor is present."""
-    if kwargs is None:
-        kwargs = {}
-    if not args and not kwargs:
-        return args, kwargs
-
-    dtensor_arg = None
-    for arg in tree.flatten((args, kwargs)):
-        if isinstance(arg, DTensor):
-            dtensor_arg = arg
-            break
-
-    if dtensor_arg is None:
-        return args, kwargs
-
+def _promote_tensor_args(args, kwargs, dtensor_arg):
+    """Promotes plain tensors to DTensors using the mesh of dtensor_arg."""
     mesh = dtensor_arg.device_mesh
     placements = [Replicate()] * len(mesh.shape)
 
@@ -151,15 +149,23 @@ class KerasDTensorPromotionMode(torch.utils._python_dispatch.TorchDispatchMode):
         if kwargs is None:
             kwargs = {}
 
-        if any(
-            isinstance(arg, DTensor) for arg in tree.flatten((args, kwargs))
-        ):
-            if not all(
-                isinstance(arg, DTensor)
-                for arg in tree.flatten((args, kwargs))
-                if isinstance(arg, torch.Tensor)
-            ):
-                args, kwargs = _promote_tensor_args(args, kwargs)
+        flat_args = tree.flatten((args, kwargs))
+        dtensor_arg = None
+        has_plain_tensor = False
+
+        for arg in flat_args:
+            if isinstance(arg, DTensor):
+                if dtensor_arg is None:
+                    dtensor_arg = arg
+            elif isinstance(arg, torch.Tensor):
+                has_plain_tensor = True
+
+            if dtensor_arg is not None and has_plain_tensor:
+                break
+
+        if dtensor_arg is not None and has_plain_tensor:
+            args, kwargs = _promote_tensor_args(args, kwargs, dtensor_arg)
+
         return func(*args, **kwargs)
 
 
@@ -173,53 +179,48 @@ class Variable(KerasVariable):
         if self._layout is None and dist is not None:
             self._layout = dist.get_variable_layout(self)
 
-        if self._layout is not None and isinstance(dist, ModelParallel):
-            if callable_initializer:
-                with device_scope("meta"):
-                    meta_tensor = convert_to_tensor(
-                        initializer(self._shape, dtype=self._dtype),
-                        dtype=self._dtype,
-                    )
-                meta_dtensor = distribution_lib.distribute_tensor(
-                    meta_tensor, self._layout
-                )
-                local_shape = meta_dtensor.to_local().shape
+        if self._layout is None or not isinstance(dist, ModelParallel):
+            return None
 
-                local_tensor = convert_to_tensor(
-                    initializer(local_shape, dtype=self._dtype),
+        if callable_initializer:
+            with device_scope("meta"):
+                meta_tensor = convert_to_tensor(
+                    initializer(self._shape, dtype=self._dtype),
                     dtype=self._dtype,
-                ).to(get_device())
+                )
+            meta_dtensor = distribution_lib.distribute_tensor(
+                meta_tensor, self._layout
+            )
+            local_shape = meta_dtensor.to_local().shape
 
-                return torch.nn.Parameter(
-                    DTensor.from_local(
-                        local_tensor,
-                        device_mesh=meta_dtensor.device_mesh,
-                        placements=meta_dtensor.placements,
-                    ),
-                    requires_grad=self.trainable,
-                )
-            else:
-                value = initializer
-                if isinstance(value, torch.nn.Parameter):
-                    value = value.data
-                if isinstance(value, torch.Tensor) and (
-                    value.requires_grad or value.grad_fn is not None
-                ):
-                    value = value.detach()
-                dtensor = distribution_lib.distribute_tensor(
-                    value, self._layout
-                )
-                device = get_device()
-                local_tensor = dtensor.to_local().to(device)
-                return torch.nn.Parameter(
-                    DTensor.from_local(
-                        local_tensor,
-                        device_mesh=dtensor.device_mesh,
-                        placements=dtensor.placements,
-                    ),
-                    requires_grad=self.trainable,
-                )
-        return None
+            # Initialize local shard directly on target device
+            local_tensor = convert_to_tensor(
+                initializer(local_shape, dtype=self._dtype),
+                dtype=self._dtype,
+            )
+            device_mesh = meta_dtensor.device_mesh
+            placements = meta_dtensor.placements
+        else:
+            value = initializer
+            if isinstance(value, torch.nn.Parameter):
+                value = value.data
+            if isinstance(value, torch.Tensor) and (
+                value.requires_grad or value.grad_fn is not None
+            ):
+                value = value.detach()
+
+            dtensor = distribution_lib.distribute_tensor(value, self._layout)
+
+            local_tensor = dtensor.to_local().to(get_device())
+            device_mesh = dtensor.device_mesh
+            placements = dtensor.placements
+
+        return torch.nn.Parameter(
+            DTensor.from_local(
+                local_tensor, device_mesh=device_mesh, placements=placements
+            ),
+            requires_grad=self.trainable,
+        )
 
     def _initialize_with_initializer(self, initializer):
         value = self._initialize_distributed(
@@ -337,16 +338,10 @@ def convert_to_tensor(x, dtype=None, sparse=None, ragged=None):
         if isinstance(x, Variable):
             x = x.value
         if isinstance(x, DTensor):
-            pushed = False
-            try:
-                pushed = torch._keras_dtensor_mode_pushed
-            except AttributeError:
-                pass
-
-            if not pushed:
+            global _DTENSOR_MODE_PUSHED
+            if not _DTENSOR_MODE_PUSHED:
                 _push_mode(KerasDTensorPromotionMode())
-                torch._keras_dtensor_mode_pushed = True
-
+                _DTENSOR_MODE_PUSHED = True
         device = get_device()
         if x.device != device:
             if x.is_meta:
@@ -412,12 +407,11 @@ def convert_to_numpy(x):
     def transform(x):
         if is_tensor(x):
             if isinstance(x, DTensor):
-                if hasattr(x, "placements"):
-                    if any(not isinstance(p, Replicate) for p in x.placements):
-                        x = x.redistribute(
-                            device_mesh=x.device_mesh,
-                            placements=[Replicate()] * len(x.placements),
-                        )
+                if any(not isinstance(p, Replicate) for p in x.placements):
+                    x = x.redistribute(
+                        device_mesh=x.device_mesh,
+                        placements=[Replicate()] * len(x.placements),
+                    )
                 x = x.to_local()
             if x.requires_grad:
                 x = x.detach()
