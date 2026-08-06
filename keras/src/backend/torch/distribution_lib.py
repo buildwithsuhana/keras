@@ -5,6 +5,7 @@ import torch
 import torch.distributed
 from torch.distributed import tensor as torch_distributed_tensor
 
+from keras.src.backend.torch import core as torch_core
 from keras.src.backend.torch.core import _parse_device_input
 from keras.src.backend.torch.core import convert_to_tensor
 from keras.src.backend.torch.core import get_device
@@ -126,6 +127,13 @@ def initialize(job_addresses=None, num_processes=None, process_id=None):
         torch.distributed.init_process_group(
             backend=backend, rank=rank, world_size=world_size
         )
+
+        if torch_core._GLOBAL_DTENSOR_PROMOTION_MODE is None:
+            torch_core._GLOBAL_DTENSOR_PROMOTION_MODE = (
+                torch_core.KerasDTensorPromotionMode()
+            )
+            # This context is intentionally never exited.
+            torch_core._GLOBAL_DTENSOR_PROMOTION_MODE.__enter__()
 
 
 def num_processes():
