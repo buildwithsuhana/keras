@@ -11,7 +11,6 @@ from torch.distributed.tensor import Replicate
 
 from keras.src import backend
 from keras.src import testing
-from keras.src.backend.torch import distribution_lib
 from keras.src.backend.torch.core import KerasDTensorPromotionMode
 from keras.src.backend.torch.core import Variable
 from keras.src.backend.torch.core import convert_to_tensor
@@ -119,6 +118,9 @@ class TorchCoreTest(testing.TestCase):
         self.assertEqual(tuple(result.shape), (2, 2, 2))
 
 
+@pytest.mark.skipif(
+    backend.backend() != "torch", reason="Requires torch backend"
+)
 class TorchCoreDistributedTest(testing.TestCase):
     def set_env(self, key, value):
         old = os.environ.get(key)
@@ -143,7 +145,13 @@ class TorchCoreDistributedTest(testing.TestCase):
         if not torch.distributed.is_initialized():
             self.set_env("MASTER_ADDR", "localhost")
             self.set_env("MASTER_PORT", port)
-            distribution_lib.initialize(num_processes=1, process_id=0)
+            backend = "nccl" if torch.cuda.is_available() else "gloo"
+            torch.distributed.init_process_group(
+                backend=backend, rank=0, world_size=1
+            )
+
+    def _get_test_device(self):
+        return "cuda:0" if torch.cuda.is_available() else "cpu:0"
 
     def test_keras_dtensor_promotion_mode(self):
         self._ensure_distributed_initialized(port="29501")
@@ -180,7 +188,8 @@ class TorchCoreDistributedTest(testing.TestCase):
         self.assertTrue(torch_core._DTENSOR_MODE_PUSHED)
 
         plain_tensor = torch.zeros((2, 2))
-        result = dtensor + plain_tensor
+        with KerasDTensorPromotionMode():
+            result = dtensor + plain_tensor
         self.assertIsInstance(result, DTensor)
         self.assertTrue(torch.allclose(result.to_local(), torch.ones((2, 2))))
 
@@ -188,7 +197,9 @@ class TorchCoreDistributedTest(testing.TestCase):
         self._ensure_distributed_initialized(port="29503")
 
         mesh = DeviceMesh(
-            shape=(1,), axis_names=["x"], devices=np.array(["cpu:0"])
+            shape=(1,),
+            axis_names=["x"],
+            devices=np.array([self._get_test_device()]),
         )
 
         layout_map = LayoutMap(mesh)
@@ -210,7 +221,9 @@ class TorchCoreDistributedTest(testing.TestCase):
         self._ensure_distributed_initialized(port="29504")
 
         mesh = DeviceMesh(
-            shape=(1,), axis_names=["x"], devices=np.array(["cpu:0"])
+            shape=(1,),
+            axis_names=["x"],
+            devices=np.array([self._get_test_device()]),
         )
 
         layout_map = LayoutMap(mesh)
@@ -229,7 +242,9 @@ class TorchCoreDistributedTest(testing.TestCase):
         self._ensure_distributed_initialized(port="29505")
 
         mesh = DeviceMesh(
-            shape=(1,), axis_names=["x"], devices=np.array(["cpu:0"])
+            shape=(1,),
+            axis_names=["x"],
+            devices=np.array([self._get_test_device()]),
         )
 
         layout_map = LayoutMap(mesh)
@@ -255,7 +270,9 @@ class TorchCoreDistributedTest(testing.TestCase):
         self._ensure_distributed_initialized(port="29506")
 
         mesh = DeviceMesh(
-            shape=(1,), axis_names=["x"], devices=np.array(["cpu:0"])
+            shape=(1,),
+            axis_names=["x"],
+            devices=np.array([self._get_test_device()]),
         )
 
         layout_map = LayoutMap(mesh)
