@@ -119,6 +119,8 @@ def _promote_tensor_args(args, kwargs, dtensor_arg):
 
     def maybe_promote(value):
         if isinstance(value, torch.Tensor) and not isinstance(value, DTensor):
+            if value.device.type != mesh.device_type:
+                value = value.to(mesh.device_type)
             return DTensor.from_local(
                 value, device_mesh=mesh, placements=placements
             )
@@ -161,20 +163,23 @@ class KerasDTensorPromotionMode(torch.utils._python_dispatch.TorchDispatchMode):
 
 class Variable(KerasVariable):
     def _initialize_distributed(self, initializer):
+        from keras.src.backend.torch import distribution_lib
         from keras.src.distribution.distribution_lib import ModelParallel
+        from keras.src.distribution.distribution_lib import TensorLayout
         from keras.src.distribution.distribution_lib import distribution
 
         dist = distribution()
         if not isinstance(dist, ModelParallel):
             return None
 
-        from keras.src.backend.torch import distribution_lib
-
         if self._layout is None:
             self._layout = dist.get_variable_layout(self)
 
         if self._layout is None:
             return None
+
+        if isinstance(self._layout, TensorLayout):
+            self._layout = self._layout.backend_layout
 
         if callable(initializer):
             with device_scope("meta"):
@@ -191,10 +196,14 @@ class Variable(KerasVariable):
                 initializer(local_shape, dtype=self._dtype),
                 dtype=self._dtype,
             )
+            if local_tensor.device.type != self._layout.device_mesh.device_type:
+                local_tensor = local_tensor.to(
+                    self._layout.device_mesh.device_type
+                )
             dtensor = DTensor.from_local(
                 local_tensor,
-                device_mesh=meta_dtensor.device_mesh,
-                placements=meta_dtensor.placements,
+                device_mesh=self._layout.device_mesh,
+                placements=self._layout.placements,
             )
         else:
             value = initializer
@@ -204,6 +213,10 @@ class Variable(KerasVariable):
                 value.requires_grad or value.grad_fn is not None
             ):
                 value = value.detach()
+
+            if isinstance(value, torch.Tensor):
+                if value.device.type != self._layout.device_mesh.device_type:
+                    value = value.to(self._layout.device_mesh.device_type)
 
             dtensor = distribution_lib.distribute_tensor(value, self._layout)
 
@@ -235,8 +248,14 @@ class Variable(KerasVariable):
     def _direct_assign(self, value):
         if isinstance(self.value.data, DTensor):
             from keras.src.backend.torch import distribution_lib
+            from keras.src.distribution.distribution_lib import TensorLayout
 
-            value = distribution_lib.distribute_tensor(value, self._layout)
+            layout = self._layout
+            if isinstance(layout, TensorLayout):
+                layout = layout.backend_layout
+            if value.device.type != layout.device_mesh.device_type:
+                value = value.to(layout.device_mesh.device_type)
+            value = distribution_lib.distribute_tensor(value, layout)
 
         with torch.no_grad():
             self.value.copy_(value)
@@ -327,12 +346,13 @@ def convert_to_tensor(x, dtype=None, sparse=None, ragged=None):
             if not _DTENSOR_MODE_PUSHED:
                 _push_mode(KerasDTensorPromotionMode())
                 _DTENSOR_MODE_PUSHED = True
-        device = get_device()
-        if x.device != device:
-            if x.is_meta:
-                x = torch.empty_like(x, device=device)
-            else:
-                x = x.to(device)
+        else:
+            device = get_device()
+            if x.device != device:
+                if x.is_meta:
+                    x = torch.empty_like(x, device=device)
+                else:
+                    x = x.to(device)
         if dtype is not None:
             x = x.to(to_torch_dtype(dtype))
         return x

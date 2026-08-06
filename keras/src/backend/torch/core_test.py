@@ -8,7 +8,6 @@ import torch
 from torch.distributed.device_mesh import DeviceMesh as TorchDeviceMesh
 from torch.distributed.tensor import DTensor
 from torch.distributed.tensor import Replicate
-from torch.utils._python_dispatch import _push_mode
 
 from keras.src import backend
 from keras.src import testing
@@ -157,9 +156,8 @@ class TorchCoreDistributedTest(testing.TestCase):
 
         plain_tensor = torch.zeros((2, 2))
 
-        _push_mode(KerasDTensorPromotionMode())
-
-        result = dtensor + plain_tensor
+        with KerasDTensorPromotionMode():
+            result = dtensor + plain_tensor
 
         self.assertIsInstance(result, DTensor)
         self.assertTrue(torch.allclose(result.to_local(), torch.ones((2, 2))))
