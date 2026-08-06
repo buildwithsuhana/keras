@@ -160,19 +160,23 @@ class KerasDTensorPromotionMode(torch.utils._python_dispatch.TorchDispatchMode):
 
 
 class Variable(KerasVariable):
-    def _initialize_distributed(self, initializer, callable_initializer=False):
-        from keras.src.backend.torch import distribution_lib
+    def _initialize_distributed(self, initializer):
         from keras.src.distribution.distribution_lib import ModelParallel
         from keras.src.distribution.distribution_lib import distribution
 
         dist = distribution()
-        if self._layout is None and dist is not None:
-            self._layout = dist.get_variable_layout(self)
-
-        if self._layout is None or not isinstance(dist, ModelParallel):
+        if not isinstance(dist, ModelParallel):
             return None
 
-        if callable_initializer:
+        from keras.src.backend.torch import distribution_lib
+
+        if self._layout is None:
+            self._layout = dist.get_variable_layout(self)
+
+        if self._layout is None:
+            return None
+
+        if callable(initializer):
             with device_scope("meta"):
                 meta_tensor = convert_to_tensor(
                     initializer(self._shape, dtype=self._dtype),
@@ -183,13 +187,15 @@ class Variable(KerasVariable):
             )
             local_shape = meta_dtensor.to_local().shape
 
-            # Initialize local shard directly on target device
             local_tensor = convert_to_tensor(
                 initializer(local_shape, dtype=self._dtype),
                 dtype=self._dtype,
             )
-            device_mesh = meta_dtensor.device_mesh
-            placements = meta_dtensor.placements
+            dtensor = DTensor.from_local(
+                local_tensor,
+                device_mesh=meta_dtensor.device_mesh,
+                placements=meta_dtensor.placements,
+            )
         else:
             value = initializer
             if isinstance(value, torch.nn.Parameter):
@@ -201,21 +207,10 @@ class Variable(KerasVariable):
 
             dtensor = distribution_lib.distribute_tensor(value, self._layout)
 
-            local_tensor = dtensor.to_local().to(get_device())
-            device_mesh = dtensor.device_mesh
-            placements = dtensor.placements
-
-        return torch.nn.Parameter(
-            DTensor.from_local(
-                local_tensor, device_mesh=device_mesh, placements=placements
-            ),
-            requires_grad=self.trainable,
-        )
+        return torch.nn.Parameter(dtensor, requires_grad=self.trainable)
 
     def _initialize_with_initializer(self, initializer):
-        value = self._initialize_distributed(
-            initializer, callable_initializer=True
-        )
+        value = self._initialize_distributed(initializer)
         if value is not None:
             self._value = value
         else:
@@ -223,9 +218,7 @@ class Variable(KerasVariable):
 
     def _initialize(self, value):
         self._shape = self._validate_shape(value.shape)
-        new_value = self._initialize_distributed(
-            value, callable_initializer=False
-        )
+        new_value = self._initialize_distributed(value)
         if new_value is not None:
             self._value = new_value
             return
@@ -240,9 +233,11 @@ class Variable(KerasVariable):
             ).to(get_device())
 
     def _direct_assign(self, value):
-        from keras.src.backend.torch import distribution_lib
+        if isinstance(self.value.data, DTensor):
+            from keras.src.backend.torch import distribution_lib
 
-        value = distribution_lib.distribute_tensor(value, self._layout)
+            value = distribution_lib.distribute_tensor(value, self._layout)
+
         with torch.no_grad():
             self.value.copy_(value)
 
