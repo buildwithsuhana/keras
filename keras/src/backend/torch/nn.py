@@ -1,7 +1,6 @@
 import torch
 import torch.nn.functional as tnn
 from torch.distributed.tensor import DTensor
-from torch.distributed.tensor import Replicate
 
 from keras.src import backend
 from keras.src.backend.common.backend_utils import check_conv_input_channels
@@ -1533,12 +1532,6 @@ def dot_product_attention(
                     (q_len, kv_len), dtype=torch.bool, device=mask.device
                 )
             )
-            if hasattr(mask, "device_mesh"):
-                causal_mask = DTensor.from_local(
-                    causal_mask,
-                    mask.device_mesh,
-                    [Replicate()] * len(mask.placements),
-                )
             mask = torch.logical_and(mask, causal_mask)
         # Explicitly set `is_causal` to `False` when `mask` is not `None`.
         is_causal = False
