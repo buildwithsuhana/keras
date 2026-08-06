@@ -205,21 +205,36 @@ def _initialize_variable(variable, initializer, callable_initializer=False):
             ):
                 value = value.detach()
 
+            # Create a meta-tensor to determine sharding without allocation
+            with device_scope("meta"):
+                # We use a dummy meta tensor of the same shape/dtype
+                meta_tensor = torch.empty(
+                    variable._shape,
+                    dtype=to_torch_dtype(variable._dtype),
+                    device="meta",
+                )
+                meta_dtensor = distribution_lib.distribute_tensor(
+                    meta_tensor, variable._layout
+                )
+
+            # Shard the value on CPU
+            # distribute_tensor is already optimized to keep it on CPU
             dtensor = distribution_lib.distribute_tensor(
                 value, variable._layout
             )
-            if dtensor.is_meta:
-                device = get_device()
-                local_tensor = torch.empty_like(
-                    dtensor.to_local(), device=device
-                )
-                dtensor = torch_distributed_tensor.DTensor.from_local(
+
+            # Move ONLY the local shard to the target device
+            device = get_device()
+            local_tensor = dtensor.to_local().to(device)
+
+            return torch.nn.Parameter(
+                torch_distributed_tensor.DTensor.from_local(
                     local_tensor,
                     device_mesh=dtensor.device_mesh,
                     placements=dtensor.placements,
-                )
-
-            return torch.nn.Parameter(dtensor, requires_grad=variable.trainable)
+                ),
+                requires_grad=variable.trainable,
+            )
     return None
 
 

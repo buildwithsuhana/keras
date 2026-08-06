@@ -104,7 +104,7 @@ class TorchTrainer(base_trainer.Trainer):
 
         # Call torch.nn.Module.zero_grad() to clear the leftover gradients
         # for the weights from the previous train step.
-        model.zero_grad()
+        model.zero_grad(set_to_none=True)
 
         loss = self._compute_loss(
             x=x, y=y, y_pred=y_pred, sample_weight=sample_weight, training=True
@@ -130,6 +130,9 @@ class TorchTrainer(base_trainer.Trainer):
             # Update weights
             with torch.no_grad():
                 self.optimizer.apply(gradients, trainable_weights)
+
+            # Free gradients immediately to reduce peak memory
+            model.zero_grad(set_to_none=True)
         else:
             warnings.warn("The model does not have any trainable weights.")
 
