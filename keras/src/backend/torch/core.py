@@ -6,7 +6,6 @@ import os
 import ml_dtypes
 import numpy as np
 import torch
-import torch.distributed.tensor as torch_distributed_tensor
 
 from keras.src import tree
 from keras.src.backend.common import KerasVariable
@@ -38,7 +37,12 @@ elif torch.cuda.is_available():
 elif hasattr(torch, "xpu") and torch.xpu.is_available():
     DEFAULT_DEVICE = "xpu"
 else:
-    DEFAULT_DEVICE = "cpu"
+    from keras.src.utils.module_utils import torch_xla
+
+    if torch_xla.available and torch_xla.core.xla_model.xla_device_count() > 0:
+        DEFAULT_DEVICE = "tpu"
+    else:
+        DEFAULT_DEVICE = "cpu"
 
 TORCH_DTYPES = {
     "float16": torch.float16,
@@ -103,154 +107,27 @@ def to_torch_dtype(dtype):
     return standardized_dtype
 
 
-def _is_dtensor(x):
-    return hasattr(x, "device_mesh") and hasattr(x, "placements")
-
-
-def _promote_tensor_args(args=(), kwargs=None):
-    if kwargs is None:
-        kwargs = {}
-    if not args and not kwargs:
-        return args, kwargs
-
-    dtensor_arg = None
-    for arg in tree.flatten((args, kwargs)):
-        if _is_dtensor(arg):
-            dtensor_arg = arg
-            break
-
-    if dtensor_arg is None:
-        return args, kwargs
-
-    mesh = dtensor_arg.device_mesh
-    placements = [torch_distributed_tensor.Replicate()] * len(mesh.shape)
-
-    def maybe_promote(value):
-        if isinstance(value, torch.Tensor) and not _is_dtensor(value):
-            return torch_distributed_tensor.DTensor.from_local(
-                value, device_mesh=mesh, placements=placements
-            )
-        return value
-
-    return tree.map_structure(maybe_promote, (args, kwargs))
-
-
-_dtensor_patched = False
-
-
-def _patch_dtensor_torch_function():
-    global _dtensor_patched
-    if _dtensor_patched:
-        return
-
-    original_dtensor_torch_function = (
-        torch_distributed_tensor.DTensor.__torch_function__
-    )
-
-    @classmethod
-    def _dtensor_torch_function(cls, func, types, args=(), kwargs=None):
-        if kwargs is None:
-            kwargs = {}
-        if not all(
-            _is_dtensor(arg) for arg in args if isinstance(arg, torch.Tensor)
-        ) or not all(
-            _is_dtensor(v)
-            for v in kwargs.values()
-            if isinstance(v, torch.Tensor)
-        ):
-            promoted_args, promoted_kwargs = _promote_tensor_args(args, kwargs)
-            return func(*promoted_args, **promoted_kwargs)
-        return original_dtensor_torch_function(func, types, args, kwargs)
-
-    torch_distributed_tensor.DTensor.__torch_function__ = (
-        _dtensor_torch_function
-    )
-    _dtensor_patched = True
-
-
-def _maybe_promote_to_dtensor(x):
-    if _is_dtensor(x):
-        _patch_dtensor_torch_function()
-    return x
-
-
 class Variable(KerasVariable):
-    def _initialize_layout(self):
-        from keras.src.distribution.distribution_lib import distribution
-
-        dist = distribution()
-        if self._layout is None and dist is not None:
-            self._layout = dist.get_variable_layout(self)
-
     def _initialize_with_initializer(self, initializer):
-        self._initialize_layout()
-        from keras.src.distribution.distribution_lib import ModelParallel
+        from keras.src.backend.torch import distribution_lib
 
-        dist = global_state.get_global_attribute("distribution")
-        if self._layout is not None and isinstance(dist, ModelParallel):
-            from keras.src.backend.torch import distribution_lib
-
-            # 1. Distribute a meta-tensor to get the local shape
-            with device_scope("meta"):
-                meta_tensor = convert_to_tensor(
-                    initializer(self._shape, dtype=self._dtype),
-                    dtype=self._dtype,
-                )
-            meta_dtensor = distribution_lib.distribute_tensor(
-                meta_tensor, self._layout
-            )
-            local_shape = meta_dtensor.to_local().shape
-
-            # 2. Initialize locally on the actual device
-            local_tensor = convert_to_tensor(
-                initializer(local_shape, dtype=self._dtype),
-                dtype=self._dtype,
-            ).to(get_device())
-
-            self._value = torch.nn.Parameter(
-                torch_distributed_tensor.DTensor.from_local(
-                    local_tensor,
-                    device_mesh=meta_dtensor.device_mesh,
-                    placements=meta_dtensor.placements,
-                ),
-                requires_grad=self.trainable,
-            )
-            return
-
-        super()._initialize_with_initializer(initializer)
+        value = distribution_lib._initialize_variable(
+            self, initializer, callable_initializer=True
+        )
+        if value is not None:
+            self._value = value
+        else:
+            super()._initialize_with_initializer(initializer)
 
     def _initialize(self, value):
         from keras.src.backend.torch import distribution_lib
-        from keras.src.distribution.distribution_lib import ModelParallel
 
         self._shape = self._validate_shape(value.shape)
-        self._initialize_layout()
-
-        dist = global_state.get_global_attribute("distribution")
-        if self._layout is not None and isinstance(dist, ModelParallel):
-            if isinstance(value, torch.nn.Parameter):
-                value = value.data
-            if value.requires_grad or (
-                hasattr(value, "grad_fn") and value.grad_fn is not None
-            ):
-                value = value.detach()
-
-            dtensor = distribution_lib.distribute_tensor(value, self._layout)
-            if dtensor.is_meta:
-                # Meta -> Actual device transition
-                device = get_device()
-                local_tensor = torch.empty_like(
-                    dtensor.to_local(), device=device
-                )
-                dtensor = torch_distributed_tensor.DTensor.from_local(
-                    local_tensor,
-                    device_mesh=dtensor.device_mesh,
-                    placements=dtensor.placements,
-                )
-
-            self._value = torch.nn.Parameter(
-                dtensor, requires_grad=self.trainable
-            )
+        new_value = distribution_lib._initialize_variable(
+            self, value, callable_initializer=False
+        )
+        if new_value is not None:
+            self._value = new_value
             return
 
         if isinstance(value, torch.nn.Parameter):
@@ -265,9 +142,19 @@ class Variable(KerasVariable):
     def _direct_assign(self, value):
         from keras.src.backend.torch import distribution_lib
 
+        if value.requires_grad or (
+            hasattr(value, "grad_fn") and value.grad_fn is not None
+        ):
+            value = value.detach()
+
         value = distribution_lib.distribute_tensor(value, self._layout)
-        with torch.no_grad():
-            self.value.copy_(value)
+        if hasattr(value, "device_mesh"):
+            self._value = torch.nn.Parameter(
+                value, requires_grad=self.trainable
+            )
+        else:
+            with torch.no_grad():
+                self.value.copy_(value)
 
     def _convert_to_tensor(self, value, dtype=None):
         return convert_to_tensor(value, dtype=dtype)
@@ -275,17 +162,7 @@ class Variable(KerasVariable):
     # Overload native accessor.
     @classmethod
     def __torch_function__(cls, func, types, args=(), kwargs=None):
-        _patch_dtensor_torch_function()
-        if kwargs is None:
-            kwargs = {}
-        args = tree.map_structure(
-            lambda x: x.value if isinstance(x, Variable) else x, args
-        )
-        kwargs = tree.map_structure(
-            lambda x: x.value if isinstance(x, Variable) else x, kwargs
-        )
-        promoted_args, promoted_kwargs = _promote_tensor_args(args, kwargs)
-        return func(*promoted_args, **promoted_kwargs)
+        return func(*args, **kwargs)
 
     def __array__(self, dtype=None):
         value = convert_to_numpy(self.value)
@@ -361,7 +238,8 @@ def convert_to_tensor(x, dtype=None, sparse=None, ragged=None):
                 x = x.to(device)
         if dtype is not None:
             x = x.to(to_torch_dtype(dtype))
-        return _maybe_promote_to_dtensor(x)
+
+        return x
     if isinstance(x, (bool, int, float, complex)):
         if dtype is not None:
             dt = to_torch_dtype(dtype)
@@ -373,15 +251,11 @@ def convert_to_tensor(x, dtype=None, sparse=None, ragged=None):
             dt = to_torch_dtype(floatx())
         else:
             dt = torch.complex64
-        return _maybe_promote_to_dtensor(
-            torch.as_tensor(x, dtype=dt, device=get_device())
-        )
+        return torch.as_tensor(x, dtype=dt, device=get_device())
     if isinstance(x, (torch.SymInt, torch.SymFloat)):
         # Scalar symbolic values from torch.export can't go through numpy.
         dt = to_torch_dtype(dtype) if dtype is not None else None
-        return _maybe_promote_to_dtensor(
-            torch.as_tensor(x, dtype=dt, device=get_device())
-        )
+        return torch.as_tensor(x, dtype=dt, device=get_device())
 
     # Convert to np in case of any array-like that is not list or tuple.
     # Skip scalar Python values to avoid np.array(float) -> float64, which
@@ -390,9 +264,7 @@ def convert_to_tensor(x, dtype=None, sparse=None, ragged=None):
     if isinstance(x, (list, tuple)):
         if len(x) > 0 and any(isinstance(x1, torch.Tensor) for x1 in x):
             # Handle list or tuple of torch tensors
-            return _maybe_promote_to_dtensor(
-                torch.stack([convert_to_tensor(x1) for x1 in x])
-            )
+            return torch.stack([convert_to_tensor(x1) for x1 in x])
         if len(x) > 0 and any(
             isinstance(x1, (torch.SymInt, torch.SymFloat))
             for x1 in tree.flatten(x)
@@ -400,9 +272,7 @@ def convert_to_tensor(x, dtype=None, sparse=None, ragged=None):
             # Symbolic shape values from torch.export can't go through numpy
             # and don't have a .dtype attribute. Use torch.as_tensor directly.
             dt = to_torch_dtype(dtype) if dtype is not None else None
-            return _maybe_promote_to_dtensor(
-                torch.as_tensor(x, dtype=dt, device=get_device())
-            )
+            return torch.as_tensor(x, dtype=dt, device=get_device())
     elif not isinstance(x, (bool, int, float)):
         x = np.array(x)
     if isinstance(x, np.ndarray):
@@ -419,26 +289,15 @@ def convert_to_tensor(x, dtype=None, sparse=None, ragged=None):
             *[getattr(item, "dtype", type(item)) for item in tree.flatten(x)]
         )
     dtype = to_torch_dtype(dtype)
-    return _maybe_promote_to_dtensor(
-        torch.as_tensor(x, dtype=dtype, device=get_device())
-    )
+    return torch.as_tensor(x, dtype=dtype, device=get_device())
 
 
 def convert_to_numpy(x):
     def transform(x):
         if is_tensor(x):
-            if hasattr(x, "to_local"):
-                # For DTensor, we need to gather the full tensor if it's sharded
-                # or partially sharded.
-                if hasattr(x, "placements"):
-                    from torch.distributed.tensor import Replicate
+            from keras.src.backend.torch import distribution_lib
 
-                    if any(not isinstance(p, Replicate) for p in x.placements):
-                        x = x.redistribute(
-                            device_mesh=x.device_mesh,
-                            placements=[Replicate()] * len(x.placements),
-                        )
-                x = x.to_local()
+            x = distribution_lib._prepare_for_numpy(x)
             if x.requires_grad:
                 x = x.detach()
             # Tensor has to be moved to CPU before converting to numpy.
@@ -480,10 +339,9 @@ def cast(x, dtype):
         x = x.value
     if is_tensor(x):
         if x.dtype == dtype:
-            res = x
+            return x
         else:
-            res = x.to(dtype)
-        return _maybe_promote_to_dtensor(res)
+            return x.to(dtype)
     return convert_to_tensor(x, dtype)
 
 
@@ -503,12 +361,11 @@ def compute_output_spec(fn, *args, **kwargs):
                 for i, e in enumerate(shape):
                     if e is None:
                         shape[i] = fill_value
-            res = torch.ones(
+            return torch.ones(
                 size=shape,
                 dtype=TORCH_DTYPES[x.dtype],
                 device=get_device(),
             )
-            return _maybe_promote_to_dtensor(res)
         return x
 
     def convert_torch_to_keras_tensor(x):
