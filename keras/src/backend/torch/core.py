@@ -415,9 +415,6 @@ def convert_to_numpy(x):
             x = x.value
         if is_tensor(x):
             if isinstance(x, DTensor):
-                # Avoid redistribute to prevent deadlocks if not all ranks
-                # call this.
-                # This returns the local chunk only for Sharded tensors.
                 x = x.to_local()
             if x.requires_grad:
                 x = x.detach()
