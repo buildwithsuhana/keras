@@ -630,19 +630,21 @@ class TorchTrainer(base_trainer.Trainer):
         return batch_outputs
 
 
-def _distribute_data(data, layouts=None):
+def _get_data_backend_layouts(data, active_distribution):
+    def get_layout(d):
+        if d is None:
+            return None
+        return active_distribution.get_data_layout(d.shape).backend_layout
+
+    return tree.map_structure(get_layout, data)
+
+
+def _distribute_data(data):
     active_distribution = distribution()
     if active_distribution is not None and isinstance(
         active_distribution, ModelParallel
     ):
-        if layouts is None:
-
-            def get_layout(d):
-                if d is None:
-                    return None
-                return active_distribution.get_data_layout(d.shape)
-
-            layouts = tree.map_structure(get_layout, data)
+        layouts = _get_data_backend_layouts(data, active_distribution)
         return tree.map_structure(
             lambda d, l: distribute_data_input(d, l),
             data,
@@ -664,34 +666,11 @@ class TorchEpochIterator(EpochIterator):
 
     def _get_distributed_iterator(self, active_distribution):
         layouts = None
-        for data in self.data_adapter.get_numpy_iterator():
+        for data in self.data_adapter.get_torch_dataloader():
             if layouts is None:
-
-                def get_layout(d):
-                    if d is None:
-                        return None
-                    return active_distribution.get_data_layout(d.shape)
-
-                layouts = tree.map_structure(get_layout, data)
-            yield _distribute_data(data, layouts)
-
-    def _one_batch_ahead_iterator(self, numpy_iterator):
-        """Initiate transfers to the device one batch ahead.
-
-        This utility takes an iterator and returns a new iterator which
-        initiates the transfer to device one step ahead. This can improve the
-        performance of training loops significantly by overlapping compute and
-        data transfer.
-        """
-        next_batch = None
-        for batch in numpy_iterator:
-            batch = _distribute_data(batch)
-            if next_batch is None:
-                next_batch = batch
-            else:
-                current_batch = next_batch
-                next_batch = batch
-                yield current_batch
-
-        if next_batch is not None:
-            yield next_batch
+                layouts = _get_data_backend_layouts(data, active_distribution)
+            yield tree.map_structure(
+                lambda d, l: distribute_data_input(d, l),
+                data,
+                layouts,
+            )

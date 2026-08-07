@@ -120,6 +120,9 @@ class TorchCoreTest(testing.TestCase):
         self.assertEqual(tuple(result.shape), (2, 2, 2))
 
 
+@pytest.mark.skipif(
+    backend.backend() != "torch", reason="Requires torch backend"
+)
 class TorchCoreDistributedTest(testing.TestCase):
     def set_env(self, key, value):
         old = os.environ.get(key)
@@ -202,7 +205,9 @@ class TorchCoreDistributedTest(testing.TestCase):
         self._ensure_distributed_initialized(port="29503")
 
         mesh = DeviceMesh(
-            shape=(1,), axis_names=["x"], devices=np.array(["cpu:0"])
+            shape=(1,),
+            axis_names=["x"],
+            devices=np.array([distribution_lib.list_devices()[0]]),
         )
 
         layout_map = LayoutMap(mesh)
@@ -224,7 +229,9 @@ class TorchCoreDistributedTest(testing.TestCase):
         self._ensure_distributed_initialized(port="29504")
 
         mesh = DeviceMesh(
-            shape=(1,), axis_names=["x"], devices=np.array(["cpu:0"])
+            shape=(1,),
+            axis_names=["x"],
+            devices=np.array([distribution_lib.list_devices()[0]]),
         )
 
         layout_map = LayoutMap(mesh)
@@ -243,7 +250,9 @@ class TorchCoreDistributedTest(testing.TestCase):
         self._ensure_distributed_initialized(port="29505")
 
         mesh = DeviceMesh(
-            shape=(1,), axis_names=["x"], devices=np.array(["cpu:0"])
+            shape=(1,),
+            axis_names=["x"],
+            devices=np.array([distribution_lib.list_devices()[0]]),
         )
 
         layout_map = LayoutMap(mesh)
@@ -262,14 +271,19 @@ class TorchCoreDistributedTest(testing.TestCase):
 
         self.assertIsInstance(v.value.data, DTensor)
         self.assertTrue(
-            torch.allclose(v.value.data.to_local(), torch.zeros((2, 2)))
+            torch.allclose(
+                v.value.data.to_local(),
+                torch.zeros((2, 2), device=v.value.data.to_local().device),
+            )
         )
 
     def test_variable_initialize_distributed_requires_grad(self):
         self._ensure_distributed_initialized(port="29506")
 
         mesh = DeviceMesh(
-            shape=(1,), axis_names=["x"], devices=np.array(["cpu:0"])
+            shape=(1,),
+            axis_names=["x"],
+            devices=np.array([distribution_lib.list_devices()[0]]),
         )
 
         layout_map = LayoutMap(mesh)
@@ -283,3 +297,30 @@ class TorchCoreDistributedTest(testing.TestCase):
 
         self.assertIsInstance(v.value, torch.nn.Parameter)
         self.assertIsInstance(v.value.data, DTensor)
+
+    def test_variable_initialize_distributed_device_mismatch(self):
+        self._ensure_distributed_initialized(port="29507")
+
+        mesh = DeviceMesh(
+            shape=(1,),
+            axis_names=["x"],
+            devices=np.array([distribution_lib.list_devices()[0]]),
+        )
+
+        layout_map = LayoutMap(mesh)
+        layout_map[".*"] = ("x", None)
+        dist = ModelParallel(layout_map=layout_map)
+
+        set_distribution(dist)
+
+        # 1. Callable initializer returning tensor on different device
+        def initializer(shape, dtype):
+            return torch.ones(shape, device=torch_core.get_device())
+
+        v = Variable(initializer, shape=(2, 2), dtype="float32")
+        self.assertEqual(v.value.device.type, mesh.backend_mesh.device_type)
+
+        # 2. Value initializer on different device
+        tensor = torch.ones((2, 2), device=torch_core.get_device())
+        v2 = Variable(tensor)
+        self.assertEqual(v2.value.device.type, mesh.backend_mesh.device_type)

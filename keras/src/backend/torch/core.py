@@ -183,11 +183,11 @@ class Variable(KerasVariable):
             self._layout = self._layout.backend_layout
 
         if callable(initializer):
-            with device_scope("meta"):
-                meta_tensor = convert_to_tensor(
-                    initializer(self._shape, dtype=self._dtype),
-                    dtype=self._dtype,
-                )
+            meta_tensor = torch.empty(
+                self._shape,
+                dtype=to_torch_dtype(self._dtype),
+                device="meta",
+            )
             meta_dtensor = distribution_lib.distribute_tensor(
                 meta_tensor, self._layout
             )
@@ -415,11 +415,9 @@ def convert_to_numpy(x):
             x = x.value
         if is_tensor(x):
             if isinstance(x, DTensor):
-                if any(not isinstance(p, Replicate) for p in x.placements):
-                    x = x.redistribute(
-                        device_mesh=x.device_mesh,
-                        placements=[Replicate()] * len(x.placements),
-                    )
+                # Avoid redistribute to prevent deadlocks if not all ranks
+                # call this.
+                # This returns the local chunk only for Sharded tensors.
                 x = x.to_local()
             if x.requires_grad:
                 x = x.detach()
