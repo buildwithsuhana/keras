@@ -162,13 +162,9 @@ class KerasDTensorPromotionMode(torch.utils._python_dispatch.TorchDispatchMode):
 
 class Variable(KerasVariable):
     def _initialize_distributed(self, initializer):
-        from keras.src.distribution.distribution_lib import ModelParallel
         from keras.src.distribution.distribution_lib import distribution
 
         dist = distribution()
-        if not isinstance(dist, ModelParallel):
-            return None
-
         from keras.src.backend.torch import distribution_lib
 
         if self._layout is None:
@@ -183,43 +179,22 @@ class Variable(KerasVariable):
             self._layout = self._layout.backend_layout
 
         if callable(initializer):
-            meta_tensor = torch.empty(
-                self._shape,
-                dtype=to_torch_dtype(self._dtype),
-                device="meta",
-            )
-            meta_dtensor = distribution_lib.distribute_tensor(
-                meta_tensor, self._layout
-            )
-            local_shape = meta_dtensor.to_local().shape
-
-            local_tensor = convert_to_tensor(
-                initializer(local_shape, dtype=self._dtype),
-                dtype=self._dtype,
-            )
-            if local_tensor.device.type != self._layout.device_mesh.device_type:
-                local_tensor = local_tensor.to(
-                    self._layout.device_mesh.device_type
-                )
-            dtensor = DTensor.from_local(
-                local_tensor,
-                device_mesh=self._layout.device_mesh,
-                placements=self._layout.placements,
-            )
+            value = initializer(self._shape, dtype=self._dtype)
         else:
             value = initializer
-            if isinstance(value, torch.nn.Parameter):
-                value = value.data
-            if isinstance(value, torch.Tensor) and (
-                value.requires_grad or value.grad_fn is not None
-            ):
-                value = value.detach()
 
-            if isinstance(value, torch.Tensor):
-                if value.device.type != self._layout.device_mesh.device_type:
-                    value = value.to(self._layout.device_mesh.device_type)
+        if isinstance(value, torch.nn.Parameter):
+            value = value.data
+        if isinstance(value, torch.Tensor) and (
+            value.requires_grad or value.grad_fn is not None
+        ):
+            value = value.detach()
 
-            dtensor = distribution_lib.distribute_tensor(value, self._layout)
+        if isinstance(value, torch.Tensor):
+            if value.device.type != self._layout.device_mesh.device_type:
+                value = value.to(self._layout.device_mesh.device_type)
+
+        dtensor = distribution_lib.distribute_tensor(value, self._layout)
 
         return torch.nn.Parameter(dtensor, requires_grad=self.trainable)
 
