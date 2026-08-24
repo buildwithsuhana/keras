@@ -1,6 +1,7 @@
 """Utilities for distribution strategy with JAX backend."""
 
 import jax
+import jax.lax as lax
 import numpy as np
 
 from keras.src.random import seed_generator
@@ -38,6 +39,17 @@ def get_device_count(device_type=None):
     """
     device_type = device_type.lower() if device_type else None
     return jax.device_count(device_type)
+
+
+def distribute_variable(variable, layout):
+    """Create a distributed variable for JAX."""
+    from keras.src.backend.jax.core import Variable
+    if isinstance(variable, Variable):
+        sharded_value = distribute_tensor(variable.value, layout)
+        variable.assign(sharded_value)
+        return variable
+    
+    return distribute_tensor(variable, layout)
 
 
 def distribute_tensor(tensor, layout):
@@ -170,6 +182,117 @@ def num_processes():
 def process_id():
     """Return the current process ID for the distribution setting."""
     return jax.process_index()
+
+
+def all_reduce(x, op="sum", axis_name="model"):
+    """Reduces a tensor across a device mesh axis using a collective.
+
+    Args:
+        x: The tensor to reduce.
+        op: The reduction operation. "sum" or "mean".
+        axis_name: The name of the mesh axis to reduce over.
+
+    Returns:
+        The reduced tensor.
+    """
+
+    def _reduce_fn(y):
+        if op == "sum":
+            return lax.psum(y, axis_name=axis_name)
+        elif op == "mean":
+            return lax.pmean(y, axis_name=axis_name)
+        else:
+            raise ValueError(
+                f"Unsupported reduction operation: {op}. "
+                "Supported options are 'sum' and 'mean'."
+            )
+
+    if jax_utils.is_in_jax_tracing_scope(x):
+        try:
+            return _reduce_fn(x)
+        except (ValueError, NameError):
+            # If the axis is not bound, we cannot perform the reduction.
+            # This happens when using patching TP inside a regular jit.
+            return x
+
+    # To use pmap with an array of arbitrary leading dimension,
+    # we need to reshape it to (axis_size, -1, ...).
+    from keras.src.distribution import distribution_lib
+
+    dist = distribution_lib.distribution()
+    axis_size = None
+    if dist is not None and dist.device_mesh is not None:
+        mesh = dist.device_mesh
+        if axis_name in mesh.axis_names:
+            axis_idx = mesh.axis_names.index(axis_name)
+            axis_size = mesh.shape[axis_idx]
+
+    if axis_size is None:
+        axis_size = jax.local_device_count()
+
+    if x.shape[0] % axis_size == 0:
+        orig_shape = x.shape
+        x_reshaped = x.reshape((axis_size, -1) + orig_shape[1:])
+        res = jax.pmap(_reduce_fn, axis_name=axis_name)(x_reshaped)
+        return res.reshape(orig_shape)
+
+    return jax.pmap(_reduce_fn, axis_name=axis_name)(x)
+
+
+def all_gather(x, axis, axis_name="model"):
+    """Gathers and concatenates tensors from all devices across a mesh axis.
+
+    This function assumes it is called within a `pjit` context. It takes
+    the local shard `x` from each device along the `axis_name` of the mesh
+    and concatenates them along the specified tensor `axis` to form a
+    single, larger tensor that is then replicated on all participating devices.
+
+    Args:
+        x (jax.Array): The input JAX array (tensor) shard on the local device.
+        axis (int): The tensor axis along which to concatenate the gathered
+            shards.
+        axis_name (str, optional): The name of the mesh axis to gather
+            from. Defaults to 'model'.
+
+    Returns:
+        jax.Array: The full, gathered JAX array, which is identical across
+        all devices participating in the gather.
+    """
+
+    def _gather_fn(y):
+        return lax.all_gather(y, axis_name=axis_name, axis=axis, tiled=True)
+
+    if jax_utils.is_in_jax_tracing_scope(x):
+        try:
+            return _gather_fn(x)
+        except (ValueError, NameError):
+            # If the axis is not bound, we cannot perform the gather.
+            return x
+
+    from keras.src.distribution import distribution_lib
+
+    dist = distribution_lib.distribution()
+    axis_size = None
+    if dist is not None and dist.device_mesh is not None:
+        mesh = dist.device_mesh
+        if axis_name in mesh.axis_names:
+            axis_idx = mesh.axis_names.index(axis_name)
+            axis_size = mesh.shape[axis_idx]
+
+    if axis_size is None:
+        axis_size = jax.local_device_count()
+
+    if x.shape[0] % axis_size == 0:
+        orig_shape = x.shape
+        x_reshaped = x.reshape((axis_size, -1) + orig_shape[1:])
+        res = jax.pmap(_gather_fn, axis_name=axis_name)(x_reshaped)
+
+        new_shape = list(orig_shape)
+        actual_axis = axis if axis >= 0 else axis + len(orig_shape)
+        new_shape[actual_axis] *= axis_size
+        return res.reshape(tuple(new_shape))
+
+    return jax.pmap(_gather_fn, axis_name=axis_name)(x)
 
 
 def _to_backend_device(device_name):

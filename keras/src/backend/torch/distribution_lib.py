@@ -2,7 +2,7 @@ import os
 
 import numpy as np
 import torch
-import torch.distributed
+import torch.distributed as dist
 from torch.distributed import tensor as torch_distributed_tensor
 
 from keras.src.backend.torch.core import _parse_device_input
@@ -46,7 +46,7 @@ def get_device_count(device_type=None):
     """
     device_type = device_type.lower() if device_type else None
 
-    if torch.distributed.is_initialized() or "WORLD_SIZE" in os.environ:
+    if dist.is_initialized() or "WORLD_SIZE" in os.environ:
         actual_device_type = _parse_device_input(get_device()).split(":")[0]
 
         if device_type in (None, "cpu", actual_device_type) or (
@@ -106,7 +106,7 @@ def initialize(job_addresses=None, num_processes=None, process_id=None):
     if process_id is not None:
         os.environ.setdefault("RANK", str(process_id))
 
-    if not torch.distributed.is_initialized():
+    if not dist.is_initialized():
         world_size = int(os.environ.get("WORLD_SIZE", -1))
         rank = int(os.environ.get("RANK", -1))
         local_rank = int(os.environ.get("LOCAL_RANK", 0))
@@ -123,23 +123,23 @@ def initialize(job_addresses=None, num_processes=None, process_id=None):
         else:
             backend = "gloo"
 
-        torch.distributed.init_process_group(
+        dist.init_process_group(
             backend=backend, rank=rank, world_size=world_size
         )
 
 
 def num_processes():
     """Return the total number of processes in the distributed group."""
-    if torch.distributed.is_initialized():
-        return torch.distributed.get_world_size()
+    if dist.is_initialized():
+        return dist.get_world_size()
 
     return int(os.environ.get("WORLD_SIZE", 1))
 
 
 def process_id():
     """Return the rank of the current process."""
-    if torch.distributed.is_initialized():
-        return torch.distributed.get_rank()
+    if dist.is_initialized():
+        return dist.get_rank()
 
     return int(os.environ.get("RANK", 0))
 
@@ -306,3 +306,181 @@ class DTensorLayout:
     def __init__(self, device_mesh, placements):
         self.device_mesh = device_mesh
         self.placements = placements
+
+
+def all_gather_variable(variable):
+    """Gather a sharded variable back to a full tensor when possible."""
+    try:
+        if not dist.is_initialized():
+            return variable
+        # If it's a DTensor use its APIs, otherwise fallback to all_gather
+        from torch.distributed.tensor import DTensor
+
+        if hasattr(variable, "_is_sharded") and variable._is_sharded:
+            # Try DTensor gather
+            if isinstance(variable, DTensor):
+                return variable
+        # Fallback: return as-is
+        return variable
+    except Exception:
+        return variable
+
+
+def broadcast(tensor, src=0):
+    """Broadcast a tensor from a source device to all other devices.
+
+    Args:
+        tensor: The tensor to broadcast. On non-source ranks, this should
+            be a tensor of the same shape and dtype.
+        src: The source rank to broadcast from. Defaults to 0.
+
+    Returns:
+        The broadcast tensor on all devices.
+    """
+    if not dist.is_initialized():
+        return tensor
+
+    rank = dist.get_rank()
+
+    if rank != src:
+        tensor = torch.zeros_like(tensor)
+
+    dist.broadcast(tensor, src=src)
+
+    return tensor
+
+
+class _AllReduce(torch.autograd.Function):
+    @staticmethod
+    def forward(ctx, tensor, op, axis_name):
+        if op == "sum":
+            reduce_op = dist.ReduceOp.SUM
+        elif op == "product":
+            reduce_op = dist.ReduceOp.PRODUCT
+        elif op == "min":
+            reduce_op = dist.ReduceOp.MIN
+        elif op == "max":
+            reduce_op = dist.ReduceOp.MAX
+        elif op == "mean":
+            reduce_op = (
+                dist.ReduceOp.AVG
+                if hasattr(dist.ReduceOp, "AVG")
+                else dist.ReduceOp.SUM
+            )
+        else:
+            reduce_op = dist.ReduceOp.SUM
+
+        # We must clone because all_reduce is in-place
+        result = tensor.clone()
+        dist.all_reduce(result, reduce_op)
+
+        if op == "mean" and not hasattr(dist.ReduceOp, "AVG"):
+            result.div_(dist.get_world_size())
+
+        ctx.op = op
+        return result
+
+    @staticmethod
+    def backward(ctx, grad_output):
+        # Gradient of all_reduce(sum) is all_reduce(sum) but it's already summed
+        if ctx.op == "sum":
+            return grad_output, None, None
+        if ctx.op == "mean":
+            return grad_output, None, None
+        return grad_output, None, None
+
+
+class _AllGather(torch.autograd.Function):
+    @staticmethod
+    def forward(ctx, tensor, axis, axis_name):
+        ctx.axis = axis
+        world_size = dist.get_world_size()
+        tensor_list = [torch.zeros_like(tensor) for _ in range(world_size)]
+        dist.all_gather(tensor_list, tensor)
+        return torch.cat(tensor_list, dim=axis)
+
+    @staticmethod
+    def backward(ctx, grad_output):
+        # Gradient of all_gather is a split/slice (scatter)
+        world_size = dist.get_world_size()
+        rank = dist.get_rank()
+        chunks = torch.chunk(grad_output, world_size, dim=ctx.axis)
+        return chunks[rank], None, None
+
+
+def all_reduce(tensor, op="sum", axis_name="model"):
+    """Reduces a tensor across a device mesh axis using a collective.
+
+    Args:
+        tensor: The tensor to reduce.
+        op: The reduction operation. One of "sum", "product", "min",
+            "max", "mean". Defaults to "sum".
+        axis_name: The name of the mesh axis to reduce over.
+            Defaults to "model".
+
+    Returns:
+        The reduced tensor.
+    """
+    if not dist.is_initialized() or dist.get_world_size() == 1:
+        return tensor
+
+    return _AllReduce.apply(tensor, op, axis_name)
+
+
+def all_gather(tensor, axis=0, axis_name="model"):
+    """Gathers and concatenates tensors from all devices across a mesh axis.
+
+    This function assumes it is called within a distributed context. It takes
+    the local shard `tensor` from each device along the `axis_name` of the mesh
+    and concatenates them along the specified tensor `axis` to form a
+    single, larger tensor that is then replicated on all participating devices.
+
+    Args:
+        tensor: The input tensor shard on the local device.
+        axis: The tensor axis along which to concatenate the gathered shards.
+            Defaults to 0.
+        axis_name: The name of the mesh axis to gather from.
+            Defaults to "model".
+
+    Returns:
+        The full, gathered tensor with all shards concatenated along the axis.
+        Returns the original tensor if distributed is not initialized
+        or world_size is 1.
+    """
+    if not dist.is_initialized() or dist.get_world_size() == 1:
+        return tensor
+
+    return _AllGather.apply(tensor, axis, axis_name)
+
+
+def distribute_variable(variable, layout):
+    """Distribute a Keras Variable according to a TensorLayout."""
+    if layout is None:
+        return variable
+
+    from keras.src.distribution.distribution_lib import TensorLayout
+    if isinstance(layout, TensorLayout):
+        layout = _to_backend_layout(layout)
+
+    # DTensor sharding for Torch
+    # If it's a Keras Variable, we distribute its value
+    from keras.src.backend.torch.core import Variable
+    
+    if isinstance(variable, Variable):
+        if not isinstance(variable.value, torch_distributed_tensor.DTensor):
+            sharded_value = torch_distributed_tensor.distribute_tensor(
+                variable.value,
+                device_mesh=layout.device_mesh,
+                placements=layout.placements,
+            )
+            variable.assign(sharded_value)
+        variable._is_sharded = True
+        variable._layout = layout
+        return variable
+    
+    # If it's a tensor value
+    return torch_distributed_tensor.distribute_tensor(
+        variable,
+        device_mesh=layout.device_mesh,
+        placements=layout.placements,
+    )

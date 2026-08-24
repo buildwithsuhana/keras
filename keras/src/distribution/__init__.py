@@ -1,3 +1,4 @@
+from keras.src.distribution.distribution_lib import AutoTPDistribution
 from keras.src.distribution.distribution_lib import DataParallel
 from keras.src.distribution.distribution_lib import DeviceMesh
 from keras.src.distribution.distribution_lib import Distribution
