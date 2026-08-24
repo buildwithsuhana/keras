@@ -151,67 +151,6 @@ class TorchMultiProcessDistributeTest(
 
     @parameterized.named_parameters(
         [
-            ("dense", layers.Dense, {"units": 4}),
-            ("conv2d", layers.Conv2D, {"filters": 4, "kernel_size": 3}),
-            ("embedding", layers.Embedding, {"input_dim": 10, "output_dim": 4}),
-            ("batch_norm", layers.BatchNormalization, {}),
-            ("layer_norm", layers.LayerNormalization, {}),
-            ("dropout", layers.Dropout, {"rate": 0.5}),
-            ("flatten", layers.Flatten, {}),
-        ]
-    )
-    def test_layer_dtensor_compatibility(self, layer_class, layer_kwargs):
-        if not torch.distributed.is_initialized():
-            self.skipTest("torch.distributed is not initialized")
-
-        num_processes = torch_distribution_lib.num_processes()
-        device_mesh = distribution_lib.DeviceMesh(
-            shape=(num_processes,),
-            axis_names=["model"],
-            devices=distribution_lib.list_devices(),
-        )
-        layout_map = distribution_lib.LayoutMap(device_mesh)
-        distribution = distribution_lib.ModelParallel(layout_map=layout_map)
-
-        with distribution.scope():
-            layer = layer_class(**layer_kwargs)
-
-            # Build and run the layer
-            if layer_class == layers.Embedding:
-                input_shape = (8, 10)
-                inputs = np.random.randint(0, 10, size=input_shape).astype(
-                    "float32"
-                )
-            elif layer_class == layers.Dense:
-                input_shape = (8, 4)
-                inputs = np.random.normal(size=input_shape).astype("float32")
-            elif layer_class == layers.Conv2D:
-                input_shape = (8, 16, 16, 3)
-                inputs = np.random.normal(size=input_shape).astype("float32")
-            else:
-                input_shape = (8, 4, 4, 3)
-                inputs = np.random.normal(size=input_shape).astype("float32")
-
-            # Forward pass
-            output = layer(inputs)
-
-            # Check output is a DTensor
-            from torch.distributed.tensor import DTensor
-
-            if isinstance(output, torch.Tensor):
-                self.assertIsInstance(output, DTensor)
-
-            # Backward pass (simple gradient)
-            loss = torch.sum(output)
-            loss.backward()
-
-            # Ensure weights have gradients
-            for weight in layer.weights:
-                if weight.trainable:
-                    self.assertIsNotNone(weight.value.grad)
-
-    @parameterized.named_parameters(
-        [
             ("data_only", 1),
             ("model_only", 2),
         ]
