@@ -8,6 +8,9 @@ import time
 import numpy as np
 import psutil
 
+# Explicitly disable X64 for JAX to ensure pure float32
+os.environ["JAX_ENABLE_X64"] = "False"
+
 class MemoryTracker:
     def __init__(self):
         self.peak_cpu = 0
@@ -57,8 +60,10 @@ def run_training(rank, world_size, backend):
     import keras
     import keras_hub
     import tensorflow as tf
+    import time
     from keras.src.distribution.distribution_lib import AutoTPDistribution, DeviceMesh, list_devices
 
+    # 0. SETUP PRECISION TO FLOAT32
     keras.backend.set_floatx("float32")
     gc.collect()
     tracker = MemoryTracker()
@@ -73,10 +78,14 @@ def run_training(rank, world_size, backend):
     
     device_mesh = DeviceMesh(shape=(world_size,), axis_names=("model",), devices=devices)
 
-    # 1. Plan Generation (Fresh Instance)
+    # 1. Plan Generation
     template_model = keras_hub.models.OPTBackbone.from_preset("opt_125m_en", dropout=0.0)
-    # Build to resolve paths
     _ = template_model({"token_ids": np.ones((1, 32), "int32"), "padding_mask": np.ones((1, 32), "int32")})
+    
+    if rank == 0:
+        print("🔍 Model Layers:")
+        for layer in template_model._flatten_layers(recursive=True):
+            print(f"   - Name: {layer.name}, Path: {layer.path}, Class: {layer.__class__.__name__}")
     
     distribution = AutoTPDistribution(template_model, device_mesh=device_mesh)
     
@@ -86,63 +95,48 @@ def run_training(rank, world_size, backend):
     # 3. Create Real Training Model
     model = keras_hub.models.OPTBackbone.from_preset("opt_125m_en", dropout=0.0)
     
-    is_jit = True if backend == "jax" else False
-    model.compile(
-        optimizer=keras.optimizers.Adam(learning_rate=1e-5),
-        loss="mse",
-        jit_compile=is_jit,
-    )
-    
-    # 4. Deterministic Data Generation
-    np.random.seed(42)
-    global_batch_size = 8
-    steps = 5
-    num_total_samples = global_batch_size * steps
-
-    token_ids = np.random.randint(0, 50272, (num_total_samples, 32)).astype("int32")
-    padding_mask = np.ones((num_total_samples, 32), dtype="int32")
-    y_true = np.random.normal(size=(num_total_samples, 32, 768)).astype("float32")
-
-    # Wrap in Dataset to satisfy Keras worker checks
-    dataset = tf.data.Dataset.from_tensor_slices(
-        ({"token_ids": token_ids, "padding_mask": padding_mask}, y_true)
-    )
-
-    if backend == "torch":
-        # Manual sharding of the dataset for Torch workers
-        dataset = dataset.shard(num_shards=world_size, index=rank)
-        batch_size = global_batch_size // world_size
+    # 4. Sync Weights
+    weights_file = "tp_experiment_sync_f32.weights.h5"
+    if backend == "jax":
+        model.save_weights(weights_file)
     else:
-        # JAX uses global dataset with AutoTP
-        batch_size = global_batch_size
+        import time
+        max_retries = 30
+        while not os.path.exists(weights_file) and max_retries > 0:
+            time.sleep(1)
+            max_retries -= 1
+        model.load_weights(weights_file)
 
-    dataset = dataset.batch(batch_size)
-
-    # Fit
-    history = model.fit(
-        dataset,
-        epochs=1,
-        steps_per_epoch=steps,
-        verbose=1 if rank == 0 else 0,
+    model.compile(
+        optimizer=keras.optimizers.SGD(learning_rate=0.0),
+        loss="mse",
+        jit_compile=False,
     )
     
-    training_time = time.time() - start_time if 'start_time' in locals() else 0
-    # Actually fit doesn't return time, we measure it
+    # 5. Deterministic Data Generation (float32)
+    np.random.seed(42)
+    token_ids = np.random.randint(0, 50272, (8, 32)).astype("int32")
+    padding_mask = np.ones((8, 32), dtype="int32")
+    y_true = np.random.normal(size=(8, 32, 768)).astype("float32")
+
+    x = {"token_ids": token_ids, "padding_mask": padding_mask}
+    y = y_true
+
+    # 6. Evaluation (Initial Loss)
     start_time = time.time()
-    model.fit(dataset, epochs=1, steps_per_epoch=1, verbose=0)
+    loss = model.test_on_batch(x, y)
     training_time = time.time() - start_time
-    
     peak_absolute = tracker.stop()
 
     if rank == 0:
         delta = float(peak_absolute - base_cpu)
         peak_mem_mb = delta / (1024 * 1024)
         
-        final_loss = float(history.history["loss"][-1])
+        initial_loss = float(keras.ops.convert_to_numpy(loss))
 
         results = {
             "backend": backend,
-            "final_loss": final_loss,
+            "initial_loss": initial_loss,
             "training_time": training_time,
             "peak_memory_mb": peak_mem_mb,
         }

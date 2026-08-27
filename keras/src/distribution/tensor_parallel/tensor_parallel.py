@@ -274,10 +274,60 @@ class TensorParallelKeras(Model):
 
     def build_assembled_model(self):
         """
-        Returns the original model, which is now patched at the layer level
-        to handle collective communications and bias adjustments.
+        Reconstructs the model's functional graph to ensure that patched 
+        layer.call methods (which handle sharding and collectives) are used.
         """
-        return self._original_model
+        if not self.distributed:
+            return self._original_model
+
+        if not hasattr(self._original_model, "_is_graph_network") or not self._original_model._is_graph_network:
+             # Subclassed models don't need reconstruction; patching layer.call is enough
+             return self._original_model
+
+        # For Functional models, we must rebuild the graph to use patched call methods.
+        # 1. Map original inputs to new Inputs
+        input_map = {}
+        for inp in self._original_model.inputs:
+            new_inp = keras.Input(batch_shape=inp.shape, dtype=inp.dtype, name=inp.name)
+            input_map[id(inp)] = new_inp
+
+        # 2. Re-execute the graph nodes
+        # Keras functional models store nodes in execution order
+        nodes_to_process = []
+        for layer in self._original_model.layers:
+            for node in layer._inbound_nodes:
+                nodes_to_process.append(node)
+
+        # Re-build functional graph by calling layers on new inputs
+        # This triggers the patched 'tp_call'
+        memo = {}
+        def get_tensor(tensor):
+            if id(tensor) in input_map:
+                return input_map[id(tensor)]
+            if id(tensor) in memo:
+                return memo[id(tensor)]
+            return tensor
+
+        for layer in self._original_model._flatten_layers(recursive=True):
+             # Layer is already patched in __init__
+             pass
+
+        # Since simple reconstruction is complex for nested models, we use a 
+        # shortcut: we re-call the original model backbone logic if possible.
+        # For KerasHub models, calling the backbone with the same inputs works.
+        try:
+             # Create new inputs that match the original ones
+             new_inputs = [keras.Input(batch_shape=inp.shape, dtype=inp.dtype, name=inp.name) for inp in self._original_model.inputs]
+             if len(new_inputs) == 1:
+                  new_inputs = new_inputs[0]
+             
+             # Calling the original model again captures the patched call logic
+             new_outputs = self._original_model(new_inputs)
+             
+             return keras.Model(inputs=new_inputs, outputs=new_outputs, name=self._original_model.name)
+        except Exception as e:
+             logger.warning(f"Functional reconstruction failed: {e}. Falling back to original.")
+             return self._original_model
 
     def canonicalize_device(self, device_spec: Union[str, int]) -> str:
         """Convert device specification to canonical form."""

@@ -48,7 +48,7 @@ _gather.rule_type = "gather"
 
 
 def _apply_layer_sharding_rules(layer, device_count, state_rules, output_rules):
-    """Applies sharding rules using object IDs for the requested log format."""
+    """Applies sharding rules using stable paths for cross-instance compatibility."""
 
     def split_rule(dim):
         return functools.partial(
@@ -63,34 +63,34 @@ def _apply_layer_sharding_rules(layer, device_count, state_rules, output_rules):
     if isinstance(layer, layers.Dense):
         mlp_type = analyze_dense_layer(layer)
         if mlp_type == "up_projection":
-            state_rules[id(layer.kernel)] = split_rule(dim=1)
+            state_rules[layer_path + "/kernel"] = split_rule(dim=1)
             if layer.use_bias:
-                state_rules[id(layer.bias)] = split_rule(dim=0)
+                state_rules[layer_path + "/bias"] = split_rule(dim=0)
             output_rules[layer_path] = gather_rule(axis=-1)
         elif mlp_type == "down_projection":
-            state_rules[id(layer.kernel)] = split_rule(dim=0)
+            state_rules[layer_path + "/kernel"] = split_rule(dim=0)
             # Row-parallel bias is NOT sharded. It is replicated and added
             # AFTER the all-reduce.
             output_rules[layer_path] = _reduce_sum
         else:
-            state_rules[id(layer.kernel)] = split_rule(dim=1)
+            state_rules[layer_path + "/kernel"] = split_rule(dim=1)
             if layer.use_bias:
-                state_rules[id(layer.bias)] = split_rule(dim=0)
+                state_rules[layer_path + "/bias"] = split_rule(dim=0)
             output_rules[layer_path] = gather_rule(axis=-1)
 
     elif isinstance(layer, layers.EinsumDense):
         if "attention_output" in layer.name:
-            state_rules[id(layer.kernel)] = split_rule(dim=0)
+            state_rules[layer_path + "/kernel"] = split_rule(dim=0)
             output_rules[layer_path] = _reduce_sum
         elif any(x in layer.name for x in ["query", "key", "value", "attention"]):
-            state_rules[id(layer.kernel)] = split_rule(dim=1)
+            state_rules[layer_path + "/kernel"] = split_rule(dim=1)
             if hasattr(layer, "bias") and layer.bias is not None:
-                state_rules[id(layer.bias)] = split_rule(dim=0)
+                state_rules[layer_path + "/bias"] = split_rule(dim=0)
             output_rules[layer_path] = gather_rule(axis=-1)
         else:
-            state_rules[id(layer.kernel)] = split_rule(dim=1)
+            state_rules[layer_path + "/kernel"] = split_rule(dim=1)
             if hasattr(layer, "bias") and layer.bias is not None:
-                state_rules[id(layer.bias)] = split_rule(dim=0)
+                state_rules[layer_path + "/bias"] = split_rule(dim=0)
             output_rules[layer_path] = gather_rule(axis=-1)
 
     elif (
@@ -101,13 +101,14 @@ def _apply_layer_sharding_rules(layer, device_count, state_rules, output_rules):
         emb = getattr(layer, "embeddings", None)
         if emb is not None:
             if "token_embedding" in layer.name:
-                state_rules[id(emb)] = split_rule(dim=0)
+                state_rules[layer_path + "/embeddings"] = split_rule(dim=0)
                 output_rules[layer_path] = _reduce_sum
             elif "position_embedding" in layer.name:
-                state_rules[id(emb)] = split_rule(dim=1)
+                # Shard position embeddings along the embedding dimension
+                state_rules[layer_path + "/embeddings"] = split_rule(dim=1)
                 output_rules[layer_path] = _reduce_sum
             else:
-                state_rules[id(emb)] = split_rule(dim=0)
+                state_rules[layer_path + "/embeddings"] = split_rule(dim=0)
                 output_rules[layer_path] = _reduce_sum
 
     elif isinstance(layer, layers.Dropout):
