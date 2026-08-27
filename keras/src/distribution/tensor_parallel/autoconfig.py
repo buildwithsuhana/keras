@@ -30,6 +30,10 @@ def _reduce_sum(x):
     return distribution_lib.all_reduce(x, op="sum", axis_name="model")
 
 
+_reduce_sum.is_collective = True
+_reduce_sum.rule_type = "reduce_sum"
+
+
 def _gather(x, axis):
     if isinstance(x, (list, tuple)):
         from keras.src import ops
@@ -37,6 +41,10 @@ def _gather(x, axis):
             return x[0]
         return ops.concatenate(x, axis=axis)
     return distribution_lib.all_gather(x, axis=axis, axis_name="model")
+
+
+_gather.is_collective = True
+_gather.rule_type = "gather"
 
 
 def _apply_layer_sharding_rules(layer, device_count, state_rules, output_rules):
@@ -58,8 +66,11 @@ def _apply_layer_sharding_rules(layer, device_count, state_rules, output_rules):
             state_rules[id(layer.kernel)] = split_rule(dim=1)
             if layer.use_bias:
                 state_rules[id(layer.bias)] = split_rule(dim=0)
+            output_rules[layer_path] = gather_rule(axis=-1)
         elif mlp_type == "down_projection":
             state_rules[id(layer.kernel)] = split_rule(dim=0)
+            # Row-parallel bias is NOT sharded. It is replicated and added
+            # AFTER the all-reduce.
             output_rules[layer_path] = _reduce_sum
         else:
             state_rules[id(layer.kernel)] = split_rule(dim=1)

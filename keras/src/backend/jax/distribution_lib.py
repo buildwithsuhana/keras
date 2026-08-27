@@ -148,6 +148,11 @@ def initialize_rng():
 
 
 def initialize(job_addresses, num_processes, process_id):
+    from keras.src.backend.config import backend
+
+    if backend() != "jax":
+        return
+
     if job_addresses and "," in job_addresses:
         # When user provide all the job addresses, we will split and get the
         # first one, which is the coordinator.

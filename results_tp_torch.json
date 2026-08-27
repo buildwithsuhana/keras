@@ -1,6 +1,6 @@
 {
-  "loss": [
-    3.8863837718963623
-  ],
-  "backend": "torch"
+  "backend": "torch",
+  "final_loss": 1.6745703220367432,
+  "training_time": 0.6409797668457031,
+  "peak_memory_mb": 4194.53125
 }

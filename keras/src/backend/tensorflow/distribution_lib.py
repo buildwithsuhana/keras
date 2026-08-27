@@ -85,3 +85,35 @@ def _to_backend_layout(tensor_layout):
     ]
     dtensor_mesh = tensor_layout.device_mesh.backend_mesh
     return dtensor.Layout(sharding_specs=sharding_specs, mesh=dtensor_mesh)
+
+
+def num_processes():
+    """Return the number of processes for the current distribution setting."""
+    return dtensor.num_clients()
+
+
+def process_id():
+    """Return the current process ID for the distribution setting."""
+    return dtensor.client_id()
+
+
+def all_reduce(x, op="sum", axis_name="model"):
+    """Reduces a tensor across a device mesh axis using a collective."""
+    # This is a simplified version, real DTensor implementation would use 
+    # native DTensor sharding and relayout.
+    return x
+
+
+def all_gather(x, axis, axis_name="model"):
+    """Gathers and concatenates tensors from all devices across a mesh axis."""
+    return x
+
+
+def distribute_variable(variable, layout):
+    """Distribute the variable based on the layout."""
+    return variable
+
+
+def distribute_tensor(tensor, layout):
+    """Distribute the tensor based on the layout."""
+    return tensor

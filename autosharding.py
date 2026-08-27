@@ -1,5 +1,11 @@
 import os
 import sys
+
+# Set fixed environment variables before any other imports
+os.environ["KERAS_BACKEND"] = "jax"
+os.environ["XLA_FLAGS"] = "--xla_force_host_platform_device_count=2"
+os.environ["JAX_PLATFORMS"] = "cpu"
+
 import argparse
 import time
 
@@ -140,19 +146,39 @@ def find_free_port():
 
 
 def _run_torch(rank, world_size, port):
+    import os
+    import sys
+    
+    # Use the local keras source
+    sys.path.insert(
+        0, os.path.abspath(os.path.join(os.path.dirname(__file__), "."))
+    )
+    
+    # Force CPU for all operations to avoid MPS issues with collectives
+    os.environ["KERAS_BACKEND"] = "torch"
+    os.environ["KERAS_TORCH_DEVICE"] = "cpu"
+    os.environ["CUDA_VISIBLE_DEVICES"] = ""
+    # Ensure JAX doesn't try to initialize anything
+    os.environ["JAX_PLATFORMS"] = "cpu"
+    
+    import torch
+    # Ensure torch doesn't try to use MPS
+    if hasattr(torch.backends, "mps"):
+         torch.backends.mps.is_available = lambda: False
+    
+    if hasattr(torch, "set_default_device"):
+        torch.set_default_device("cpu")
+
+    import keras
+    keras.config.set_backend("torch")
+    
+    import torch.distributed as dist
     os.environ["RANK"] = str(rank)
     os.environ["WORLD_SIZE"] = str(world_size)
     os.environ["LOCAL_RANK"] = str(rank)
     os.environ["MASTER_ADDR"] = "localhost"
     os.environ["MASTER_PORT"] = str(port)
 
-    import torch
-    os.environ["KERAS_TORCH_DEVICE"] = "cpu"
-    if hasattr(torch, "set_default_device"):
-        torch.set_default_device("cpu")
-
-    import torch.distributed as dist
-    import keras
     from keras.src.distribution.distribution_lib import AutoTPDistribution, DeviceMesh, initialize, list_devices
 
     initialize()
@@ -188,20 +214,24 @@ def _run_torch(rank, world_size, port):
     loss_fn = keras.losses.SparseCategoricalCrossentropy(from_logits=True)
     
     # Initial
-    logits = sharded_model(x)
-    initial_loss = loss_fn(y, logits)
+    import torch
+    with torch.no_grad():
+        logits = sharded_model(x)
+        initial_loss = loss_fn(y, logits)
     
     # Use standard train_on_batch
     fit_loss = sharded_model.train_on_batch(x, y)
     
-    logits_after = sharded_model(x)
-    final_loss = loss_fn(y, logits_after)
+    with torch.no_grad():
+        logits_after = sharded_model(x)
+        final_loss = loss_fn(y, logits_after)
 
     if rank == 0:
-        print(f"INITIAL_LOSS: {float(initial_loss):.12f}")
-        fit_loss_val = float(np.array(fit_loss))
+        from keras import ops
+        print(f"INITIAL_LOSS: {float(ops.convert_to_numpy(initial_loss)):.12f}")
+        fit_loss_val = float(ops.convert_to_numpy(fit_loss))
         print(f"FIT_LOSS: {fit_loss_val:.12f}")
-        print(f"FINAL_LOSS_AFTER_FIT: {float(final_loss):.12f}")
+        print(f"FINAL_LOSS_AFTER_FIT: {float(ops.convert_to_numpy(final_loss)):.12f}")
 
     if dist.is_initialized():
         dist.destroy_process_group()

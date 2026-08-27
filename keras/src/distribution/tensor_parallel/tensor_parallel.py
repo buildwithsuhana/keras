@@ -32,11 +32,13 @@ class TensorParallelKeras(Model):
         device_count=None,
         device_ids=None,
         world_size=None,
+        device_mesh=None,
         **kwargs,
     ):
         super().__init__(**kwargs)
 
         self._original_model = model
+        self.device_mesh = device_mesh
 
         if world_size is not None and device_count is None:
             device_count = world_size
@@ -120,12 +122,24 @@ class TensorParallelKeras(Model):
 
         if self.tensor_parallel_config is None:
             device_names = [str(d) for d in self.devices]
-            self.tensor_parallel_config = get_default_config(
-                model, device_names
-            )
+            
+            # Use 'meta' device for analysis if supported by backend
+            # to avoid full memory allocation.
+            from keras.src import backend
+            try:
+                with backend.device_scope("meta"):
+                    self.tensor_parallel_config = get_default_config(
+                        model, device_names
+                    )
+            except:
+                # Fallback for backends that don't support meta device
+                self.tensor_parallel_config = get_default_config(
+                    model, device_names
+                )
+            
             print(self.tensor_parallel_config)
             logger.info(
-                "Using automatic config with auto sharding strategy: sharding individual Dense/Conv/Embedding layers"
+                "Using automatic config with memory-efficient meta-analysis."
             )
 
         print(
@@ -147,41 +161,35 @@ class TensorParallelKeras(Model):
 
         process_id = distribution_lib.process_id()
 
-        for rank, device_id in enumerate(self.devices):
-            # In multi-process mode, each process only creates its own shard.
-            if num_processes > 1 and rank != process_id:
-                continue
-
-            print(f"[{device_id}] ➡️  Starting sharding process for Rank {rank}")
-            shard, modified_parameters_names = make_parameter_sharded_model(
-                model,
+        if num_processes == 1:
+            # Single-process mode (e.g. JAX): Shard the original model in-place once.
+            shard, modified_names = make_parameter_sharded_model(
+                self._original_model,
                 self.tensor_parallel_config,
-                rank=rank,
+                rank=0,
                 device_count=self.device_count,
-                device_id=device_id,
+                device_id=self.devices[0],
+                device_mesh=self.device_mesh,
             )
-            self.model_shards.append(shard)
-            self.modified_parameters_names.update(modified_parameters_names)
-
-            logger.info(f"   ✅ Created shard {rank} for device {device_id}")
-
-        params_per_shard = []
-        for i, shard in enumerate(self.model_shards):
-            total_params = sum(np.prod(p.shape) for p in shard.weights)
-            params_per_shard.append(int(total_params))
-            logger.info(f"   📊 Shard {i} parameters: {int(total_params):,}")
-
-        if len(set(params_per_shard)) > 1:
-            logger.info(
-                "✅ REAL SHARDING CONFIRMED: Different parameter counts across shards"
-            )
-            logger.info("✅ This is NOT using stubs - real tensor parallelism!")
+            self.model_shards = [shard]
+            self.modified_parameters_names.update(modified_names)
         else:
-            pass
+            # Multi-process mode (e.g. Torch): Each process shards its own copy.
+            for rank, device_id in enumerate(self.devices):
+                if rank != process_id:
+                    continue
 
-        logger.info(
-            f"Using '{keras.backend.backend()}' backend logic for distribution."
-        )
+                print(f"[{device_id}] ➡️  Starting sharding process for Rank {rank}")
+                shard, modified_names = make_parameter_sharded_model(
+                    self._original_model,
+                    self.tensor_parallel_config,
+                    rank=rank,
+                    device_count=self.device_count,
+                    device_id=device_id,
+                    device_mesh=self.device_mesh,
+                )
+                self.model_shards.append(shard)
+                self.modified_parameters_names.update(modified_names)
 
         self.built = True
         if self.distributed:
@@ -193,55 +201,27 @@ class TensorParallelKeras(Model):
 
     @property
     def variables(self):
-        unique_vars = {
-            id(var): var
-            for shard in self.model_shards
-            for var in shard.variables
-        }
-        return list(unique_vars.values())
+        return self._original_model.variables
 
     @property
     def trainable_variables(self):
-        unique_vars = {
-            id(var): var
-            for shard in self.model_shards
-            for var in shard.trainable_variables
-        }
-        return list(unique_vars.values())
+        return self._original_model.trainable_variables
 
     @property
     def non_trainable_variables(self):
-        unique_vars = {
-            id(var): var
-            for shard in self.model_shards
-            for var in shard.non_trainable_variables
-        }
-        return list(unique_vars.values())
+        return self._original_model.non_trainable_variables
 
     @property
     def weights(self):
-        unique_vars = {
-            id(var): var for shard in self.model_shards for var in shard.weights
-        }
-        return list(unique_vars.values())
+        return self._original_model.weights
 
     @property
     def trainable_weights(self):
-        unique_vars = {
-            id(var): var
-            for shard in self.model_shards
-            for var in shard.trainable_weights
-        }
-        return list(unique_vars.values())
+        return self._original_model.trainable_weights
 
     @property
     def non_trainable_weights(self):
-        unique_vars = {
-            id(var): var
-            for shard in self.model_shards
-            for var in shard.non_trainable_weights
-        }
-        return list(unique_vars.values())
+        return self._original_model.non_trainable_weights
 
     def _auto_detect_parallelism(self):
         """Auto-detect device_count and device_ids efficiently."""
@@ -294,90 +274,10 @@ class TensorParallelKeras(Model):
 
     def build_assembled_model(self):
         """
-        Builds a single, JIT-friendly Keras Functional model that encapsulates
-        the entire tensor parallel logic, correctly handling multiple inputs.
+        Returns the original model, which is now patched at the layer level
+        to handle collective communications and bias adjustments.
         """
-        if not self.distributed:
-            return self._original_model
-
-        input_layers = {
-            inp.name.split(":")[0]: keras.Input(
-                shape=inp.shape[1:],
-                dtype=inp.dtype,
-                name=inp.name.split(":")[0],
-            )
-            for inp in self._original_model.inputs
-        }
-
-        num_processes = distribution_lib.num_processes()
-
-        if num_processes == 1:
-            # In single-process mode (like JAX on multi-device), the model
-            # is already sharded natively. We just need to call it once.
-            shard = self.model_shards[0]
-            shard_inputs = {
-                inp.name.split(":")[0]: input_layers[inp.name.split(":")[0]]
-                for inp in getattr(shard, "inputs", self._original_model.inputs)
-            }
-            final_output = shard(shard_inputs)
-        else:
-            partial_outputs = []
-            for shard in self.model_shards:
-                # Prefer the shard's declared input names, fall back to its input tensors.
-                shard_inputs = {}
-                try:
-                    input_names = getattr(shard, "input_names", None)
-                    if input_names:
-                        for name in input_names:
-                            clean_name = name.split(":")[0]
-                            if clean_name in input_layers:
-                                shard_inputs[clean_name] = input_layers[clean_name]
-                    else:
-                        # Fall back to inspecting shard.inputs
-                        for inp in getattr(shard, "inputs", []):
-                            clean_name = inp.name.split(":")[0]
-                            if clean_name in input_layers:
-                                shard_inputs[clean_name] = input_layers[clean_name]
-
-                    if not shard_inputs:
-                        # Last resort: forward the full mapping (may be positional in some cases)
-                        shard_inputs = dict(input_layers)
-
-                    logger.info(
-                        f"Calling shard '{getattr(shard, 'name', '<shard>')}' with inputs: {list(shard_inputs.keys())}"
-                    )
-                    partial_outputs.append(shard(shard_inputs))
-                except Exception:
-                    logger.exception(
-                        "Exception when calling shard %s with inputs=%s",
-                        getattr(shard, "name", "<shard>"),
-                        list(shard_inputs.keys()),
-                    )
-                    raise
-
-            model_output_rule = self.tensor_parallel_config.output_rules.get(
-                self._original_model.name
-            )
-            final_layer = self._original_model.layers[-1]
-            final_layer_rule = self.tensor_parallel_config.output_rules.get(
-                getattr(final_layer, "path", final_layer.name)
-            )
-            
-            # In multi-process mode, we use the collective output rule if available.
-            # Favor final_layer_rule if it's a collective, otherwise model_output_rule.
-            rule = final_layer_rule if final_layer_rule and callable(final_layer_rule) else model_output_rule
-            
-            if rule and callable(rule):
-                final_output = keras.layers.Lambda(
-                    lambda x: rule(x)
-                )(partial_outputs[0])
-            else:
-                final_output = partial_outputs[0]
-
-        assembled_model = keras.Model(
-            inputs=list(input_layers.values()), outputs=final_output
-        )
-        return assembled_model
+        return self._original_model
 
     def canonicalize_device(self, device_spec: Union[str, int]) -> str:
         """Convert device specification to canonical form."""

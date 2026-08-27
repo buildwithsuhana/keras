@@ -68,7 +68,7 @@ except Exception as e:
     TARGET_WORLD_SIZE = 0
 
 
-from keras.src.distribution.tensor_parallel.tensor_parallel_keras import (
+from keras.src.distribution.tensor_parallel.tensor_parallel import (
     TensorParallelKeras,
 )
 

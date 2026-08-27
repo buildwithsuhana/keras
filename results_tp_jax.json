@@ -1,6 +1,6 @@
 {
-  "loss": [
-    1.8002840280532837
-  ],
-  "backend": "jax"
+  "backend": "jax",
+  "final_loss": 1.662219762802124,
+  "training_time": 0.32408881187438965,
+  "peak_memory_mb": 9363.1875
 }

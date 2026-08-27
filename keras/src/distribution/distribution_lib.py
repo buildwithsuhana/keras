@@ -876,6 +876,7 @@ class AutoTPDistribution(Distribution):
             model=self._original_model,
             world_size=np.prod(self.device_mesh.shape),
             device_ids=self.device_mesh.devices.flatten().tolist(),
+            device_mesh=self.device_mesh,
         )
         # Attach sharding config to the original model for summary/compile
         self._original_model._tensor_parallel_config = (
