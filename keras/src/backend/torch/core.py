@@ -168,11 +168,6 @@ class Variable(KerasVariable):
         if dist is None:
             return None
 
-        from keras.src.distribution.distribution_lib import DataParallel
-
-        if isinstance(dist, DataParallel):
-            return None
-
         from keras.src.backend.torch import distribution_lib
 
         if self._layout is None:
@@ -184,6 +179,8 @@ class Variable(KerasVariable):
         from keras.src.distribution.distribution_lib import TensorLayout
 
         if isinstance(self._layout, TensorLayout):
+            if all(axis is None for axis in self._layout.axes):
+                return None
             self._layout = self._layout.backend_layout
 
         if callable(initializer):
@@ -325,11 +322,6 @@ def convert_to_tensor(x, dtype=None, sparse=None, ragged=None):
     if isinstance(x, Variable) or is_tensor(x):
         if isinstance(x, Variable):
             x = x.value
-        if isinstance(x, DTensor):
-            global _GLOBAL_DTENSOR_PROMOTION_MODE
-            if _GLOBAL_DTENSOR_PROMOTION_MODE is None:
-                _GLOBAL_DTENSOR_PROMOTION_MODE = KerasDTensorPromotionMode()
-                _GLOBAL_DTENSOR_PROMOTION_MODE.__enter__()
         else:
             device = get_device()
             if x.device != device:
