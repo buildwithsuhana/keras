@@ -6,6 +6,9 @@ since your modifications would be overwritten.
 
 from keras.src.distribution.distribution_lib import DataParallel as DataParallel
 from keras.src.distribution.distribution_lib import DeviceMesh as DeviceMesh
+from keras.src.distribution.distribution_lib import (
+    FullyShardedDataParallel as FullyShardedDataParallel,
+)
 from keras.src.distribution.distribution_lib import LayoutMap as LayoutMap
 from keras.src.distribution.distribution_lib import (
     ModelParallel as ModelParallel,

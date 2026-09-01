@@ -530,6 +530,146 @@ class DataParallel(Distribution):
         return None
 
 
+@keras_export("keras.distribution.FullyShardedDataParallel")
+class FullyShardedDataParallel(Distribution):
+    """Distribution strategy for Fully Sharded Data Parallelism (ZeRO-3).
+
+    `FullyShardedDataParallel` shards model parameters, gradients, and optimizer
+    states across devices in the computation cluster. Full parameters are
+    all-gathered on-demand during forward and backward passes and discarded
+    immediately after use.
+
+    You can create this instance by either specifying the `device_mesh` or
+    `devices` arguments (but not both).
+
+    When `device_mesh` is provided, `sharding_axis` indicates which axis of the
+    mesh to shard on. If not specified, the first axis is used.
+
+    Args:
+        device_mesh: Optional `DeviceMesh` instance.
+        devices: Optional list of devices to construct a 1D mesh.
+        sharding_axis: Optional string, the axis name in the `device_mesh`
+            along which to shard parameters and data. Defaults to the first axis
+            in `device_mesh`.
+        auto_wrap_layers: Optional list or tuple of `Layer` classes to wrap/shard
+            as sub-units (e.g. `[TransformerBlock]`).
+        min_num_params: Integer. Minimum number of parameters for a layer to be
+            automatically wrapped as a separate FSDP unit (default: 1e7).
+        cpu_offload: Boolean. If `True`, offload parameters and optimizer states
+            to CPU memory when not in active computation (default: `False`).
+        auto_shard_dataset: Automatically shard the dataset amongst processes
+            in a multi-process setting. Defaults to `True`.
+    """
+
+    def __init__(
+        self,
+        device_mesh=None,
+        devices=None,
+        *,
+        sharding_axis=None,
+        auto_wrap_layers=None,
+        min_num_params=1e7,
+        cpu_offload=False,
+        auto_shard_dataset=True,
+    ):
+        if device_mesh:
+            self._initialize_with_device_mesh(
+                device_mesh, sharding_axis, auto_shard_dataset
+            )
+        elif devices:
+            self._initialize_mesh_from_devices(
+                devices, sharding_axis, auto_shard_dataset
+            )
+        else:
+            self._initialize_mesh_from_list_devices(
+                sharding_axis, auto_shard_dataset
+            )
+
+        self._sharding_axis = sharding_axis or self.device_mesh.axis_names[0]
+        self._auto_wrap_layers = (
+            tuple(auto_wrap_layers) if auto_wrap_layers else ()
+        )
+        self._min_num_params = int(min_num_params)
+        self._cpu_offload = bool(cpu_offload)
+
+    @property
+    def sharding_axis(self):
+        return self._sharding_axis
+
+    @property
+    def auto_wrap_layers(self):
+        return self._auto_wrap_layers
+
+    @property
+    def min_num_params(self):
+        return self._min_num_params
+
+    @property
+    def cpu_offload(self):
+        return self._cpu_offload
+
+    @property
+    def num_model_replicas(self):
+        mesh_axis_index = self.device_mesh.axis_names.index(self.sharding_axis)
+        return self.device_mesh.shape[mesh_axis_index]
+
+    def _initialize_with_device_mesh(
+        self, device_mesh, sharding_axis, auto_shard_dataset
+    ):
+        if not isinstance(device_mesh, DeviceMesh):
+            raise ValueError(
+                "Expect `device_mesh` to be an instance of `DeviceMesh`. "
+                f"Received: device_mesh={device_mesh} (of type {type(device_mesh)})"
+            )
+        axis_name = sharding_axis or device_mesh.axis_names[0]
+        if axis_name not in device_mesh.axis_names:
+            raise ValueError(
+                f"Invalid sharding_axis '{axis_name}'. "
+                f"Valid axis names in device mesh: {device_mesh.axis_names}"
+            )
+        super().__init__(device_mesh, axis_name, auto_shard_dataset)
+
+    def _initialize_mesh_from_devices(
+        self, devices, sharding_axis, auto_shard_dataset
+    ):
+        devices = np.array(devices)
+        axis_name = sharding_axis or DEFAULT_BATCH_DIM_NAME
+        device_mesh = DeviceMesh(
+            shape=devices.shape,
+            axis_names=[axis_name],
+            devices=devices,
+        )
+        super().__init__(device_mesh, axis_name, auto_shard_dataset)
+
+    def _initialize_mesh_from_list_devices(
+        self, sharding_axis, auto_shard_dataset
+    ):
+        devices = np.array(list_devices())
+        axis_name = sharding_axis or DEFAULT_BATCH_DIM_NAME
+        device_mesh = DeviceMesh(
+            shape=devices.shape,
+            axis_names=[axis_name],
+            devices=devices,
+        )
+        super().__init__(device_mesh, axis_name, auto_shard_dataset)
+
+    def get_data_layout(self, data_shape):
+        data_shard_spec = [None] * len(data_shape)
+        data_shard_spec[0] = self.sharding_axis
+        return TensorLayout(data_shard_spec, self.device_mesh)
+
+    def get_variable_layout(self, variable):
+        if getattr(variable, "_layout", None) is not None:
+            return variable._layout
+        variable_shard_spec = [None] * len(variable.shape)
+        if len(variable_shard_spec) > 0:
+            variable_shard_spec[0] = self.sharding_axis
+        return TensorLayout(variable_shard_spec, self.device_mesh)
+
+    def get_tensor_layout(self, path):
+        return None
+
+
 @keras_export("keras.distribution.ModelParallel")
 class ModelParallel(Distribution):
     """Distribution that shards model variables.

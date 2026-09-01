@@ -168,6 +168,14 @@ class Variable(KerasVariable):
         if dist is None:
             return None
 
+        from keras.src.distribution.distribution_lib import DataParallel
+        from keras.src.distribution.distribution_lib import (
+            FullyShardedDataParallel,
+        )
+
+        if isinstance(dist, (DataParallel, FullyShardedDataParallel)):
+            return None
+
         from keras.src.backend.torch import distribution_lib
 
         if self._layout is None:
@@ -179,8 +187,6 @@ class Variable(KerasVariable):
         from keras.src.distribution.distribution_lib import TensorLayout
 
         if isinstance(self._layout, TensorLayout):
-            if all(axis is None for axis in self._layout.axes):
-                return None
             self._layout = self._layout.backend_layout
 
         if callable(initializer):
@@ -231,12 +237,15 @@ class Variable(KerasVariable):
             from keras.src.backend.torch import distribution_lib
             from keras.src.distribution.distribution_lib import TensorLayout
 
-            layout = self._layout
-            if isinstance(layout, TensorLayout):
-                layout = layout.backend_layout
-            if value.device.type != layout.device_mesh.device_type:
-                value = value.to(layout.device_mesh.device_type)
-            value = distribution_lib.distribute_tensor(value, layout)
+            if isinstance(value, torch.Tensor) and not value.is_leaf:
+                value = value.detach()
+            if not isinstance(value, DTensor):
+                layout = self._layout
+                if isinstance(layout, TensorLayout):
+                    layout = layout.backend_layout
+                if value.device.type != layout.device_mesh.device_type:
+                    value = value.to(layout.device_mesh.device_type)
+                value = distribution_lib.distribute_tensor(value, layout)
 
         with torch.no_grad():
             self.value.copy_(value)
@@ -322,6 +331,11 @@ def convert_to_tensor(x, dtype=None, sparse=None, ragged=None):
     if isinstance(x, Variable) or is_tensor(x):
         if isinstance(x, Variable):
             x = x.value
+        if isinstance(x, DTensor):
+            global _GLOBAL_DTENSOR_PROMOTION_MODE
+            if _GLOBAL_DTENSOR_PROMOTION_MODE is None:
+                _GLOBAL_DTENSOR_PROMOTION_MODE = KerasDTensorPromotionMode()
+                _GLOBAL_DTENSOR_PROMOTION_MODE.__enter__()
         else:
             device = get_device()
             if x.device != device:
