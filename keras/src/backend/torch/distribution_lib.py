@@ -132,6 +132,7 @@ def initialize(job_addresses=None, num_processes=None, process_id=None):
             torch_core._GLOBAL_DTENSOR_PROMOTION_MODE = (
                 torch_core.KerasDTensorPromotionMode()
             )
+            # This context is intentionally never exited.
             torch_core._GLOBAL_DTENSOR_PROMOTION_MODE.__enter__()
 
 
