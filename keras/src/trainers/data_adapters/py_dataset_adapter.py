@@ -1,4 +1,5 @@
 import itertools
+import multiprocessing
 import multiprocessing.dummy
 import queue
 import random
@@ -328,7 +329,7 @@ class PyDatasetAdapter(DataAdapter):
             output_signature=self._output_signature,
         )
         if self.enqueuer is not None:
-            # The enqueuer does its own multithreading / multiprocesssing to
+            # The enqueuer does its own multithreading / multiprocessing to
             # prefetch items. Disable the tf.data.Dataset prefetching and
             # threading as it interferes.
             options = tf.data.Options()
@@ -390,18 +391,28 @@ _WORKER_ID_QUEUE = None  # Only created if needed.
 _FORCE_THREADPOOL = False
 
 
+def _get_safe_mp_context():
+    """Returns a multiprocessing context safe from fork-in-thread issues."""
+    try:
+        return multiprocessing.get_context("forkserver")
+    except ValueError:
+        return multiprocessing.get_context("spawn")
+
+
 def get_pool_class(use_multiprocessing):
     global _FORCE_THREADPOOL
     if not use_multiprocessing or _FORCE_THREADPOOL:
         return multiprocessing.dummy.Pool  # ThreadPool
-    return multiprocessing.Pool
+    ctx = _get_safe_mp_context()
+    return ctx.Pool
 
 
 def get_worker_id_queue():
     """Lazily create the queue to track worker ids."""
     global _WORKER_ID_QUEUE
     if _WORKER_ID_QUEUE is None:
-        _WORKER_ID_QUEUE = multiprocessing.Queue()
+        ctx = _get_safe_mp_context()
+        _WORKER_ID_QUEUE = ctx.Queue()
     return _WORKER_ID_QUEUE
 
 
@@ -457,8 +468,9 @@ class PyDatasetEnqueuer:
         global _SEQUENCE_COUNTER
         if _SEQUENCE_COUNTER is None:
             try:
-                _SEQUENCE_COUNTER = multiprocessing.Value("i", 0)
-            except OSError:
+                ctx = _get_safe_mp_context()
+                _SEQUENCE_COUNTER = ctx.Value("i", 0)
+            except (OSError, ValueError):
                 # In this case the OS does not allow us to use
                 # multiprocessing. We resort to an int
                 # for enqueuer indexing.
