@@ -6,7 +6,9 @@ import torch.distributed
 import torch.distributed as dist
 from torch.distributed import tensor as torch_tensor
 
+from keras.src.backend.torch import core as torch_core
 from keras.src.backend.torch.core import _parse_device_input
+from keras.src.backend.torch.core import convert_to_tensor
 from keras.src.backend.torch.core import get_device
 
 
@@ -127,6 +129,19 @@ def initialize(job_addresses=None, num_processes=None, process_id=None):
             backend=backend, rank=rank, world_size=world_size
         )
 
+        if torch_core._GLOBAL_DTENSOR_PROMOTION_MODE is None:
+            torch_core._GLOBAL_DTENSOR_PROMOTION_MODE = (
+                torch_core.KerasDTensorPromotionMode()
+            )
+
+
+def activate_dtensor_promotion():
+    torch_core.activate_dtensor_promotion()
+
+
+def deactivate_dtensor_promotion():
+    torch_core.deactivate_dtensor_promotion()
+
 
 def num_processes():
     """Return the total number of processes in the distributed group."""
@@ -155,9 +170,13 @@ def _to_backend_mesh(device_mesh):
     """
     devices = device_mesh.devices
 
-    ranks = np.array(
-        [int(d.split(":")[-1]) for d in devices.flatten()]
-    ).reshape(devices.shape)
+    ranks = []
+    for d in devices.flatten():
+        if ":" in d:
+            ranks.append(int(d.split(":")[-1]))
+        else:
+            ranks.append(0)  # Default to rank 0 for device without index
+    ranks = np.array(ranks).reshape(devices.shape)
 
     first_device = (
         devices.flatten()[0].split(":")[0] if devices.size > 0 else "cpu"
@@ -202,17 +221,40 @@ def _to_backend_layout(tensor_layout):
     if tensor_layout is None:
         return None
 
+    from keras.src.distribution.distribution_lib import TensorLayout
+
+    if not isinstance(tensor_layout, TensorLayout):
+        # It's already a backend layout
+        return tensor_layout
+
     keras_mesh = tensor_layout.device_mesh
+    if keras_mesh is None:
+        raise ValueError(
+            "Cannot convert TensorLayout to PyTorch DTensor layout because "
+            "the 'device_mesh' is not specified. Please ensure the layout "
+            "has a valid 'device_mesh'."
+        )
     torch_mesh = _to_backend_mesh(keras_mesh)
 
+    mesh_axis_to_tensor_dim = {}
+    valid_axis_names = set(keras_mesh.axis_names)
+    if tensor_layout.axes is not None:
+        for tensor_dim, axis_spec in enumerate(tensor_layout.axes):
+            if axis_spec is None:
+                continue
+            axes = [axis_spec] if isinstance(axis_spec, str) else axis_spec
+            for axis_name in axes:
+                if axis_name is not None:
+                    if axis_name not in valid_axis_names:
+                        raise ValueError(
+                            f"Invalid axis name '{axis_name}' in TensorLayout. "
+                            f"Available mesh axes are: {keras_mesh.axis_names}"
+                        )
+                    mesh_axis_to_tensor_dim[axis_name] = tensor_dim
+
     placements = []
-    for i, mesh_dim_name in enumerate(keras_mesh.axis_names):
-        shard_dim = None
-        if tensor_layout.axes is not None:
-            for tensor_dim, axis_name in enumerate(tensor_layout.axes):
-                if axis_name == mesh_dim_name:
-                    shard_dim = tensor_dim
-                    break
+    for mesh_dim_name in keras_mesh.axis_names:
+        shard_dim = mesh_axis_to_tensor_dim.get(mesh_dim_name)
         if shard_dim is not None:
             placements.append(torch_tensor.Shard(shard_dim))
         else:
@@ -224,8 +266,23 @@ def _to_backend_layout(tensor_layout):
 def distribute_tensor(tensor, layout):
     """Scatters or replicates a tensor across devices according to the
     layout."""
-    if type(layout).__name__ == "TensorLayout":
-        layout = layout.backend_layout
+    if layout is None:
+        return tensor
+
+    from keras.src.distribution.distribution_lib import TensorLayout
+
+    if isinstance(layout, TensorLayout):
+        layout = _to_backend_layout(layout)
+
+    if isinstance(tensor, torch_tensor.DTensor):
+        if (
+            tensor.device_mesh == layout.device_mesh
+            and tensor.placements == layout.placements
+        ):
+            return tensor
+
+    if not isinstance(tensor, torch.Tensor):
+        tensor = convert_to_tensor(tensor)
 
     return torch_tensor.distribute_tensor(
         tensor, device_mesh=layout.device_mesh, placements=layout.placements
@@ -241,30 +298,33 @@ def distribute_variable(value, layout):
     return dtensor
 
 
-def distribute_data_input(per_process_batch, layout, batch_dim_name=None):
+def distribute_data_input(per_process_batch, layout):
     """Distribute a local data tensor according to a TensorLayout."""
     if layout is None:
         return per_process_batch
 
-    if hasattr(per_process_batch, "device_mesh"):
-        return per_process_batch
+    from keras.src.distribution.distribution_lib import TensorLayout
 
-    if type(layout).__name__ == "TensorLayout":
-        layout = layout.backend_layout
+    if isinstance(layout, TensorLayout):
+        layout = _to_backend_layout(layout)
 
-    del batch_dim_name
+    if isinstance(per_process_batch, torch_tensor.DTensor):
+        if (
+            per_process_batch.device_mesh == layout.device_mesh
+            and per_process_batch.placements == layout.placements
+        ):
+            return per_process_batch
 
     if not isinstance(per_process_batch, torch.Tensor):
-        per_process_batch = torch.as_tensor(
-            per_process_batch, device=get_device()
-        )
-    elif str(per_process_batch.device) != str(get_device()):
-        per_process_batch = per_process_batch.to(get_device())
+        per_process_batch = torch.as_tensor(per_process_batch, device="cpu")
+    elif per_process_batch.device.type != "cpu":
+        per_process_batch = per_process_batch.cpu()
 
     return torch_tensor.DTensor.from_local(
         per_process_batch,
         device_mesh=layout.device_mesh,
         placements=layout.placements,
+        run_check=False,
     )
 
 
