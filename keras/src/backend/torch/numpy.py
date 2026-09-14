@@ -9,12 +9,10 @@ from keras.src.backend import config
 from keras.src.backend.common import dtypes
 from keras.src.backend.common.backend_utils import canonicalize_axis
 from keras.src.backend.common.backend_utils import to_tuple_or_list
-from keras.src.backend.common.backend_utils import vectorize_impl
 from keras.src.backend.common.variables import standardize_dtype
 from keras.src.backend.torch.core import cast
 from keras.src.backend.torch.core import convert_to_tensor
 from keras.src.backend.torch.core import get_device
-from keras.src.backend.torch.core import is_tensor
 from keras.src.backend.torch.core import to_torch_dtype
 
 TORCH_INT_TYPES = (
@@ -2012,6 +2010,21 @@ def take(x, indices, axis=None):
     indices = convert_to_tensor(indices, dtype="int64")
     if axis is None:
         return torch.take(x, indices)
+    # Handle multidimensional indices for index_select
+    if indices.ndim > 1:
+        if axis == 0:
+            return torch.nn.functional.embedding(indices, x)
+        # Fallback for other axes: flatten indices, index_select, then reshape
+        original_indices_shape = indices.shape
+        indices = indices.reshape(-1)
+        res = torch.index_select(x, axis, indices)
+        # Reshape result: move axis to the end, then expand by indices shape
+        # But Torch's index_select with 1D indices results in (..., len(indices), ...)
+        # We want the indices shape to replace the axis dimension.
+        new_shape = list(x.shape)
+        new_shape[axis : axis + 1] = list(original_indices_shape)
+        return res.reshape(new_shape)
+
     return torch.index_select(x, axis, indices)
 
 
@@ -2195,6 +2208,11 @@ def power(x1, x2):
         x2 = cast(x2, "float32")
         return cast(torch.pow(x1, x2), dtype)
     return torch.pow(x1, x2)
+
+
+def array_split(x, indices_or_sections, axis=0):
+    x = convert_to_tensor(x)
+    return list(torch.tensor_split(x, indices_or_sections, dim=axis))
 
 
 def around(x, decimals=0):

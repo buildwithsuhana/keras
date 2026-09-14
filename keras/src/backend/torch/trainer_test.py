@@ -1,7 +1,6 @@
 import numpy as np
 import pytest
 import torch
-from absl.testing import parameterized
 
 from keras.src import backend
 from keras.src import layers
@@ -39,9 +38,7 @@ class TorchTrainerTest(testing.TestCase):
     @pytest.mark.skipif(backend.backend() != "torch", reason="Requires torch")
     def test_train_on_batch_with_data_parallel(self):
         self._ensure_distributed_initialized()
-        mesh = DeviceMesh(
-            shape=(1,), axis_names=["batch"], devices=["cpu:0"]
-        )
+        mesh = DeviceMesh(shape=(1,), axis_names=["batch"], devices=["cpu:0"])
         dist = DataParallel(device_mesh=mesh)
         set_distribution(dist)
 
@@ -65,12 +62,9 @@ class TorchTrainerTest(testing.TestCase):
     @pytest.mark.skipif(backend.backend() != "torch", reason="Requires torch")
     def test_train_on_batch_with_model_parallel(self):
         self._ensure_distributed_initialized()
-        mesh = DeviceMesh(
-            shape=(1,), axis_names=["model"], devices=["cpu:0"]
-        )
+        mesh = DeviceMesh(shape=(1,), axis_names=["model"], devices=["cpu:0"])
         layout_map = ModelParallel.generate_layout_map(
-            models.Sequential([layers.Dense(2, input_shape=(3,))]),
-            mesh
+            models.Sequential([layers.Dense(2, input_shape=(3,))]), mesh
         )
         dist = ModelParallel(device_mesh=mesh, layout_map=layout_map)
         set_distribution(dist)
@@ -95,9 +89,7 @@ class TorchTrainerTest(testing.TestCase):
     @pytest.mark.skipif(backend.backend() != "torch", reason="Requires torch")
     def test_fit_with_data_parallel(self):
         self._ensure_distributed_initialized()
-        mesh = DeviceMesh(
-            shape=(1,), axis_names=["batch"], devices=["cpu:0"]
-        )
+        mesh = DeviceMesh(shape=(1,), axis_names=["batch"], devices=["cpu:0"])
         dist = DataParallel(device_mesh=mesh)
         set_distribution(dist)
 

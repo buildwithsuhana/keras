@@ -176,8 +176,19 @@ class ParameterShardingStrategy:
 
                     # Update original variable to sharded state (backend-agnostic hack)
                     shard_tensor = self._convert_to_tensor(shard)
-                    param._shape = shard.shape
-                    param._ndim = len(shard.shape)
+
+                    def update_shape():
+                        from keras.src.backend import backend as backend_fn
+
+                        if backend_fn() == "torch":
+                            from keras.src.backend.torch.core import get_device
+
+                            if get_device() == "meta":
+                                return
+                        param._shape = shard.shape
+                        param._ndim = len(shard.shape)
+
+                    update_shape()
                     if hasattr(param, "_value"):
                         param._value = shard_tensor
 
@@ -187,9 +198,20 @@ class ParameterShardingStrategy:
                     )
 
         # 2. Patch layers recursively with output rules (communication ops)
-        print("🔗 Patching layers with communication rules...")
+        from keras.src.backend import backend as backend_fn
+
         patched_count = 0
+        is_meta = False
+        if backend_fn() == "torch":
+            from keras.src.backend.torch.core import get_device
+
+            if get_device() == "meta":
+                is_meta = True
+
         for layer in model._flatten_layers(recursive=True, include_self=True):
+            if is_meta:
+                continue
+
             lp = getattr(layer, "path", None) or layer.name
             lp_s = str(lp)
 
@@ -228,7 +250,9 @@ class ParameterShardingStrategy:
                     self._patch_layer(layer, actual_rule)
                     patched_count += 1
                     break
-        print(f"🎯 Patched {patched_count} layers with communication rules")
+
+        if not is_meta:
+            print(f"🎯 Patched {patched_count} layers with communication rules")
 
         sharded_model = ParameterShardedModel(model, self, config, device_id)
 
@@ -258,6 +282,18 @@ class ParameterShardingStrategy:
 
         @functools.wraps(old_call)
         def sharded_call(*args, **kwargs):
+            # Skip communication ops during symbolic trace
+            from keras.src.backend import backend
+
+            if backend() == "torch":
+                from keras.src.backend.common.symbolic_scope import (
+                    get_symbolic_scope,
+                )
+                from keras.src.backend.torch.core import get_device
+
+                if get_device() == "meta" or get_symbolic_scope() is not None:
+                    return old_call(*args, **kwargs)
+
             # Rule 3: For Row Parallel layers, bias should be added AFTER all_reduce
             from keras.src.distribution.tensor_parallel.autoconfig import (
                 _reduce_sum,
@@ -474,8 +510,45 @@ def _define_parameter_sharded_model():
                 return self.original_model.compute_output_spec(args[0])
             return self.original_model.compute_output_spec(**kwargs)
 
+        @property
+        def trainable_variables(self):
+            # Skip sharded weights during symbolic trace
+            from keras.src.backend import backend as backend_fn
+
+            if backend_fn() == "torch":
+                from keras.src.backend.torch.core import get_device
+
+                if get_device() == "meta":
+                    return self.original_model.trainable_variables
+
+            return super().trainable_variables
+
+        @property
+        def non_trainable_variables(self):
+            # Skip sharded weights during symbolic trace
+            from keras.src.backend import backend as backend_fn
+
+            if backend_fn() == "torch":
+                from keras.src.backend.torch.core import get_device
+
+                if get_device() == "meta":
+                    return self.original_model.non_trainable_variables
+
+            return super().non_trainable_variables
+
         def call(self, inputs, training=None, mask=None):
             """Forward pass that correctly handles sharded variable state."""
+            # Skip weight replacement during symbolic trace
+            from keras.src.backend import backend
+
+            if backend() == "torch":
+                from keras.src.backend.torch.core import get_device
+
+                if get_device() == "meta":
+                    return self.original_model(
+                        inputs, training=training, mask=mask
+                    )
+
             # Since we've already updated the layers' internal state via shape-lying,
             # we can call the original model directly.
             # The sharded variables are stored in self._weights_list and tracked via
