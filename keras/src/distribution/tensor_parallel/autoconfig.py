@@ -132,14 +132,21 @@ def _apply_layer_sharding_rules(layer, device_count, state_rules, output_rules):
 
     elif isinstance(layer, layers.EinsumDense):
         if "attention_output" in layer.name:
+            # Row-parallel style: shard on a contracting dimension (heads, axis 0)
             state_rules[id(layer.kernel)] = split_rule(dim=0)
             output_rules[layer_path] = _reduce_sum
-        elif "h" in layer.equation.split("->")[1] or "attention" in layer.name:
-            # This looks like MHA projections (query, key, value)
+        elif (
+            "query" in layer.name
+            or "key" in layer.name
+            or "value" in layer.name
+            or "attention" in layer.name
+            or "h" in layer.equation.split("->")[1]
+        ):
+            # Column-parallel style for QKV: shard on output heads (dim 1)
             state_rules[id(layer.kernel)] = split_rule(dim=1)
             if hasattr(layer, "bias") and layer.bias is not None:
                 state_rules[id(layer.bias)] = split_rule(dim=0)
-            # No gather here for projections!
+            # No gather! Keep it sharded for dot_product_attention.
         else:
             state_rules[id(layer.kernel)] = split_rule(dim=1)
             if hasattr(layer, "bias") and layer.bias is not None:
@@ -168,8 +175,16 @@ def _apply_layer_sharding_rules(layer, device_count, state_rules, output_rules):
         if embeddings_var is not None:
             # Shard along the vocabulary dimension (row-parallel equivalent for embedding)
             state_rules[id(embeddings_var)] = split_rule(dim=0)
-            # All-reduce to sum partial embeddings from each device
-            output_rules[layer_path] = _reduce_sum
+
+        # For ReversibleEmbedding with untied weights
+        if hasattr(layer, "tie_weights") and not layer.tie_weights:
+            if hasattr(layer, "reverse_embeddings"):
+                # reverse_embeddings shape is (output_dim, input_dim)
+                # Shard along input_dim (axis 1)
+                state_rules[id(layer.reverse_embeddings)] = split_rule(dim=1)
+
+        # All-reduce to sum partial embeddings from each device
+        output_rules[layer_path] = _reduce_sum
 
     elif isinstance(layer, layers.Dropout):
         # Rule 5: Mark dropout layers for parallel RNG handling if they follow a sharded op

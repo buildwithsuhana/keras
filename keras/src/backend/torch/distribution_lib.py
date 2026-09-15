@@ -354,6 +354,93 @@ def all_gather_variable(variable):
         return variable
 
 
+class AllReduce(torch.autograd.Function):
+    @staticmethod
+    def forward(ctx, tensor, op, axis_name):
+        if op == "sum":
+            reduce_op = dist.ReduceOp.SUM
+        elif op == "product":
+            reduce_op = dist.ReduceOp.PRODUCT
+        elif op == "min":
+            reduce_op = dist.ReduceOp.MIN
+        elif op == "max":
+            reduce_op = dist.ReduceOp.MAX
+        elif op == "mean":
+            if hasattr(dist.ReduceOp, "AVG"):
+                reduce_op = dist.ReduceOp.AVG
+            else:
+                reduce_op = dist.ReduceOp.SUM
+        else:
+            reduce_op = dist.ReduceOp.SUM
+
+        # Clone to avoid in-place modification of the input tensor
+        output = tensor.clone()
+        dist.all_reduce(output, reduce_op)
+
+        if op == "mean" and not hasattr(dist.ReduceOp, "AVG"):
+            output.div_(dist.get_world_size())
+
+        ctx.op = op
+        return output
+
+    @staticmethod
+    def backward(ctx, grad_output):
+        # The gradient of all_reduce(sum) is just all_reduce(sum) of the gradients
+        # because each device gets the full sum in forward.
+        # But wait, actually, if each device has x_i and forward gives y = sum(x_i) to all,
+        # then dy/dx_i = 1 for all i. So grad_input is just grad_output.
+        # However, since each device contributes to the loss, we need to be careful.
+        # Standard TP AllReduce(Sum) in forward (RowParallel) corresponds to
+        # Identity in backward (gradients are already correct).
+        # Actually, for RowParallel: y = sum(x_i). Grad_output is dL/dy.
+        # dL/dx_i = dL/dy * dy/dx_i = dL/dy.
+        # So we just return grad_output.
+        return grad_output, None, None
+
+
+class AllGather(torch.autograd.Function):
+    @staticmethod
+    def forward(ctx, tensor, axis, axis_name):
+        world_size = dist.get_world_size()
+        rank = dist.get_rank()
+        tensor_list = [torch.zeros_like(tensor) for _ in range(world_size)]
+        dist.all_gather(tensor_list, tensor)
+        # Use the input tensor itself for our own rank to preserve the autograd graph
+        tensor_list[rank] = tensor
+        ctx.axis = axis
+        ctx.world_size = world_size
+        return torch.cat(tensor_list, dim=axis)
+
+    @staticmethod
+    def backward(ctx, grad_output):
+        # The backward of all_gather is reduce_scatter (sum).
+        # Since we don't have reduce_scatter readily available for all backends,
+        # we can use all_reduce(sum) and then pick our shard.
+        axis = ctx.axis
+        world_size = ctx.world_size
+
+        # Split the gathered gradient back into shards
+        grad_shards = torch.chunk(grad_output, world_size, dim=axis)
+
+        # The gradient for the local shard is the sum of gradients from all devices
+        # that received this shard. But wait, in all_gather, every device gets every shard.
+        # So each device i contributed tensor_i.
+        # grad_output has [g_0, g_1, ..., g_{N-1}] concatenated along axis.
+        # dL/d(tensor_i) = dL/dy * dy/d(tensor_i).
+        # y = cat(tensor_0, ..., tensor_{N-1})
+        # dy/d(tensor_i) picks the i-th block of y.
+        # So each device should take its own shard from the grad_output.
+        # BUT, the shards are replicated on all devices.
+        # So we need to sum the gradients for the i-th shard across ALL devices.
+        rank = dist.get_rank()
+        local_grad = grad_shards[rank].clone()
+
+        # Sync gradients across devices
+        dist.all_reduce(local_grad, dist.ReduceOp.SUM)
+
+        return local_grad, None, None
+
+
 def all_reduce(tensor, op="sum", axis_name="model"):
     """Reduces a tensor across a device mesh axis using a collective.
 
@@ -367,31 +454,10 @@ def all_reduce(tensor, op="sum", axis_name="model"):
     Returns:
         The reduced tensor.
     """
-    if not dist.is_initialized():
+    if not dist.is_initialized() or dist.get_world_size() == 1:
         return tensor
 
-    if op == "sum":
-        reduce_op = dist.ReduceOp.SUM
-    elif op == "product":
-        reduce_op = dist.ReduceOp.PRODUCT
-    elif op == "min":
-        reduce_op = dist.ReduceOp.MIN
-    elif op == "max":
-        reduce_op = dist.ReduceOp.MAX
-    elif op == "mean":
-        if hasattr(dist.ReduceOp, "AVG"):
-            reduce_op = dist.ReduceOp.AVG
-        else:
-            # Fallback for older torch versions
-            dist.all_reduce(tensor, dist.ReduceOp.SUM)
-            tensor.div_(dist.get_world_size())
-            return tensor
-    else:
-        reduce_op = dist.ReduceOp.SUM
-
-    dist.all_reduce(tensor, reduce_op)
-
-    return tensor
+    return AllReduce.apply(tensor, op, axis_name)
 
 
 def all_gather(tensor, axis=0, axis_name="model"):
@@ -414,19 +480,10 @@ def all_gather(tensor, axis=0, axis_name="model"):
         Returns the original tensor if distributed is not initialized
         or world_size is 1.
     """
-    if not dist.is_initialized():
+    if not dist.is_initialized() or dist.get_world_size() == 1:
         return tensor
 
-    world_size = dist.get_world_size()
-
-    if world_size == 1:
-        return tensor
-
-    tensor_list = [torch.zeros_like(tensor) for _ in range(world_size)]
-    dist.all_gather(tensor_list, tensor)
-
-    result = torch.cat(tensor_list, dim=axis)
-    return result
+    return AllGather.apply(tensor, axis, axis_name)
 
 
 def broadcast(tensor, src=0):

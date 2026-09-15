@@ -7,6 +7,7 @@ sys.path.insert(
 )
 
 import argparse
+import hashlib
 
 import numpy as np
 import torch
@@ -16,6 +17,7 @@ BATCH_SIZE = 8
 SEQ_LENGTH = 32
 VOCAB_SIZE = 50272  # OPT default
 NUM_DEVICES = 2
+SEED = 1337
 
 
 def create_model():
@@ -23,16 +25,47 @@ def create_model():
 
     import keras
 
+    keras.utils.set_random_seed(SEED)
     model = keras_hub.models.OPTCausalLM.from_preset(
         "opt_125m_en",
         load_weights=False,
     )
+    initialize_model_weights(model)
     # Use random init for speed
     model.compile(
         optimizer=keras.optimizers.AdamW(learning_rate=2e-5),
         loss=keras.losses.SparseCategoricalCrossentropy(from_logits=True),
     )
     return model
+
+
+def initialize_model_weights(model):
+    for weight in model.weights:
+        shape = tuple(weight.shape)
+        if len(shape) == 1:
+            values = np.zeros(shape, dtype="float32")
+            if "scale" in weight.path or "gamma" in weight.path:
+                values.fill(1.0)
+        else:
+            path_seed = int.from_bytes(
+                hashlib.sha256(weight.path.encode("utf-8")).digest()[:8],
+                "little",
+            )
+            rng = np.random.default_rng(SEED + path_seed)
+            values = rng.normal(0.0, 0.02, size=shape).astype("float32")
+        weight.assign(values)
+
+
+def create_batch():
+    rng = np.random.default_rng(SEED)
+    token_ids = rng.integers(
+        0, VOCAB_SIZE, (BATCH_SIZE, SEQ_LENGTH), dtype=np.int32
+    )
+    padding_mask = np.ones((BATCH_SIZE, SEQ_LENGTH), dtype="int32")
+    y = rng.integers(
+        0, VOCAB_SIZE, (BATCH_SIZE, SEQ_LENGTH), dtype=np.int32
+    )
+    return {"token_ids": token_ids, "padding_mask": padding_mask}, y
 
 
 def run_training_torch(rank, world_size):
@@ -69,10 +102,7 @@ def run_training_torch(rank, world_size):
         loss=keras.losses.SparseCategoricalCrossentropy(from_logits=True),
     )
 
-    token_ids = np.random.randint(0, VOCAB_SIZE, (BATCH_SIZE, SEQ_LENGTH))
-    padding_mask = np.ones((BATCH_SIZE, SEQ_LENGTH), dtype="int32")
-    x = {"token_ids": token_ids, "padding_mask": padding_mask}
-    y = np.random.randint(0, VOCAB_SIZE, (BATCH_SIZE, SEQ_LENGTH))
+    x, y = create_batch()
 
     print(f"[Rank {rank}] Training one step...")
     loss = model.train_on_batch(x, y)
@@ -107,10 +137,7 @@ def run_jax():
         loss=keras.losses.SparseCategoricalCrossentropy(from_logits=True),
     )
 
-    token_ids = np.random.randint(0, VOCAB_SIZE, (BATCH_SIZE, SEQ_LENGTH))
-    padding_mask = np.ones((BATCH_SIZE, SEQ_LENGTH), dtype="int32")
-    x = {"token_ids": token_ids, "padding_mask": padding_mask}
-    y = np.random.randint(0, VOCAB_SIZE, (BATCH_SIZE, SEQ_LENGTH))
+    x, y = create_batch()
 
     print("Training one step...")
     loss = model.train_on_batch(x, y)

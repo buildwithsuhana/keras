@@ -188,10 +188,11 @@ class Variable(KerasVariable):
             # Reuse same parameter
             self._value = value
         else:
+            value = convert_to_tensor(value, dtype=self._dtype).to(get_device())
             self._value = torch.nn.Parameter(
-                convert_to_tensor(value, dtype=self._dtype),
+                value,
                 requires_grad=self.trainable,
-            ).to(get_device())
+            )
 
     def _direct_assign(self, value):
         with torch.no_grad():

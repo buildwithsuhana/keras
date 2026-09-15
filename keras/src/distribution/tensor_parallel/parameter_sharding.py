@@ -282,8 +282,106 @@ class ParameterShardingStrategy:
 
         @functools.wraps(old_call)
         def sharded_call(*args, **kwargs):
+            is_reversible = "ReversibleEmbedding" in layer.__class__.__name__
+            is_reverse = is_reversible and (
+                getattr(layer, "reverse", False)
+                or kwargs.get("reverse", False)
+            )
+
             # Skip communication ops during symbolic trace
             from keras.src.backend import backend
+
+            # Row-sharded embeddings must translate global indices to local
+            # indices before lookup and contribute zeros for rows owned by
+            # other ranks. This is required by both JAX and Torch backends.
+            if backend() != "torch" and not is_reverse:
+                is_embedding = (
+                    "Embedding" in layer.__class__.__name__
+                    or hasattr(layer, "_embeddings")
+                )
+                if is_embedding:
+                    target_var = next(
+                        (
+                            weight
+                            for weight in layer.weights
+                            if weight.path.endswith("/embeddings")
+                        ),
+                        getattr(layer, "_embeddings", None),
+                    )
+                    mapping = self.weight_mapping.get(
+                        getattr(target_var, "path", None)
+                    )
+                    if mapping and mapping["original"][0] != mapping[
+                        "sharded"
+                    ][0]:
+                        inputs = args[0] if args else kwargs.get("inputs")
+                        if inputs is not None:
+                            nelem = mapping["original"][0]
+                            default_size, remainder = divmod(
+                                nelem, self.device_count
+                            )
+                            start_idx = self.rank * default_size + min(
+                                self.rank, remainder
+                            )
+                            shard_size = default_size + (
+                                self.rank < remainder
+                            )
+                            end_idx = start_idx + shard_size
+                            dtype = str(inputs.dtype)
+
+                            if dtype.startswith(("int", "uint")):
+                                mask = ops.logical_and(
+                                    inputs >= start_idx, inputs < end_idx
+                                )
+                                local_inputs = ops.where(
+                                    mask,
+                                    inputs - start_idx,
+                                    ops.zeros_like(inputs),
+                                )
+                                new_args = list(args)
+                                if new_args:
+                                    new_args[0] = local_inputs
+                                    out = old_call(*new_args, **kwargs)
+                                else:
+                                    new_kwargs = dict(kwargs)
+                                    new_kwargs["inputs"] = local_inputs
+                                    out = old_call(**new_kwargs)
+                            elif "PositionEmbedding" in layer.__class__.__name__:
+                                positions = kwargs.get("positions")
+                                if args and len(args) > 2:
+                                    positions = args[2]
+                                if positions is None:
+                                    start_index = kwargs.get("start_index", 0)
+                                    if args and len(args) > 1:
+                                        start_index = args[1]
+                                    positions = ops.arange(
+                                        start_index,
+                                        start_index + inputs.shape[1],
+                                    )
+                                mask = ops.logical_and(
+                                    positions >= start_idx, positions < end_idx
+                                )
+                                local_positions = ops.where(
+                                    mask,
+                                    positions - start_idx,
+                                    ops.zeros_like(positions),
+                                )
+                                new_kwargs = dict(kwargs)
+                                new_kwargs["positions"] = local_positions
+                                out = old_call(inputs, **new_kwargs)
+                            else:
+                                out = old_call(*args, **kwargs)
+
+                            out = ops.where(
+                                ops.expand_dims(mask, -1),
+                                out,
+                                ops.zeros_like(out),
+                            )
+                            if callable(rule):
+                                return rule(out)
+                            if isinstance(rule, str):
+                                return self._comm(out, rule)
+                            return out
 
             if backend() == "torch":
                 from keras.src.backend.common.symbolic_scope import (
@@ -294,7 +392,148 @@ class ParameterShardingStrategy:
                 if get_device() == "meta" or get_symbolic_scope() is not None:
                     return old_call(*args, **kwargs)
 
+                is_embedding = (
+                    "Embedding" in layer.__class__.__name__
+                    or hasattr(layer, "_embeddings")
+                ) and not is_reverse
+
+                if is_embedding:
+                    target_var = None
+                    for w in layer.weights:
+                        if w.path.endswith("/embeddings"):
+                            target_var = w
+                            break
+                    if target_var is None:
+                        target_var = getattr(layer, "_embeddings", None)
+
+                    weight_path = getattr(target_var, "path", None)
+                    mapping = self.weight_mapping.get(weight_path)
+
+                    if (
+                        mapping
+                        and len(mapping["original"]) > 0
+                        and mapping["original"][0] != mapping["sharded"][0]
+                    ):
+                        import torch
+
+                        inputs = args[0] if args else kwargs.get("inputs")
+                        if inputs is not None:
+                            if not isinstance(inputs, torch.Tensor):
+                                inputs = torch.as_tensor(inputs)
+
+                            # Calculate shard boundaries using np.array_split logic
+                            nelem = mapping["original"][0]
+                            ncat = self.device_count
+                            default_size = nelem // ncat
+                            remainder = nelem % ncat
+
+                            if self.rank < remainder:
+                                start_idx = self.rank * (default_size + 1)
+                                my_shard_size = default_size + 1
+                            else:
+                                start_idx = (
+                                    self.rank * default_size + remainder
+                                )
+                                my_shard_size = default_size
+                            end_idx = start_idx + my_shard_size
+
+                            if not inputs.is_floating_point():
+                                # Standard index lookup (Token Embedding)
+                                mask = (inputs >= start_idx) & (
+                                    inputs < end_idx
+                                )
+                                local_inputs = torch.where(
+                                    mask,
+                                    inputs - start_idx,
+                                    torch.zeros_like(inputs),
+                                )
+
+                                new_args = list(args)
+                                if args:
+                                    new_args[0] = local_inputs
+                                else:
+                                    kwargs["inputs"] = local_inputs
+
+                                # Call with local indices
+                                out = old_call(*new_args, **kwargs)
+
+                                # Zero out embeddings for indices not owned by this shard
+                                out = torch.where(
+                                    mask.unsqueeze(-1),
+                                    out,
+                                    torch.zeros_like(out),
+                                )
+                            elif (
+                                "PositionEmbedding"
+                                in layer.__class__.__name__
+                            ):
+                                # Float inputs (Position Embedding receiving hidden states)
+                                # We need to find the sequence positions.
+                                start_index = kwargs.get("start_index", 0)
+                                if args and len(args) > 1:
+                                    start_index = args[1]
+
+                                positions = kwargs.get("positions")
+                                if args and len(args) > 2:
+                                    positions = args[2]
+
+                                seq_len = inputs.shape[1]
+                                if positions is None:
+                                    positions = torch.arange(
+                                        start_index,
+                                        start_index + seq_len,
+                                        device=inputs.device,
+                                    )
+
+                                # Mask and shift POSITIONS instead of INPUTS
+                                mask = (positions >= start_idx) & (
+                                    positions < end_idx
+                                )
+                                local_positions = torch.where(
+                                    mask,
+                                    positions - start_idx,
+                                    torch.zeros_like(positions),
+                                )
+
+                                # Update kwargs/args to use local_positions
+                                new_kwargs = dict(kwargs)
+                                if "positions" in kwargs or (
+                                    args and len(args) > 2
+                                ):
+                                    new_kwargs["positions"] = local_positions
+                                else:
+                                    # Handle case where positions was not passed
+                                    # but we generated it.
+                                    # If it's KerasHub PositionEmbedding, it expects it.
+                                    new_kwargs["positions"] = local_positions
+
+                                # Call old_call
+                                out = old_call(inputs, **new_kwargs)
+
+                                # Zero out output based on mask
+                                # Broadcast mask to (batch, seq_len, 1)
+                                if mask.dim() == 1:
+                                    mask = mask.unsqueeze(0)  # (1, seq_len)
+
+                                out = torch.where(
+                                    mask.unsqueeze(-1),
+                                    out,
+                                    torch.zeros_like(out),
+                                )
+                            else:
+                                # Fallback for other embedding types
+                                out = old_call(*args, **kwargs)
+
+                            # Apply the communication rule (usually AllReduce sum)
+                            if rule:
+                                if callable(rule):
+                                    return rule(out)
+                                elif isinstance(rule, str):
+                                    return self._comm(out, rule)
+                            return out
+
             # Rule 3: For Row Parallel layers, bias should be added AFTER all_reduce
+            # to avoid summing the bias N times.
             from keras.src.distribution.tensor_parallel.autoconfig import (
                 _reduce_sum,
             )
@@ -308,14 +547,29 @@ class ParameterShardingStrategy:
                     seed_state.assign(seed_state.value + self.rank * 1000)
                 return old_call(*args, **kwargs)
 
+            # Special override for ReversibleEmbedding in reverse mode:
+            # force all_gather on axis -1
+            if is_reverse:
+                out = old_call(*args, **kwargs)
+                return distribution_lib.all_gather(
+                    out, axis=-1, axis_name="model"
+                )
+
             use_bias = getattr(layer, "use_bias", False)
-            if use_bias and rule == _reduce_sum:
+            if (
+                use_bias
+                and rule == _reduce_sum
+                and hasattr(layer, "bias")
+                and layer.bias is not None
+            ):
                 # Temporarily disable bias addition in the original call
                 layer.use_bias = False
-                out = old_call(*args, **kwargs)
-                layer.use_bias = True
+                try:
+                    out = old_call(*args, **kwargs)
+                finally:
+                    layer.use_bias = True
 
-                # Apply the rule (AllReduce)
+                # Apply the rule (AllReduce Sum)
                 out = rule(out)
 
                 # Add the bias manually after AllReduce
@@ -334,8 +588,17 @@ class ParameterShardingStrategy:
 
         # Disable input_spec validation for sharded layers
         # as it often conflicts with sharded input shapes.
-        if hasattr(layer, "input_spec"):
-            layer.input_spec = None
+        def disable_input_spec(l):
+            if hasattr(l, "input_spec"):
+                l.input_spec = None
+            if hasattr(l, "_flatten_layers"):
+                for sub_l in l._flatten_layers(
+                    recursive=True, include_self=False
+                ):
+                    if hasattr(sub_l, "input_spec"):
+                        sub_l.input_spec = None
+
+        disable_input_spec(layer)
 
         # Patch compute_output_shape to return full shape if gathering
         old_cos = layer.compute_output_shape
@@ -538,6 +801,9 @@ def _define_parameter_sharded_model():
 
         def call(self, inputs, training=None, mask=None):
             """Forward pass that correctly handles sharded variable state."""
+            from keras.src import tree
+            from keras.src.backend import is_tensor
+
             # Skip weight replacement during symbolic trace
             from keras.src.backend import backend
 
@@ -581,7 +847,17 @@ def _define_parameter_sharded_model():
                         len(sharded_var.shape) if sharded_var.shape else 0
                     )
                     if hasattr(orig_var, "_value"):
-                        orig_var._value = sharded_var.value
+                        # Use the underlying leaf Parameter object (_value)
+                        # instead of .value which might return an autocasted tensor.
+                        val = getattr(sharded_var, "_value", sharded_var.value)
+                        if (
+                            hasattr(sharded_var, "trainable")
+                            and sharded_var.trainable
+                            and hasattr(val, "requires_grad")
+                            and not val.requires_grad
+                        ):
+                            val.requires_grad_(True)
+                        orig_var._value = val
 
             for orig_var in self.original_model.non_trainable_variables:
                 var_id = id(orig_var)
@@ -608,13 +884,51 @@ def _define_parameter_sharded_model():
                         len(sharded_var.shape) if sharded_var.shape else 0
                     )
                     if hasattr(orig_var, "_value"):
-                        orig_var._value = sharded_var.value
+                        orig_var._value = getattr(
+                            sharded_var, "_value", sharded_var.value
+                        )
 
             try:
                 # Call the original model
                 outputs = self.original_model.call(
                     inputs, training=training, mask=mask
                 )
+
+                # Special handling for sharded outputs (e.g. final Dense layer)
+                # If the output tensor is sharded along its last dimension (column-parallel),
+                # and it was NOT gathered yet, we must gather it so the loss function
+                # sees the full vocabulary/classes.
+                
+                # Heuristic: if the output shape doesn't match the original model's 
+                # expected output shape (if we could know it), we gather.
+                # Since we don't easily know the full expected shape here, 
+                # we check if any of the "leaf" layers that contributed to the output
+                # are sharded on axis 1 (column-parallel) but don't have a gather rule.
+                
+                def maybe_gather(out):
+                    if not is_tensor(out):
+                        return out
+                    
+                    # If the last dim size * device_count matches a typical vocabulary size
+                    # or if we can find the layer that produced it.
+                    # A more reliable way: check if the output layer was sharded.
+                    output_layer = self.original_model.layers[-1]
+                    
+                    # If it's a ColumnParallel layer, restored shape should have 
+                    # full dim at -1.
+                    for w in output_layer.weights:
+                        mapping = self.sharding_strategy.weight_mapping.get(w.path)
+                        if mapping and len(mapping["original"]) > 1:
+                            if mapping["original"][-1] != mapping["sharded"][-1]:
+                                # It's column-parallel on the last dimension.
+                                # Check if the current output tensor has the sharded size.
+                                if out.shape[-1] == mapping["sharded"][-1]:
+                                    return distribution_lib.all_gather(
+                                        out, axis=-1, axis_name="model"
+                                    )
+                    return out
+
+                outputs = tree.map_structure(maybe_gather, outputs)
             finally:
                 # Restore original variable state
                 for orig_var in list(
