@@ -62,9 +62,7 @@ def create_batch():
         0, VOCAB_SIZE, (BATCH_SIZE, SEQ_LENGTH), dtype=np.int32
     )
     padding_mask = np.ones((BATCH_SIZE, SEQ_LENGTH), dtype="int32")
-    y = rng.integers(
-        0, VOCAB_SIZE, (BATCH_SIZE, SEQ_LENGTH), dtype=np.int32
-    )
+    y = rng.integers(0, VOCAB_SIZE, (BATCH_SIZE, SEQ_LENGTH), dtype=np.int32)
     return {"token_ids": token_ids, "padding_mask": padding_mask}, y
 
 

@@ -284,8 +284,7 @@ class ParameterShardingStrategy:
         def sharded_call(*args, **kwargs):
             is_reversible = "ReversibleEmbedding" in layer.__class__.__name__
             is_reverse = is_reversible and (
-                getattr(layer, "reverse", False)
-                or kwargs.get("reverse", False)
+                getattr(layer, "reverse", False) or kwargs.get("reverse", False)
             )
 
             # Skip communication ops during symbolic trace
@@ -311,9 +310,10 @@ class ParameterShardingStrategy:
                     mapping = self.weight_mapping.get(
                         getattr(target_var, "path", None)
                     )
-                    if mapping and mapping["original"][0] != mapping[
-                        "sharded"
-                    ][0]:
+                    if (
+                        mapping
+                        and mapping["original"][0] != mapping["sharded"][0]
+                    ):
                         inputs = args[0] if args else kwargs.get("inputs")
                         if inputs is not None:
                             nelem = mapping["original"][0]
@@ -323,9 +323,7 @@ class ParameterShardingStrategy:
                             start_idx = self.rank * default_size + min(
                                 self.rank, remainder
                             )
-                            shard_size = default_size + (
-                                self.rank < remainder
-                            )
+                            shard_size = default_size + (self.rank < remainder)
                             end_idx = start_idx + shard_size
                             dtype = str(inputs.dtype)
 
@@ -346,7 +344,9 @@ class ParameterShardingStrategy:
                                     new_kwargs = dict(kwargs)
                                     new_kwargs["inputs"] = local_inputs
                                     out = old_call(**new_kwargs)
-                            elif "PositionEmbedding" in layer.__class__.__name__:
+                            elif (
+                                "PositionEmbedding" in layer.__class__.__name__
+                            ):
                                 positions = kwargs.get("positions")
                                 if args and len(args) > 2:
                                     positions = args[2]
@@ -431,9 +431,7 @@ class ParameterShardingStrategy:
                                 start_idx = self.rank * (default_size + 1)
                                 my_shard_size = default_size + 1
                             else:
-                                start_idx = (
-                                    self.rank * default_size + remainder
-                                )
+                                start_idx = self.rank * default_size + remainder
                                 my_shard_size = default_size
                             end_idx = start_idx + my_shard_size
 
@@ -464,8 +462,7 @@ class ParameterShardingStrategy:
                                     torch.zeros_like(out),
                                 )
                             elif (
-                                "PositionEmbedding"
-                                in layer.__class__.__name__
+                                "PositionEmbedding" in layer.__class__.__name__
                             ):
                                 # Float inputs (Position Embedding receiving hidden states)
                                 # We need to find the sequence positions.
@@ -802,10 +799,10 @@ def _define_parameter_sharded_model():
         def call(self, inputs, training=None, mask=None):
             """Forward pass that correctly handles sharded variable state."""
             from keras.src import tree
-            from keras.src.backend import is_tensor
 
             # Skip weight replacement during symbolic trace
             from keras.src.backend import backend
+            from keras.src.backend import is_tensor
 
             if backend() == "torch":
                 from keras.src.backend.torch.core import get_device
@@ -898,28 +895,33 @@ def _define_parameter_sharded_model():
                 # If the output tensor is sharded along its last dimension (column-parallel),
                 # and it was NOT gathered yet, we must gather it so the loss function
                 # sees the full vocabulary/classes.
-                
-                # Heuristic: if the output shape doesn't match the original model's 
+
+                # Heuristic: if the output shape doesn't match the original model's
                 # expected output shape (if we could know it), we gather.
-                # Since we don't easily know the full expected shape here, 
+                # Since we don't easily know the full expected shape here,
                 # we check if any of the "leaf" layers that contributed to the output
                 # are sharded on axis 1 (column-parallel) but don't have a gather rule.
-                
+
                 def maybe_gather(out):
                     if not is_tensor(out):
                         return out
-                    
+
                     # If the last dim size * device_count matches a typical vocabulary size
                     # or if we can find the layer that produced it.
                     # A more reliable way: check if the output layer was sharded.
                     output_layer = self.original_model.layers[-1]
-                    
-                    # If it's a ColumnParallel layer, restored shape should have 
+
+                    # If it's a ColumnParallel layer, restored shape should have
                     # full dim at -1.
                     for w in output_layer.weights:
-                        mapping = self.sharding_strategy.weight_mapping.get(w.path)
+                        mapping = self.sharding_strategy.weight_mapping.get(
+                            w.path
+                        )
                         if mapping and len(mapping["original"]) > 1:
-                            if mapping["original"][-1] != mapping["sharded"][-1]:
+                            if (
+                                mapping["original"][-1]
+                                != mapping["sharded"][-1]
+                            ):
                                 # It's column-parallel on the last dimension.
                                 # Check if the current output tensor has the sharded size.
                                 if out.shape[-1] == mapping["sharded"][-1]:

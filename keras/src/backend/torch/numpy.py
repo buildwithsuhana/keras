@@ -1967,7 +1967,6 @@ def split(x, indices_or_sections, axis=0):
     return list(out)
 
 
-
 def array_split(x, indices_or_sections, axis=0):
     x = convert_to_tensor(x)
     out = torch.tensor_split(x, indices_or_sections, dim=axis)
